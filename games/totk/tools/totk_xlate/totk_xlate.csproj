@@ -1,0 +1,26 @@
+<!-- TOTK runtime shader translator: Switch Maxwell code -> SPIR-V via the vendored Ryujinx 1.3.2 shader translator. -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RyuSrc Condition="'$(RyuSrc)' == ''">$(MSBuildThisFileDirectory)../../tooling/d2r-mobile/dm/third_party/ryujinx</RyuSrc>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(RyuSrc)/src/Ryujinx.Graphics.Shader/Ryujinx.Graphics.Shader.csproj" />
+    <ProjectReference Include="$(RyuSrc)/src/Ryujinx.Common/Ryujinx.Common.csproj" />
+  </ItemGroup>
+  <!-- .NET 10's linux-bionic pack still selects the OpenSSL shim, unlike android-arm64.
+       No translator path needs native crypto. Keep its DirectPInvoke entries so a future crypto
+       call fails at link time instead of silently falling back to dlopen on Android/BoringSSL. -->
+  <Target Name="RemoveAndroidOpenSslShim" AfterTargets="SetupOSSpecificProps"
+          Condition="'$(PublishAot)' == 'true' and '$(RuntimeIdentifier)' == 'linux-bionic-arm64'">
+    <ItemGroup>
+      <_AndroidCryptoShim Include="@(NativeLibrary)" Condition="'%(Filename)' == 'libSystem.Security.Cryptography.Native.OpenSsl'" />
+      <NativeLibrary Remove="@(_AndroidCryptoShim)" />
+      <!-- SetupOSSpecificProps has already copied these paths into LinkerArg. -->
+      <LinkerArg Remove="@(_AndroidCryptoShim)" />
+    </ItemGroup>
+  </Target>
+</Project>
