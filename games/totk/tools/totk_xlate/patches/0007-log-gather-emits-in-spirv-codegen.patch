@@ -1,0 +1,13 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs	2026-10-22 21:01:44.926230801 -0500
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs	2026-10-22 21:01:44.938278393 -0500
+@@ -1173,6 +1173,10 @@
+             AstTextureOperation texOp = (AstTextureOperation)operation;
+ 
+             bool isGather = (texOp.Flags & TextureFlags.Gather) != 0;
++            if (isGather)
++            {
++                context.Logger.Log($"[totk-cg] gather emitted: flags={texOp.Flags} type={texOp.Type} set/binding={texOp.Set}/{texOp.Binding}");
++            }
+             bool hasDerivatives = (texOp.Flags & TextureFlags.Derivatives) != 0;
+             bool intCoords = (texOp.Flags & TextureFlags.IntCoords) != 0;
+             bool hasLodBias = (texOp.Flags & TextureFlags.LodBias) != 0;
