@@ -1,0 +1,28 @@
+{
+  "schema": 1, "status": "ready", "seq": 1, "gameVersion": "1.4.3",
+  "player": {"life": 47, "maxLife": 80, "extraLife": 8, "breakLife": 12, "maxStamina": 2500, "extraStamina": 500, "maxEnergy": 1800, "extraEnergy": 300, "rupees": 12845, "poes": 238, "ability": "UltraHand", "pos": [-254, 120, -1102], "heading": 135, "layer": "Ground", "cookBuff": {"type": "AttackUp", "level": 2, "time": 120}},
+  "pouch": {
+    "weapons": [
+      {"name":"Weapon_Sword_001","life":18,"fuse":"Item_Enemy_77","fuseLife":12,"effect":{"type":"AttackUp","value":5},"equipped":true},
+      {"name":"Weapon_Sword_002","life":8,"fuse":"Item_Ore_A","equipped":false},
+      {"name":"Weapon_Lsword_001","life":23,"equipped":false},
+      {"name":"Weapon_Spear_001","life":3,"fuse":"Item_Enemy_01"},
+      {"name":"Weapon_Sword_003","life":24}, {"name":"Weapon_Lsword_002","life":16},
+      {"name":"Weapon_Spear_002","life":31}, {"name":"Weapon_Sword_019","life":12},
+      {"name":"Weapon_Sword_020","life":19}, {"name":"Weapon_Sword_021","life":27},
+      {"name":"Weapon_Sword_022","life":8}, {"name":"Weapon_Lsword_003","life":6}
+    ],
+    "bows": [{"name":"Weapon_Bow_001","life":20,"equipped":true},{"name":"Weapon_Bow_002","life":8},{"name":"Weapon_Bow_003","life":17}],
+    "arrows": [{"name":"NormalArrow","count":86,"equipped":true}],
+    "shields": [{"name":"Weapon_Shield_001","life":12,"fuse":"SpObj_FlameThrower_A_01","equipped":true},{"name":"Weapon_Shield_002","life":21}],
+    "armor": [{"name":"Armor_001_Head","color":"None","equipped":true},{"name":"Armor_001_Upper","color":"None","equipped":true},{"name":"Armor_001_Lower","color":"None","equipped":true},{"name":"Armor_002_Head"}],
+    "materials": [{"name":"Item_Fruit_A","count":12},{"name":"Item_Mushroom_A","count":28},{"name":"Item_Meat_01","count":8},{"name":"Item_Ore_A","count":2},{"name":"Item_Enemy_77","count":37},{"name":"Item_Enemy_01","count":18},{"name":"Item_PlantGet_A","count":24},{"name":"Item_FishGet_A","count":6}],
+    "food": [{"name":"Item_Cook_C_17","count":1,"heal":12,"effect":"AttackUp","level":2,"time":150,"price":30,"materials":["Item_Meat_01","Item_Fruit_A"]},{"name":"Item_Cook_A_01","count":3,"heal":8},{"name":"Item_Cook_B_01","count":1,"heal":16,"effect":"GloomResistance","level":1,"time":120}],
+    "zonai": [{"name":"SpObj_FlameThrower_Capsule_A_01","count":3},{"name":"SpObj_WindGenerator_Capsule_A_01","count":14},{"name":"SpObj_ControlStick_Capsule_A_01","count":6},{"name":"SpObj_Cart_Capsule_A_01","count":8}],
+    "keyItems": [{"name":"Obj_DRStone_Get","count":1},{"name":"Obj_HeartUtuwa_A_01","count":2},{"name":"Obj_StaminaUtuwa_A_01","count":1}]
+  },
+  "slots":{"weapons":12,"bows":5,"shields":6},
+  "abilities":["UltraHand","OneTouchBond","CeilingClipper","ReverseRecorder","AutoBuilder"],
+  "sages":[{"id":"Wind","joined":true,"summoned":true,"cooldown":0},{"id":"Fire","joined":true,"summoned":false,"cooldown":12},{"id":"Water","joined":true,"summoned":true,"cooldown":0},{"id":"Electric","joined":true,"summoned":false,"cooldown":0},{"id":"Soul","joined":false,"summoned":false}],
+  "map":{"pins":[{"x":-100,"y":120,"z":-900,"type":"Red"},{"x":-500,"y":120,"z":-1200,"type":"Blue"}],"stamps":[{"x":-650,"z":-1000,"type":"Star","layer":"Ground"},{"x":-450,"z":-1400,"type":"TreasureBox","layer":"Ground"},{"x":-200,"z":-1000,"type":"Leaf","layer":"Sky"},{"x":-500,"z":-1200,"type":"Skull","layer":"UnderGround"}]}
+}
