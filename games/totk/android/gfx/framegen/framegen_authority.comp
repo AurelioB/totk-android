@@ -1,0 +1,227 @@
+#version 450
+// Ordered raw D32 observations certify depth VALUE, never raster coverage.
+// Each unproven span observes a clipped before/after rectangle. Only proven
+// geometry may occur between spans; changed gap/final values restore authority.
+// Source row prefixes/ranges become immutable after phase 0. Each CURRENT pair
+// owns separate masks/census; phases 1..3 retain their conservative 4x4 dilation.
+layout(local_size_x=256) in;
+layout(set=0,binding=0,std430) buffer Authority { uint words[]; };
+layout(set=0,binding=1,std430) buffer PairAuthority { uint pair_words[]; };
+layout(push_constant) uniform Push {
+    uint phase; uint width; uint height; uint reserved;
+    vec4 row[4]; // This source's ACTUAL current-pair sourceClip -> midpointClip.
+    uvec4 rect; // Native x,y,width,height for phases 4..6 only.
+} pc;
+const uint header=16u;
+const uint tile_edge=4u;
+const float cap=0.04;
+const float eps=1.1920928955078125e-7;
+shared uint scan[256];
+shared uint range_lo[256],range_hi[256],range_count[256];
+shared uint carry;
+
+uint prefix(uint value) {
+    uint lane=gl_LocalInvocationID.x;
+    scan[lane]=value;
+    barrier();
+    for (uint step=1u;step<256u;step<<=1u) {
+        uint add=lane>=step ? scan[lane-step] : 0u;
+        barrier();
+        scan[lane]+=add;
+        barrier();
+    }
+    return scan[lane];
+}
+bool finite_value(float x) { return !isnan(x) && !isinf(x); }
+
+// Same conservative polynomial-box proof as fg_math_motion_bound: W is affine;
+// P_i-q_i*W is quadratic only in q_i and affine in the other coordinates. Its
+// absolute extrema are on four parallel edges at endpoints or the vertex.
+// Divide that numerator envelope by a positive-W certificate, with outward
+// FP32 error. Clipping/horizons never justify a smaller bound: retain hard cap.
+vec2 motion_bound() {
+    vec2 result=vec2(cap);
+    vec4 sums=vec4(0.0);
+    for (int r=0;r<4;r++) {
+        if (any(isnan(pc.row[r])) || any(isinf(pc.row[r]))) return result;
+        sums[r]=dot(abs(pc.row[r]),vec4(1.0));
+    }
+    float det=determinant(mat4(pc.row[0],pc.row[1],pc.row[2],pc.row[3]));
+    // The row-norm product bounds the absolute Leibniz terms. Its outward
+    // FP32 allowance prevents a rounded nonzero determinant certifying a
+    // singular (or numerically indistinguishable) transform.
+    float det_error=128.0*eps*sums.x*sums.y*sums.z*sums.w;
+    if (!finite_value(det) || !finite_value(det_error) || abs(det)<=det_error || words[6]==0u) return result;
+    // EVERY valid retained final D32 texel contributes to these atomic extrema.
+    // Negative zero is canonicalized by phase 0; positive IEEE words are ordered.
+    vec2 z=clamp(2.0*vec2(uintBitsToFloat(words[4]),uintBitsToFloat(words[5]))-1.0+
+                 vec2(-8.0*eps,8.0*eps),vec2(-1.0),vec2(1.0));
+    float wmin=3.402823466e38;
+    for (uint corner=0u;corner<8u;corner++) {
+        vec4 q=vec4((corner&1u)!=0u ? 1.0 : -1.0,(corner&2u)!=0u ? 1.0 : -1.0,z[(corner>>2u)&1u],1.0);
+        wmin=min(wmin,dot(pc.row[3],q));
+    }
+    float error_w=32.0*eps*(1.0+sums.w);
+    if (!finite_value(wmin) || wmin<=1e-5+error_w) return result;
+    for (int axis=0;axis<2;axis++) {
+        if (all(equal(pc.row[3],vec4(0,0,0,1))) &&
+            all(equal(pc.row[axis],axis==0 ? vec4(1,0,0,0) : vec4(0,1,0,0)))) {
+            result[axis]=0.0; // Exact identity; one radius texel covers UV rounding.
+            continue;
+        }
+        float largest=0.0;
+        for (uint edge=0u;edge<4u;edge++) {
+            vec4 q=vec4(0,0,z[(edge>>1u)&1u],1);
+            q[1-axis]=(edge&1u)!=0u ? 1.0 : -1.0;
+            float a=pc.row[axis][axis],c=pc.row[3][axis];
+            float b=dot(pc.row[axis],q),d=dot(pc.row[3],q),linear=a-d;
+            largest=max(largest,max(abs(-c-linear+b),abs(-c+linear+b)));
+            if (c!=0.0) {
+                float t=linear/(2.0*c);
+                if (t>-1.0 && t<1.0) largest=max(largest,abs((-c*t+linear)*t+b));
+            }
+        }
+        float error=128.0*eps*(1.0+sums[axis]+sums.w);
+        float bound=(largest+error)/(2.0*(wmin-error_w))+8.0*eps;
+        if (finite_value(bound)) result[axis]=min(cap,bound+8.0*eps);
+    }
+    return result;
+}
+void main() {
+    uint lane=gl_LocalInvocationID.x,line=gl_WorkGroupID.x;
+    uint pixels=pc.width*pc.height;
+    if (pc.phase>=4u && pc.phase<=6u) {
+        uint local=line*256u+lane;
+        if (local>=pc.rect.z*pc.rect.w) return;
+        uint pixel=(pc.rect.y+local/pc.rect.z)*pc.width+pc.rect.x+local%pc.rect.z;
+        // Binding 1 is private before, last-after, last-proven VALUE, state.
+        // State: 0 unobserved, 1 known, 2 unknown, 3 experimental assumption.
+        uint before=pair_words[pixel],after=pair_words[pixels+pixel];
+        uint state=pair_words[3u*pixels+pixel];
+        if (pc.phase==5u) {
+            if (state==0u || before!=after) {
+                pair_words[2u*pixels+pixel]=before;
+                pair_words[3u*pixels+pixel]=1u;
+            }
+        } else if (after!=before) {
+            pair_words[3u*pixels+pixel]=after==pair_words[2u*pixels+pixel] ?
+                1u : pc.phase==6u ? 3u : 2u;
+        }
+        // Unchanged unproven writes MUST preserve an earlier unknown state.
+        // Same-value proven writes/hidden change-restore gaps remain unknown.
+        return;
+    }
+    if (pc.phase==3u) {
+        if (lane==0u) {
+            for (uint i=0u;i<header;i++) pair_words[i]=words[i];
+            vec2 bound=motion_bound();
+            pair_words[3]=0u;
+            pair_words[8]=floatBitsToUint(bound.x); pair_words[9]=floatBitsToUint(bound.y);
+            // Scene-mode retained colors contain a spatial kernel. Host
+            // supplies its conservative x/y halo in depth pixels, once/pair.
+            pair_words[10]=min(pc.width,uint(ceil(float(pc.width)*bound.x))+1u+(pc.reserved&65535u));
+            pair_words[11]=min(pc.height,uint(ceil(float(pc.height)*bound.y))+1u+(pc.reserved>>16u));
+            pair_words[12]=tile_edge; // Granularity only; radii remain native pixels.
+        }
+        return;
+    }
+    if (pc.phase==1u) {
+        uint coarse_w=(pc.width+tile_edge-1u)/tile_edge;
+        uint coarse_h=(pc.height+tile_edge-1u)/tile_edge;
+        uint tile=line*256u+lane;
+        if (tile<coarse_w*coarse_h) {
+            uint x=(tile%coarse_w)*tile_edge,y=(tile/coarse_w)*tile_edge;
+            uint radius=pair_words[10],end_x=min(x+tile_edge,pc.width);
+            uint lo=x>radius ? x-radius : 0u,hi=min(end_x-1u+radius,pc.width-1u);
+            uint unknown=0u;
+            // Fuse the 4x4 max reduction and horizontal dilation. The union
+            // of every output texel's native-radius X window is [lo,hi].
+            // Immutable full-resolution row prefixes answer each in O(1).
+            for (uint row=y;row<min(y+tile_edge,pc.height);row++) {
+                uint sum=words[header+row*pc.width+hi];
+                if (lo>0u) sum-=words[header+row*pc.width+lo-1u];
+                unknown|=sum>0u ? 1u : 0u;
+            }
+            pair_words[header+tile]=unknown;
+        }
+        return;
+    }
+    if (pc.phase==2u) {
+        uint coarse_w=(pc.width+tile_edge-1u)/tile_edge;
+        uint coarse_h=(pc.height+tile_edge-1u)/tile_edge;
+        uint tile=line*256u+lane,count=0u;
+        if (tile<coarse_w*coarse_h) {
+            uint x=tile%coarse_w,y=tile/coarse_w;
+            uint radius=(pair_words[11]+tile_edge-1u)/tile_edge;
+            uint lo=y>radius ? y-radius : 0u,hi=min(y+radius,coarse_h-1u);
+            uint unknown=0u;
+            // If |native_y-source_y| <= native_radius, their tile indices
+            // differ by at most ceil(native_radius/4). Thus no exact old
+            // rectangular dilation pixel can become known here. Coarse
+            // rounding may only enlarge the unknown region, never shrink it.
+            for (uint row=lo;row<=hi;row++)
+                unknown|=pair_words[header+row*coarse_w+x];
+            uint begin_x=x*tile_edge,begin_y=y*tile_edge;
+            uint end_x=min(begin_x+tile_edge,pc.width),end_y=min(begin_y+tile_edge,pc.height);
+            for (uint row=begin_y;row<end_y;row++)
+                for (uint column=begin_x;column<end_x;column++)
+                    pair_words[header+pixels+row*pc.width+column]=1u-unknown;
+            // Partial right/bottom tiles count actual native pixels, not 16.
+            count=unknown*(end_x-begin_x)*(end_y-begin_y);
+        }
+        scan[lane]=count;
+        barrier();
+        for (uint step=128u;step>0u;step>>=1u) {
+            if (lane<step) scan[lane]+=scan[lane+step];
+            barrier();
+        }
+        if (lane==0u) atomicAdd(pair_words[3],scan[0]);
+        return;
+    }
+    if (lane==0u) carry=0u;
+    barrier();
+    uint extent=pc.width;
+    uint local_lo=0x3f800000u,local_hi=0u,local_count=0u,local_admitted=0u;
+    for (uint chunk=0u;chunk<extent;chunk+=256u) {
+        uint coordinate=chunk+lane,value=0u;
+        if (coordinate<extent) {
+            uint pixel=line*pc.width+coordinate,raw=words[header+pixels+pixel];
+            uint state=pair_words[3u*pixels+pixel];
+            bool retained=state>=2u && pair_words[pixels+pixel]==raw;
+            value=retained ? 1u : 0u;
+            if (retained && state==3u && pc.reserved!=0u) {
+                value=0u;
+                local_admitted++;
+            }
+            float depth=uintBitsToFloat(raw);
+            if (finite_value(depth) && depth>=0.0 && depth<1.0-1e-6) {
+                uint ordered=depth==0.0 ? 0u : raw;
+                local_lo=min(local_lo,ordered); local_hi=max(local_hi,ordered); local_count++;
+            }
+        }
+        uint sum=prefix(value)+carry;
+        if (coordinate<extent) {
+            uint pixel=line*pc.width+coordinate;
+            words[header+pixel]=sum;
+        }
+        barrier();
+        if (lane==0u) carry+=scan[255];
+        barrier();
+    }
+    if (local_admitted!=0u) atomicAdd(words[7],local_admitted);
+    range_lo[lane]=local_lo; range_hi[lane]=local_hi; range_count[lane]=local_count;
+    barrier();
+    for (uint step=128u;step>0u;step>>=1u) {
+        if (lane<step) {
+            range_lo[lane]=min(range_lo[lane],range_lo[lane+step]);
+            range_hi[lane]=max(range_hi[lane],range_hi[lane+step]);
+            range_count[lane]+=range_count[lane+step];
+        }
+        barrier();
+    }
+    if (lane==0u) {
+        atomicAdd(words[2],carry);
+        atomicMin(words[4],range_lo[0]); atomicMax(words[5],range_hi[0]);
+        atomicAdd(words[6],range_count[0]);
+    }
+}

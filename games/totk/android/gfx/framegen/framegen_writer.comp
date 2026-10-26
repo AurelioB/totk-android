@@ -1,0 +1,44 @@
+#version 450
+// Diagnostic only. Never writes ordinary authority or affects eligibility.
+// Gross span changes overlap; only final last-changed VALUE ownership is exclusive.
+layout(local_size_x=256) in;
+layout(set=0,binding=0,std430) buffer Writer { uint data[]; };
+layout(set=0,binding=1,std430) readonly buffer Authority { uint authority[]; };
+layout(push_constant) uniform Push {
+    uint phase; uint width; uint height; uint owner;
+    uint span; uint spans; uint groups; uint reserved;
+} pc;
+const uint header=4u, max_spans=256u;
+shared uint gross[256];
+void main() {
+    uint p=gl_GlobalInvocationID.x, lane=gl_LocalInvocationID.x;
+    uint pixels=pc.width*pc.height, counts=4u*pixels;
+    if (pc.phase==0u) {
+        uint changed=0u;
+        if (p<pixels && data[p]!=data[pixels+p]) {
+            changed=1u;
+            data[2u*pixels+p]=pc.owner; // zero invalidates an earlier unproven owner
+            data[3u*pixels+p]=data[pixels+p];
+        }
+        gross[lane]=changed;
+        barrier();
+        for (uint step=128u;step>0u;step>>=1u) {
+            if (lane<step) gross[lane]+=gross[lane+step];
+            barrier();
+        }
+        if (lane==0u) atomicAdd(data[counts+header+pc.span],gross[0]);
+    } else if (p<pixels) {
+        // Authority phase 0 has replaced baseline words with row prefixes.
+        // A one-step difference is the ACTUAL residual unknown bit, already
+        // excluding exact UNCERTIFIED candidate values when that arm is enabled.
+        uint prefix=authority[16u+p];
+        bool unknown=prefix!=(p%pc.width==0u ? 0u : authority[16u+p-1u]);
+        if (!unknown) return;
+        atomicAdd(data[counts+2u],1u);
+        uint owner=data[2u*pixels+p];
+        if (owner>0u && owner<=pc.groups &&
+            data[3u*pixels+p]==authority[16u+pixels+p])
+            atomicAdd(data[counts+header+max_spans+owner-1u],1u);
+        else atomicAdd(data[counts+3u],1u);
+    }
+}
