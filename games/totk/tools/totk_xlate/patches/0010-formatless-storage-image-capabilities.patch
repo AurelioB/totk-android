@@ -1,0 +1,63 @@
+diff --git a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+index e1571fc..4c687a6 100644
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -256,7 +256,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+ 
+                 SpvInstruction imageVariable = context.Variable(imageArrayPointerType, StorageClass.UniformConstant);
+ 
+-                context.Images.Add(new(image.Set, image.Binding), new ImageDeclaration(imageType, imagePointerType, imageVariable, image.ArrayLength != 1));
++                context.Images.Add(new(image.Set, image.Binding), new ImageDeclaration(imageType, imagePointerType, imageVariable,
++                    image.ArrayLength != 1, image.Format == TextureFormat.Unknown));
+ 
+                 context.Name(imageVariable, image.Name);
+                 context.Decorate(imageVariable, Decoration.DescriptorSet, (LiteralInteger)setIndex);
+diff --git a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/ImageDeclaration.cs b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/ImageDeclaration.cs
+index 1e0aee7..d29d8ac 100644
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/ImageDeclaration.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/ImageDeclaration.cs
+@@ -8,13 +8,15 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+         public readonly Instruction ImagePointerType;
+         public readonly Instruction Image;
+         public readonly bool IsIndexed;
++        public readonly bool FormatUnknown;
+ 
+-        public ImageDeclaration(Instruction imageType, Instruction imagePointerType, Instruction image, bool isIndexed)
++        public ImageDeclaration(Instruction imageType, Instruction imagePointerType, Instruction image, bool isIndexed, bool formatUnknown)
+         {
+             ImageType = imageType;
+             ImagePointerType = imagePointerType;
+             Image = image;
+             IsIndexed = isIndexed;
++            FormatUnknown = formatUnknown;
+         }
+     }
+ }
+diff --git a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+index 79383ec..b6be259 100644
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -700,6 +700,11 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+             }
+ 
+             ImageDeclaration declaration = context.Images[texOp.GetTextureSetAndBinding()];
++            if (declaration.FormatUnknown)
++            {
++                context.AddCapability(Capability.StorageImageReadWithoutFormat);
++            }
++
+             SpvInstruction image = declaration.Image;
+             bool isIndexed = declaration.IsIndexed;
+ 
+@@ -763,6 +768,11 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+             }
+ 
+             ImageDeclaration declaration = context.Images[texOp.GetTextureSetAndBinding()];
++            if (declaration.FormatUnknown)
++            {
++                context.AddCapability(Capability.StorageImageWriteWithoutFormat);
++            }
++
+             SpvInstruction image = declaration.Image;
+             bool isIndexed = declaration.IsIndexed;
+ 
