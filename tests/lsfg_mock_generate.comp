@@ -1,0 +1,15 @@
+// MIT. Known midpoint for testing direct sampled/storage bindings, not LSFG.
+#version 450
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=1) uniform sampler linearSampler;
+layout(set=0,binding=3) uniform texture2D previousImage;
+layout(set=0,binding=4) uniform texture2D currentImage;
+layout(rgba16f,set=0,binding=8) writeonly uniform image2D outputImage;
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size=imageSize(outputImage);
+    if (any(greaterThanEqual(p,size))) return;
+    vec4 a=texelFetch(sampler2D(previousImage,linearSampler),p,0);
+    vec4 b=texelFetch(sampler2D(currentImage,linearSampler),p,0);
+    imageStore(outputImage,p,(a+b)*0.5);
+}
