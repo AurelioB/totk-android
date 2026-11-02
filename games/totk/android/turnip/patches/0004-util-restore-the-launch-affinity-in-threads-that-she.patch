@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+Date: Thu, 22 Oct 2026 10:25:56 -0400
+Subject: [PATCH] util: restore the launch affinity in threads that shed a
+ pinned one
+
+util_set_current_thread_full_affinity() set every cpu, so under taskset
+the wsi, vk_queue submit, and queue threads that use it escaped to cpus
+the user excluded. Record the affinity at cpu detection and restore that
+instead, renaming the helper to match.
+
+Fixes: 33bc54d9332 ("util,vulkan/wsi: don't let x11 swapchain threads inherit a pinned affinity")
+Fixes: afe1e0d5026 ("vulkan: don't let the queue submit thread inherit a pinned affinity")
+Generated-by: LLM
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45519>
+(cherry picked from commit a8ed94aea549d7f6285eb9ce8fed0ebf91ab2360)
+---
+ src/util/u_cpu_detect.c         |  6 ++++
+ src/util/u_cpu_detect.h         |  5 +++
+ src/util/u_queue.c              |  2 +-
+ src/util/u_thread.c             | 64 ++++++++++++++++++++++++---------
+ src/util/u_thread.h             | 21 ++++++++++-
+ src/vulkan/runtime/vk_queue.c   |  2 +-
+ src/vulkan/wsi/wsi_common_x11.c |  4 +--
+ 7 files changed, 83 insertions(+), 21 deletions(-)
+
+diff --git a/src/util/u_cpu_detect.c b/src/util/u_cpu_detect.c
+index 2640e1174be..1a7270649ea 100644
+--- a/src/util/u_cpu_detect.c
++++ b/src/util/u_cpu_detect.c
+@@ -861,6 +861,12 @@ _util_cpu_detect_once(void)
+    util_cpu_caps.max_cpus = total_cpus;
+    util_cpu_caps.num_cpu_mask_bits = align(total_cpus, 32);
+ 
++   if (!util_get_current_thread_affinity(util_cpu_caps.initial_affinity_mask,
++                                         util_cpu_caps.num_cpu_mask_bits)) {
++      memset(util_cpu_caps.initial_affinity_mask, 0xff,
++             sizeof(util_cpu_caps.initial_affinity_mask));
++   }
++
+    /* Make the fallback cacheline size nonzero so that it can be
+     * safely passed to align().
+     */
+diff --git a/src/util/u_cpu_detect.h b/src/util/u_cpu_detect.h
+index 29725afef5f..bca9a29e201 100644
+--- a/src/util/u_cpu_detect.h
++++ b/src/util/u_cpu_detect.h
+@@ -118,6 +118,11 @@ struct util_cpu_caps_t {
+ 
+    uint16_t cpu_to_L3[UTIL_MAX_CPUS];
+ 
++   /* Affinity of the thread that ran detection, before any pinning by Mesa
++    * (e.g. from taskset); all ones if it couldn't be queried.
++    */
++   util_affinity_mask initial_affinity_mask;
++
+    /* Affinity masks for each L3 cache. */
+    util_affinity_mask *L3_affinity_mask;
+    /**
+diff --git a/src/util/u_queue.c b/src/util/u_queue.c
+index f38952b4182..98a6eafaec6 100644
+--- a/src/util/u_queue.c
++++ b/src/util/u_queue.c
+@@ -241,7 +241,7 @@ util_queue_thread_func(void *input)
+ 
+    /* Don't inherit the thread affinity from the parent thread. */
+    if (queue->flags & UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY)
+-      util_set_current_thread_full_affinity();
++      util_set_current_thread_initial_affinity();
+ 
+ #if defined(__linux__)
+    if (queue->flags & UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY) {
+diff --git a/src/util/u_thread.c b/src/util/u_thread.c
+index ccac55fe36c..d6b3a074e1d 100644
+--- a/src/util/u_thread.c
++++ b/src/util/u_thread.c
+@@ -122,6 +122,45 @@ void u_thread_setname( const char *name )
+    (void)name;
+ }
+ 
++bool
++util_get_thread_affinity(thrd_t thread,
++                         uint32_t *mask,
++                         unsigned num_mask_bits)
++{
++#if defined(HAVE_PTHREAD_SETAFFINITY)
++   cpu_set_t cpuset;
++
++   if (pthread_getaffinity_np(thread, sizeof(cpuset), &cpuset) != 0)
++      return false;
++
++   memset(mask, 0, num_mask_bits / 8);
++   for (unsigned i = 0; i < num_mask_bits && i < CPU_SETSIZE; i++) {
++      if (CPU_ISSET(i, &cpuset))
++         mask[i / 32] |= 1u << (i % 32);
++   }
++
++   return true;
++
++#elif defined(_WIN32) && !defined(HAVE_PTHREAD)
++   /* there is no per-thread getter, so report the process affinity */
++   DWORD_PTR process_mask, system_mask;
++
++   if (!GetProcessAffinityMask(GetCurrentProcess(), &process_mask,
++                               &system_mask))
++      return false;
++
++   memset(mask, 0, num_mask_bits / 8);
++   mask[0] = process_mask;
++#ifdef _WIN64
++   mask[1] = process_mask >> 32;
++#endif
++
++   return true;
++#else
++   return false;
++#endif
++}
++
+ bool
+ util_set_thread_affinity(thrd_t thread,
+                          const uint32_t *mask,
+@@ -131,16 +170,8 @@ util_set_thread_affinity(thrd_t thread,
+ #if defined(HAVE_PTHREAD_SETAFFINITY)
+    cpu_set_t cpuset;
+ 
+-   if (old_mask) {
+-      if (pthread_getaffinity_np(thread, sizeof(cpuset), &cpuset) != 0)
+-         return false;
+-
+-      memset(old_mask, 0, num_mask_bits / 8);
+-      for (unsigned i = 0; i < num_mask_bits && i < CPU_SETSIZE; i++) {
+-         if (CPU_ISSET(i, &cpuset))
+-            old_mask[i / 32] |= 1u << (i % 32);
+-      }
+-   }
++   if (old_mask && !util_get_thread_affinity(thread, old_mask, num_mask_bits))
++      return false;
+ 
+    CPU_ZERO(&cpuset);
+    for (unsigned i = 0; i < num_mask_bits && i < CPU_SETSIZE; i++) {
+@@ -258,13 +289,14 @@ bool util_barrier_wait(util_barrier *barrier)
+ 
+ #endif
+ 
+-/* threads inherit their creator's affinity, which may be pinned to one CPU */
++/* threads inherit their creator's affinity, which may be pinned to one CPU;
++ * restore the affinity the process started with so taskset is respected
++ */
+ void
+-util_set_current_thread_full_affinity(void)
++util_set_current_thread_initial_affinity(void)
+ {
+-   util_affinity_mask mask;
+-
+-   memset(mask, 0xff, sizeof(mask));
++   const struct util_cpu_caps_t *caps = util_get_cpu_caps();
+ 
+-   util_set_current_thread_affinity(mask, NULL, util_get_cpu_caps()->num_cpu_mask_bits);
++   util_set_current_thread_affinity(caps->initial_affinity_mask, NULL,
++                                    caps->num_cpu_mask_bits);
+ }
+diff --git a/src/util/u_thread.h b/src/util/u_thread.h
+index dcf32a9cf00..475256bea36 100644
+--- a/src/util/u_thread.h
++++ b/src/util/u_thread.h
+@@ -68,6 +68,25 @@ int u_thread_create(thrd_t *thrd, int (*routine)(void *), void *param);
+ 
+ void u_thread_setname( const char *name );
+ 
++/**
++ * Get thread affinity.
++ *
++ * \param thread         Thread
++ * \param mask           Affinity mask returned
++ * \param num_mask_bits  Number of bits in the mask
++ * \return  true on success
++ */
++bool
++util_get_thread_affinity(thrd_t thread,
++                         uint32_t *mask,
++                         unsigned num_mask_bits);
++
++static inline bool
++util_get_current_thread_affinity(uint32_t *mask, unsigned num_mask_bits)
++{
++   return util_get_thread_affinity(thrd_current(), mask, num_mask_bits);
++}
++
+ /**
+  * Set thread affinity.
+  *
+@@ -93,7 +112,7 @@ util_set_current_thread_affinity(const uint32_t *mask,
+ }
+ 
+ void
+-util_set_current_thread_full_affinity(void);
++util_set_current_thread_initial_affinity(void);
+ 
+ /*
+  * Thread statistics.
+diff --git a/src/vulkan/runtime/vk_queue.c b/src/vulkan/runtime/vk_queue.c
+index 52cd5527f92..c26ae4e5efd 100644
+--- a/src/vulkan/runtime/vk_queue.c
++++ b/src/vulkan/runtime/vk_queue.c
+@@ -739,7 +739,7 @@ vk_queue_submit_thread_func(void *_data)
+    struct vk_queue *queue = _data;
+    VkResult result;
+ 
+-   util_set_current_thread_full_affinity();
++   util_set_current_thread_initial_affinity();
+ 
+    mtx_lock(&queue->submit.mutex);
+ 
+diff --git a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
+index 003ef7a79aa..573676c3e0f 100644
+--- a/src/vulkan/wsi/wsi_common_x11.c
++++ b/src/vulkan/wsi/wsi_common_x11.c
+@@ -2342,7 +2342,7 @@ x11_manage_event_queue(void *state)
+ {
+    struct x11_swapchain *chain = state;
+    u_thread_setname("WSI swapchain event");
+-   util_set_current_thread_full_affinity();
++   util_set_current_thread_initial_affinity();
+ 
+    /* While there is an outstanding IDLE we should wait for it.
+     * In FLIP modes at most one image will not be driver owned eventually.
+@@ -2563,7 +2563,7 @@ x11_manage_present_queue(void *state)
+          wsi_x11_get_connection((struct wsi_device*)chain->base.wsi, chain->conn);
+    VkResult result = VK_SUCCESS;
+ 
+-   util_set_current_thread_full_affinity();
++   util_set_current_thread_initial_affinity();
+ 
+    u_thread_setname("WSI swapchain queue");
+ 
+-- 
+2.53.0
+

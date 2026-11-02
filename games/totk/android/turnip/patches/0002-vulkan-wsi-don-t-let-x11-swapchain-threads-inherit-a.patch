@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+Date: Mon, 19 Oct 2026 13:15:58 -0400
+Subject: [PATCH] vulkan/wsi: don't let x11 swapchain threads inherit a pinned
+ affinity
+
+with mesa_pin_threads the app thread is pinned to one cpu before the
+swapchain exists, and the x11 present and event threads inherited that cpu
+and preempted the app thread on every present
+
+Generated-by: LLM
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45386>
+(cherry picked from commit 0204fb3d9fb105f99ffdfdcf18cceaad9f0de117)
+---
+ src/vulkan/wsi/wsi_common_x11.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
+index 532e9a2067a..003ef7a79aa 100644
+--- a/src/vulkan/wsi/wsi_common_x11.c
++++ b/src/vulkan/wsi/wsi_common_x11.c
+@@ -2342,6 +2342,7 @@ x11_manage_event_queue(void *state)
+ {
+    struct x11_swapchain *chain = state;
+    u_thread_setname("WSI swapchain event");
++   util_set_current_thread_full_affinity();
+ 
+    /* While there is an outstanding IDLE we should wait for it.
+     * In FLIP modes at most one image will not be driver owned eventually.
+@@ -2562,6 +2563,8 @@ x11_manage_present_queue(void *state)
+          wsi_x11_get_connection((struct wsi_device*)chain->base.wsi, chain->conn);
+    VkResult result = VK_SUCCESS;
+ 
++   util_set_current_thread_full_affinity();
++
+    u_thread_setname("WSI swapchain queue");
+ 
+    uint64_t target_msc = 0;
+-- 
+2.53.0
+

@@ -1,0 +1,2092 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TOTK Turnip integration <totk-turnip@localhost>
+Date: Sat, 24 Oct 2026 04:22:02 -0600
+Subject: [PATCH] tu/kgsl: suballocate command streams from reusable mapped
+ slabs
+
+Keep real parent BO identities with per-stream slice bounds, reuse freed page ranges and retain only bounded empty slab caches. Default to pooled storage on KGSL with startup TU_DEBUG=noslabcs opt-out. Add BOS slice/slab attribution and native production-CS storage invariant tests.
+---
+ docs/drivers/freedreno.rst               |  24 +
+ src/freedreno/vulkan/meson.build         |   5 +
+ src/freedreno/vulkan/tests/cs_fake_bo.cc | 192 ++++++
+ src/freedreno/vulkan/tests/cs_fake_bo.h  |  39 ++
+ src/freedreno/vulkan/tests/cs_slabs.cc   | 751 +++++++++++++++++++++++
+ src/freedreno/vulkan/tests/meson.build   |  56 ++
+ src/freedreno/vulkan/tu_cs.cc            | 247 ++++----
+ src/freedreno/vulkan/tu_cs.h             |  18 +-
+ src/freedreno/vulkan/tu_cs_pool.cc       | 343 +++++++++++
+ src/freedreno/vulkan/tu_cs_pool.h        |  43 ++
+ src/freedreno/vulkan/tu_device.cc        |  14 +
+ src/freedreno/vulkan/tu_device.h         |   3 +
+ src/freedreno/vulkan/tu_util.cc          |   1 +
+ src/freedreno/vulkan/tu_util.h           |   1 +
+ 14 files changed, 1623 insertions(+), 114 deletions(-)
+ create mode 100644 src/freedreno/vulkan/tests/cs_fake_bo.cc
+ create mode 100644 src/freedreno/vulkan/tests/cs_fake_bo.h
+ create mode 100644 src/freedreno/vulkan/tests/cs_slabs.cc
+ create mode 100644 src/freedreno/vulkan/tests/meson.build
+ create mode 100644 src/freedreno/vulkan/tu_cs_pool.cc
+ create mode 100644 src/freedreno/vulkan/tu_cs_pool.h
+
+diff --git a/docs/drivers/freedreno.rst b/docs/drivers/freedreno.rst
+index 60ab3e98c11..ccfccd197df 100644
+--- a/docs/drivers/freedreno.rst
++++ b/docs/drivers/freedreno.rst
+@@ -647,6 +647,30 @@ The best way to pinpoint the reg which causes a failure is to bisect the regs
+ range. In case when a fail is caused by combination of several registers
+ the ``inverse`` flag may be set to find the reg which prevents the failure.
+ 
++Command-stream storage on KGSL
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++Turnip pools command-stream storage in mapped 2 MiB BO slabs on KGSL. Independent
++streams own non-overlapping, page-aligned slices; read-only and GPU-writable
++storage use separate slabs. Large allocations remain dedicated BOs. Reset keeps
++only the last slice of each stream, returning overflow slices for reuse, and
++destroying a stream returns all of its slices. At most one empty slab per access
++class is retained to avoid repeated mapping churn.
++
++Set ``TU_DEBUG=noslabcs`` before starting the application to restore dedicated
++command-stream BO allocation for comparison. This allocation policy cannot be
++changed through ``TU_DEBUG_FILE`` while a device is running. ``TU_DEBUG=bos``
++reports both mapped parent slabs and live command-stream slices; slice counts
++must not be added to BO counts when estimating userspace mappings. Slabs reduce
++command-storage mappings, not mappings for application resources or imported
++memory.
++
++A native build with ``-Dbuild-tests=true`` provides ``tu_cs_slabs_test`` in the
++``turnip-cs`` Meson test suite. It exercises the production CS and slab allocator
++with a host-only BO backend, including slice reuse, borrowed IB offsets, reset,
++growth, allocation failures, concurrent owners, and bounded empty-slab caching.
++The test does not submit GPU work or replace device conformance testing.
++
+ Runtime toggling of ``TU_DEBUG`` options
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 
+diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
+index b0197103975..21d9703fdf4 100644
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -41,6 +41,7 @@ libtu_files = files(
+   'tu_cmd_buffer.cc',
+   'tu_cs_breadcrumbs.cc',
+   'tu_cs.cc',
++  'tu_cs_pool.cc',
+   'tu_device.cc',
+   'tu_descriptor_set.cc',
+   'tu_dynamic_rendering.cc',
+@@ -281,3 +282,7 @@ _dev_icd = custom_target(
+ )
+ 
+ devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
++
++if with_tests and not meson.is_cross_build()
++  subdir('tests')
++endif
+diff --git a/src/freedreno/vulkan/tests/cs_fake_bo.cc b/src/freedreno/vulkan/tests/cs_fake_bo.cc
+new file mode 100644
+index 00000000000..cbdafead0b5
+--- /dev/null
++++ b/src/freedreno/vulkan/tests/cs_fake_bo.cc
+@@ -0,0 +1,192 @@
++/* SPDX-License-Identifier: MIT */
++#include "cs_fake_bo.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <unordered_map>
++#include <sys/mman.h>
++#include <unistd.h>
++
++/* Production tu_cs_pool uses this device-wide page-size value. */
++uint64_t os_page_size;
++
++namespace cs_test {
++namespace {
++struct bo_record {
++   enum tu_bo_alloc_flags flags;
++   void *mapping;
++   size_t mapping_size;
++};
++
++std::mutex backend_mutex;
++std::unordered_map<const struct tu_bo *, bo_record> live_bos;
++bo_counters totals;
++uint64_t next_iova;
++uint32_t next_handle;
++bool allocation_failure;
++bool map_failure;
++}
++
++[[noreturn]] void
++fail(const char *expression, const char *file, int line)
++{
++   fprintf(stderr, "%s:%d: CHECK(%s) failed\n", file, line, expression);
++   abort();
++}
++
++void
++reset_backend()
++{
++   std::lock_guard<std::mutex> lock(backend_mutex);
++   CHECK(live_bos.empty());
++   os_page_size = sysconf(_SC_PAGESIZE);
++   CHECK(os_page_size != 0 && (os_page_size & (os_page_size - 1)) == 0);
++   totals = {};
++   next_iova = 0x100000000ull;
++   next_handle = 1;
++   allocation_failure = map_failure = false;
++}
++
++bo_counters
++counters()
++{
++   std::lock_guard<std::mutex> lock(backend_mutex);
++   return totals;
++}
++
++enum tu_bo_alloc_flags
++flags(const struct tu_bo *bo)
++{
++   std::lock_guard<std::mutex> lock(backend_mutex);
++   CHECK(live_bos.count(bo));
++   return live_bos.at(bo).flags;
++}
++
++bool
++is_live(const struct tu_bo *bo)
++{
++   std::lock_guard<std::mutex> lock(backend_mutex);
++   return live_bos.count(bo);
++}
++
++void
++fail_next_allocation()
++{
++   std::lock_guard<std::mutex> lock(backend_mutex);
++   CHECK(!allocation_failure);
++   allocation_failure = true;
++}
++
++void
++fail_next_map()
++{
++   std::lock_guard<std::mutex> lock(backend_mutex);
++   CHECK(!map_failure);
++   map_failure = true;
++}
++} /* namespace cs_test */
++
++VkResult
++tu_bo_init_new_explicit_iova(struct tu_device *dev,
++                             struct vk_object_base *base,
++                             struct tu_bo **out_bo, uint64_t size,
++                             uint64_t alignment, uint64_t client_iova,
++                             VkMemoryPropertyFlags memory_properties,
++                             enum tu_bo_alloc_flags flags,
++                             struct tu_sparse_vma *lazy_vma, const char *name)
++{
++   (void)dev;
++   (void)memory_properties;
++   CHECK(size && !client_iova && !lazy_vma);
++   std::lock_guard<std::mutex> lock(cs_test::backend_mutex);
++   if (cs_test::allocation_failure) {
++      cs_test::allocation_failure = false;
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++
++   struct tu_bo *bo = static_cast<struct tu_bo *>(calloc(1, sizeof(*bo)));
++   CHECK(bo);
++   const uint64_t page = os_page_size;
++   bo->size = (size + page - 1) & ~(page - 1);
++   const uint64_t va_alignment = alignment > page ? alignment : page;
++   CHECK((va_alignment & (va_alignment - 1)) == 0);
++   cs_test::next_iova = (cs_test::next_iova + va_alignment - 1) & ~(va_alignment - 1);
++   /* Deliberately use addresses above 4GiB, exercising both IB address words. */
++   bo->iova = cs_test::next_iova;
++   CHECK((bo->iova >> 32) == ((bo->iova + bo->size - 1) >> 32));
++   cs_test::next_iova += bo->size + page;
++   bo->gem_handle = cs_test::next_handle++;
++   bo->refcnt = 1;
++   bo->base = base;
++   bo->name = name;
++   cs_test::live_bos.emplace(bo, cs_test::bo_record{flags, nullptr, 0});
++   ++cs_test::totals.allocations;
++   ++cs_test::totals.live;
++   cs_test::totals.live_bytes += bo->size;
++   *out_bo = bo;
++   return VK_SUCCESS;
++}
++
++VkResult
++tu_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
++{
++   (void)dev;
++   CHECK(!placed_addr);
++   std::lock_guard<std::mutex> lock(cs_test::backend_mutex);
++   CHECK(cs_test::live_bos.count(bo));
++   if (bo->map)
++      return VK_SUCCESS;
++   if (cs_test::map_failure) {
++      cs_test::map_failure = false;
++      return VK_ERROR_MEMORY_MAP_FAILED;
++   }
++
++   auto &record = cs_test::live_bos.at(bo);
++   /* Guard pages catch whole-parent overruns. Neighbor sentinels in the tests
++    * catch the more subtle within-parent slice overruns.
++    */
++   record.mapping_size = bo->size + 2 * os_page_size;
++   record.mapping = mmap(nullptr, record.mapping_size, PROT_NONE,
++                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++   CHECK(record.mapping != MAP_FAILED);
++   bo->map = static_cast<char *>(record.mapping) + os_page_size;
++   CHECK(mprotect(bo->map, bo->size, PROT_READ | PROT_WRITE) == 0);
++   ++cs_test::totals.maps;
++   return VK_SUCCESS;
++}
++
++VkResult
++tu_bo_unmap(struct tu_device *dev, struct tu_bo *bo, bool reserve)
++{
++   (void)dev;
++   CHECK(!reserve);
++   std::lock_guard<std::mutex> lock(cs_test::backend_mutex);
++   CHECK(cs_test::live_bos.count(bo));
++   auto &record = cs_test::live_bos.at(bo);
++   if (bo->map) {
++      CHECK(munmap(record.mapping, record.mapping_size) == 0);
++      bo->map = nullptr;
++      record.mapping = nullptr;
++      record.mapping_size = 0;
++      ++cs_test::totals.unmaps;
++   }
++   return VK_SUCCESS;
++}
++
++void
++tu_bo_finish(struct tu_device *dev, struct tu_bo *bo)
++{
++   CHECK(cs_test::is_live(bo));
++   CHECK(p_atomic_read(&bo->refcnt) > 0);
++   if (!p_atomic_dec_zero(&bo->refcnt))
++      return;
++
++   CHECK(tu_bo_unmap(dev, bo, false) == VK_SUCCESS);
++   std::lock_guard<std::mutex> lock(cs_test::backend_mutex);
++   CHECK(cs_test::live_bos.erase(bo) == 1);
++   ++cs_test::totals.destroys;
++   --cs_test::totals.live;
++   cs_test::totals.live_bytes -= bo->size;
++   free(bo);
++}
+diff --git a/src/freedreno/vulkan/tests/cs_fake_bo.h b/src/freedreno/vulkan/tests/cs_fake_bo.h
+new file mode 100644
+index 00000000000..77aa1d72e5c
+--- /dev/null
++++ b/src/freedreno/vulkan/tests/cs_fake_bo.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef TU_CS_FAKE_BO_H
++#define TU_CS_FAKE_BO_H
++
++#include "tu_knl.h"
++
++#include <cstddef>
++#include <cstdint>
++
++/* Only the kernel/BO boundary is replaced. Allocator, CS, suballocator and RMV
++ * implementation code are compiled from the driver sources by meson.build.
++ */
++namespace cs_test {
++
++[[noreturn]] void fail(const char *expression, const char *file, int line);
++
++#define CHECK(expression) do { \
++   if (!(expression)) \
++      cs_test::fail(#expression, __FILE__, __LINE__); \
++} while (0)
++
++struct bo_counters {
++   uint64_t allocations;
++   uint64_t maps;
++   uint64_t unmaps;
++   uint64_t destroys;
++   uint64_t live;
++   uint64_t live_bytes;
++};
++
++void reset_backend();
++bo_counters counters();
++enum tu_bo_alloc_flags flags(const struct tu_bo *bo);
++bool is_live(const struct tu_bo *bo);
++void fail_next_allocation();
++void fail_next_map();
++
++} /* namespace cs_test */
++#endif
+diff --git a/src/freedreno/vulkan/tests/cs_slabs.cc b/src/freedreno/vulkan/tests/cs_slabs.cc
+new file mode 100644
+index 00000000000..f658c34b533
+--- /dev/null
++++ b/src/freedreno/vulkan/tests/cs_slabs.cc
+@@ -0,0 +1,751 @@
++/* SPDX-License-Identifier: MIT */
++#include "cs_fake_bo.h"
++#include "tu_cs.h"
++#include "tu_cs_pool.h"
++#include "tu_device.h"
++#include "tu_rmv.h"
++#include "tu_suballoc.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <set>
++#include <thread>
++#include <vector>
++
++/* A fixture-owned setting, not a replacement for any allocator/CS logic. */
++struct tu_env tu_env;
++
++namespace {
++using cs_test::counters;
++constexpr uint32_t page = TU_CS_POOL_PAGE_SIZE;
++constexpr uint32_t slab_size = TU_CS_SLAB_SIZE;
++bool bos_enabled;
++
++struct fixture {
++   std::unique_ptr<tu_device> dev{new tu_device{}};
++
++   explicit fixture(bool pooled = true)
++   {
++      cs_test::reset_backend();
++      dev->vk.alloc = *vk_default_allocator();
++      struct vk_rmv_device_info info = {};
++      vk_memory_trace_init(&dev->vk, &info);
++      if (pooled) {
++         CHECK(tu_cs_pool_init(dev.get()) == VK_SUCCESS);
++         CHECK(dev->cs_pool);
++      }
++   }
++
++   ~fixture()
++   {
++      tu_cs_pool_finish(dev.get());
++      CHECK(!dev->cs_pool);
++      const auto totals = counters();
++      CHECK(totals.live == 0 && totals.live_bytes == 0);
++      CHECK(totals.allocations == totals.destroys);
++      CHECK(totals.maps == totals.unmaps);
++
++      /* Real RMV tokens: one command-allocator resource per parent lifetime,
++       * never one per slice, and every created resource destroyed exactly once.
++       */
++      std::set<uint32_t> live_resources;
++      uint64_t creates = 0, destroys = 0;
++      util_dynarray_foreach(&dev->vk.memory_trace_data.tokens,
++                           struct vk_rmv_token, token) {
++         if (token->type == VK_RMV_TOKEN_TYPE_RESOURCE_CREATE) {
++            CHECK(token->data.resource_create.type == VK_RMV_RESOURCE_TYPE_COMMAND_ALLOCATOR);
++            CHECK(live_resources.insert(token->data.resource_create.resource_id).second);
++            ++creates;
++         } else if (token->type == VK_RMV_TOKEN_TYPE_RESOURCE_DESTROY) {
++            CHECK(live_resources.erase(token->data.resource_destroy.resource_id) == 1);
++            ++destroys;
++         }
++      }
++      CHECK(live_resources.empty() && creates == destroys);
++      CHECK(creates <= totals.maps);
++      CHECK(_mesa_hash_table_num_entries(&dev->vk.memory_trace_data.handle_table->table) == 0);
++      vk_memory_trace_finish(&dev->vk);
++      simple_mtx_destroy(&dev->vk.memory_trace_data.token_mtx);
++   }
++};
++
++uint32_t *
++map(const struct tu_cs_allocation &allocation)
++{
++   return reinterpret_cast<uint32_t *>(static_cast<char *>(allocation.bo->map) + allocation.offset);
++}
++
++void
++fill(const struct tu_cs_allocation &allocation, uint32_t value)
++{
++   CHECK(allocation.size % 4 == 0);
++   std::fill_n(map(allocation), allocation.size / 4, value);
++}
++
++void
++check_fill(const struct tu_cs_allocation &allocation, uint32_t value)
++{
++   CHECK(cs_test::is_live(allocation.bo));
++   for (uint32_t i = 0; i < allocation.size / 4; ++i)
++      CHECK(map(allocation)[i] == value);
++}
++
++void
++check_allocation(const struct tu_cs_allocation &allocation, uint32_t size,
++                 bool writeable, bool pooled = true)
++{
++   CHECK(allocation.bo && allocation.bo->map && cs_test::is_live(allocation.bo));
++   CHECK(allocation.size == size);
++   CHECK(uint64_t(allocation.offset) + size <= allocation.bo->size);
++   CHECK((cs_test::flags(allocation.bo) & TU_BO_ALLOC_GPU_READ_ONLY) ==
++         (writeable ? 0 : TU_BO_ALLOC_GPU_READ_ONLY));
++   CHECK(cs_test::flags(allocation.bo) & TU_BO_ALLOC_ALLOW_DUMP);
++   CHECK(cs_test::flags(allocation.bo) & TU_BO_ALLOC_NO_32B_ROLLOVER);
++   CHECK(bool(allocation.slab) == (pooled && size <= slab_size));
++   if (allocation.slab) {
++      CHECK(allocation.offset % page == 0);
++      CHECK(allocation.bo->size == slab_size);
++   } else {
++      CHECK(allocation.offset == 0);
++   }
++}
++
++bool
++nonoverlap(const struct tu_cs_allocation &a, const struct tu_cs_allocation &b)
++{
++   if (a.bo != b.bo)
++      return true;
++   const uint64_t a_end = a.offset + ((uint64_t(a.size) + page - 1) / page) * page;
++   const uint64_t b_end = b.offset + ((uint64_t(b.size) + page - 1) / page) * page;
++   return a_end <= b.offset || b_end <= a.offset;
++}
++
++const struct tu_cs_allocation &
++last(const struct tu_cs_allocation_array &array)
++{
++   CHECK(array.count);
++   return array.allocations[array.count - 1];
++}
++
++void
++check_same(const struct tu_cs_allocation &a, const struct tu_cs_allocation &b)
++{
++   CHECK(a.bo == b.bo && a.slab == b.slab && a.offset == b.offset && a.size == b.size);
++}
++
++void
++check_entry(const struct tu_cs_entry &entry, const struct tu_cs &owner)
++{
++   CHECK(entry.bo && entry.size && cs_test::is_live(entry.bo));
++   bool contained = false;
++   for (const auto *array : {&owner.read_only, &owner.read_write}) {
++      for (uint32_t i = 0; i < array->count; ++i) {
++         const auto &allocation = array->allocations[i];
++         if (entry.bo == allocation.bo && entry.offset >= allocation.offset &&
++             uint64_t(entry.offset) + entry.size <= uint64_t(allocation.offset) + allocation.size)
++            contained = true;
++      }
++   }
++   CHECK(contained);
++}
++
++void
++emit(struct tu_cs *cs, uint32_t count, uint32_t value)
++{
++   CHECK(tu_cs_reserve_space(cs, count) == VK_SUCCESS);
++   for (uint32_t i = 0; i < count; ++i)
++      tu_cs_emit(cs, value);
++}
++
++void
++test_page_reuse_and_nonoverlap()
++{
++   fixture f;
++   constexpr unsigned count = slab_size / page;
++   std::vector<struct tu_cs_allocation> allocations(count);
++   std::set<uint32_t> released;
++   for (unsigned i = 0; i < count; ++i) {
++      /* Odd sizes exercise requested bytes versus page reservation. */
++      CHECK(tu_cs_pool_alloc(f.dev.get(), page - 4, false, "reuse cs", &allocations[i]) == VK_SUCCESS);
++      check_allocation(allocations[i], page - 4, false);
++      for (unsigned j = 0; j < i; ++j)
++         CHECK(nonoverlap(allocations[i], allocations[j]));
++      fill(allocations[i], i + 1);
++   }
++   CHECK(counters().maps == 1);
++   struct tu_bo *parent = allocations[0].bo;
++   for (unsigned i = 0; i < count; i += 2) {
++      released.insert(allocations[i].offset);
++      tu_cs_pool_free(f.dev.get(), &allocations[i]);
++      CHECK(!allocations[i].bo);
++   }
++   for (unsigned i = 0; i < count; i += 2) {
++      CHECK(tu_cs_pool_alloc(f.dev.get(), page - 4, false, "reuse cs", &allocations[i]) == VK_SUCCESS);
++      CHECK(allocations[i].bo == parent);
++      CHECK(released.erase(allocations[i].offset) == 1);
++      fill(allocations[i], i + 1);
++   }
++   CHECK(released.empty() && counters().maps == 1);
++   for (unsigned i = 0; i < count; ++i) {
++      check_fill(allocations[i], i + 1);
++      tu_cs_pool_free(f.dev.get(), &allocations[i]);
++   }
++   CHECK(counters().live == 1); /* one bounded empty RO slab */
++}
++
++void
++test_mixed_ranges_and_permissions()
++{
++   fixture f;
++   std::vector<struct tu_cs_allocation> allocations(180);
++   for (unsigned i = 0; i < allocations.size(); ++i) {
++      const uint32_t size = ((i * 17) % 23 + 1) * page - 4;
++      CHECK(tu_cs_pool_alloc(f.dev.get(), size, i & 1, "mixed cs", &allocations[i]) == VK_SUCCESS);
++      check_allocation(allocations[i], size, i & 1);
++      for (unsigned j = 0; j < i; ++j) {
++         CHECK(nonoverlap(allocations[i], allocations[j]));
++         if ((i & 1) != (j & 1))
++            CHECK(allocations[i].bo != allocations[j].bo);
++      }
++      fill(allocations[i], 0xab000000u + i);
++   }
++   /* Interleaved releases, not a stack or a linear allocator's single spare. */
++   for (unsigned phase = 0; phase < 3; ++phase) {
++      for (unsigned i = phase; i < allocations.size(); i += 3) {
++         check_fill(allocations[i], 0xab000000u + i);
++         tu_cs_pool_free(f.dev.get(), &allocations[i]);
++      }
++   }
++   CHECK(counters().live == 2); /* at most one empty slab in each permission pool */
++   CHECK(counters().live_bytes == 2 * slab_size);
++}
++
++void
++test_warm_recorder_shape()
++{
++   fixture f;
++   /* 4,608 live owners with both warm streams, matching the chunk-600-scale
++    * recorder high water. This is a host storage invariant, not a frame replay.
++    */
++   constexpr unsigned owners = 4608;
++   std::vector<struct tu_cs> draws(owners), states(owners);
++   for (unsigned i = 0; i < owners; ++i) {
++      tu_cs_init(&draws[i], f.dev.get(), TU_CS_MODE_GROW, 4096, "draw cs");
++      tu_cs_begin(&draws[i]);
++      emit(&draws[i], 1, 0xc5000000u + i);
++      tu_cs_end(&draws[i]);
++      tu_cs_init(&states[i], f.dev.get(), TU_CS_MODE_SUB_STREAM, 2048, "draw sub cs");
++      struct tu_cs_memory memory;
++      CHECK(tu_cs_alloc(&states[i], 1, 4, &memory) == VK_SUCCESS);
++      std::fill_n(memory.map, 4, i);
++   }
++   const auto warm = counters();
++   CHECK(warm.maps == (uint64_t(owners) * (16384 + 8192) + slab_size - 1) / slab_size);
++   CHECK(warm.maps * 100 < 2 * owners);
++   tu_cs_pool_dump_stats(f.dev.get());
++   for (unsigned i = 0; i < owners; ++i) {
++      check_entry(draws[i].entries[0], draws[i]);
++      CHECK(*reinterpret_cast<uint32_t *>(static_cast<char *>(draws[i].entries[0].bo->map) +
++                                         draws[i].entries[0].offset) == 0xc5000000u + i);
++      tu_cs_reset(&draws[i]);
++      tu_cs_reset(&states[i]);
++      tu_cs_begin(&draws[i]);
++      emit(&draws[i], 1, i);
++      tu_cs_end(&draws[i]);
++      struct tu_cs_memory memory;
++      CHECK(tu_cs_alloc(&states[i], 1, 4, &memory) == VK_SUCCESS);
++      std::fill_n(memory.map, 4, ~i);
++   }
++   CHECK(counters().maps == warm.maps);
++   for (unsigned i = 0; i < owners; ++i) {
++      tu_cs_finish(&draws[i]);
++      tu_cs_finish(&states[i]);
++   }
++   CHECK(counters().live == 1);
++}
++
++void
++test_switch_overflow_and_reset(bool pooled)
++{
++   fixture f(pooled);
++   struct tu_cs_allocation neighbor;
++   CHECK(tu_cs_pool_alloc(f.dev.get(), page, false, "neighbor cs", &neighbor) == VK_SUCCESS);
++   fill(neighbor, 0xdeadbeef);
++   struct tu_cs cs;
++   tu_cs_init(&cs, f.dev.get(), TU_CS_MODE_GROW, 16, "switch cs");
++   tu_cs_begin(&cs);
++   emit(&cs, 3, 0x11111111);
++   const auto first_ro = last(cs.read_only);
++   if (pooled) {
++      CHECK(first_ro.bo == neighbor.bo && first_ro.offset != 0);
++   }
++   const uint64_t ro_cursor = tu_cs_get_cur_iova(&cs);
++   tu_cs_set_writeable(&cs, true);
++   emit(&cs, 5, 0x22222222);
++   CHECK(last(cs.read_write).bo != first_ro.bo);
++   const uint64_t rw_cursor = tu_cs_get_cur_iova(&cs);
++   tu_cs_set_writeable(&cs, false);
++   CHECK(tu_cs_get_cur_iova(&cs) == ro_cursor);
++   CHECK(cs.end == map(first_ro) + first_ro.size / 4);
++   emit(&cs, tu_cs_get_space(&cs), 0x33333333);
++   emit(&cs, 1, 0x44444444);
++   CHECK(cs.read_only.count == 2);
++   tu_cs_set_writeable(&cs, true);
++   CHECK(tu_cs_get_cur_iova(&cs) == rw_cursor);
++   const auto first_rw = last(cs.read_write);
++   CHECK(cs.end == map(first_rw) + first_rw.size / 4);
++   emit(&cs, tu_cs_get_space(&cs), 0x55555555);
++   emit(&cs, 1, 0x66666666);
++   CHECK(cs.read_write.count == 2);
++   tu_cs_set_writeable(&cs, false);
++   tu_cs_end(&cs);
++   for (unsigned i = 0; i < cs.entry_count; ++i)
++      check_entry(cs.entries[i], cs);
++
++   const auto retained_ro = last(cs.read_only);
++   const auto retained_rw = last(cs.read_write);
++   const uint64_t maps_before_reset = counters().maps;
++   tu_cs_reset(&cs);
++   CHECK(cs.entry_count == 0 && cs.read_only.count == 1 && cs.read_write.count == 1);
++   check_same(last(cs.read_only), retained_ro);
++   check_same(last(cs.read_write), retained_rw);
++   CHECK(cs.start == map(retained_ro) && cs.cur == cs.start);
++   CHECK(cs.end == cs.start + retained_ro.size / 4);
++   CHECK(tu_cs_get_cur_iova(&cs) == retained_ro.bo->iova + retained_ro.offset);
++   check_fill(neighbor, 0xdeadbeef);
++   tu_cs_begin(&cs);
++   emit(&cs, retained_ro.size / 4, 0x77777777);
++   tu_cs_set_writeable(&cs, true);
++   CHECK(cs.start == map(retained_rw));
++   CHECK(cs.end == cs.start + retained_rw.size / 4);
++   emit(&cs, retained_rw.size / 4, 0x88888888);
++   tu_cs_set_writeable(&cs, false);
++   tu_cs_end(&cs);
++   check_fill(neighbor, 0xdeadbeef);
++   CHECK(counters().maps == maps_before_reset);
++   tu_cs_finish(&cs);
++   check_fill(neighbor, 0xdeadbeef);
++   tu_cs_pool_free(f.dev.get(), &neighbor);
++}
++
++void
++test_borrowed_entries_and_ib_addresses()
++{
++   fixture f;
++   struct tu_cs a, b, borrowed, caller;
++   for (auto *cs : {&a, &b}) {
++      tu_cs_init(cs, f.dev.get(), TU_CS_MODE_GROW, 16, "secondary draw cs");
++      tu_cs_begin(cs);
++      emit(cs, 4, cs == &a ? 0xaaaaaaaa : 0xbbbbbbbb);
++      tu_cs_end(cs);
++   }
++   CHECK(a.entries[0].bo == b.entries[0].bo);
++   CHECK(a.entries[0].offset != b.entries[0].offset);
++   const int32_t refs = p_atomic_read(&a.entries[0].bo->refcnt);
++   tu_cs_init(&borrowed, f.dev.get(), TU_CS_MODE_GROW, 16, "primary entry list");
++   CHECK(tu_cs_add_entries(&borrowed, &a) == VK_SUCCESS);
++   CHECK(tu_cs_add_entries(&borrowed, &b) == VK_SUCCESS);
++   CHECK(tu_cs_add_entries(&borrowed, &a) == VK_SUCCESS);
++   CHECK(borrowed.entry_count == 3 && !borrowed.read_only.count);
++   CHECK(p_atomic_read(&a.entries[0].bo->refcnt) == refs);
++   tu_cs_init(&caller, f.dev.get(), TU_CS_MODE_GROW, 64, "IB caller cs");
++   tu_cs_begin(&caller);
++   CHECK(tu_cs_get_call_size(&borrowed) == 12);
++   tu_cs_emit_call(&caller, &borrowed);
++   tu_cs_end(&caller);
++   CHECK(caller.entry_count == 1 && caller.entries[0].size == 12 * 4);
++   auto *packets = reinterpret_cast<uint32_t *>(static_cast<char *>(caller.entries[0].bo->map) +
++                                               caller.entries[0].offset);
++   for (unsigned i = 0; i < borrowed.entry_count; ++i) {
++      const auto &entry = borrowed.entries[i];
++      CHECK(packets[4 * i] == pm4_pkt7_hdr(CP_INDIRECT_BUFFER, 3));
++      const uint64_t address = uint64_t(packets[4 * i + 1]) | (uint64_t(packets[4 * i + 2]) << 32);
++      CHECK(address == entry.bo->iova + entry.offset);
++      CHECK(packets[4 * i + 3] == entry.size / 4);
++      check_entry(entry, i == 1 ? b : a);
++   }
++   /* Borrowing is intentionally not made owning. Both secondaries stay alive
++    * until all borrowed entry use above is complete, as Vulkan requires.
++    */
++   tu_cs_finish(&borrowed);
++   CHECK(cs_test::is_live(a.entries[0].bo));
++   CHECK(p_atomic_read(&a.entries[0].bo->refcnt) >= refs);
++   CHECK(*reinterpret_cast<uint32_t *>(static_cast<char *>(b.entries[0].bo->map) +
++                                      b.entries[0].offset) == 0xbbbbbbbb);
++   tu_cs_finish(&caller);
++   tu_cs_finish(&b);
++   tu_cs_finish(&a);
++}
++
++void
++test_substreams_and_alignment()
++{
++   fixture f;
++   struct tu_cs_allocation neighbor;
++   CHECK(tu_cs_pool_alloc(f.dev.get(), page, false, "alignment neighbor", &neighbor) == VK_SUCCESS);
++   fill(neighbor, 0xfeedface);
++   struct tu_cs cs, sub;
++   tu_cs_init(&cs, f.dev.get(), TU_CS_MODE_SUB_STREAM, 16, "aligned sub cs");
++   struct tu_cs_memory zero;
++   CHECK(tu_cs_alloc(&cs, 0, 4, &zero) == VK_SUCCESS && !zero.map);
++   CHECK(counters().maps == 1 && cs.read_only.count == 0);
++
++   /* A new slice starts at page 1, not offset zero. Three-dword alignment must
++    * account for this origin and for padding when growth is required.
++    */
++   CHECK(tu_cs_begin_sub_stream_aligned(&cs, 2, 3, &sub) == VK_SUCCESS);
++   CHECK(last(cs.read_only).offset != 0);
++   emit(&sub, 6, 0xa1234567);
++   auto entry = tu_cs_end_sub_stream(&cs, &sub);
++   CHECK(entry.offset / 4 % 3 == 0 && entry.size == 24);
++   CHECK(sub.external_iova == entry.bo->iova + entry.offset);
++   check_entry(entry, cs);
++   const uint32_t old_count = cs.read_only.count;
++   CHECK(tu_cs_begin_sub_stream_aligned(&cs, 32, 3, &sub) == VK_SUCCESS);
++   emit(&sub, 96, 0xb1234567);
++   entry = tu_cs_end_sub_stream(&cs, &sub);
++   CHECK(cs.read_only.count > old_count);
++   CHECK(entry.offset / 4 % 3 == 0 && entry.size == 96 * 4);
++   check_entry(entry, cs);
++
++   for (unsigned size : {1u, 4u, 16u, 1024u}) {
++      struct tu_cs_memory memory;
++      CHECK(tu_cs_alloc(&cs, 3, size, &memory) == VK_SUCCESS);
++      const auto &allocation = last(cs.read_only);
++      CHECK(memory.iova % (size * 4) == 0);
++      CHECK(memory.map >= map(allocation));
++      CHECK(memory.map + 3 * size <= map(allocation) + allocation.size / 4);
++      std::fill_n(memory.map, 3 * size, size);
++   }
++   tu_cs_set_writeable(&cs, true);
++   CHECK(tu_cs_begin_sub_stream_aligned(&cs, 2, 16, &sub) == VK_SUCCESS);
++   emit(&sub, 8, 0xc1234567);
++   const auto state = tu_cs_end_draw_state(&cs, &sub);
++   CHECK(state.writeable && state.size == 8);
++   CHECK(state.iova % 64 == 0);
++   tu_cs_set_writeable(&cs, false);
++   const auto ro = last(cs.read_only);
++   const auto rw = last(cs.read_write);
++   tu_cs_reset(&cs);
++   check_same(last(cs.read_only), ro);
++   check_same(last(cs.read_write), rw);
++   CHECK(cs.start == map(ro) && cs.end == map(ro) + ro.size / 4);
++   struct tu_cs draw;
++   auto draw_state = tu_cs_draw_state(&cs, &draw, 8);
++   CHECK(draw_state.size == 8 && !draw_state.writeable);
++   emit(&draw, 8, 0xd1234567);
++   tu_cs_end(&draw);
++   tu_cs_finish(&draw);
++   check_fill(neighbor, 0xfeedface);
++   tu_cs_finish(&cs);
++   tu_cs_pool_free(f.dev.get(), &neighbor);
++}
++
++void
++test_external_and_refcount_modes()
++{
++   fixture f;
++   uint32_t storage[34] = {};
++   storage[0] = storage[33] = 0x1234abcd;
++   struct tu_cs external;
++   tu_cs_init_external(&external, f.dev.get(), storage + 1, storage + 33,
++                       0x234567890ull, true);
++   tu_cs_begin(&external);
++   emit(&external, 32, 0x12345678);
++   CHECK(tu_cs_get_cur_iova(&external) == 0x234567890ull + 128);
++   tu_cs_end(&external);
++   CHECK(!external.entry_count && !external.read_write.count);
++   tu_cs_reset(&external);
++   CHECK(external.cur == storage + 1 && external.end == storage + 33);
++   emit(&external, 32, 0x87654321);
++   tu_cs_finish(&external);
++   CHECK(storage[0] == 0x1234abcd && storage[33] == 0x1234abcd);
++   CHECK(counters().maps == 0);
++
++   struct tu_suballocator allocator;
++   tu_bo_suballocator_init(&allocator, f.dev.get(), 65536,
++                           TU_BO_ALLOC_GPU_READ_ONLY, "refcount test BO");
++   struct tu_suballoc_bo prefix, allocation;
++   CHECK(tu_suballoc_bo_alloc(&prefix, &allocator, page, page) == VK_SUCCESS);
++   CHECK(tu_suballoc_bo_alloc(&allocation, &allocator, page, page) == VK_SUCCESS);
++   CHECK(allocation.iova != allocation.bo->iova);
++   auto *base = static_cast<uint32_t *>(allocation.bo->map);
++   std::fill_n(base, page / 4, 0xabcdef01);
++   std::fill_n(base + 2 * page / 4, page / 4, 0xabcdef02);
++   struct tu_cs cs, sub;
++   const uint64_t initial_iova = allocation.iova;
++   tu_cs_init_suballoc(&cs, f.dev.get(), &allocation);
++   struct tu_bo *bo = allocation.bo;
++   CHECK(p_atomic_read(&bo->refcnt) == 4);
++   tu_suballoc_bo_free(&allocator, &prefix);
++   tu_suballoc_bo_free(&allocator, &allocation);
++   tu_bo_suballocator_finish(&allocator);
++   CHECK(p_atomic_read(&bo->refcnt) == 1);
++   CHECK(tu_cs_get_cur_iova(&cs) == initial_iova);
++   CHECK(tu_cs_begin_sub_stream_aligned(&cs, 2, 16, &sub) == VK_SUCCESS);
++   emit(&sub, 32, 0x31415926);
++   auto entry = tu_cs_end_sub_stream(&cs, &sub);
++   CHECK(entry.bo == bo && entry.offset == page && entry.size == 128);
++   tu_cs_reset(&cs);
++   CHECK(tu_cs_get_cur_iova(&cs) == initial_iova);
++   CHECK(cs.start == base + page / 4 && cs.end == base + 2 * page / 4);
++   struct tu_cs_memory memory;
++   CHECK(tu_cs_alloc(&cs, page / 4, 1, &memory) == VK_SUCCESS);
++   std::fill_n(memory.map, page / 4, 0x27182818);
++   for (unsigned i = 0; i < page / 4; ++i) {
++      CHECK(base[i] == 0xabcdef01);
++      CHECK(base[2 * page / 4 + i] == 0xabcdef02);
++   }
++   tu_cs_finish(&cs);
++   CHECK(counters().live == 0);
++}
++
++void
++test_dedicated_and_disabled()
++{
++   for (bool pooled : {true, false}) {
++      fixture f(pooled);
++      struct tu_cs_allocation a, b, large;
++      CHECK(tu_cs_pool_alloc(f.dev.get(), 64, false, "small dedicated cs", &a) == VK_SUCCESS);
++      CHECK(tu_cs_pool_alloc(f.dev.get(), 64, false, "small dedicated cs", &b) == VK_SUCCESS);
++      CHECK(tu_cs_pool_alloc(f.dev.get(), slab_size + page, true, "large dedicated cs", &large) == VK_SUCCESS);
++      check_allocation(a, 64, false, pooled);
++      check_allocation(b, 64, false, pooled);
++      check_allocation(large, slab_size + page, true, pooled);
++      CHECK(!large.slab && large.offset == 0);
++      CHECK((a.bo == b.bo) == pooled);
++      CHECK(counters().maps == (pooled ? 2 : 3));
++      fill(large, 0x10010010);
++      tu_cs_pool_dump_stats(f.dev.get());
++      tu_cs_pool_free(f.dev.get(), &a);
++      tu_cs_pool_free(f.dev.get(), &b);
++      check_fill(large, 0x10010010);
++      tu_cs_pool_free(f.dev.get(), &large);
++      CHECK(counters().live == (pooled ? 1 : 0));
++   }
++}
++
++void
++test_failure_cleanup()
++{
++   for (bool pooled : {true, false}) {
++      for (uint32_t size : {page, slab_size + page}) {
++         for (bool map_failure : {false, true}) {
++            fixture f(pooled);
++            struct tu_cs_allocation allocation = {};
++            if (map_failure)
++               cs_test::fail_next_map();
++            else
++               cs_test::fail_next_allocation();
++            const auto error = map_failure ? VK_ERROR_MEMORY_MAP_FAILED : VK_ERROR_OUT_OF_DEVICE_MEMORY;
++            CHECK(tu_cs_pool_alloc(f.dev.get(), size, false, "failed cs", &allocation) == error);
++            CHECK(!allocation.bo && counters().live == 0);
++            CHECK(tu_cs_pool_alloc(f.dev.get(), size, false, "recovered cs", &allocation) == VK_SUCCESS);
++            check_allocation(allocation, size, false, pooled);
++            tu_cs_pool_free(f.dev.get(), &allocation);
++         }
++      }
++      for (bool map_failure : {false, true}) {
++         fixture f(pooled);
++         struct tu_cs cs;
++         tu_cs_init(&cs, f.dev.get(), TU_CS_MODE_GROW, 16, "failed grow cs");
++         tu_cs_begin(&cs);
++         emit(&cs, 4, 0x1234);
++         const auto ro = last(cs.read_only);
++         tu_cs_set_writeable(&cs, true);
++         if (map_failure)
++            cs_test::fail_next_map();
++         else
++            cs_test::fail_next_allocation();
++         const auto error = map_failure ? VK_ERROR_MEMORY_MAP_FAILED : VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         CHECK(tu_cs_reserve_space(&cs, 4) == error);
++         CHECK(cs.status == error && !cs.read_write.count);
++         CHECK(cs.cur == tu_cs_fail_sink);
++         tu_cs_emit(&cs, 0xbadbad);
++         CHECK(tu_cs_reserve_space(&cs, 4) == error);
++         tu_cs_end(&cs);
++         tu_cs_set_writeable(&cs, false);
++         tu_cs_reset(&cs);
++         CHECK(cs.status == VK_SUCCESS && !cs.writeable);
++         check_same(last(cs.read_only), ro);
++         tu_cs_begin(&cs);
++         emit(&cs, 4, 0x5678);
++         tu_cs_end(&cs);
++         tu_cs_finish(&cs);
++      }
++   }
++}
++
++void
++test_conditional_growth_and_request_bounds()
++{
++   fixture f;
++   struct tu_cs_allocation before, after;
++   CHECK(tu_cs_pool_alloc(f.dev.get(), page, false, "conditional neighbor", &before) == VK_SUCCESS);
++   fill(before, 0x13572468);
++   struct tu_cs cs;
++   tu_cs_init(&cs, f.dev.get(), TU_CS_MODE_GROW, 16, "conditional cs");
++   tu_cs_begin(&cs);
++   tu_cond_exec_start(&cs, CP_COND_EXEC_0_RENDER_MODE_GMEM);
++   tu_cond_exec_start(&cs, CP_COND_EXEC_0_RENDER_MODE_SYSMEM);
++   uint32_t *old_outer = cs.cond_dwords[0];
++   uint32_t *old_inner = cs.cond_dwords[1];
++   CHECK(tu_cs_pool_alloc(f.dev.get(), page, false, "conditional neighbor", &after) == VK_SUCCESS);
++   fill(after, 0x24681357);
++   emit(&cs, tu_cs_get_space(&cs), 0xaaaa0000);
++   const uint32_t outer_length = cs.cur - old_outer - 1;
++   const uint32_t inner_length = cs.cur - old_inner - 1;
++   emit(&cs, 32, 0xbbbb0000);
++   CHECK(cs.read_only.count == 2);
++   CHECK(*old_outer == outer_length && *old_inner == inner_length);
++   const auto &allocation = last(cs.read_only);
++   CHECK(cs.end == map(allocation) + allocation.size / 4);
++   CHECK(cs.cur <= cs.reserved_end && cs.reserved_end <= cs.end);
++   uint32_t *new_outer = cs.cond_dwords[0];
++   uint32_t *new_inner = cs.cond_dwords[1];
++   tu_cond_exec_end(&cs);
++   tu_cond_exec_end(&cs);
++   CHECK(*new_inner == 32 && *new_outer == 35);
++   tu_cs_end(&cs);
++   CHECK(cs.entry_count == 2);
++   for (unsigned i = 0; i < cs.entry_count; ++i)
++      check_entry(cs.entries[i], cs);
++   check_fill(before, 0x13572468);
++   check_fill(after, 0x24681357);
++   tu_cs_finish(&cs);
++   tu_cs_pool_free(f.dev.get(), &before);
++   tu_cs_pool_free(f.dev.get(), &after);
++
++   struct tu_cs suballoc, sub;
++   tu_cs_init(&suballoc, f.dev.get(), TU_CS_MODE_SUB_STREAM, 16, "overflow request cs");
++   const auto maps = counters().maps;
++   struct tu_cs_memory memory;
++   CHECK(tu_cs_alloc(&suballoc, UINT32_MAX, 1024, &memory) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   CHECK(counters().maps == maps && !suballoc.read_only.count);
++   tu_cs_reset(&suballoc);
++   CHECK(tu_cs_begin_sub_stream_aligned(&suballoc, UINT32_MAX, 3, &sub) ==
++         VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   CHECK(!tu_cs_end_sub_stream(&suballoc, &sub).bo);
++   tu_cs_finish(&sub);
++   tu_cs_finish(&suballoc);
++}
++
++void
++test_concurrent_alloc_free()
++{
++   fixture f;
++   std::mutex live_mutex;
++   std::vector<struct tu_cs_allocation> live;
++   std::atomic<unsigned> ready{0};
++   std::atomic<bool> go{false};
++   std::vector<std::thread> threads;
++   constexpr unsigned thread_count = 8, rounds = 1200;
++   for (unsigned thread = 0; thread < thread_count; ++thread) {
++      threads.emplace_back([&, thread] {
++         ready.fetch_add(1, std::memory_order_release);
++         while (!go.load(std::memory_order_acquire))
++            std::this_thread::yield();
++         for (unsigned round = 0; round < rounds; ++round) {
++            struct tu_cs_allocation allocation;
++            const bool writeable = (thread + round) & 1;
++            const uint32_t size = ((round * 13 + thread) % 7 + 1) * page - 4;
++            CHECK(tu_cs_pool_alloc(f.dev.get(), size, writeable, "thread cs", &allocation) == VK_SUCCESS);
++            {
++               std::lock_guard<std::mutex> lock(live_mutex);
++               for (const auto &other : live)
++                  CHECK(nonoverlap(allocation, other));
++               live.push_back(allocation);
++            }
++            const uint32_t sentinel = 0x80000000u | (thread << 20) | round;
++            fill(allocation, sentinel);
++            if ((round & 7) == 0)
++               std::this_thread::yield();
++            check_fill(allocation, sentinel);
++            {
++               std::lock_guard<std::mutex> lock(live_mutex);
++               auto it = std::find_if(live.begin(), live.end(), [&](const auto &other) {
++                  return other.bo == allocation.bo && other.offset == allocation.offset;
++               });
++               CHECK(it != live.end());
++               live.erase(it);
++            }
++            tu_cs_pool_free(f.dev.get(), &allocation);
++         }
++      });
++   }
++   while (ready.load(std::memory_order_acquire) != thread_count)
++      std::this_thread::yield();
++   go.store(true, std::memory_order_release);
++   for (auto &thread : threads)
++      thread.join();
++   CHECK(live.empty());
++   CHECK(counters().live <= 2 && counters().live_bytes <= 2 * slab_size);
++   tu_cs_pool_dump_stats(f.dev.get());
++}
++
++void
++test_empty_cache_and_partial_parent_lifetime()
++{
++   fixture f;
++   for (bool writeable : {false, true}) {
++      std::vector<struct tu_cs_allocation> allocations(4 * slab_size / page);
++      for (auto &allocation : allocations)
++         CHECK(tu_cs_pool_alloc(f.dev.get(), page, writeable, "cache cs", &allocation) == VK_SUCCESS);
++      const unsigned per_slab = slab_size / page;
++      std::vector<struct tu_cs_allocation> pinned;
++      std::set<struct tu_bo *> parents;
++      for (unsigned i = 0; i < allocations.size(); ++i) {
++         if (parents.insert(allocations[i].bo).second) {
++            pinned.push_back(allocations[i]);
++            fill(pinned.back(), 0xfacefeed);
++         } else {
++            tu_cs_pool_free(f.dev.get(), &allocations[i]);
++         }
++      }
++      CHECK(pinned.size() == 4 && allocations.size() == 4 * per_slab);
++      CHECK(counters().live == (writeable ? 5 : 4));
++      for (auto &allocation : pinned) {
++         check_fill(allocation, 0xfacefeed);
++         tu_cs_pool_free(f.dev.get(), &allocation);
++      }
++      CHECK(counters().live == (writeable ? 2 : 1));
++   }
++}
++
++void
++run(const char *name, void (*test)())
++{
++   printf("[ RUN      ] %s%s\n", name, bos_enabled ? " (BOS)" : "");
++   fflush(stdout);
++   test();
++   printf("[       OK ] %s\n", name);
++}
++} /* namespace */
++
++int
++main(int argc, char **argv)
++{
++   CHECK(argc == 1 || (argc == 2 && strcmp(argv[1], "--bos") == 0));
++   bos_enabled = argc == 2;
++   tu_env.debug.store(bos_enabled ? TU_DEBUG_BOS : 0, std::memory_order_relaxed);
++   tu_env.start_debug = bos_enabled ? TU_DEBUG_BOS : 0;
++   run("page reuse and nonoverlap", test_page_reuse_and_nonoverlap);
++   run("mixed ranges and RO/RW separation", test_mixed_ranges_and_permissions);
++   run("4608 live warm recorder owners", test_warm_recorder_shape);
++   run("pooled switch overflow reset neighbor sentinel", [] { test_switch_overflow_and_reset(true); });
++   run("dedicated switch overflow reset", [] { test_switch_overflow_and_reset(false); });
++   run("borrowed secondary entries and IB execution addresses", test_borrowed_entries_and_ib_addresses);
++   run("substreams and slice-origin alignment", test_substreams_and_alignment);
++   run("external and refcount-backed modes", test_external_and_refcount_modes);
++   run("oversized and disabled dedicated paths", test_dedicated_and_disabled);
++   run("allocation/map failure cleanup and reset recovery", test_failure_cleanup);
++   run("conditional growth and oversized request bounds", test_conditional_growth_and_request_bounds);
++   run("concurrent allocation/free", test_concurrent_alloc_free);
++   run("bounded empty cache and pinned parent lifetime", test_empty_cache_and_partial_parent_lifetime);
++   puts("All host CS storage invariants passed; no GPU commands were submitted.");
++   return 0;
++}
+diff --git a/src/freedreno/vulkan/tests/meson.build b/src/freedreno/vulkan/tests/meson.build
+new file mode 100644
+index 00000000000..280562dbb80
+--- /dev/null
++++ b/src/freedreno/vulkan/tests/meson.build
+@@ -0,0 +1,56 @@
++# SPDX-License-Identifier: MIT
++
++# Deliberately do not inherit tu_flags: this target has no KGSL/MSM/virtio
++# backend and never opens a GPU. All CS storage logic is the production code.
++tu_cs_slabs_test = executable(
++  'tu_cs_slabs_test',
++  [
++    files(
++      'cs_slabs.cc',
++      'cs_fake_bo.cc',
++      '../tu_cs.cc',
++      '../tu_cs_pool.cc',
++      '../tu_suballoc.cc',
++      '../tu_rmv.cc',
++    ),
++    tu_entrypoints[0],
++    tu_drirc[1],
++    tu_tracepoints[1],
++    freedreno_xml_header_files,
++    sha1_h,
++    u_format_pack_h,
++  ],
++  include_directories : [libtu_includes, include_directories('..')],
++  dependencies : [
++    dep_thread,
++    idep_libfreedreno_common,
++    idep_mesautil,
++    idep_nir_headers,
++    idep_vulkan_util,
++    idep_vulkan_runtime,
++    idep_vulkan_wsi,
++  ],
++  cpp_args : [tu_cpp_args, soong_compat_cpp_args, '-UNDEBUG', '-ffunction-sections', '-fdata-sections'],
++  # Unused RMV entrypoints reference the rest of the driver. Keep the real
++  # command-allocator/resource lifetime implementations without linking a GPU
++  # ICD or replacing RMV behavior with test stubs.
++  link_args : ld_args_gc_sections,
++  build_by_default : false,
++)
++
++test(
++  'tu-cs-slabs',
++  tu_cs_slabs_test,
++  suite : ['freedreno', 'turnip-cs'],
++  is_parallel : false,
++  timeout : 120,
++)
++
++test(
++  'tu-cs-slabs-bos',
++  tu_cs_slabs_test,
++  args : ['--bos'],
++  suite : ['freedreno', 'turnip-cs'],
++  is_parallel : false,
++  timeout : 120,
++)
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+index a6f15622d5e..13a3c172554 100644
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -6,7 +6,6 @@
+ #include "tu_cs.h"
+ 
+ #include "tu_device.h"
+-#include "tu_rmv.h"
+ #include "tu_suballoc.h"
+ 
+ uint32_t tu_cs_fail_sink[TU_CS_FAIL_SINK_SIZE];
+@@ -35,7 +34,7 @@ tu_cs_init(struct tu_cs *cs,
+ 
+    cs->device = device;
+    cs->mode = mode;
+-   cs->next_bo_size = initial_size;
++   cs->next_bo_size = tu_sanitize_ib_size(initial_size);
+    cs->name = name;
+ }
+ 
+@@ -74,6 +73,8 @@ tu_cs_init_suballoc(struct tu_cs *cs, struct tu_device *device,
+    cs->start = cs->reserved_end = cs->cur = start;
+    cs->end = end;
+    cs->refcount_bo = tu_bo_get_ref(suballoc_bo->bo);
++   cs->refcount_offset = suballoc_bo->iova - suballoc_bo->bo->iova;
++   cs->refcount_size = suballoc_bo->size;
+ }
+ 
+ /**
+@@ -82,22 +83,32 @@ tu_cs_init_suballoc(struct tu_cs *cs, struct tu_device *device,
+ void
+ tu_cs_finish(struct tu_cs *cs)
+ {
+-   for (uint32_t i = 0; i < cs->read_only.bo_count; ++i) {
+-      TU_RMV(resource_destroy, cs->device, cs->read_only.bos[i]);
+-      tu_bo_finish(cs->device, cs->read_only.bos[i]);
+-   }
++   for (uint32_t i = 0; i < cs->read_only.count; ++i)
++      tu_cs_pool_free(cs->device, &cs->read_only.allocations[i]);
+ 
+-   for (uint32_t i = 0; i < cs->read_write.bo_count; ++i) {
+-      TU_RMV(resource_destroy, cs->device, cs->read_write.bos[i]);
+-      tu_bo_finish(cs->device, cs->read_write.bos[i]);
+-   }
++   for (uint32_t i = 0; i < cs->read_write.count; ++i)
++      tu_cs_pool_free(cs->device, &cs->read_write.allocations[i]);
+ 
+    if (cs->refcount_bo)
+       tu_bo_finish(cs->device, cs->refcount_bo);
+ 
+    free(cs->entries);
+-   free(cs->read_only.bos);
+-   free(cs->read_write.bos);
++   free(cs->read_only.allocations);
++   free(cs->read_write.allocations);
++}
++
++static uint32_t *
++tu_cs_allocation_start(const struct tu_cs_allocation *allocation)
++{
++   return reinterpret_cast<uint32_t *>(
++      static_cast<char *>(allocation->bo->map) + allocation->offset);
++}
++
++static uint32_t *
++tu_cs_allocation_end(const struct tu_cs_allocation *allocation)
++{
++   return tu_cs_allocation_start(allocation) +
++          tu_sanitize_ib_size(allocation->size / sizeof(uint32_t));
+ }
+ 
+ static struct tu_bo *
+@@ -106,9 +117,10 @@ tu_cs_current_bo(const struct tu_cs *cs)
+    if (cs->refcount_bo) {
+       return cs->refcount_bo;
+    } else {
+-      const struct tu_bo_array *bos = cs->writeable ? &cs->read_write : &cs->read_only;
+-      assert(bos->bo_count);
+-      return bos->bos[bos->bo_count - 1];
++      const struct tu_cs_allocation_array *allocs =
++         cs->writeable ? &cs->read_write : &cs->read_only;
++      assert(allocs->count);
++      return allocs->allocations[allocs->count - 1].bo;
+    }
+ }
+ 
+@@ -119,8 +131,10 @@ tu_cs_current_bo(const struct tu_cs *cs)
+ static uint32_t
+ tu_cs_get_offset(const struct tu_cs *cs)
+ {
+-   const struct tu_bo_array *bos = cs->writeable ? &cs->read_write : &cs->read_only;
+-   return (cs->refcount_bo || bos->bo_count != 0) ? cs->start - static_cast<uint32_t *>(tu_cs_current_bo(cs)->map) : 0;
++   const struct tu_cs_allocation_array *allocs =
++      cs->writeable ? &cs->read_write : &cs->read_only;
++   return (cs->refcount_bo || allocs->count) ?
++      cs->start - static_cast<uint32_t *>(tu_cs_current_bo(cs)->map) : 0;
+ }
+ 
+ /**
+@@ -155,45 +169,31 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
+    /* no dangling command packet */
+    assert(tu_cs_is_empty(cs));
+ 
+-   struct tu_bo_array *bos = cs->writeable ? &cs->read_write : &cs->read_only;
++   struct tu_cs_allocation_array *allocs =
++      cs->writeable ? &cs->read_write : &cs->read_only;
+ 
+-   /* grow cs->bos if needed */
+-   if (bos->bo_count == bos->bo_capacity) {
+-      uint32_t new_capacity = MAX2(4, 2 * bos->bo_capacity);
+-      struct tu_bo **new_bos = static_cast<struct tu_bo **>(
+-         realloc(bos->bos, new_capacity * sizeof(struct tu_bo *)));
+-      if (!new_bos)
++   if (allocs->count == allocs->capacity) {
++      uint32_t new_capacity = MAX2(4, 2 * allocs->capacity);
++      struct tu_cs_allocation *new_allocations =
++         static_cast<struct tu_cs_allocation *>(
++            realloc(allocs->allocations,
++                    new_capacity * sizeof(struct tu_cs_allocation)));
++      if (!new_allocations)
+          return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
+-      bos->bo_capacity = new_capacity;
+-      bos->bos = new_bos;
++      allocs->capacity = new_capacity;
++      allocs->allocations = new_allocations;
+    }
+ 
+-   struct tu_bo *new_bo;
+-
+-   VkResult result =
+-      tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t),
+-                     static_cast<enum tu_bo_alloc_flags>(COND(!cs->writeable,
+-                                                   TU_BO_ALLOC_GPU_READ_ONLY) |
+-                                              TU_BO_ALLOC_ALLOW_DUMP |
+-                                              tu_bo_ib_flags(cs->device)),
+-                     cs->name);
+-   if (result != VK_SUCCESS) {
+-      return result;
+-   }
+-
+-   result = tu_bo_map(cs->device, new_bo, NULL);
+-   if (result != VK_SUCCESS) {
+-      tu_bo_finish(cs->device, new_bo);
++   struct tu_cs_allocation allocation;
++   VkResult result = tu_cs_pool_alloc(cs->device, size * sizeof(uint32_t),
++                                      cs->writeable, cs->name, &allocation);
++   if (result != VK_SUCCESS)
+       return result;
+-   }
+ 
+-   TU_RMV(cmd_buffer_bo_create, cs->device, new_bo);
+-
+-   bos->bos[bos->bo_count++] = new_bo;
+-
+-   cs->start = cs->cur = cs->reserved_end = static_cast<uint32_t *>(new_bo->map);
+-   cs->end = cs->start + size;
++   allocs->allocations[allocs->count++] = allocation;
++   cs->start = cs->cur = cs->reserved_end = tu_cs_allocation_start(&allocation);
++   cs->end = tu_cs_allocation_end(&allocation);
+ 
+    return VK_SUCCESS;
+ }
+@@ -240,7 +240,7 @@ tu_cs_add_entry(struct tu_cs *cs)
+     * because we disallow empty entry, tu_cs_add_bo and tu_cs_reserve_entry
+     * must both have been called
+     */
+-   assert(cs->writeable ? cs->read_write.bo_count : cs->read_only.bo_count);
++   assert(cs->writeable ? cs->read_write.count : cs->read_only.count);
+    assert(cs->entry_count < cs->entry_capacity);
+ 
+    /* add an entry for [cs->start, cs->cur] */
+@@ -316,23 +316,54 @@ tu_cs_set_writeable(struct tu_cs *cs, bool writeable)
+       assert(!cs->cond_stack_depth);
+       if (cs->mode == TU_CS_MODE_GROW && !tu_cs_is_empty(cs))
+          tu_cs_add_entry(cs);
+-      struct tu_bo_array *old_bos = cs->writeable ? &cs->read_write : &cs->read_only;
+-      struct tu_bo_array *new_bos = writeable ? &cs->read_write : &cs->read_only;
+-
+-      old_bos->start = cs->start;
+-      cs->start = cs->cur = cs->reserved_end = new_bos->start;
+-      if (new_bos->bo_count) {
+-         struct tu_bo *bo = new_bos->bos[new_bos->bo_count - 1];
+-         cs->end = static_cast<uint32_t *>(bo->map) +
+-                   tu_sanitize_ib_size(bo->size / sizeof(uint32_t));
+-      } else {
+-         cs->end = NULL;
+-      }
++      /* A tu_suballoc BO has fixed permissions and cannot switch pools. */
++      assert(!cs->refcount_bo);
++      struct tu_cs_allocation_array *old_allocs =
++         cs->writeable ? &cs->read_write : &cs->read_only;
++      struct tu_cs_allocation_array *new_allocs =
++         writeable ? &cs->read_write : &cs->read_only;
++
++      old_allocs->start = cs->start;
++      cs->start = cs->cur = cs->reserved_end = new_allocs->start;
++      cs->end = new_allocs->count ?
++         tu_cs_allocation_end(&new_allocs->allocations[new_allocs->count - 1]) :
++         NULL;
+ 
+       cs->writeable = writeable;
+    }
+ }
+ 
++/* Reserve from the actual parent-relative cursor, including when a new slice
++ * begins at a nonzero offset.  A new allocation may need different padding.
++ */
++static VkResult
++tu_cs_reserve_aligned(struct tu_cs *cs, uint32_t count, uint32_t size)
++{
++   if (unlikely(cs->status != VK_SUCCESS))
++      return cs->status;
++
++   uint64_t dwords = (uint64_t) count * size;
++   if (dwords + size - 1 > tu_sanitize_ib_size(UINT32_MAX)) {
++      tu_cs_fail(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return cs->status;
++   }
++
++   uint32_t padding = (size - tu_cs_get_offset(cs) % size) % size;
++   uint32_t reserve = dwords + padding;
++   if (tu_cs_get_space(cs) < reserve)
++      reserve = dwords + size - 1;
++
++   VkResult result = tu_cs_reserve_space(cs, reserve);
++   if (result != VK_SUCCESS)
++      return result;
++
++   padding = (size - tu_cs_get_offset(cs) % size) % size;
++   cs->start += padding;
++   cs->cur = cs->start;
++   cs->reserved_end = cs->cur + dwords;
++   return VK_SUCCESS;
++}
++
+ /**
+  * Begin command packet emission to a sub-stream.  \a cs must be in
+  * TU_CS_MODE_SUB_STREAM mode.
+@@ -348,16 +379,7 @@ tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
+    assert(cs->mode == TU_CS_MODE_SUB_STREAM);
+    assert(size);
+ 
+-   VkResult result;
+-   if (tu_cs_get_space(cs) < count * size) {
+-      /* When we have to allocate a new BO, assume that the alignment of the
+-       * BO is sufficient.
+-       */
+-      result = tu_cs_reserve_space(cs, count * size);
+-   } else {
+-      result = tu_cs_reserve_space(cs, count * size + (size - tu_cs_get_offset(cs)) % size);
+-      cs->start += (size - tu_cs_get_offset(cs)) % size;
+-   }
++   VkResult result = tu_cs_reserve_aligned(cs, count, size);
+    if (result != VK_SUCCESS) {
+       /* Freshly declared, nothing owned yet so safe to zero. */
+       memset(sub_cs, 0, sizeof(*sub_cs));
+@@ -365,8 +387,6 @@ tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
+       return result;
+    }
+ 
+-   cs->cur = cs->start;
+-
+    tu_cs_init_external(sub_cs, cs->device, cs->cur, cs->reserved_end,
+                        tu_cs_get_cur_iova(cs), cs->writeable);
+    tu_cs_begin(sub_cs);
+@@ -399,14 +419,12 @@ tu_cs_alloc(struct tu_cs *cs,
+       return VK_SUCCESS;
+    }
+ 
+-   /* TODO: smarter way to deal with alignment? */
+-
+-   VkResult result = tu_cs_reserve_space(cs, count * size + (size-1));
++   VkResult result = tu_cs_reserve_aligned(cs, count, size);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+    struct tu_bo *bo = tu_cs_current_bo(cs);
+-   size_t offset = align(tu_cs_get_offset(cs), size);
++   size_t offset = tu_cs_get_offset(cs);
+ 
+    memory->map = static_cast<uint32_t *>(bo->map) + offset;
+    memory->iova = bo->iova + offset * sizeof(uint32_t);
+@@ -464,12 +482,26 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+    if (unlikely(cs->status != VK_SUCCESS))
+       return cs->status;
+ 
++   const uint32_t cond_size = 3 * cs->cond_stack_depth;
++   if ((uint64_t) reserved_size + cond_size >
++       tu_sanitize_ib_size(UINT32_MAX)) {
++      tu_cs_fail(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return cs->status;
++   }
++
+    if (tu_cs_get_space(cs) < reserved_size) {
+       if (cs->mode == TU_CS_MODE_EXTERNAL) {
+          UNREACHABLE("cannot grow external buffer");
+          cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
+          return cs->status;
+       }
++      /* A tu_suballoc wrapper cannot acquire another allocation or extend its
++       * original range, even if the underlying parent BO has spare space.
++       */
++      if (cs->refcount_bo) {
++         tu_cs_fail(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++         return cs->status;
++      }
+ 
+       /* add an entry for the exiting command packets */
+       if (!tu_cs_is_empty(cs)) {
+@@ -482,13 +514,10 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+       for (uint32_t i = 0; i < cs->cond_stack_depth; i++) {
+          /* Subtract one here to account for the DWORD field itself. */
+          *cs->cond_dwords[i] = cs->cur - cs->cond_dwords[i] - 1;
+-
+-         /* space for CP_COND_REG_EXEC in next bo */
+-         reserved_size += 3;
+       }
+ 
+       /* switch to a new BO */
+-      uint32_t new_size = MAX2(cs->next_bo_size, reserved_size);
++      uint32_t new_size = MAX2(cs->next_bo_size, reserved_size + cond_size);
+       VkResult result = tu_cs_add_bo(cs, new_size);
+       if (result != VK_SUCCESS) {
+          tu_cs_fail(cs, result);
+@@ -496,7 +525,7 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+       }
+ 
+       if (cs->cond_stack_depth) {
+-         cs->reserved_end = cs->cur + reserved_size;
++         cs->reserved_end = cs->cur + reserved_size + cond_size;
+       }
+ 
+       /* Re-emit CP_COND_REG_EXECs */
+@@ -538,42 +567,44 @@ void
+ tu_cs_reset(struct tu_cs *cs)
+ {
+    cs->status = VK_SUCCESS;
++   cs->cond_stack_depth = 0;
+ 
+    if (cs->mode == TU_CS_MODE_EXTERNAL) {
+-      assert(!cs->read_only.bo_count && !cs->read_write.bo_count &&
++      assert(!cs->read_only.count && !cs->read_write.count &&
+              !cs->refcount_bo && !cs->entry_count);
+       cs->reserved_end = cs->cur = cs->start;
+       return;
+    }
+ 
+-   for (uint32_t i = 0; i + 1 < cs->read_only.bo_count; ++i) {
+-      TU_RMV(resource_destroy, cs->device, cs->read_only.bos[i]);
+-      tu_bo_finish(cs->device, cs->read_only.bos[i]);
+-   }
+-
+-   for (uint32_t i = 0; i + 1 < cs->read_write.bo_count; ++i) {
+-      TU_RMV(resource_destroy, cs->device, cs->read_write.bos[i]);
+-      tu_bo_finish(cs->device, cs->read_write.bos[i]);
+-   }
+-
+-   assert(!cs->writeable);
+-
+-   if (cs->read_only.bo_count) {
+-      cs->read_only.bos[0] = cs->read_only.bos[cs->read_only.bo_count - 1];
+-      cs->read_only.bo_count = 1;
+-
+-      cs->start = cs->cur = cs->reserved_end = static_cast<uint32_t *>(cs->read_only.bos[0]->map);
+-      cs->end = cs->start + tu_sanitize_ib_size(cs->read_only.bos[0]->size /
+-                                                sizeof(uint32_t));
++   if (cs->refcount_bo) {
++      cs->start = cs->cur = cs->reserved_end = reinterpret_cast<uint32_t *>(
++         static_cast<char *>(cs->refcount_bo->map) + cs->refcount_offset);
++      cs->end = cs->start + cs->refcount_size / sizeof(uint32_t);
++      return;
+    }
+ 
+-   if (cs->read_write.bo_count) {
+-      cs->read_write.bos[0] = cs->read_write.bos[cs->read_write.bo_count - 1];
+-      cs->read_write.bo_count = 1;
+-
+-      cs->read_write.start = static_cast<uint32_t *>(cs->read_write.bos[0]->map);
++   struct tu_cs_allocation_array *arrays[] = {
++      &cs->read_only, &cs->read_write,
++   };
++   for (struct tu_cs_allocation_array *allocs : arrays) {
++      for (uint32_t i = 0; i + 1 < allocs->count; ++i)
++         tu_cs_pool_free(cs->device, &allocs->allocations[i]);
++      if (allocs->count) {
++         allocs->allocations[0] = allocs->allocations[allocs->count - 1];
++         allocs->count = 1;
++         allocs->start = tu_cs_allocation_start(&allocs->allocations[0]);
++      } else {
++         allocs->start = NULL;
++      }
+    }
+ 
++   /* Failure while writing a writeable slice can prevent the normal switch
++    * back.  Reset always starts in the read-only pool, including that case.
++    */
++   cs->writeable = false;
++   cs->start = cs->cur = cs->reserved_end = cs->read_only.start;
++   cs->end = cs->read_only.count ?
++      tu_cs_allocation_end(&cs->read_only.allocations[0]) : NULL;
+    cs->entry_count = 0;
+ }
+ 
+diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
+index 8f0d6eadb89..8e3c59da82a 100644
+--- a/src/freedreno/vulkan/tu_cs.h
++++ b/src/freedreno/vulkan/tu_cs.h
+@@ -11,6 +11,7 @@
+ #include "freedreno_pm4.h"
+ 
+ #include "tu_knl.h"
++#include "tu_cs_pool.h"
+ 
+ /* For breadcrumbs we may open a network socket based on the envvar,
+  * it's not something that should be enabled by default.
+@@ -71,10 +72,11 @@ struct tu_draw_state {
+    bool writeable;
+ };
+ 
+-struct tu_bo_array {
+-   struct tu_bo **bos;
+-   uint32_t bo_count;
+-   uint32_t bo_capacity;
++struct tu_cs_allocation_array {
++   struct tu_cs_allocation *allocations;
++   uint32_t count;
++   uint32_t capacity;
++   /* Saved emission cursor when switching between read-only/writeable slices. */
+    uint32_t *start;
+ };
+ 
+@@ -122,10 +124,14 @@ struct tu_cs
+    uint32_t entry_count;
+    uint32_t entry_capacity;
+ 
+-   struct tu_bo_array read_only, read_write;
++   struct tu_cs_allocation_array read_only, read_write;
+ 
+-   /* Optional BO that this CS is sub-allocated from for TU_CS_MODE_SUB_STREAM */
++   /* Optional BO that this CS is sub-allocated from for TU_CS_MODE_SUB_STREAM.
++    * Keep its original byte range for reset; it does not own a pool slice.
++    */
+    struct tu_bo *refcount_bo;
++   uint32_t refcount_offset;
++   uint32_t refcount_size;
+ 
+    /* iova that this CS starts with in TU_CS_MODE_EXTERNAL */
+    uint64_t external_iova;
+diff --git a/src/freedreno/vulkan/tu_cs_pool.cc b/src/freedreno/vulkan/tu_cs_pool.cc
+new file mode 100644
+index 00000000000..242523dcb4d
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_cs_pool.cc
+@@ -0,0 +1,343 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "tu_cs_pool.h"
++
++#include "tu_device.h"
++#include "tu_rmv.h"
++#include "util/bitset.h"
++
++#define TU_CS_SLAB_PAGES (TU_CS_SLAB_SIZE / TU_CS_POOL_PAGE_SIZE)
++
++struct tu_cs_name_stats {
++   struct list_head link;
++   uint64_t slices;
++   uint64_t bytes;
++   uint64_t pages;
++   char name[];
++};
++
++struct tu_cs_slab {
++   struct list_head link;
++   struct tu_bo *bo;
++   bool writeable;
++   uint32_t free_pages;
++   BITSET_DECLARE(used, TU_CS_SLAB_PAGES);
++
++   /* Only slice heads are populated, and only with TU_DEBUG=bos.  Names are
++    * interned once per distinct stream name, not allocated for each slice.
++    */
++   struct tu_cs_name_stats *names[TU_CS_SLAB_PAGES];
++};
++
++struct tu_cs_pool {
++   /* Lock order is pool -> device BO/statistics locks.  No emission takes it. */
++   mtx_t mutex;
++   struct list_head slabs[2];
++   struct tu_cs_slab *empty[2];
++   struct list_head names;
++   uint64_t slab_count[2];
++   uint64_t slab_bytes;
++   uint64_t slices;
++   uint64_t bytes;
++   uint64_t pages;
++   uint64_t dedicated;
++   uint64_t dedicated_bytes;
++};
++
++static VkResult
++create_bo(struct tu_device *dev, uint32_t size, bool writeable,
++          const char *name, struct tu_bo **out)
++{
++   VkResult result = tu_bo_init_new(
++      dev, NULL, out, size,
++      static_cast<enum tu_bo_alloc_flags>(
++         COND(!writeable, TU_BO_ALLOC_GPU_READ_ONLY) |
++         TU_BO_ALLOC_ALLOW_DUMP | tu_bo_ib_flags(dev)),
++      name);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = tu_bo_map(dev, *out, NULL);
++   if (result != VK_SUCCESS) {
++      tu_bo_finish(dev, *out);
++      *out = NULL;
++      return result;
++   }
++
++   /* Resource identity belongs to the parent, never to individual slices. */
++   TU_RMV(cmd_buffer_bo_create, dev, *out);
++   return VK_SUCCESS;
++}
++
++static void
++destroy_slab(struct tu_device *dev, struct tu_cs_slab *slab)
++{
++   assert(slab->free_pages == TU_CS_SLAB_PAGES);
++   struct tu_cs_pool *pool = dev->cs_pool;
++   pool->slab_count[slab->writeable]--;
++   pool->slab_bytes -= slab->bo->size;
++   list_del(&slab->link);
++   TU_RMV(resource_destroy, dev, slab->bo);
++   tu_bo_finish(dev, slab->bo);
++   vk_free(&dev->vk.alloc, slab);
++}
++
++VkResult
++tu_cs_pool_init(struct tu_device *dev)
++{
++   assert(!dev->cs_pool);
++   struct tu_cs_pool *pool = static_cast<struct tu_cs_pool *>(
++      vk_zalloc(&dev->vk.alloc, sizeof(*pool), 8,
++                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
++   if (!pool)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   if (mtx_init(&pool->mutex, mtx_plain) != thrd_success) {
++      vk_free(&dev->vk.alloc, pool);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   list_inithead(&pool->slabs[0]);
++   list_inithead(&pool->slabs[1]);
++   list_inithead(&pool->names);
++   dev->cs_pool = pool;
++   return VK_SUCCESS;
++}
++
++static struct tu_cs_name_stats *
++get_name_stats(struct tu_device *dev, const char *name)
++{
++   if (likely(!TU_DEBUG(BOS)))
++      return NULL;
++
++   struct tu_cs_pool *pool = dev->cs_pool;
++   name = name ? name : "(unnamed)";
++   list_for_each_entry(struct tu_cs_name_stats, stats, &pool->names, link) {
++      if (!strcmp(stats->name, name))
++         return stats;
++   }
++
++   size_t len = strlen(name) + 1;
++   struct tu_cs_name_stats *stats = static_cast<struct tu_cs_name_stats *>(
++      vk_zalloc(&dev->vk.alloc, sizeof(*stats) + len, 8,
++                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
++   if (!stats)
++      return NULL;
++   memcpy(stats->name, name, len);
++   list_addtail(&stats->link, &pool->names);
++   return stats;
++}
++
++static bool
++find_pages(const struct tu_cs_slab *slab, uint32_t pages, uint32_t *first)
++{
++   if (slab->free_pages < pages)
++      return false;
++
++   uint32_t run = 0;
++   for (uint32_t i = 0; i < TU_CS_SLAB_PAGES; i++) {
++      run = BITSET_TEST(slab->used, i) ? 0 : run + 1;
++      if (run == pages) {
++         *first = i + 1 - pages;
++         return true;
++      }
++   }
++   return false;
++}
++
++VkResult
++tu_cs_pool_alloc(struct tu_device *dev, uint32_t size, bool writeable,
++                 const char *name, struct tu_cs_allocation *out)
++{
++   *out = (struct tu_cs_allocation) {};
++   assert(size);
++   struct tu_cs_pool *pool = dev->cs_pool;
++   if (!pool || size > TU_CS_SLAB_SIZE) {
++      /* Disabled pooling preserves the original BO size, flags and name. */
++      if (pool)
++         mtx_lock(&pool->mutex);
++      VkResult result = create_bo(dev, size, writeable, name, &out->bo);
++      if (result == VK_SUCCESS) {
++         out->size = size;
++         if (pool) {
++            pool->dedicated++;
++            pool->dedicated_bytes += out->bo->size;
++         }
++      }
++      if (pool)
++         mtx_unlock(&pool->mutex);
++      return result;
++   }
++
++   const uint32_t pages = DIV_ROUND_UP(size, TU_CS_POOL_PAGE_SIZE);
++   mtx_lock(&pool->mutex);
++
++   struct tu_cs_slab *slab = NULL;
++   uint32_t first = 0;
++   list_for_each_entry(struct tu_cs_slab, candidate, &pool->slabs[writeable], link) {
++      if (find_pages(candidate, pages, &first)) {
++         slab = candidate;
++         break;
++      }
++   }
++
++   if (!slab) {
++      slab = static_cast<struct tu_cs_slab *>(
++         vk_zalloc(&dev->vk.alloc, sizeof(*slab), 8,
++                   VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
++      if (!slab) {
++         mtx_unlock(&pool->mutex);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++
++      VkResult result = create_bo(dev, TU_CS_SLAB_SIZE, writeable,
++                                  writeable ? "cs slab rw" : "cs slab ro",
++                                  &slab->bo);
++      if (result != VK_SUCCESS) {
++         vk_free(&dev->vk.alloc, slab);
++         mtx_unlock(&pool->mutex);
++         return result;
++      }
++      slab->writeable = writeable;
++      slab->free_pages = TU_CS_SLAB_PAGES;
++      list_addtail(&slab->link, &pool->slabs[writeable]);
++      pool->slab_count[writeable]++;
++      pool->slab_bytes += slab->bo->size;
++   }
++
++   if (pool->empty[writeable] == slab)
++      pool->empty[writeable] = NULL;
++   BITSET_SET_RANGE(slab->used, first, first + pages - 1);
++   slab->free_pages -= pages;
++   pool->slices++;
++   pool->bytes += size;
++   pool->pages += pages;
++
++   struct tu_cs_name_stats *stats = get_name_stats(dev, name);
++   slab->names[first] = stats;
++   if (stats) {
++      stats->slices++;
++      stats->bytes += size;
++      stats->pages += pages;
++   }
++
++   *out = (struct tu_cs_allocation) {
++      .bo = tu_bo_get_ref(slab->bo),
++      .slab = slab,
++      .offset = first * TU_CS_POOL_PAGE_SIZE,
++      .size = size,
++   };
++   mtx_unlock(&pool->mutex);
++   return VK_SUCCESS;
++}
++
++void
++tu_cs_pool_free(struct tu_device *dev, struct tu_cs_allocation *allocation)
++{
++   if (!allocation->bo)
++      return;
++
++   struct tu_cs_pool *pool = dev->cs_pool;
++   if (!allocation->slab) {
++      if (pool) {
++         mtx_lock(&pool->mutex);
++         assert(pool->dedicated);
++         pool->dedicated--;
++         pool->dedicated_bytes -= allocation->bo->size;
++      }
++      TU_RMV(resource_destroy, dev, allocation->bo);
++      tu_bo_finish(dev, allocation->bo);
++      if (pool)
++         mtx_unlock(&pool->mutex);
++   } else {
++      assert(pool);
++      struct tu_cs_slab *slab = allocation->slab;
++      uint32_t first = allocation->offset / TU_CS_POOL_PAGE_SIZE;
++      uint32_t pages = DIV_ROUND_UP(allocation->size, TU_CS_POOL_PAGE_SIZE);
++      assert(allocation->bo == slab->bo);
++      assert(allocation->offset % TU_CS_POOL_PAGE_SIZE == 0);
++      assert(first + pages <= TU_CS_SLAB_PAGES);
++      mtx_lock(&pool->mutex);
++      assert(BITSET_TEST_RANGE(slab->used, first, first + pages - 1));
++      BITSET_CLEAR_RANGE(slab->used, first, first + pages - 1);
++      slab->free_pages += pages;
++      pool->slices--;
++      pool->bytes -= allocation->size;
++      pool->pages -= pages;
++
++      struct tu_cs_name_stats *stats = slab->names[first];
++      slab->names[first] = NULL;
++      if (stats) {
++         stats->slices--;
++         stats->bytes -= allocation->size;
++         stats->pages -= pages;
++      }
++
++      /* Drop the slice's reference before considering the pool's cached one. */
++      tu_bo_finish(dev, allocation->bo);
++      if (slab->free_pages == TU_CS_SLAB_PAGES) {
++         if (pool->empty[slab->writeable])
++            destroy_slab(dev, slab);
++         else
++            pool->empty[slab->writeable] = slab;
++      }
++      mtx_unlock(&pool->mutex);
++   }
++   *allocation = (struct tu_cs_allocation) {};
++}
++
++void
++tu_cs_pool_dump_stats(struct tu_device *dev)
++{
++   struct tu_cs_pool *pool = dev->cs_pool;
++   if (!pool || likely(!TU_DEBUG(BOS)))
++      return;
++
++   mtx_lock(&pool->mutex);
++   mesa_logi("cs pool: %llu live slices, %llu ro/%llu rw parent slabs, "
++             "%llu dedicated, %llu requested bytes, %llu allocated pages "
++             "(%llu bytes), %llu parent mapped bytes, %llu dedicated mapped bytes",
++             (unsigned long long) pool->slices,
++             (unsigned long long) pool->slab_count[0],
++             (unsigned long long) pool->slab_count[1],
++             (unsigned long long) pool->dedicated,
++             (unsigned long long) pool->bytes,
++             (unsigned long long) pool->pages,
++             (unsigned long long) (pool->pages * TU_CS_POOL_PAGE_SIZE),
++             (unsigned long long) pool->slab_bytes,
++             (unsigned long long) pool->dedicated_bytes);
++   list_for_each_entry(struct tu_cs_name_stats, stats, &pool->names, link) {
++      if (stats->slices) {
++         mesa_logi("%30s: %llu cs slices, %llu requested bytes, "
++                   "%llu allocated pages (%llu bytes)",
++                   stats->name, (unsigned long long) stats->slices,
++                   (unsigned long long) stats->bytes,
++                   (unsigned long long) stats->pages,
++                   (unsigned long long) (stats->pages * TU_CS_POOL_PAGE_SIZE));
++      }
++   }
++   mtx_unlock(&pool->mutex);
++}
++
++void
++tu_cs_pool_finish(struct tu_device *dev)
++{
++   struct tu_cs_pool *pool = dev->cs_pool;
++   if (!pool)
++      return;
++
++   tu_cs_pool_dump_stats(dev);
++   assert(!pool->slices && !pool->dedicated);
++   for (unsigned i = 0; i < ARRAY_SIZE(pool->slabs); i++) {
++      list_for_each_entry_safe(struct tu_cs_slab, slab, &pool->slabs[i], link)
++         destroy_slab(dev, slab);
++   }
++   list_for_each_entry_safe(struct tu_cs_name_stats, stats, &pool->names, link) {
++      list_del(&stats->link);
++      vk_free(&dev->vk.alloc, stats);
++   }
++   mtx_destroy(&pool->mutex);
++   vk_free(&dev->vk.alloc, pool);
++   dev->cs_pool = NULL;
++}
+diff --git a/src/freedreno/vulkan/tu_cs_pool.h b/src/freedreno/vulkan/tu_cs_pool.h
+new file mode 100644
+index 00000000000..11338a22439
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_cs_pool.h
+@@ -0,0 +1,43 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef TU_CS_POOL_H
++#define TU_CS_POOL_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include "vulkan/vulkan_core.h"
++
++struct tu_bo;
++struct tu_device;
++struct tu_cs_pool;
++struct tu_cs_slab;
++
++#define TU_CS_SLAB_SIZE (2u * 1024 * 1024)
++#define TU_CS_POOL_PAGE_SIZE 4096u
++
++/* An owning allocation, stored by value.  Entries borrow the parent BO and
++ * include offset in their BO-relative address.  size is the requested capacity
++ * in bytes; the pool privately rounds its reservation up to whole pages.
++ *
++ * A non-NULL slab owns both a bitmap reservation and a real parent BO reference.
++ * A NULL slab denotes a dedicated BO, including the disabled-pool path.
++ */
++struct tu_cs_allocation {
++   struct tu_bo *bo;
++   struct tu_cs_slab *slab;
++   uint32_t offset;
++   uint32_t size;
++};
++
++VkResult tu_cs_pool_init(struct tu_device *dev);
++/* All CS owners must have been finished before destroying the device pool. */
++void tu_cs_pool_finish(struct tu_device *dev);
++VkResult tu_cs_pool_alloc(struct tu_device *dev, uint32_t size, bool writeable,
++                          const char *name, struct tu_cs_allocation *out);
++void tu_cs_pool_free(struct tu_device *dev, struct tu_cs_allocation *allocation);
++/* Call before, never while, holding the device BO/statistics mutex. */
++void tu_cs_pool_dump_stats(struct tu_device *dev);
++
++#endif /* TU_CS_POOL_H */
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index c317ed1b034..0b493bf73f3 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -36,6 +36,7 @@
+ #include "tu_clear_blit.h"
+ #include "tu_cmd_buffer.h"
+ #include "tu_cs.h"
++#include "tu_cs_pool.h"
+ #include "tu_descriptor_set.h"
+ #include "tu_dynamic_rendering.h"
+ #include "tu_image.h"
+@@ -3081,6 +3082,12 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+                                           TU_BO_ALLOC_ALLOW_DUMP),
+       "vis_stream_suballoc");
+ 
++   if (is_kgsl(physical_device->instance) && !TU_DEBUG_START(NOSLABCS)) {
++      result = tu_cs_pool_init(device);
++      if (result != VK_SUCCESS)
++         goto fail_global_bo;
++   }
++
+    result = tu_bo_init_new(
+       device, NULL, &device->global_bo, global_size,
+       static_cast<enum tu_bo_alloc_flags>(TU_BO_ALLOC_ALLOW_DUMP |
+@@ -3311,9 +3318,11 @@ fail_null_accel_struct:
+ fail_global_bo_map:
+    TU_RMV(resource_destroy, device, device->global_bo);
+    tu_bo_finish(device, device->global_bo);
++   tu_cs_pool_finish(device);
+    vk_free(&device->vk.alloc, device->submit_bo_list);
+    util_dynarray_fini(&device->dump_bo_list);
+ fail_global_bo:
++   tu_cs_pool_finish(device);
+    if (physical_device->has_set_iova)
+       util_vma_heap_finish(&device->vma);
+ fail_free_zombie_vma:
+@@ -3439,6 +3448,8 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+          vk_free(&device->vk.alloc, device->queues[i]);
+    }
+ 
++   tu_cs_pool_finish(device);
++
+    tu_drm_device_finish(device);
+ 
+    if (device->physical_device->has_set_iova)
+@@ -4591,6 +4602,9 @@ tu_debug_bos_print_stats(struct tu_device *dev)
+    if (likely(!dev->bo_sizes))
+       return;
+ 
++   /* Slab allocation can take bo_mutex while holding its pool mutex. */
++   tu_cs_pool_dump_stats(dev);
++
+    mtx_lock(&dev->bo_mutex);
+ 
+    /* Put the HT's sizes data in an array so we can sort by number of allocations. */
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index 5ef943a684d..38f5a730505 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -357,6 +357,9 @@ struct tu_device
+    struct tu_suballocator pipeline_suballoc;
+    mtx_t pipeline_mutex;
+ 
++   /* Reusable command-stream slices from mapped KGSL parent BOs. */
++   struct tu_cs_pool *cs_pool;
++
+    /* KGSL requires a small chunk of GPU mem to retrieve raw GPU time on
+     * each submission.
+     */
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index 76e4f4afedd..8c082d3eaf9 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -40,6 +40,7 @@ static const struct debug_control tu_debug_options[] = {
+    { "log_skip_gmem_ops", TU_DEBUG_LOG_SKIP_GMEM_OPS },
+    { "dynamic", TU_DEBUG_DYNAMIC },
+    { "bos", TU_DEBUG_BOS },
++   { "noslabcs", TU_DEBUG_NOSLABCS },
+    { "3d_load", TU_DEBUG_3D_LOAD },
+    { "fdm", TU_DEBUG_FDM },
+    { "rd", TU_DEBUG_RD },
+diff --git a/src/freedreno/vulkan/tu_util.h b/src/freedreno/vulkan/tu_util.h
+index c212db40e73..4eb896a2c9f 100644
+--- a/src/freedreno/vulkan/tu_util.h
++++ b/src/freedreno/vulkan/tu_util.h
+@@ -75,6 +75,7 @@ enum tu_debug_flags : uint64_t
+    TU_DEBUG_FORCE_CONCURRENT_BINNING = BITFIELD64_BIT(36),
+    TU_DEBUG_COMPUTE_ROUND_ROBIN      = BITFIELD64_BIT(37),
+    TU_DEBUG_GMEM_WARMUP              = BITFIELD64_BIT(38),
++   TU_DEBUG_NOSLABCS                 = BITFIELD64_BIT(39),
+ };
+ 
+ struct tu_env {
+-- 
+2.53.0
+

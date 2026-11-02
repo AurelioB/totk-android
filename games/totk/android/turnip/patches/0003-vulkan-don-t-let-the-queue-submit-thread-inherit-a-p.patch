@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+Date: Mon, 19 Oct 2026 12:47:00 -0400
+Subject: [PATCH] vulkan: don't let the queue submit thread inherit a pinned
+ affinity
+
+the submit thread is created from the app thread, which mesa_pin_threads
+may have pinned to one cpu
+
+Generated-by: LLM
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45386>
+(cherry picked from commit afe1e0d5026d3879af483357ff21ae99be4ecba0)
+---
+ src/vulkan/runtime/vk_queue.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/vulkan/runtime/vk_queue.c b/src/vulkan/runtime/vk_queue.c
+index 78439dbbefb..52cd5527f92 100644
+--- a/src/vulkan/runtime/vk_queue.c
++++ b/src/vulkan/runtime/vk_queue.c
+@@ -25,6 +25,7 @@
+ 
+ #include "util/perf/cpu_trace.h"
+ #include "util/u_debug.h"
++#include "util/u_thread.h"
+ #include <inttypes.h>
+ 
+ #include "vk_alloc.h"
+@@ -738,6 +739,8 @@ vk_queue_submit_thread_func(void *_data)
+    struct vk_queue *queue = _data;
+    VkResult result;
+ 
++   util_set_current_thread_full_affinity();
++
+    mtx_lock(&queue->submit.mutex);
+ 
+    while (queue->submit.thread_run) {
+-- 
+2.53.0
+

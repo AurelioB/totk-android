@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+Date: Mon, 19 Oct 2026 13:15:58 -0400
+Subject: [PATCH] util: add util_set_current_thread_full_affinity
+
+factor the full-mask affinity reset out of u_queue so other thread
+creators can drop an inherited pinned affinity too
+
+Generated-by: LLM
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45386>
+(cherry picked from commit 45abb7cedbf49129718ae91b31dd30dfb087ba78)
+---
+ src/util/u_queue.c  | 15 +++------------
+ src/util/u_thread.c | 12 ++++++++++++
+ src/util/u_thread.h |  3 +++
+ 3 files changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/src/util/u_queue.c b/src/util/u_queue.c
+index cb69184a581..f38952b4182 100644
+--- a/src/util/u_queue.c
++++ b/src/util/u_queue.c
+@@ -28,7 +28,6 @@
+ 
+ #include "c11/threads.h"
+ #include "perf/u_perfetto.h"
+-#include "util/u_cpu_detect.h"
+ #include "util/os_time.h"
+ #include "util/u_string.h"
+ #include "util/u_thread.h"
+@@ -240,17 +239,9 @@ util_queue_thread_func(void *input)
+ 
+    free(input);
+ 
+-   if (queue->flags & UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY) {
+-      /* Don't inherit the thread affinity from the parent thread.
+-       * Set the full mask.
+-       */
+-      uint32_t mask[UTIL_MAX_CPUS / 32];
+-
+-      memset(mask, 0xff, sizeof(mask));
+-
+-      util_set_current_thread_affinity(mask, NULL,
+-                                       util_get_cpu_caps()->num_cpu_mask_bits);
+-   }
++   /* Don't inherit the thread affinity from the parent thread. */
++   if (queue->flags & UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY)
++      util_set_current_thread_full_affinity();
+ 
+ #if defined(__linux__)
+    if (queue->flags & UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY) {
+diff --git a/src/util/u_thread.c b/src/util/u_thread.c
+index d1cf0858c61..ccac55fe36c 100644
+--- a/src/util/u_thread.c
++++ b/src/util/u_thread.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "util/u_thread.h"
++#include "util/u_cpu_detect.h"
+ #include "util/perf/u_perfetto.h"
+ 
+ #include "macros.h"
+@@ -256,3 +257,14 @@ bool util_barrier_wait(util_barrier *barrier)
+ }
+ 
+ #endif
++
++/* threads inherit their creator's affinity, which may be pinned to one CPU */
++void
++util_set_current_thread_full_affinity(void)
++{
++   util_affinity_mask mask;
++
++   memset(mask, 0xff, sizeof(mask));
++
++   util_set_current_thread_affinity(mask, NULL, util_get_cpu_caps()->num_cpu_mask_bits);
++}
+diff --git a/src/util/u_thread.h b/src/util/u_thread.h
+index 57ebdc51ba1..dcf32a9cf00 100644
+--- a/src/util/u_thread.h
++++ b/src/util/u_thread.h
+@@ -92,6 +92,9 @@ util_set_current_thread_affinity(const uint32_t *mask,
+                                    num_mask_bits);
+ }
+ 
++void
++util_set_current_thread_full_affinity(void);
++
+ /*
+  * Thread statistics.
+  */
+-- 
+2.53.0
+
