@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TOTK Turnip integration <totk-turnip@localhost>
+Date: Wed, 28 Oct 2026 15:30:56 -0600
+Subject: [PATCH] tu: use two CCUs for A722
+
+Qualcomm gen7_17_0 identifies chip 0x43020100 with 1 MiB GMEM. Its upstream
+Linux snapshot topology lists RB_0/RB_1, CCU_0/CCU_1 and two SPs/two USPTPs.
+Match the A722 descriptor to that two-CCU topology while preserving chip IDs,
+tile alignment, shared memory and register tables. num_sp_cores shares its
+storage with num_ccu, so the A722 is also described with two SPs.
+
+With one CCU the Retroid Pocket Duo (A722) reported a burst of UCHE BR_SP
+write page faults on every cold start of the TOTK port; with two it reports
+none. Other GPUs are unchanged.
+
+Sources: https://github.com/qualcomm-linux/kgsl/blob/gfx-kernel.le.0.0/adreno-gpulist.h ;
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/gpu/drm/msm/adreno/adreno_gen7_17_0_snapshot.h
+---
+ src/freedreno/common/freedreno_devices.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/freedreno/common/freedreno_devices.py b/src/freedreno/common/freedreno_devices.py
+index 7ab1706fd81..1796c683820 100644
+--- a/src/freedreno/common/freedreno_devices.py
++++ b/src/freedreno/common/freedreno_devices.py
+@@ -1115,7 +1115,7 @@ add_gpus([
+     ], A6xxGPUInfo(
+         CHIP.A7XX,
+         [a7xx_base, a7xx_gen1],
+-        num_ccu = 1,
++        num_ccu = 2,
+         tile_align_w = 64,
+         tile_align_h = 16,
+         tile_max_w = 1024,
+-- 
+2.53.0
+
