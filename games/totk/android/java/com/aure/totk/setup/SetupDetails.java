@@ -73,15 +73,15 @@ final class SetupDetails {
             if (h == 0) {
                 channel.position(0);
                 byte[] line = readLine(channel);
-                if (line.length == size) return bounded(scrub(decode(line), excluded), budget);
-                headBytes = line.length;
-                beginning = bounded(scrub(decode(line), excluded), (budget - 128) / 2);
+                if (line != null && line.length == size) return bounded(scrub(decode(line), excluded), budget);
+                headBytes = line == null ? 0 : line.length;
+                beginning = line == null ? LONG_LINE : bounded(scrub(decode(line), excluded), (budget - 128) / 2);
             } else beginning = scrub(new String(head, 0, h, StandardCharsets.UTF_8), excluded);
             if (t == tail.length) {
                 channel.position(lastLineStart(channel, size));
                 byte[] line = readLine(channel);
-                tailBytes = line.length;
-                ending = bounded(scrub(decode(line), excluded), (budget - 128) / 2);
+                tailBytes = line == null ? 0 : line.length;
+                ending = line == null ? LONG_LINE : bounded(scrub(decode(line), excluded), (budget - 128) / 2);
             } else ending = scrub(new String(tail, t, tail.length - t, StandardCharsets.UTF_8), excluded);
             long skipped = size - headBytes - tailBytes;
             return bounded(beginning + (skipped > 0 ? omitted(skipped) : "") + ending, budget);
@@ -90,7 +90,10 @@ final class SetupDetails {
         }
     }
 
-    /** Only needed when an edge record is larger than its window. Never truncate its raw text before scrubbing. */
+    /** Only needed when an edge record is larger than its window. Never truncate its raw text before scrubbing: a record
+     *  longer than MAX_LINE is left out whole (null), so neither memory nor a fragment of it escapes. */
+    private static final int MAX_LINE = 1 << 20;
+    private static final String LONG_LINE = "[a line longer than 1 MiB is not included]\n";
     private static byte[] readLine(SeekableByteChannel channel) throws IOException {
         ByteArrayOutputStream line = new ByteArrayOutputStream();
         ByteBuffer block = ByteBuffer.allocate(4096);
@@ -98,6 +101,7 @@ final class SetupDetails {
             int end = 0;
             while (end < n && block.array()[end] != '\n') end++;
             line.write(block.array(), 0, end < n ? end + 1 : end);
+            if (line.size() > MAX_LINE) return null;
             if (end < n) break;
         }
         return line.toByteArray();

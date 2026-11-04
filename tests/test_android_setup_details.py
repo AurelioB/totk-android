@@ -179,6 +179,18 @@ class SetupDetailsTests(unittest.TestCase):
                     for start in range(len(secret) - 7):
                         self.assertNotIn(secret[start:start + 8], report, 'an oversized line leaked a private value')
 
+    def test_edge_lines_over_one_mib_are_left_out_whole(self):
+        secret = 'SensitivePickedName-PrefixHiddenSuffix.nsp'
+        line = b'!' * (2 << 20) + (' ' + secret + ' ').encode() + b'!' * (2 << 20)
+        for data in [line, b'HEAD-CONTEXT\n' + line, line + b'\nTAIL-CONTEXT\n']:
+            with self.subTest(first_bytes=data[:20]):
+                (self.logs / 'hactool-romfs.log').write_bytes(data)
+                report = self.report(excluded=[secret])
+                self.assertIn('[a line longer than 1 MiB is not included]', report)
+                for start in range(len(secret) - 7):
+                    self.assertNotIn(secret[start:start + 8], report)
+                self.assertLess(len(report.encode()), 64 * 1024 + 1)
+
     def test_symlinks_and_nonregular_files_are_not_opened(self):
         secret = self.game / 'prod.keys'
         secret.write_text('NEVER-READ-THIS')
