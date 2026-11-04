@@ -15,6 +15,7 @@
 #include "host_os.h"
 #include "runtime.h"
 #include "world_survey.h"
+#include "android_pause.h"
 #include <jni.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -68,6 +69,7 @@ static void actions_init(void) {   /* JNI_OnLoad: before any snapshot or request
 static jint JNICALL native_request(JNIEnv *env, jclass cls, jstring action, jstring category, jint slot, jstring actor,
                                    jint partition, jlong pouch_gen) {
     if (!native_enabled(env, cls)) return COMPANION_UNSUPPORTED;
+    if (runtime_android_game_paused()) return COMPANION_BUSY;
     if (!action || !category || !actor) return COMPANION_INVALID;
     const char *a = (*env)->GetStringUTFChars(env, action, NULL), *c = (*env)->GetStringUTFChars(env, category, NULL),
                *n = (*env)->GetStringUTFChars(env, actor, NULL);
@@ -130,6 +132,7 @@ static void *release_later(void *arg) {
    decide what they do in a menu, a cutscene or a loading screen. */
 static jboolean JNICALL native_action(JNIEnv *env, jclass cls, jint kind, jint arg) {
     if (!native_enabled(env, cls) || kind != 1 || arg < 0 || arg >= 16) return JNI_FALSE;
+    if (runtime_android_game_paused()) return JNI_FALSE;
     CompanionBuf b = {0};
     int ready = companion_snapshot((uintptr_t)runtime_module_base("main"), COMPANION_LIVE, guest_read, &b) &&
                 strstr(b.data, "\"status\":\"ready\"") != NULL;

@@ -6,6 +6,7 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## 1.0.1 (versionCode 10001), game 1.4.3
 
 A bug-fix release.
+- The game pauses, with its sound, while it's in the background or the recent-apps screen is open.
 
 ### Setup
 - The container route (XCI/NSP + update + `prod.keys`) no longer fails with "Could not create romfs.fifo" when the

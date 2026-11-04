@@ -56,6 +56,19 @@
 #include "adreno_gmem.h"
 #include "overlay_chord.h"
 int totk_host_main(int argc, char **argv);
+#include "android_pause.h"
+static AndroidGamePause game_pause = ANDROID_GAME_PAUSE_INIT;
+int runtime_android_game_paused(void) {
+    return atomic_load_explicit(&game_pause.paused, memory_order_acquire);
+}
+void runtime_android_game_pause_wait(void) {
+    if (!runtime_android_game_paused() || runtime_fs_save_pending()) return;
+    uint64_t begin = runtime_now_ns();
+    fprintf(stderr, "[totk-app] paused at guest frame boundary\n");
+    android_game_pause_wait(&game_pause, runtime_fs_save_pending);
+    fprintf(stderr, "[totk-app] frame boundary released after %.3f s (%s)\n",
+            (runtime_now_ns() - begin) / 1e9, runtime_android_game_paused() ? "finishing save" : "resumed");
+}
 uint64_t vk_window_set(ANativeWindow *window, ANativeWindow *surface_parent, int display_id);   /* android/gfx/vk_draw.c */
 void vk_window_resized(ANativeWindow *window, uint64_t epoch);   /* android/gfx/vk_draw.c */
 void vk_window_transform_hint(ANativeWindow *window, uint64_t epoch, int hint);   /* android/gfx/vk_draw.c */
@@ -1606,6 +1619,7 @@ static void chord_trace(unsigned button, unsigned action, unsigned r, unsigned s
             states[state < 5 ? state : 0]);
 }
 static int handle_input(AInputEvent *ev) {
+    if (runtime_android_game_paused()) return 1;
     int type = AInputEvent_getType(ev), src = AInputEvent_getSource(ev);
     int pad = (src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK || (src & AINPUT_SOURCE_DPAD) == AINPUT_SOURCE_DPAD;
     if (type == AINPUT_EVENT_TYPE_KEY) {
@@ -2160,10 +2174,22 @@ static void on_focus(ANativeActivity *a, int focused) {
         vk_window_resized(g_window, g_window_epoch);
     } else { runtime_gamepad_clear(); runtime_feedback_quiet(); }   /* releases may not arrive while another window has focus; no rumble meanwhile */
 }
-static void on_pause(ANativeActivity *a) { (void)a; present_timeline_lifecycle(-1, 1); vk_pcache_background(1); }
-static void on_stop(ANativeActivity *a) { (void)a; present_timeline_lifecycle(-1, 1); vk_pcache_background(1); }
+static void android_game_lifecycle_pause(int paused) {
+    android_game_pause_set(&game_pause, paused);
+    runtime_audio_output_pause(paused);
+    runtime_input_clear();
+    fprintf(stderr, "[totk-app] activity %s: game and audio %s\n",
+            paused ? "paused/stopped" : "resumed", paused ? "paused (pending saves may finish)" : "resumed");
+}
+static void on_pause(ANativeActivity *a) {
+    (void)a; android_game_lifecycle_pause(1); present_timeline_lifecycle(-1, 1); vk_pcache_background(1);
+}
+static void on_stop(ANativeActivity *a) {
+    (void)a; android_game_lifecycle_pause(1); present_timeline_lifecycle(-1, 1); vk_pcache_background(1);
+}
 static void on_resume(ANativeActivity *a) {
     (void)a;
+    android_game_lifecycle_pause(0);
     present_timeline_lifecycle(-1, 0);
     vk_pcache_background(0);
     vk_window_resized(g_window, g_window_epoch);

@@ -37,6 +37,7 @@
 #include "../../../../runtime/fps_auto_runtime.h"
 #include "../../../../runtime/frame_lag.h"
 #include "../../../../runtime/android_perf.h"
+#include "../../../../runtime/android_pause.h"
 #include <mach/mach_time.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -2858,6 +2859,9 @@ uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     NVN_BLOCKING();
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+    runtime_android_game_pause_wait();
+#endif
     game_controller_tick(g_frame + 1, 0);
     uint64_t ft_begin = totk_ft_on() ? totk_ft_now() : 0;
     uint64_t ft_frame = ft_begin ? totk_ft_current() : 0;

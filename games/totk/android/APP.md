@@ -1853,6 +1853,20 @@ needs `su`). The folder holds what the adb-shell folder holds:
   The menu waits for the game lock/start marker to clear (bounded), then retries the selected operation. Once the
   game is gone, a stale `save-busy` left by a crash does not block completion. A timeout explains why the game was left
   running.
+- **Background pause (default).** `TotkActivity`'s actual `onPause`/`onStop` pauses gameplay at the next
+  `nvnWindowAcquireTexture`, after releasing the guest virtual core and before taking graphics locks. `onResume`
+  wakes it. Focus changes alone do not suspend the game: using the same activity's companion Presentation or another
+  display while Android keeps the game resumed continues playing. NativeActivity callbacks only publish the pause
+  state; they never wait for a frame or an audio stream. Input is cleared on each transition and ignored while paused,
+  including synthetic button presses and new companion requests. Rumble and motion retain GameFeedback's lifecycle.
+  A pending save is allowed the guest frames it needs through `Commit`, not merely the three-second busy heuristic;
+  save I/O, the save-generation watcher and Java's `SaveMirror` stop flush are never gated. The independent close-request
+  poller still admits `runtime_fs_begin_close`, flushes the pipeline cache and exits while the frame thread is asleep.
+  The AAudio callback mutes immediately and discards pre-pause samples. Its device worker requests pause then flush,
+  and restarts only after flush completes, with fresh prefill; no queued background audio plays on return. The renderer
+  keeps signalling its frame event at the normal 5-ms cadence, without advancing voices or holding its lock across a
+  pause wait. Guest/host monotonic clocks continue; the existing realtime frame-step producer rejects intervals over
+  250 ms and resets its five-frame history rather than feeding the background interval into physics.
 - **Save signals.** `fs_host.c` creates `<private>/state/save-busy` on the first change to save data and, on the
   `Commit` that completes it with every fsync successful, removes it and rewrites `state/save-generation` (counter,
   tmp+rename). The game-process `SaveMirror.Watcher` polls it (1 s), waits 3 s and for `save-busy` to be gone, then

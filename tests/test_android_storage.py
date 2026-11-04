@@ -150,6 +150,56 @@ int main(void) {
 }
 '''
 
+SAVE_PAUSE_MAIN = SAVE_MAIN[:SAVE_MAIN.index('int main(void)')] + r'''
+#include "android_pause.h"
+static AndroidGamePause pause_gate = ANDROID_GAME_PAUSE_INIT;
+static _Atomic unsigned frames;
+static void *guest_frames(void *unused) {
+    (void)unused;
+    for (;;) {
+        android_game_pause_wait(&pause_gate, runtime_fs_save_pending);
+        atomic_fetch_add(&frames, 1);
+        usleep(1000);
+    }
+    return NULL;
+}
+static int advancing(void) {
+    unsigned before = atomic_load(&frames);
+    for (int i = 0; i < 1000; i++) {
+        if (atomic_load(&frames) > before) return 1;
+        usleep(1000);
+    }
+    return 0;
+}
+static int stopped(void) {
+    usleep(100000);
+    unsigned before = atomic_load(&frames);
+    usleep(100000);
+    return atomic_load(&frames) == before;
+}
+int main(void) {
+    uint64_t uid[2]; runtime_account_uid(uid);
+    if (mount_save("save", uid)) return 3;
+    android_game_pause_set(&pause_gate, 1);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, guest_frames, NULL) || !stopped()) return 4;
+    /* A save beginning on another thread after the frame gate has slept must
+       still get guest frames, even after the three-second UI busy heuristic. */
+    if (create_file("save:/paused.sav", 8)) return 5;
+    atomic_store(&save_changed_ns, runtime_now_ns() - 10000000000ull);
+    if (runtime_fs_save_busy() || !runtime_fs_save_pending() || !advancing()) return 6;
+    if (runtime_fs_begin_close()) return 7;
+    if (commit("save") || runtime_fs_save_pending() || !stopped()) return 8;
+    android_game_pause_set(&pause_gate, 0);
+    if (!advancing()) return 9;
+    android_game_pause_set(&pause_gate, 1);
+    if (!stopped() || !runtime_fs_begin_close()) return 10;
+    puts("paused frames held; save progresses through Commit; resume wakes; close admitted while paused");
+    fflush(stdout);
+    _exit(0); /* native close does not need the suspended guest or its gate */
+}
+'''
+
 
 def compiler():
     return shutil.which(os.environ.get('CC', 'cc'))
@@ -174,6 +224,10 @@ class Storage(unittest.TestCase):
         cls.close_probe = cls.work / 'close_probe'
         subprocess.run([compiler(), '-std=gnu11', '-O1', '-w', '-I', str(save), '-I', str(RUNTIME), str(save / 'close.c'),
                         '-pthread', '-o', str(cls.close_probe)], check=True)
+        (save / 'pause.c').write_text(SAVE_PAUSE_MAIN)
+        cls.pause_probe = cls.work / 'pause_probe'
+        subprocess.run([compiler(), '-std=gnu11', '-O1', '-w', '-I', str(save), '-I', str(RUNTIME), str(save / 'pause.c'),
+                        '-pthread', '-o', str(cls.pause_probe)], check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -371,6 +425,13 @@ class Storage(unittest.TestCase):
         result = subprocess.run([self.close_probe], capture_output=True, text=True, env=env, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('save-first refused; close-first save blocked before any change', result.stdout)
+
+    def test_background_pause_allows_save_commit_and_close(self):
+        state = self.dir / 'state'; state.mkdir()
+        env = dict(os.environ, TOTK_PROFILE_DIR=str(self.dir / 'profile'), TOTK_SAVE_BUSY=str(state / 'save-busy'))
+        result = subprocess.run([self.pause_probe], capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('paused frames held; save progresses through Commit; resume wakes; close admitted while paused', result.stdout)
 
 
 if __name__ == '__main__':

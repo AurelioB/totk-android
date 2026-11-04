@@ -87,6 +87,11 @@ int runtime_fs_save_busy(void) {
     if (atomic_load(&save_writers) > 0) return 1;
     return atomic_load(&save_dirty) && runtime_now_ns() - atomic_load(&save_changed_ns) < 3000000000ull;
 }
+/* Unlike the UI's short busy heuristic, suspension must wait through Commit,
+   however long the gap between files. No locks or I/O on the acquire path. */
+int runtime_fs_save_pending(void) {
+    return atomic_load(&save_marked) || atomic_load(&save_writers) > 0 || atomic_load(&save_dirty);
+}
 int runtime_fs_begin_close(void) {
     pthread_mutex_lock(&save_close_lock);
     const char *path = getenv("TOTK_SAVE_BUSY");
