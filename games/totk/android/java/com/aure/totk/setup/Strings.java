@@ -505,14 +505,19 @@ final class Strings {
     static final String STEP_ROUTE = "What you have", STEP_FILES = "Choose your files", STEP_PREPARE = "Prepare", STEP_GRAPHICS = "Choose graphics";
     static final String STEP_ROUTE_NONE = "A decrypted dump, or game files and keys";
     static final String STEP_FILES_TEXT = "From this device or an SD card";
-    static final String STEP_PREPARE_TEXT = "About half an hour · you can play before it ends";
+    static String prepareEstimate(String route) {
+        return Inputs.DECRYPTED.equals(route) ? "About 2–3 min · longer when copying from an SD card"
+                : Inputs.CONTAINERS.equals(route) ? "About 15 min, plus SD-card copy time"
+                : "About 2–3 min decrypted, or 15 min XCI/NSP, plus SD-card copy time";
+    }
     static final String STEP_GRAPHICS_TEXT = "Pick a preset, start playing";
     static String routeName(String route) { return Inputs.CONTAINERS.equals(route) ? "Game files and keys" : Inputs.DECRYPTED.equals(route) ? "Decrypted dump" : STEP_ROUTE_NONE; }
 
     // Welcome
     static final String WELCOME_TITLE = "Prepare your game";
     static final String WELCOME_BODY = "This app contains no game data. Point it at your own dump of the game and it builds "
-            + "everything it needs here on the device. Plan for about 19 GB of free space and half an hour.";
+            + "everything it needs here on the device. Plan for about 19 GB of free space. Preparing a decrypted dump takes "
+            + "roughly 2–3 minutes; XCI/NSP around 15 minutes, plus time copying from an SD card. Times vary by device and storage.";
     static final String BEGIN = "Begin setup";
     static final String BEGIN_HINT = "Pick what you have, then choose your files";
     static final String CONTINUE_SETUP = "Continue setup";
@@ -523,10 +528,11 @@ final class Strings {
     static final String ROUTE_BODY = "Both routes need version 1.4.3. Pick the one that matches your files.";
     static final String ROUTE_DECRYPTED = "RomFS + ExeFS dump";
     static final String ROUTE_DECRYPTED_BODY = "Decrypted files, e.g. from nxdumptool or hactool: the 1.4.3 RomFS "
-            + "(one file or its split parts) and the ExeFS files main, sdk, subsdk0. No keys needed.";
+            + "(one file or its split parts) and the ExeFS files main, sdk, subsdk0. No keys needed. "
+            + "About 2–3 minutes to prepare; copying from an SD card can take longer.";
     static final String ROUTE_CONTAINERS = "XCI / NSP + update + keys";
     static final String ROUTE_CONTAINERS_BODY = "The base game 1.0.0 as XCI or NSP, the 1.4.3 update NSP, and the "
-            + "prod.keys from your own console. Decryption happens on the device.";
+            + "prod.keys from your own console. Decryption happens on the device. About 15 minutes to prepare, plus SD-card copy time.";
     static final String BACK = "Back";
 
     // Files

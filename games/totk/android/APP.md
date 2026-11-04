@@ -1813,6 +1813,9 @@ needs `su`). The folder holds what the adb-shell folder holds:
 - **Backup.** `allowBackup=false` (no cloud backup, unchanged) plus `dataExtractionRules`/`fullBackupContent`
   (`build_apk.backup_rules`, res/xml) excluding `file:game`, `file:state` and `external:.` from cloud backup and
   device-to-device transfer; the rest of the private files (saves, settings) keep Android's D2D behaviour.
+- **Setup estimates.** Welcome, route cards and the Prepare rail use the route's measured approximate duration:
+  decrypted dumps about 2–3 minutes, containers about 15 minutes, plus SD-card copy time (device/storage dependent),
+  not the former blanket half-hour estimate.
 - **Game lock.** The game holds an OFD write lock on `<private>/state/game.lock` for its lifetime (up to four seconds'
   wait for a setup operation). `GameLock` owns the setup JVM's single POSIX-lock descriptor behind a mutex/refcount:
   concurrent menu probes, save swaps, sync and service work share that owner instead of conflicting with themselves.

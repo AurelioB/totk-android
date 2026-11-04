@@ -2117,7 +2117,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         items.add(new String[]{Strings.STEP_STORAGE, current > 0 ? StorageLocation.label(this) : Strings.STEP_STORAGE_TEXT});
         items.add(new String[]{Strings.STEP_ROUTE, Strings.routeName(current > 1 ? inputs.route : "")});
         items.add(new String[]{Strings.STEP_FILES, Strings.STEP_FILES_TEXT});
-        items.add(new String[]{Strings.STEP_PREPARE, Strings.STEP_PREPARE_TEXT});
+        items.add(new String[]{Strings.STEP_PREPARE, Strings.prepareEstimate(inputs.route)});
         items.add(new String[]{Strings.STEP_GRAPHICS, Strings.STEP_GRAPHICS_TEXT});
         int at = current + 1;
         for (int i = 0; i < items.size(); i++) {
