@@ -24,10 +24,19 @@ All scripts are in `tools/bench/` (paths below are relative to the repository ro
   - **Kernel log and sysfs**: the dmesg marker and the GPU/SMMU fault check read the kernel log; the sampler and the
     frequency snapshots read thermal zones, cooling devices, cpufreq policies and `/sys/class/kgsl` (several of them
     root-only on production builds).
+  - **The tools' own footprint**: every `su -c` opens a su session, and with Magisk each also starts a su-notify
+    `app_process` (on the Duo it crashes: ~0.4 s of CPU, plus ~0.2 s of `crash_dump64`) on any core, the game's
+    included; a screencap costs ~1.1 s of CPU. On the Duo those bursts landed in its >50 ms frames. So
+    `bench_input.sh`, `pan.sh` and `live.sh` send every root command through ONE persistent root shell per device,
+    `tools/bench/rootsh.py` (a host-side broker holding one `adb shell su -c sh`, started on first use, ended by
+    `rootsh.py -s <serial> stop` or after 30 idle minutes); `sampler.py` keeps its own one. Both pin themselves, and
+    so every command they start (`sendevent`, `grep`, `cat`, `screencap`), to the slowest cpufreq cluster with the
+    device's `taskset` (`rootsh.py -s <serial> status` and the sampler's start line print the cores; on the Odin 3,
+    whose slowest cluster is six of its eight cores, this only keeps them off the two fastest). A pan then starts no
+    su at all (Thor: 6 su sessions and su-notify processes per 20 s pan before, 0 after).
 - **Without root nothing is automatic**: `collect.sh` stops with "no root (su)", `sampler.py` with "the root shell never
-  started", `pan.sh` / `bench_input.sh press|rstick|detect|freqs` fail at `su`. Only `bench_input.sh shot` (screencap)
-  works. There is no non-root source of the frame timings, so such a device cannot be measured with this method or
-  added to the ledger.
+  started", `pan.sh` / `bench_input.sh` fail with "rootsh: no root shell". There is no non-root source of the frame
+  timings, so such a device cannot be measured with this method or added to the ledger.
 - **Unknown devices** (anything besides the Thor, Odin 3 and Pocket Duo of the baseline) are handled like this:
   - Controller node: auto-detected as the input device whose `getevent -p` lists ABS_Z, ABS_RZ and BTN_SOUTH (a built-in
     gamepad; an attached USB/Bluetooth pad matches too). If none or the wrong one is found, give
@@ -149,6 +158,8 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
     3. `adb pull "/sdcard/Download/TotK Native saves <date> <time>.zip"`, unzip it on the host and, inside its
        `TotK Native saves/` folder, `sha256sum -c merged-saves.sha256` must print 32 `OK` lines.
     4. Delete both zips from `/sdcard/Download` and stop the app.
+    5. End the persistent root shell: `python3 tools/bench/rootsh.py -s <serial> stop` (`status` then prints
+       "not running").
 
 ## Reading the results
 

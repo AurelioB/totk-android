@@ -5,10 +5,12 @@ and comparing against the recorded baselines. The full procedure is the `totk-be
 (`.omp/skills/totk-benchmark/SKILL.md`); this is the quick reference.
 
 Device side: `su` root (for `sendevent`, the app's private `totk.log` and `settings.env`, `dmesg`, and the thermal /
-cpufreq / kgsl sysfs files). Without root only `bench_input.sh shot` works. Nothing is pushed to the device; the device
-writes are the dmesg marker of `collect.sh --mark` and the live-switch control file of `live.sh` / `ab.sh`
-(`<game>/totk.ctl`, written with the game folder's owner and `chcon --reference=<game dir>`). Everything is read from
-`totk.log` and sysfs / procfs, never from logcat (some devices' logd drops the game's lines).
+cpufreq / kgsl sysfs files). Nothing is pushed to the device; the device writes are the dmesg marker of
+`collect.sh --mark` and the live-switch control file of `live.sh` / `ab.sh` (`<game>/totk.ctl`, written with the game
+folder's owner and `chcon --reference=<game dir>`). Everything is read from `totk.log` and sysfs / procfs, never from
+logcat (some devices' logd drops the game's lines). `bench_input.sh`, `pan.sh` and `live.sh` run every root command
+through one persistent root shell per device (`rootsh.py`; `sampler.py` holds its own), pinned to the slowest cpufreq
+cluster: a `su -c` per command costs the device a su session and, with Magisk, a su-notify `app_process` on any core.
 
 Common options: `-s <serial>` (adb serial), `--device <label>` (a short name used in file names, e.g. `thor`),
 `--package` (default `com.aure.totk`), `--game-dir` (default `/data/user/0/<package>/files/game`).
@@ -17,6 +19,7 @@ Common options: `-s <serial>` (adb serial), `--device <label>` (a short name use
 |---|---|
 | `bench_input.sh -s <serial> [--event /dev/input/eventN] [--display <id>] <action>` | `press <A\|B\|X\|Y\|L\|R\|PLUS\|MINUS\|UP\|DOWN\|LEFT\|RIGHT> [ms]`, `rstick <x> [y]` (`rstick 0` releases), `shot <file>`, `log`, `detect`, `freqs` (the frequency limits as one line: `cpuN=<cpus>:<scaling_min>:<scaling_max>:<cpuinfo_max>` kHz per cpufreq policy, `gpu_maxclk`, `gpu_freqs`, `gpu_devfreq_max`, GPU power levels). Auto-detects the controller node (`getevent -p`: ABS_Z/ABS_RZ + BTN_SOUTH) and the first display (`dumpsys SurfaceFlinger --display-id`). |
 | `pan.sh -s <serial> --device <label> --scene <label> --seconds N [--value 16000] [--first right\|left] --out <dir>` | Steady pan: stick right for N/2 s, left for N/2 s (`--first left`: the other way round), so the view returns. Appends `<device> <scene> F0= F1= T0= T1= V= D=` to `<dir>/pans.txt` and the frequency limits before / after the pan to `<dir>/freqs.txt`, mid-pan screenshot in `<dir>/shots/`. The game must be running. |
+| `rootsh.py -s <serial> run [-c <script>] \| status \| stop` | The serial's persistent root shell: a host-side broker holding one `adb shell su -c sh`, started by the first `run`, ended by `stop`, after 30 idle minutes or when the device goes. `run` executes the script (default: stdin) in its own `sh -c` and passes its stdout, stderr and status through (124: no answer in time, 125: no root shell). The shell pins itself to the slowest cpufreq cluster (`status` prints the cores). |
 | `live.sh -s <serial> set KEY=VALUE \| unset KEY \| mark <text>...` | Live switches (APP.md *Live switches*): appends the lines to `<game>/totk.ctl` in one write (one generation at the next presented frame) and prints the game's `[totk-ctl]` answer (a mark's acknowledgement, refusals); exit 3 when a mark is not acknowledged, 4 when a line was refused. |
 | `ab.sh -s <serial> --device <label> --scene <label> --arms 'A:<lines>;B:<lines>' [--order ABBAABBA] [--pan-seconds 30] [--settle 15] --out <dir>` | In-session A/B in one loaded scene: per block, the arm's lines plus `mark ab arm=<X> block=<n>` (live.sh), a settle, a pan (direction alternating). Writes `<dir>/arms.txt`. |
 | `sampler.py -s <serial> --device <label> --out <dir> [--duration S]` | Every 3 s: newest frame, max CPU/GPU zone temperature, cooling states, GPU `thermal_pwrlevel`/clock/`max_gpuclk`, cpufreq `scaling_max/cpuinfo_max`, MemAvailable, the game's VmRSS / VmSwap / RssShmem, its kgsl memory (`/sys/class/kgsl/kgsl/proc/<pid>/{kernel,gpumem_mapped,imported}`), PSI cpu / memory some / full avg10 and kswapd CPU % → `<dir>/samples-<label>.txt` (values a device lacks stay empty → null). Stops on Ctrl-C / SIGTERM / `--duration` and removes its device loop. |

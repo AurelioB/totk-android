@@ -9,11 +9,12 @@
 # (D: 1 right first, -1 left first) and two lines to <out>/freqs.txt, the frequency limits (`bench_input.sh freqs`)
 # just before and just after the pan:
 #   <device> <scene> T0=<epoch s> start|end <cpuN=... gpu_...>
-# and takes a mid-pan screenshot into <out>/shots/<device>-<scene>-pan-<T0>.png. The game must be running.
+# and takes a mid-pan screenshot into <out>/shots/<device>-<scene>-pan-<T0>.png. The game must be running. Root
+# commands go through the serial's persistent root shell (rootsh.py), so the pan itself starts no su.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die() { echo "pan: $*" >&2; exit 1; }
 
 SER=""; DEV=""; SCENE=""; SECS=""; V=16000; FIRST=right; OUT=""; EV=""; DISP=""; PKG=com.aure.totk; GAME=""
@@ -47,7 +48,7 @@ if [ -z "$EV" ] || [ -z "$DISP" ]; then
 fi
 input() { "$HERE/bench_input.sh" -s "$SER" --event "$EV" --display "$DISP" "$@"; }
 lastf() {
-  adb -s "$SER" shell "su -c 'grep -ao \"至帧 [0-9]*\" $LOG | tail -n1'" | tr -d '\r' | grep -o '[0-9][0-9]*'
+  python3 "$HERE/rootsh.py" -s "$SER" run -c "grep -ao '至帧 [0-9]*' $LOG | tail -n1" | tr -d '\r' | grep -o '[0-9][0-9]*'
 }
 
 F0=$(lastf) || die "no '至帧 N' timing line in $LOG yet (has the game rendered 300 frames?)"

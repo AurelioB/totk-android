@@ -5,11 +5,11 @@
 #        live.sh -s X 'unset TOTK_VK_DESC_STOCK' 'mark ab arm=A block=1'
 #
 # Appends the lines to the running game's control file <game>/totk.ctl (runtime/live_ctl.h) in ONE write, so they apply
-# at the same frame boundary (one generation). Root writes it with the game folder's owner, mode 0600 and SELinux
-# context (chcon --reference=<game dir>: a root-made file lacks the app's MLS categories and the app could not read
-# it). Then waits up to --wait seconds (default 10) for the game's [totk-ctl] lines in totk.log and prints them: the
-# mark's line when there is a mark, refusals always. Exit 3 when a mark was not acknowledged in time, 4 when the game
-# refused a line (the other lines of the write still apply).
+# at the same frame boundary (one generation). Root (the serial's persistent root shell, rootsh.py) writes it with the
+# game folder's owner, mode 0600 and SELinux context (chcon --reference=<game dir>: a root-made file lacks the app's MLS
+# categories and the app could not read it). Then waits up to --wait seconds (default 10) for the game's [totk-ctl]
+# lines in totk.log and prints them: the mark's line when there is a mark, refusals always. Exit 3 when a mark was not
+# acknowledged in time, 4 when the game refused a line (the other lines of the write still apply).
 set -u
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die() { echo "live: $*" >&2; exit 1; }
@@ -47,25 +47,25 @@ CTL=$GAME/totk.ctl; LOG=$GAME/totk.log
 case $GAME in *[!A-Za-z0-9_./-]*) die "--game-dir: unexpected characters" ;; esac
 adb -s "$SER" shell pidof "$PKG" >/dev/null 2>&1 || die "$PKG is not running on $SER"
 
+HERE=$(cd "$(dirname "$0")" && pwd)
+root() { python3 "$HERE/rootsh.py" -s "$SER" run -c "$1"; }   # the serial's persistent root shell
 # Lines already in the log, so only the answer to this write is shown.
-N0=$(adb -s "$SER" shell "su -c 'grep -ac \"\\[totk-ctl\\]\" $LOG'" 2>/dev/null | tr -d '\r')
+N0=$(root "grep -ac '\\[totk-ctl\\]' $LOG" 2>/dev/null | tr -d '\r')
 case $N0 in ""|*[!0-9]*) N0=0 ;; esac
-# Build the batch in a root-only temp file, give the control file the game folder's owner / mode / context (create it
-# if needed), then append the whole batch with one cat (one write). The command substitution drops the batch's final
-# newline, so the remote printf puts it back: the game stages complete lines only, and an unterminated last line would
-# wait for (and run into) the next write.
-Q=$(printf '%s' "$LINES" | sed "s/'/'\\\\''/g")
-TMP=/data/local/tmp/totk-ctl.$$
-REMOTE="umask 077; printf '%s\n' '$Q' > $TMP || exit 1
+# Give the control file the game folder's owner / mode / context (create it if needed), then append the whole batch
+# with one cat (one write). The batch keeps its final newline: the game stages complete lines only, and an unterminated
+# last line would wait for (and run into) the next write. The lines were validated above, so none is the delimiter.
+REMOTE="umask 077
 [ -e $CTL ] || : > $CTL || exit 1
 chown \$(stat -c %u:%g $GAME) $CTL && chmod 0600 $CTL || exit 1
 chcon --reference=$GAME $CTL 2>/dev/null || chcon \$(ls -Zd $GAME | cut -d' ' -f1) $CTL || exit 1
-cat $TMP >> $CTL; r=\$?; rm -f $TMP; exit \$r"
-printf '%s\n' "$REMOTE" | adb -s "$SER" shell "su -c sh" || die "could not write $CTL (root, owner or SELinux context)"
+cat >> $CTL <<'TOTK_CTL_END'
+${LINES}TOTK_CTL_END"
+root "$REMOTE" || die "could not write $CTL (root, owner or SELinux context)"
 
 end=$(( $(date +%s) + WAIT )); shown=0; acked=""
 while :; do
-  new=$(adb -s "$SER" shell "su -c 'grep -a \"\\[totk-ctl\\]\" $LOG'" 2>/dev/null | tr -d '\r' | tail -n +$((N0 + 1)))
+  new=$(root "grep -a '\\[totk-ctl\\]' $LOG" 2>/dev/null | tr -d '\r' | tail -n +$((N0 + 1)))
   if [ -n "$new" ]; then
     printf '%s\n' "$new" | tail -n +$((shown + 1))
     shown=$(printf '%s\n' "$new" | wc -l)

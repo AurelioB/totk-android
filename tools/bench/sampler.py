@@ -17,11 +17,15 @@ is left empty and becomes null.
 
 Runs until --duration elapses, or SIGINT / SIGTERM; then the device loop and its sleep are killed, so no process is left
 on the device. As a safety net the device loop also ends by itself after --max-seconds (default 3 h, or --duration + 60).
-(The loop sleeps with `sleep`: mksh's `read -t` under su overshoots its timeout by seconds on some devices.)"""
+(The loop sleeps with `sleep`: mksh's `read -t` under su overshoots its timeout by seconds on some devices.) The loop
+pins itself, and so every command it starts, to the slowest cpufreq cluster (rootsh.PIN_SH); the cleanup goes through
+the serial's persistent root shell (rootsh.py), so sampling costs two su sessions in all."""
 import argparse, os, signal, subprocess, sys, threading, time
 
+import rootsh
+
 LOOP = r'''
-echo "pid=$$"
+echo "pid=$$ cpus=$C"
 END=$(( $(date +%s) + @MAX@ ))
 cd /sys/class/thermal 2>/dev/null
 CZ=""; GZ=""; CD=""
@@ -97,7 +101,7 @@ def main():
     p = subprocess.Popen(['adb', '-s', a.serial, 'shell', 'su -c sh'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          text=True, start_new_session=True)
     max_s = a.max_seconds or (int(a.duration) + 60 if a.duration else 10800)
-    p.stdin.write(LOOP.replace('@LOG@', f'{game}/totk.log').replace('@INTERVAL@', str(a.interval))
+    p.stdin.write(rootsh.PIN_SH + LOOP.replace('@LOG@', f'{game}/totk.log').replace('@INTERVAL@', str(a.interval))
                   .replace('@PKG@', a.package)
                   .replace('@MAX@', str(max_s)))
     p.stdin.flush()
@@ -107,8 +111,9 @@ def main():
             for line in p.stdout:
                 line = line.rstrip('\r\n')
                 if remote_pid is None and line.startswith('pid='):
-                    remote_pid = line[4:]
-                    print(f'sampler: {a.serial} -> {path} (device loop pid {remote_pid})', file=sys.stderr)
+                    remote_pid, _, cpus = line[4:].partition(' cpus=')
+                    print(f'sampler: {a.serial} -> {path} (device loop pid {remote_pid}, cpus {cpus or "unpinned"})',
+                          file=sys.stderr)
                     continue
                 if not line.startswith('f='):
                     print(f'sampler: device: {line}', file=sys.stderr)
@@ -124,8 +129,7 @@ def main():
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.setitimer(signal.ITIMER_REAL, 0)
         if remote_pid:   # the loop shell and its current sleep / cat children
-            subprocess.run(['adb', '-s', a.serial, 'shell', f"su -c 'kill $(pgrep -P {remote_pid}) {remote_pid}'"],
-                           capture_output=True)
+            rootsh.run(a.serial, f'kill $(pgrep -P {remote_pid}) {remote_pid}')
         try:
             p.stdin.close()
         except (BrokenPipeError, OSError):
@@ -137,8 +141,7 @@ def main():
         except subprocess.TimeoutExpired:
             p.kill(); p.wait()
         if remote_pid:
-            left = subprocess.run(['adb', '-s', a.serial, 'shell', f"su -c 'ps -p {remote_pid} -o PID='"],
-                                  capture_output=True, text=True).stdout.strip()
+            left = rootsh.run(a.serial, f'ps -p {remote_pid} -o PID=')[1].decode(errors='replace').strip()
             if left:
                 print(f'sampler: WARNING device loop pid {remote_pid} still running', file=sys.stderr)
     print(f'sampler: stopped, {n} samples in {path}', file=sys.stderr)

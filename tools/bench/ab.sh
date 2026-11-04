@@ -58,6 +58,11 @@ done
 # live LINE...: one live.sh write; prints the game's acknowledgement.
 live() { "$HERE/live.sh" $COMMON --wait 30 "$@"; }
 
+# The controller node and display once, not before every pan.
+if [ -z "$EV" ] || [ -z "$DISP" ]; then
+  det=$("$HERE/bench_input.sh" -s "$SER" ${EV:+--event "$EV"} ${DISP:+--display "$DISP"} detect) || exit 1
+  EV=${det#event=}; EV=${EV%% *}; DISP=${det##*display=}
+fi
 mkdir -p "$OUT"
 n=$(printf '%s' "$ORDER" | wc -c)
 echo "ab: $n blocks ($ORDER) in $SCENE on $DEV: about $(( n * (SETTLE + PAN + 12) / 60 + 1 )) min (settle ${SETTLE}s, pan ${PAN}s each)"

@@ -8,6 +8,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -387,46 +389,113 @@ class InSessionAB(unittest.TestCase):
         r = subprocess.run(['sh', str(BENCH / 'live.sh'), '-s', 'x', 'mark', 'a"b'], capture_output=True, text=True)
         self.assertIn('mark text', r.stderr)
 
-    FAKE_ADB = r'''#!/bin/sh
-# adb -s <serial> shell <command> with this host as the rooted device; after a control-file write the "game" answers
-# with $FAKE_ANSWER in totk.log
+    def test_live_write(self):
+        """live.sh ends its batch with a newline (the game stages complete lines only), reports refusals, and all its
+        root commands share one root shell."""
+        with fake_device() as dev:
+            log, ctl = dev.game / 'totk.log', dev.game / 'totk.ctl'
+            log.write_text('[totk-ctl] following\n')
+            stop = threading.Event()
+            game = threading.Thread(target=fake_game, args=(ctl, log, stop), daemon=True)
+            game.start()
+            try:
+                def live(*lines):
+                    return subprocess.run(['sh', str(BENCH / 'live.sh'), '-s', 'x', '--game-dir', str(dev.game),
+                                           '--wait', '5', *lines], capture_output=True, text=True, env=dev.env)
+                r = live('set', 'TOTK_VK_PIPE_BOOST=1', 'mark', 'a', 'b')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn('gen=1 frame=10 mark a b', r.stdout)
+                self.assertEqual(ctl.read_text(), 'set TOTK_VK_PIPE_BOOST=1\nmark a b\n')
+                r = live('unset TOTK_VK_PIPE_BOOST', 'mark ok')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn('gen=2 frame=20 mark ok', r.stdout)
+                self.assertEqual(ctl.read_text(), 'set TOTK_VK_PIPE_BOOST=1\nmark a b\nunset TOTK_VK_PIPE_BOOST\nmark ok\n')
+                self.assertEqual(oct(ctl.stat().st_mode & 0o777), '0o600')
+                r = live('set', 'TOTK_X=1', 'mark', 'r')
+                self.assertEqual(r.returncode, 4, r.stderr)
+                self.assertIn('refused "set TOTK_X=1"', r.stdout)
+            finally:
+                stop.set()
+            self.assertEqual(dev.root_shells(), 1)
+
+
+FAKE_ADB = r'''#!/bin/sh
+# adb -s <serial> shell <command> with this host as the rooted device; every call is logged to $FAKE_CALLS
+echo "$*" >> "$FAKE_CALLS"
 shift 3
 case $1 in
-  pidof\ *) exit 0 ;;
-  'su -c sh') sed "s#/data/local/tmp/#$FAKE_TMP/#g" | sh; r=$?; printf '%b' "$FAKE_ANSWER" >> "$FAKE_LOG"; exit $r ;;
-  su\ -c\ *) eval "sh -c ${1#su -c }" ;;
+  pidof) exit 0 ;;
+  'su -c sh') exec sh ;;
+  *) echo "fake adb: unexpected $1" >&2; exit 1 ;;
 esac
 '''
 
-    def test_live_write(self):
-        """live.sh ends its batch with a newline (the game stages complete lines only) and reports refusals."""
-        with tempfile.TemporaryDirectory() as tmp:
-            d = Path(tmp)
-            (d / 'bin').mkdir(); (d / 'tmp').mkdir(); (d / 'game').mkdir()
-            (d / 'bin/adb').write_text(self.FAKE_ADB); (d / 'bin/adb').chmod(0o755)
-            (d / 'bin/chcon').write_text('#!/bin/sh\nexit 0\n'); (d / 'bin/chcon').chmod(0o755)
-            log, ctl = d / 'game/totk.log', d / 'game/totk.ctl'
-            log.write_text('[totk-ctl] following\n')
 
-            def live(answer, *lines):
-                env = dict(os.environ, PATH=f"{d / 'bin'}:{os.environ['PATH']}", FAKE_TMP=str(d / 'tmp'),
-                           FAKE_LOG=str(log), FAKE_ANSWER=answer)
-                return subprocess.run(['sh', str(BENCH / 'live.sh'), '-s', 'x', '--game-dir', str(d / 'game'),
-                                       '--wait', '1', *lines], capture_output=True, text=True, env=env)
+class fake_device:
+    """A temp dir with a fake adb (and chcon) on PATH and its own rootsh.py socket dir; stops the broker on exit."""
 
-            r = live('', 'set', 'TOTK_VK_PIPE_BOOST=1', 'mark', 'a', 'b')
-            self.assertEqual(r.returncode, 3, r.stderr)   # no acknowledgement
-            self.assertEqual(ctl.read_text(), 'set TOTK_VK_PIPE_BOOST=1\nmark a b\n')
-            r = live('[totk-ctl] gen=1 frame=9 mark ok\n', 'unset TOTK_VK_PIPE_BOOST', 'mark ok')
-            self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn('gen=1 frame=9 mark ok', r.stdout)
-            self.assertEqual(ctl.read_text(), 'set TOTK_VK_PIPE_BOOST=1\nmark a b\nunset TOTK_VK_PIPE_BOOST\nmark ok\n')
-            self.assertEqual(oct(ctl.stat().st_mode & 0o777), '0o600')
-            r = live('[totk-ctl] refused "set TOTK_X=1": TOTK_X is not a live switch\n[totk-ctl] gen=2 frame=12 mark r\n',
-                     'set', 'TOTK_X=1', 'mark', 'r')
-            self.assertEqual(r.returncode, 4, r.stderr)
-            self.assertIn('refused', r.stdout)
-            self.assertEqual(list((d / 'tmp').iterdir()), [])   # the batch's temp file is removed
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.dir = Path(self.tmp.name)
+        (d / 'bin').mkdir(); (d / 'game').mkdir()
+        for name, text in (('adb', FAKE_ADB), ('chcon', '#!/bin/sh\nexit 0\n')):
+            (d / 'bin' / name).write_text(text); (d / 'bin' / name).chmod(0o755)
+        self.game, self.calls = d / 'game', d / 'calls'
+        self.env = dict(os.environ, PATH=f"{d / 'bin'}:{os.environ['PATH']}", FAKE_CALLS=str(self.calls),
+                        XDG_RUNTIME_DIR=str(d))
+        return self
+
+    def rootsh(self, *args, stdin=None):
+        return subprocess.run([sys.executable, str(BENCH / 'rootsh.py'), '-s', 'x', *args], input=stdin,
+                              capture_output=True, env=self.env)
+
+    def root_shells(self):
+        return self.calls.read_text().count('su -c sh') if self.calls.exists() else 0
+
+    def __exit__(self, *exc):
+        self.rootsh('stop')
+        self.tmp.cleanup()
+
+
+def fake_game(ctl, log, stop):
+    """The game's side of totk.ctl: each poll that finds new complete lines is one generation."""
+    seen, gen = 0, 0
+    while not stop.is_set():
+        data = ctl.read_bytes() if ctl.exists() else b''
+        end = data.rfind(b'\n') + 1
+        if end > seen:
+            gen += 1
+            out = []
+            for line in data[seen:end].decode().splitlines():
+                if line.startswith('set TOTK_X'):
+                    out.append(f'[totk-ctl] refused "{line}": TOTK_X is not a live switch')
+                elif line.startswith('mark '):
+                    out.append(f'[totk-ctl] gen={gen} frame={gen * 10} {line}')
+                else:
+                    out.append(f'[totk-ctl] gen={gen} frame={gen * 10} applied {line.removeprefix("set ")}')
+            seen = end
+            with log.open('a') as f:
+                f.write(''.join(x + '\n' for x in out))
+        time.sleep(0.02)
+
+
+class RootShell(unittest.TestCase):
+    def test_broker(self):
+        """One root shell serves every request; each script's output, status, exit and syntax errors stay its own."""
+        with fake_device() as dev:
+            r = dev.rootsh('run', '-c', 'echo out; echo err >&2; exit 3')
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (3, b'out\n', b'err\n'))
+            r = dev.rootsh('run', '-c', 'if then')   # a syntax error ends only that script
+            self.assertNotEqual(r.returncode, 0)
+            r = dev.rootsh('run', stdin=b"printf '\\000\\377abc'")   # binary output, no final newline
+            self.assertEqual((r.returncode, r.stdout), (0, b'\x00\xffabc'))
+            r = dev.rootsh('run', '-c', 'cat; echo done')   # stdin is /dev/null, not the root shell's
+            self.assertEqual((r.returncode, r.stdout), (0, b'done\n'))
+            self.assertRegex(dev.rootsh('status').stdout.decode(), r'^rootsh pid=\d+ cpus=')
+            self.assertEqual(dev.root_shells(), 1)
+            self.assertEqual(dev.rootsh('stop').returncode, 0)
+            self.assertFalse((dev.dir / 'totk-rootsh-x.sock').exists())
+            self.assertIn(b'not running', dev.rootsh('status').stdout)
 
 
 class MemorySampling(unittest.TestCase):
