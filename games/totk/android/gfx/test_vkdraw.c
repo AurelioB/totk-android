@@ -4495,6 +4495,46 @@ int main(int argc, char **argv) {
         int correct = 1; for (uint32_t i = 0; i < 64; i++) if (result[i] != (i ^ 0x12345678u)) correct = 0;
         CHECK(correct, "GPU profile: compute dispatch writes all 64 output words");
     }
+    /* NVN ClearTexture: only the region of the selected level changes, and only the masked channels. Before the region
+       path these cleared the whole level and every channel. */
+    {
+        tex_t ct = rt; ct.d.levels = 2; nvn_tex_layout(&ct.d, &ct.L); ct.mem = gpu_pool + 0xa00000; ct.serial = 30101;
+        uint8_t *back = cpu_pool + 0x700000; memset(back, 0xcd, 2 * 64 * 64 * 4);
+        view_t level1 = {.set_levels = 1, .base_level = 1, .nlevels = 1};
+        p_clear_tex all = {.tex = &ct, .r = {0, 0, 0, 64, 64, 1}, .mask = 0xf, .c = {.f = {0, 0, 1, 1}}};
+        p_clear_tex all1 = all; all1.view = level1; all1.has_view = 1; all1.r = (NVNcopyRegion){0, 0, 0, 32, 32, 1};
+        p_clear_tex box = all; box.r = (NVNcopyRegion){8, 4, 0, 16, 20, 1}; box.c.f[0] = 1; box.c.f[2] = 0;
+        p_clear_tex green = all; green.r = (NVNcopyRegion){40, 40, 0, 10, 12, 1}; green.mask = 0x2;
+        green.c.f[1] = 1; green.c.f[2] = 0; green.c.f[3] = 0;
+        p_clear_tex box1 = all1; box1.r = (NVNcopyRegion){4, 4, 0, 8, 8, 1}; box1.mask = 0x9;
+        box1.c.f[0] = 1; box1.c.f[1] = 1; box1.c.f[2] = 0; box1.c.f[3] = 0.5f;
+        p_clear_tex none = box; none.mask = 0; none.r = all.r;
+        p_copy_b2t c0 = {.src = (uint64_t)(uintptr_t)back, .tex = &ct, .r = {0, 0, 0, 64, 64, 1}};
+        p_copy_b2t c1 = {.src = (uint64_t)(uintptr_t)(back + 64 * 64 * 4), .tex = &ct, .view = level1, .has_view = 1, .r = {0, 0, 0, 32, 32, 1}};
+        uint64_t clears0[2], clears1[2]; vk_draw_test_clear_counts(clears0);
+        op(OP_CLEAR_TEX, &all, sizeof all); op(OP_CLEAR_TEX, &all1, sizeof all1); op(OP_CLEAR_TEX, &box, sizeof box);
+        op(OP_CLEAR_TEX, &green, sizeof green); op(OP_CLEAR_TEX, &box1, sizeof box1); op(OP_CLEAR_TEX, &none, sizeof none);
+        op(OP_COPY_T2B, &c0, sizeof c0); op(OP_COPY_T2B, &c1, sizeof c1);
+        CHECK(mtl_wait(run(), 5000000000ull), "region/masked texture clears complete");
+        vk_draw_test_clear_counts(clears1);
+        CHECK(clears1[0] - clears0[0] == 3 && clears1[1] - clears0[1] == 2,
+            "region/mask clear path taken for 3 regions and 2 masks (got %llu/%llu)",
+            (unsigned long long)(clears1[0] - clears0[0]), (unsigned long long)(clears1[1] - clears0[1]));
+        int bad0 = 0, bad1 = 0;
+        for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+            const uint8_t *p = back + 4 * (y * 64 + x);
+            int in_box = x >= 8 && x < 24 && y >= 4 && y < 24, in_green = x >= 40 && x < 50 && y >= 40 && y < 52;
+            int r = in_box ? 255 : 0, g = in_green ? 255 : 0, b = in_box ? 0 : 255;
+            bad0 += p[0] != r || p[1] != g || p[2] != b || p[3] != 255;
+        }
+        for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++) {
+            const uint8_t *p = back + 64 * 64 * 4 + 4 * (y * 32 + x);
+            int in = x >= 4 && x < 12 && y >= 4 && y < 12;
+            bad1 += p[0] != (in ? 255 : 0) || p[1] != 0 || p[2] != 255 || abs(p[3] - (in ? 128 : 255)) > 1;
+        }
+        CHECK(!bad0, "level-0 region and green-only clears keep every other texel and channel (%d wrong)", bad0);
+        CHECK(!bad1, "level-1 red+alpha region clear keeps level 0, other texels and green/blue (%d wrong)", bad1);
+    }
     { void vk_mem_report(void); vk_mem_report(); }   /* the memory line runs */
 #ifdef TOTK_FRAME_TIMELINE_TEST
     if (totk_ft_on()) {

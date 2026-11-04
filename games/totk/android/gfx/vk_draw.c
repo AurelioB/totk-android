@@ -5653,43 +5653,157 @@ static void copy_t2t(const p_copy_t2t *c) {   /* texture -> texture: same size a
         vk_texcopy_readback("CopyTextureToTexture", "dst", c->dst, d, dl, dz0, &dr);
     }
 }
+/* NVN ClearTexture clears a region of one level (x/y/width/height, layers or 3D slices zoffset/depth) and only the
+   channels in its mask. vkCmdClearColorImage/DepthStencilImage clear whole subresources and every channel, so a
+   region or a colour channel mask is cleared in a temporary rendering pass on that level: vkCmdClearAttachments with
+   the region as its rect, or, for a channel mask, one triangle drawing the value through a pipeline whose
+   colorWriteMask is the mask, scissored to the region. Whole unmasked clears keep the image clears. */
+static VkPipelineLayout g_clear_mask_layout;
+static VkShaderModule g_clear_mask_module[4];   /* vertex; fragment float, uint, int */
+static struct { VkFormat format; uint32_t mask; VkSampleCountFlagBits samples; VkPipeline pipeline; } g_clear_mask_pipe[32];
+static int g_clear_mask_npipe;
+static uint64_t g_clear_region, g_clear_masked;   /* ClearTexture calls that needed the region/mask path (tests) */
+#include "vk_clear_mask_spv.h"
+static VkPipeline clear_mask_pipeline(VkFormat format, uint32_t mask, VkSampleCountFlagBits samples, int type) {
+    for (int i = 0; i < g_clear_mask_npipe; i++)
+        if (g_clear_mask_pipe[i].format == format && g_clear_mask_pipe[i].mask == mask && g_clear_mask_pipe[i].samples == samples)
+            return g_clear_mask_pipe[i].pipeline;
+    if (g_clear_mask_npipe == (int)(sizeof g_clear_mask_pipe / sizeof *g_clear_mask_pipe)) return VK_NULL_HANDLE;
+    if (!g_clear_mask_layout) {
+        VkPushConstantRange range = {.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .size = 16};
+        VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1, .pPushConstantRanges = &range};
+        if (vkCreatePipelineLayout(V.dev, &lci, NULL, &g_clear_mask_layout)) { g_clear_mask_layout = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    }
+    static const uint32_t *const code[4] = {clear_mask_vert_spv, clear_mask_frag0_spv, clear_mask_frag1_spv, clear_mask_frag2_spv};
+    static const size_t size[4] = {sizeof clear_mask_vert_spv, sizeof clear_mask_frag0_spv, sizeof clear_mask_frag1_spv, sizeof clear_mask_frag2_spv};
+    const int modules[2] = {0, 1 + type};   /* the vertex shader and this value type's fragment shader */
+    for (int k = 0, i; k < 2; k++) if (!g_clear_mask_module[i = modules[k]]) {
+        VkShaderModuleCreateInfo sm = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size[i], .pCode = code[i]};
+        if (vkCreateShaderModule(V.dev, &sm, NULL, &g_clear_mask_module[i])) { g_clear_mask_module[i] = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    }
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = g_clear_mask_module[0], .pName = "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = g_clear_mask_module[1 + type], .pName = "main"}};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = samples};
+    VkPipelineColorBlendAttachmentState att = {.colorWriteMask = mask};
+    VkPipelineColorBlendStateCreateInfo blend = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &att};
+    const VkDynamicState dynamic[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dynamic};
+    VkPipelineRenderingCreateInfo rendering = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1, .pColorAttachmentFormats = &format};
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering, .stageCount = 2, .pStages = stages,
+        .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
+        .pMultisampleState = &ms, .pColorBlendState = &blend, .pDynamicState = &dy, .layout = g_clear_mask_layout};
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (vk_pcache_graphics(&ci, &pipeline)) return VK_NULL_HANDLE;
+    g_clear_mask_pipe[g_clear_mask_npipe++] = (__typeof__(g_clear_mask_pipe[0])){format, mask, samples, pipeline};
+    return pipeline;
+}
+/* One rendering pass per layer/slice over level lv, LOAD/STORE, clearing only the region (and channels). 0 when an
+   attachment view or pipeline is unavailable: the caller falls back to the whole-subresource clear. */
+static int clear_tex_region(const p_clear_tex *c, vk_tex *x, VkCommandBuffer cb, unsigned lv, unsigned first, unsigned layers,
+                            VkImageAspectFlags as, const VkClearValue *value, uint32_t mask) {
+    uint32_t w = vk_tex_width(x, lv), h = vk_tex_height(x, lv);
+    int f = c->has_view && c->view.set_format ? c->view.format : c->tex->d.format;
+    { int bw, bh, vbw, vbh; nvn_fmt_bpb(c->tex->d.format, &bw, &bh); nvn_fmt_bpb(f, &vbw, &vbh); if (bw != vbw || bh != vbh) return 0; }
+    int64_t x0 = MAXV(c->r.xoffset, 0), y0 = MAXV(c->r.yoffset, 0);
+    int64_t x1 = MINV((int64_t)c->r.xoffset + c->r.width, (int64_t)w), y1 = MINV((int64_t)c->r.yoffset + c->r.height, (int64_t)h);
+    if (x1 <= x0 || y1 <= y0) return 1;   /* nothing of the level is inside the region */
+    VkRect2D rect = {{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+    int color = !(as & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (color && mask != 0xf) {
+        VkFormat vf; if (!vk_fmt(f, &vf, NULL) || !vf) return 0;
+        int cls = vk_fmt_class(f);
+        pipeline = clear_mask_pipeline(vf, mask, (VkSampleCountFlagBits)vk_tex_samples(x), cls == 1 ? 1 : cls == 2 ? 2 : 0);
+        if (!pipeline) return 0;
+    }
+    VkImageView views[64]; if (layers > 64) return 0;
+    for (unsigned k = 0; k < layers; k++) {
+        view_t v = c->has_view ? c->view : (view_t){0};
+        v.set_levels = 1; v.base_level = lv; v.nlevels = 1; v.set_layers = 1; v.min_layer = first + k; v.nlayers = 1;
+        if (!(views[k] = vk_tex_view(x, c->tex, &v, 1))) return 0;
+    }
+    for (unsigned k = 0; k < layers; k++) {
+        VkRenderingAttachmentInfo a = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = views[k], .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1,
+            .colorAttachmentCount = color, .pColorAttachments = color ? &a : NULL,
+            .pDepthAttachment = as & VK_IMAGE_ASPECT_DEPTH_BIT ? &a : NULL, .pStencilAttachment = as & VK_IMAGE_ASPECT_STENCIL_BIT ? &a : NULL};
+        vkCmdBeginRendering(cb, &ri);
+        if (pipeline) {
+            VkViewport viewport = {0, 0, (float)w, (float)h, 0, 1};
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            vkCmdSetViewport(cb, 0, 1, &viewport); vkCmdSetScissor(cb, 0, 1, &rect);
+            vkCmdPushConstants(cb, g_clear_mask_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, value->color.uint32);
+            vkCmdDraw(cb, 3, 1, 0, 0);
+        } else {
+            VkClearAttachment ca = {as, 0, *value}; VkClearRect cr = {rect, 0, 1};
+            vkCmdClearAttachments(cb, 1, &ca, 1, &cr);
+        }
+        vkCmdEndRendering(cb);
+    }
+    if (pipeline) { g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = g_pipe_dirty = 1; descriptor_unbind(); }
+    return 1;
+}
+#ifdef TOTK_VK_TESTS
+void vk_draw_test_clear_counts(uint64_t out[2]) { out[0] = g_clear_region; out[1] = g_clear_masked; }
+#endif
 static void clear_tex(const p_clear_tex *c) {   /* clear a texture region with a value, outside any pass */
     if (!vk_lag_uniform_private()) vk_ub_flush();
     else vk_ub_touch((uint64_t)(uintptr_t)c->tex->mem, c->tex->L.size);
     vk_tex *x = vk_tex_get(c->tex); if (!x) return;
     unsigned lv = vlevel(&c->view, c->has_view), l0 = vlayer(&c->view, c->has_view);
     int nz = c->r.depth ? c->r.depth : 1;
-    if ((c->mask & 0xf) != 0xf) RED(4, "texture clear with channel mask %#x: cleared whole", c->mask);
+    VkImageAspectFlags as = vk_tex_aspect(x);
+    int color = !(as & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
+    uint32_t mask = color ? (uint32_t)c->mask & 0xf : 0xf;
+    if (!mask) return;   /* no channel is written */
     int partial = c->r.xoffset || c->r.yoffset || (uint32_t)c->r.width != vk_tex_width(x,lv) || (uint32_t)c->r.height != vk_tex_height(x,lv);
-    int native_region = partial && vk_tex_native_active(x) && !lv && !l0 && !c->r.zoffset && nz == 1;
-    if (partial && !native_region) RED(4, "partial texture clear: cleared whole level");
+    int native_region = partial && mask == 0xf && vk_tex_native_active(x) && !lv && !l0 && !c->r.zoffset && nz == 1;
     vk_end_rendering_at(VK_PASS_END_CLEAR, OP_CLEAR_TEX);
     vk_tex_native_read(x);
     VkCommandBuffer cb = vk_cb(); vk_barrier_all(cb);
-    VkImageAspectFlags as = vk_tex_aspect(x);
     VkImageSubresourceRange rr = {as, lv, 1, vk_tex_is3d(x) ? 0 : l0 + c->r.zoffset, vk_tex_is3d(x) ? 1 : (uint32_t)nz};
-    if (as & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
-        VkClearDepthStencilValue v = {vk_tex_format(x) == VK_FORMAT_D16_UNORM ? d16_clear(c->c.f[0]) : c->c.f[0], (as & VK_IMAGE_ASPECT_DEPTH_BIT) ? c->c.u[1] : c->c.u[0]};
-        vkCmdClearDepthStencilImage(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, &v, 1, &rr);
-    } else {
-        VkClearColorValue v; memcpy(&v, c->c.u, 16);
-        if (!c->is_uint) { int f = c->has_view && c->view.set_format ? c->view.format : c->tex->d.format; int cls = vk_fmt_class(f); if (cls) { for (int i = 0; i < 4; i++) v.uint32[i] = (uint32_t)c->c.f[i]; } }
-        if (native_region) {
+    VkClearValue value;
+    if (!color) value.depthStencil = (VkClearDepthStencilValue){vk_tex_format(x) == VK_FORMAT_D16_UNORM ? d16_clear(c->c.f[0]) : c->c.f[0], (as & VK_IMAGE_ASPECT_DEPTH_BIT) ? c->c.u[1] : c->c.u[0]};
+    else {
+        memcpy(&value.color, c->c.u, 16);
+        if (!c->is_uint) { int f = c->has_view && c->view.set_format ? c->view.format : c->tex->d.format; int cls = vk_fmt_class(f); if (cls) { for (int i = 0; i < 4; i++) value.color.uint32[i] = (uint32_t)c->c.f[i]; } }
+    }
+    int region = (partial || mask != 0xf) && !native_region;
+    if (region) {
+        /* 3D: slices zoffset.. of the level through 2D views; arrays: layers from the view's first layer */
+        unsigned first = vk_tex_is3d(x) ? (unsigned)c->r.zoffset : l0 + (unsigned)c->r.zoffset;
+        if (clear_tex_region(c, x, cb, lv, first, (unsigned)nz, as, &value, mask)) {
+            g_clear_region += partial; g_clear_masked += mask != 0xf;
+            rr.baseArrayLayer = first; rr.layerCount = (uint32_t)nz;
+        } else {
+            region = 0;
+            RED(4, "texture clear of a region (%d) or channel mask %#x without a render-target view: cleared whole", partial, mask);
+        }
+    }
+    if (!region) {
+        if (!color) vkCmdClearDepthStencilImage(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, &value.depthStencil, 1, &rr);
+        else if (native_region) {
             VkRenderingAttachmentInfo a = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
                 .imageView=vk_tex_view(x,c->tex,c->has_view?&c->view:NULL,1),.imageLayout=VK_IMAGE_LAYOUT_GENERAL,
                 .loadOp=VK_ATTACHMENT_LOAD_OP_LOAD,.storeOp=VK_ATTACHMENT_STORE_OP_STORE};
             VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO,
                 .renderArea={{0,0},{vk_tex_width(x,0),vk_tex_height(x,0)}},.layerCount=1,
                 .colorAttachmentCount=1,.pColorAttachments=&a};
-            VkClearAttachment ca={VK_IMAGE_ASPECT_COLOR_BIT,0,{.color=v}};
+            VkClearAttachment ca={VK_IMAGE_ASPECT_COLOR_BIT,0,value};
             VkClearRect rect={{{c->r.xoffset,c->r.yoffset},{c->r.width,c->r.height}},0,1};
             vkCmdBeginRendering(cb,&ri); vkCmdClearAttachments(cb,1,&ca,1,&rect); vkCmdEndRendering(cb);
-        } else vkCmdClearColorImage(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, &v, 1, &rr);
+        } else vkCmdClearColorImage(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, &value.color, 1, &rr);
     }
     vk_barrier_all(cb);
     if (native_region) vk_tex_native_patch(x,lv,l0,&c->r);
     else vk_tex_native_written(x, 0);
-    if (vk_fg_extract_active) fg_extract_texture_write(c->tex, lv, rr.baseArrayLayer, rr.layerCount, as, 1, 0, 0);
+    if (vk_fg_extract_active) fg_extract_texture_write(c->tex, lv, rr.baseArrayLayer, rr.layerCount, as, 1, region, 0);
     vk_tex_mark_gpu_written(x); probe_write_note('K', x, NULL, 0);
     vk_pso_life_external_write(x, lv, rr.baseArrayLayer, rr.layerCount, "texture-clear");
 }

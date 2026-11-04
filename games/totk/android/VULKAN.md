@@ -2554,6 +2554,16 @@ including the 9-frame lighting cycle; also check Gerudo Town, the Depths, menu t
 host harness separately with each option combination. Device timing, power, visual comparisons and host execution are
 pending; only Android compile checks are part of this change's host acceptance.
 
+### Region and channel-masked texture clears (correctness, unconditional)
+
+NVN `ClearTexture` clears a region of one level and only the channels in its mask. It used to become
+`vkCmdClearColorImage`/`vkCmdClearDepthStencilImage` of the whole level and every channel (logged `cleared whole`).
+A region or colour channel mask now opens a temporary pass per layer/slice on that level (`loadOp=LOAD`): a region is
+`vkCmdClearAttachments` with the region as its rect; a mask draws one triangle through a small pipeline whose
+`colorWriteMask` is the mask (`vk_clear_mask.vert/.frag`, float/uint/int outputs), scissored to the region. Mask 0
+writes nothing. Whole unmasked clears keep the image clears; views that cannot be render targets keep the old path and
+its log line. `vkdrawtest` checks level-0/level-1 region, green-only and red+alpha clears texel by texel.
+
 ## Upstream Android integration (2026-10-22, device measurement pending)
 
 `origin/android-port` through `d2eb744` is merged with the measured dev work above; [UPSTREAM_MERGE.md](UPSTREAM_MERGE.md)

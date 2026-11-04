@@ -517,6 +517,7 @@ void vk_wb_test_fresh(uint64_t v[3]); /* landed before base quiet, bytes, releva
 uint64_t vk_wb_test_inflight(void); /* exact preflight matches on a synchronous owner's borrowed landing list */
 void vk_res_mem(uint64_t v[8]); /* resource memory summary (also read by the present statistics) */
 void vk_draw_test_split_counts(uint64_t out[3]); /* TOTK_VK_SPLIT_PASS_DRAWS splits, reopened parts, refused passes */
+void vk_draw_test_clear_counts(uint64_t out[2]); /* ClearTexture calls cleared through the region path: partial, masked */
 #endif
 void vk_res_stats(void);   /* rendered / copied / cleared by the GPU: never re-uploaded from guest memory */
 void vk_upload_threads_init(void);         /* launch-time TOTK_VK_UPLOAD_THREADS, before any upload */
