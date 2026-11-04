@@ -174,6 +174,8 @@ static VkFormatFeatureFlags fmt_features(VkFormat f) {
 typedef struct tex_generation { _Atomic uint64_t value; struct tex_generation *next; } tex_generation;
 typedef struct { tex_generation *cell; uint64_t value; } tex_stamp;
 static tex_generation *g_free_generations;
+/* Any texture or image identity bumped or dropped (TOTK_VK_TEX_MEMO: one load instead of two cells per lookup). */
+static _Atomic uint64_t g_tex_ident_rev = 1;
 static tex_stamp tex_stamp_new(void) {
     if (!g_free_generations) {
         tex_generation *page = calloc(256, sizeof *page);
@@ -188,9 +190,11 @@ static tex_stamp tex_stamp_new(void) {
 }
 static void tex_stamp_bump(tex_stamp *stamp) {
     stamp->value = atomic_fetch_add_explicit(&stamp->cell->value, 1, memory_order_release) + 1;
+    atomic_fetch_add_explicit(&g_tex_ident_rev, 1, memory_order_release);
 }
 static void tex_stamp_drop(tex_stamp stamp) {
     atomic_fetch_add_explicit(&stamp.cell->value, 1, memory_order_release);
+    atomic_fetch_add_explicit(&g_tex_ident_rev, 1, memory_order_release);
     stamp.cell->next = g_free_generations; g_free_generations = stamp.cell;
 }
 static int tex_stamp_current(tex_stamp stamp) {
@@ -223,6 +227,7 @@ struct vk_tex {
     uint64_t serial; tex_t t; vk_img *im;
     tex_stamp identity;
     int mirrored; uint64_t stamp, csub;   /* mirrored: dirty-page stamp of the uploaded content, last submission checked */
+    _Atomic uint64_t memo_sub;            /* TOTK_VK_TEX_MEMO: last submission whose tex_get_inner work for it is done */
     int cpu_pool;                         /* tex_mirrored at creation: GPU writes re-arm settled/opt-in invalidate write-back */
     int canvas_window;                   /* registration cached at object creation, not on every draw */
     VkBufferView tbv;                     /* TARGET_BUFFER textures */
@@ -682,15 +687,18 @@ static vk_tex *tex_get_inner(const tex_t *t) {
         x->csub = sub;
         stor_key k; vk_img *g = NULL;
         if (mirshare_on() && stor_key_of(t, &k) && (g = nvn_hm_get(&g_by_storage, &k)) && g != x->im && g->gpu_written) {
-            retire_img(x->im); x->im = g; g->refs++; x->mirrored = 0; g_stat_switched++;   /* the GPU renders this storage now */
+            retire_img(x->im); x->im = g; g->refs++; __atomic_store_n(&x->mirrored, 0, __ATOMIC_RELAXED); g_stat_switched++;   /* the GPU renders this storage now */
             tex_stamp_bump(&x->identity);
             texcopy_resource("switch", x);
         } else if (!nvn_dirty_tracked(t->mem, t->L.size) || nvn_dirty_since(t->mem, t->L.size, x->stamp)) {
             texcopy_resource("reupload", x); upload(x); g_stat_reuploads++;
         }
     }
+    /* TOTK_VK_TEX_MEMO: whatever this submission needs for x (above) is done; memo hits on mirrored textures wait for it. */
+    if (x && vk_tex_memo_on() && atomic_load_explicit(&x->memo_sub, memory_order_relaxed) != sub)
+        atomic_store_explicit(&x->memo_sub, sub, memory_order_release);
     if (x) { pthread_mutex_unlock(&g_tex_mu); return x->im || x->tbv ? x : NULL; }
-    x = calloc(1, sizeof *x); x->serial = t->serial; x->t = *t; x->csub = sub;
+    x = calloc(1, sizeof *x); x->serial = t->serial; x->t = *t; x->csub = sub; atomic_init(&x->memo_sub, sub);
     x->identity = tex_stamp_new();
     if (vk_canvas_on) x->canvas_window = nvn_hm_get(&g_window_serials, &t->serial) != NULL;
     nvn_hm_put(&g_by_serial, &t->serial, x);
@@ -752,7 +760,7 @@ void vk_tex_pool_gone(uintptr_t lo, uintptr_t hi) {   /* nvn_vk.c: a pool was fi
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         vk_tex *x = g_by_serial.vals ? g_by_serial.vals[i] : NULL;
         if (!x || (uintptr_t)x->t.mem >= hi || (uintptr_t)x->t.mem + x->t.L.size <= lo) continue;
-        tex_stamp_bump(&x->identity); x->csub = 0; x->stamp = 0;
+        tex_stamp_bump(&x->identity); x->csub = 0; x->stamp = 0; atomic_store_explicit(&x->memo_sub, 0, memory_order_relaxed);
     }
     for (uint32_t i = 0; i < g_by_storage.cap; i++) {
         vk_img *im = g_by_storage.vals ? g_by_storage.vals[i] : NULL;
@@ -1621,7 +1629,7 @@ static void tex_mark_gpu_written_inner(vk_tex *x) {
     x->im->gpu_written = 1;
     stor_key k;
     if (x->mirrored && !x->im->shared && mirshare_on() && stor_key_of(&x->t, &k) && !nvn_hm_get(&g_by_storage, &k)) {
-        x->im->shared = 1; x->im->k = k; x->im->refs = 1; nvn_hm_put(&g_by_storage, &k, x->im); x->mirrored = 0; g_stat_published++;
+        x->im->shared = 1; x->im->k = k; x->im->refs = 1; nvn_hm_put(&g_by_storage, &k, x->im); __atomic_store_n(&x->mirrored, 0, __ATOMIC_RELAXED); g_stat_published++;
         texcopy_resource("publish", x);
     }
     if (x->cpu_pool || wb_tile_match(&x->t)) wb_note_locked(x);
@@ -2048,11 +2056,21 @@ void mtl_set_tex_pool_n(int n) { atomic_store_explicit(&g_tpool_n, n, memory_ord
 static _Atomic uint32_t g_samp_epoch = 1;
 uint64_t vk_record_sampler_revision(void) { return atomic_load_explicit(&g_samp_epoch, memory_order_acquire); }
 static int texcache_on(void) { static int on = -1; if (on < 0) on = !vk_off("texcache"); return on; }
+static _Atomic uint64_t g_treg_calls, g_treg_unchanged;   /* TOTK_VK_TEX_MEMO: registrations, of those identical */
 void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     if (tid < 0) return;
     pthread_mutex_lock(&g_reg_mu);
     if (tid >= g_ntreg) { int n = tid + 1024; g_treg = realloc(g_treg, (size_t)n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (size_t)(n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
     vk_treg *r = &g_treg[tid];
+    /* TOTK_VK_TEX_MEMO: the same object (its serial is in tex_t) and view written again change no lookup result, so
+       the revisions that retire every memo entry, stage signature and freeze key stay as they are. */
+    if (vk_tex_memo_on()) {
+        atomic_fetch_add_explicit(&g_treg_calls, 1, memory_order_relaxed);
+        if (t ? r->ok && r->has_v == (v != NULL) && !memcmp(&r->t, t, sizeof *t) && (!v || !memcmp(&r->v, v, sizeof *v)) : !r->ok) {
+            atomic_fetch_add_explicit(&g_treg_unchanged, 1, memory_order_relaxed);
+            pthread_mutex_unlock(&g_reg_mu); return;
+        }
+    }
     r->ok = t != NULL; if (t) r->t = *t; r->has_v = v != NULL;
     if (v) r->v = *v; else memset(&r->v, 0, sizeof r->v);
     if (vk_native_ui_enabled()) native_index_tid(tid, t);
@@ -2124,9 +2142,7 @@ static VkImageView tex_by_id_slow(int tid, int want, vk_tex **x_out, tidc_t *cac
     *x_out = x;
     return v;
 }
-VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out) {
-    int want = target_out ? *target_out : -1;
-    TEX_LOOKUP_COUNT(0);
+static VkImageView tex_by_id_cached(int tid, int want, vk_tex **x_out) {
     if (!texcache_on() || tid <= 0 || tid >= TID_GEN_N) {
         TEX_LOOKUP_COUNT(1);
         vk_tex *x; VkImageView v = tex_by_id_slow(tid, want, &x, NULL); if (x_out) *x_out = x; return v;
@@ -2171,6 +2187,82 @@ VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out) {
     }
     if (x_out) *x_out = c->x;
     return c->v;
+}
+/* TOTK_VK_TEX_MEMO=1 (default 0): a per-thread memo in front of the cache above. Every entry was filled under one
+   (registry revision, texture identity revision) pair, read before its lookup; while the current pair equals it, the
+   cache above would return the same view and object (its per-ID generation and pool bound are covered by the registry
+   revision, its texture/image stamps by the identity revision), so a hit costs one small direct-mapped probe instead of
+   the ID's generation, the cache entry and two stamp cells. A changed pair retires every entry at once (a new memo
+   generation). The cache's once-per-submission work is kept per entry: an empty result holds for its submission only,
+   and a CPU-mirrored texture only once tex_get_inner finished with it in the current submission (x->memo_sub, stored
+   after its content check; the check itself stays in the cache path). Other textures never need it: a texture is
+   mirrored only from its creation, so one seen unmirrored stays so. Live (runtime/live_ctl.h): each lookup reads it.
+   [tex-memo] reports hits, misses and retirements. */
+typedef struct { uint32_t gen, key; uint64_t sub; VkImageView v; vk_tex *x; } texmemo_ent;   /* sub: 0 = any submission */
+enum { TEXMEMO_N = 2048 };
+typedef struct {
+    uint64_t registry, identity; uint32_t gen;
+    uint64_t counts[3], published[3];   /* hits, misses, retirements; published to g_tex_memo_counts every 4096 */
+    texmemo_ent e[TEXMEMO_N];
+} texmemo_t;
+static __thread texmemo_t *T_texmemo;
+static int g_tex_memo_launch;
+static totk_live_cache g_tex_memo_live;
+static _Atomic uint64_t g_tex_memo_counts[3];
+void vk_tex_memo_init(void) {
+    const char *e = getenv("TOTK_VK_TEX_MEMO"); g_tex_memo_launch = e && atoi(e) == 1;
+    LOGV("TOTK_VK_TEX_MEMO=%d: %s", g_tex_memo_launch, g_tex_memo_launch ?
+         "texture ID lookups memoized per thread until the registry, a texture identity or the submission changes" :
+         "every texture ID lookup validates its cache entry (default)");
+}
+int vk_tex_memo_on(void) { return totk_live_cached(&g_tex_memo_live, "TOTK_VK_TEX_MEMO", g_tex_memo_launch); }
+void vk_tex_memo_counts(uint64_t out[5]) {
+    for (int i = 0; i < 3; i++) out[i] = atomic_load_explicit(&g_tex_memo_counts[i], memory_order_relaxed);
+    out[3] = atomic_load_explicit(&g_treg_calls, memory_order_relaxed);
+    out[4] = atomic_load_explicit(&g_treg_unchanged, memory_order_relaxed);
+}
+static void texmemo_publish(texmemo_t *m) {
+    for (int i = 0; i < 3; i++) {
+        atomic_fetch_add_explicit(&g_tex_memo_counts[i], m->counts[i] - m->published[i], memory_order_relaxed);
+        m->published[i] = m->counts[i];
+    }
+}
+VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out) {
+    int want = target_out ? *target_out : -1;
+    TEX_LOOKUP_COUNT(0);
+    texmemo_t *m = T_texmemo;
+    if (!vk_tex_memo_on() || tid <= 0 || tid >= TID_GEN_N || !texcache_on() ||
+        (!m && !(m = T_texmemo = calloc(1, sizeof *m))))
+        return tex_by_id_cached(tid, want, x_out);
+    uint64_t registry = vk_treg_revision(), identity = atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire);
+    uint64_t sub = vk_submit_serial();
+    if (registry != m->registry || identity != m->identity) {
+        m->registry = registry; m->identity = identity; m->counts[2]++;
+        if (!++m->gen) { memset(m->e, 0, sizeof m->e); m->gen = 1; }
+    }
+    if (want < -2 || want >= 4094) return tex_by_id_cached(tid, want, x_out);   /* outside the packed key */
+    uint32_t key = (uint32_t)tid | (uint32_t)(want + 2) << 20;   /* tid < 2^20 */
+    texmemo_ent *e = &m->e[(key ^ key >> 11 ^ key >> 20) % TEXMEMO_N];
+    VkImageView v = VK_NULL_HANDLE; vk_tex *x = NULL;
+    int hit = e->gen == m->gen && e->key == key &&
+        (e->x ? e->sub != UINT64_MAX || atomic_load_explicit(&e->x->memo_sub, memory_order_acquire) == sub : e->sub == sub);
+    if (hit) {
+        v = e->v; x = e->x; m->counts[0]++;
+        if (texgen_check()) {   /* the cache above is the oracle while nothing it depends on moved */
+            vk_tex *oracle; VkImageView view = tex_by_id_cached(tid, want, &oracle);
+            if (registry == vk_treg_revision() && identity == atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire) &&
+                sub == vk_submit_serial() && (view != v || oracle != x)) {
+                LOGV("texture memo mismatch: tid=%d target=%d", tid, want); abort();
+            }
+        }
+    } else {
+        v = tex_by_id_cached(tid, want, &x); m->counts[1]++;
+        /* An empty result: this submission only. A mirrored texture: UINT64_MAX, checked against x->memo_sub per hit. */
+        *e = (texmemo_ent){m->gen, key, !x ? sub : __atomic_load_n(&x->mirrored, __ATOMIC_RELAXED) ? UINT64_MAX : 0, v, x};
+    }
+    if (!((m->counts[0] + m->counts[1]) & 4095)) texmemo_publish(m);
+    if (x_out) *x_out = x;
+    return v;
 }
 static VkBufferView tbuf_by_id(int tid, int writable, VkDescriptorBufferInfo *live, uint32_t *reason) {
     vk_treg rc, *r = &rc;

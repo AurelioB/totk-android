@@ -2639,6 +2639,21 @@ A region or colour channel mask now opens a temporary pass per layer/slice on th
 writes nothing. Whole unmasked clears keep the image clears; views that cannot be render targets keep the old path and
 its log line. `vkdrawtest` checks level-0/level-1 region, green-only and red+alpha clears texel by texel.
 
+### Texture ID memo (`TOTK_VK_TEX_MEMO`, default off)
+
+Descriptor builds resolve every sampled texture ID through `vk_tex_by_id`; on the Duo walker that path
+(`vk_tex_by_id` + `tex_get_inner` + `vk_treg_kind`) took ~2.7 ms/frame in T7, mostly cache misses: the ID's generation,
+its cache entry and two identity cells per lookup. `TOTK_VK_TEX_MEMO=1` puts a per-thread direct-mapped memo (2,048
+entries) in front of that cache, keyed by ID and shader target and valid while the registry revision, a global
+texture/image identity revision (every stamp bump or drop) and the submission are unchanged; any change retires the
+whole memo, which then refills from the cache. With it on, a registration that writes the same texture (same bytes,
+serial included) and view again keeps every revision, so it no longer retires the memo, the stage signatures (the
+`vk_treg_kind` scans) or freeze keys. Startup logs the value; `[tex-memo]` reports hits, misses, hit rate, retirements,
+registrations and unchanged ones per frame every 300 presents. Live: each lookup and registration reads it.
+`TOTK_VK_TEXGEN_CHECK=1` re-resolves every memo hit through the cache and aborts on a mismatch.
+`vktest --texture-cache-bench`/`--texture-churn-bench` and `vkrectest` (texture/sampler handles changing per draw)
+cover it.
+
 ### Same-pass mip feedback (`TOTK_VK_FEEDBACK_CUT`, default off)
 
 A pass that renders one level of an image while sampling that image (mip chains generated level by level) has a

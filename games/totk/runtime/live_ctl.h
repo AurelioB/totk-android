@@ -51,6 +51,7 @@ static const totk_live_switch totk_live_switches[] = {
     {"TOTK_VK_PREPARE_MASK", 0, 1},          /* the next draw's uniform preparation; a change dirties every register */
     {"TOTK_THREAD_SAMPLER", 0, 1},           /* the next presented frame (thread_sampler.h); starts its thread once */
     {"TOTK_VK_REC_WAKE_BATCH", 0, 2000},     /* the next chunk enqueue and the next time a recorder worker finds no work */
+    {"TOTK_VK_TEX_MEMO", 0, 1},              /* the next texture ID lookup (entries are kept: their key is the registry state) */
 };
 enum { TOTK_LIVE_MAX = 16 };
 _Static_assert(sizeof totk_live_switches / sizeof *totk_live_switches <= TOTK_LIVE_MAX, "live switch table");

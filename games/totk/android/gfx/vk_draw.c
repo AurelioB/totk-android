@@ -10030,6 +10030,16 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
                  (unsigned long long)(c[2] - previous[2]), prepare_mask_live());
             memcpy(previous, c, sizeof previous);
         }
+        { static uint64_t previous[5]; static int shown; uint64_t c[5]; vk_tex_memo_counts(c);
+          int on = vk_tex_memo_on();
+          if (on || shown) {
+              uint64_t hits = c[0] - previous[0], misses = c[1] - previous[1];
+              LOGV("[tex-memo] frame %llu: per frame %.1f hits %.1f misses (%.1f%% hit), %.1f retirements; registrations %.1f, %.1f unchanged (kept every revision) (TOTK_VK_TEX_MEMO=%d)",
+                   (unsigned long long)n, hits / 300.0, misses / 300.0, hits + misses ? 100.0 * hits / (hits + misses) : 0.0,
+                   (c[2] - previous[2]) / 300.0, (c[3] - previous[3]) / 300.0, (c[4] - previous[4]) / 300.0, on);
+              shown = on;
+          }
+          memcpy(previous, c, sizeof previous); }
         vk_rec_unlock();
         LOGV("frame %llu: %.1f fps over the last 300, %llu draws, %llu passes, %llu pipelines, %llu dispatches; skipped: no program %llu, disabled %llu, culled %llu, primitive %llu, shader missing %llu, scissor %llu, pipeline %llu, pipeline compiling %llu",
              (unsigned long long)n, 300e9 / (double)(now - g_present_t0), (unsigned long long)g_stat_draws, (unsigned long long)g_stat_passes, (unsigned long long)g_stat_pipes,

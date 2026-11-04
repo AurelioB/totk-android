@@ -1363,17 +1363,29 @@ static int texture_cache_bench(void) {
     int valid = expected != VK_NULL_HANDLE;
     for (int wide = 0; wide < 2; wide++) {
         for (int tid = 1; tid <= NIDS; tid++) { int want = 1; (void)vk_tex_by_id(tid, &want, NULL); }
+        uint64_t memo0[5], memo1[5]; vk_tex_memo_counts(memo0);
         uint64_t start = host_now_ns();
         for (int draw = 0; draw < NDRAWS; draw++) for (int slot = 0; slot < NSLOTS; slot++) {
             int tid = wide ? 1 + ((draw * NSLOTS + slot) & (NIDS - 1)) : slot + 1, want = 1;
             vk_tex *resolved = NULL; VkImageView view = vk_tex_by_id(tid, &want, &resolved);
             valid &= view == expected && resolved == object;
         }
-        uint64_t ns = host_now_ns() - start;
-        printf("texture-cache-bench %s: %.2f ns/draw (%d slots), %.2f ns/lookup\n",
-            wide ? "wide" : "hot", (double)ns / NDRAWS, NSLOTS, (double)ns / (NDRAWS * NSLOTS));
+        uint64_t ns = host_now_ns() - start; vk_tex_memo_counts(memo1);
+        uint64_t hits = memo1[0] - memo0[0], misses = memo1[1] - memo0[1];
+        printf("texture-cache-bench %s: %.2f ns/draw (%d slots), %.2f ns/lookup; TOTK_VK_TEX_MEMO=%d hits %llu misses %llu\n",
+            wide ? "wide" : "hot", (double)ns / NDRAWS, NSLOTS, (double)ns / (NDRAWS * NSLOTS), vk_tex_memo_on(),
+            (unsigned long long)hits, (unsigned long long)misses);
+        /* One submission, no registration: after the warm pass nearly every ID is a memo hit (direct-mapped: the wide set
+           of 2048 IDs has a few slot collisions). Counts are published every 4096 lookups. */
+        if (vk_tex_memo_on()) CHECK(hits + misses + 8192 >= (uint64_t)NDRAWS * NSLOTS && misses * 100 <= (uint64_t)NDRAWS * NSLOTS,
+            "%s lookups hit the texture memo (%llu hits, %llu misses)", wide ? "wide" : "hot", (unsigned long long)hits, (unsigned long long)misses);
+        else CHECK(!hits && !misses, "the texture memo stays out of the way while it is off");
     }
     CHECK(valid, "all hot/wide cached descriptors return the exact expected view and object");
+    { uint64_t revision = vk_treg_revision(); mtl_reg_tex(2, &texture, NULL);
+      CHECK(vk_tex_memo_on() ? vk_treg_revision() == revision : vk_treg_revision() != revision,
+          "an unchanged re-registration keeps every revision with the texture memo on, and only then");
+      int want2 = 1; CHECK(vk_tex_by_id(2, &want2, NULL) == expected, "an unchanged re-registration resolves the same view"); }
     view_t swizzle = {.set_swizzle = 1, .swz = {3, 2, 4, 5}};
     mtl_reg_tex(1, &texture, &swizzle);
     int want = 1; expected = vk_tex_view(object, &texture, &swizzle, 0);

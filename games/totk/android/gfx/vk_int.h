@@ -534,6 +534,9 @@ void vk_upload_report(uint64_t frame);     /* every 300 presents: uploads, their
 void vk_texel_stats(uint64_t frame); /* opt-in CPU texel access counters, per 300 frames */
 /* the texture registered at a texture-pool id (vk_reg), resolved to its Vulkan view; NULL for an empty slot */
 VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out);
+void vk_tex_memo_init(void);               /* launch-time TOTK_VK_TEX_MEMO, before any lookup */
+int vk_tex_memo_on(void);                  /* the value in use (live) */
+void vk_tex_memo_counts(uint64_t out[5]);  /* TOTK_VK_TEX_MEMO: hits, misses, retirements (published every 4096 lookups), registrations, unchanged ones */
 #ifdef TOTK_VK_TESTS
 void vk_tex_lookup_counters(uint64_t out[3]); /* calling thread: requests, registry/view slow paths, readiness checks */
 #endif

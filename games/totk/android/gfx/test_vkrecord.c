@@ -174,19 +174,21 @@ int main(int argc, char **argv) {
         ok &= run(binary, "--xlate-stats", log, i ? "2" : "0", 0);
         ok &= xlate_log(log); unlink(log);
     }
-    /* TOTK_VK_REC_WAKE_BATCH: the same bytes as the inline recorder with batched worker wakes and with workers that poll
-       the queue before parking (fresh processes, 2 and 3 workers; the boundary stream's worker gates run under both). */
+    /* Opt-in hot-path switches: the same bytes as the default inline recorder, in fresh processes at 0/2/3 workers.
+       TOTK_VK_REC_WAKE_BATCH with batched worker wakes and with workers polling the queue before parking (the boundary
+       stream's worker gates run under both); TOTK_VK_TEX_MEMO with every texture/sampler handle changing per draw. */
+    const char *arms[][2] = {{"TOTK_VK_REC_WAKE_BATCH", "1"}, {"TOTK_VK_REC_WAKE_BATCH", "200"}, {"TOTK_VK_TEX_MEMO", "1"}};
     for (int mode = 0; mode < 3; mode++) {
-        const char *arms[] = {"1", "200"}; char reference[PATH_MAX], output[PATH_MAX];
-        snprintf(reference, sizeof reference, "%s/wake-m%d-reference.bin", dir, mode);
-        if (!run(binary, modes[mode], reference, "0", 0)) { fprintf(stderr, "%s failed inline (wake reference)\n", modes[mode]); ok = 0; }
-        for (int arm = 0; arm < 2; arm++) for (int i = 1; i < 3; i++) {
-            snprintf(output, sizeof output, "%s/wake-m%d-%s-%s.bin", dir, mode, arms[arm], threads[i]);
-            setenv("TOTK_VK_REC_WAKE_BATCH", arms[arm], 1);
+        char reference[PATH_MAX], output[PATH_MAX];
+        snprintf(reference, sizeof reference, "%s/arm-m%d-reference.bin", dir, mode);
+        if (!run(binary, modes[mode], reference, "0", 0)) { fprintf(stderr, "%s failed inline (arm reference)\n", modes[mode]); ok = 0; }
+        for (unsigned arm = 0; arm < sizeof arms / sizeof *arms; arm++) for (int i = 0; i < 3; i++) {
+            snprintf(output, sizeof output, "%s/arm-m%d-%u-%s.bin", dir, mode, arm, threads[i]);
+            setenv(arms[arm][0], arms[arm][1], 1);
             int ran = run(binary, modes[mode], output, threads[i], 0);
-            unsetenv("TOTK_VK_REC_WAKE_BATCH");
-            if (!ran) { fprintf(stderr, "%s failed with %s workers, TOTK_VK_REC_WAKE_BATCH=%s\n", modes[mode], threads[i], arms[arm]); ok = 0; }
-            printf("%s threads=0 vs %s, TOTK_VK_REC_WAKE_BATCH=%s: ", modes[mode], threads[i], arms[arm]);
+            unsetenv(arms[arm][0]);
+            if (!ran) { fprintf(stderr, "%s failed with %s workers, %s=%s\n", modes[mode], threads[i], arms[arm][0], arms[arm][1]); ok = 0; }
+            printf("%s threads=0 vs %s, %s=%s: ", modes[mode], threads[i], arms[arm][0], arms[arm][1]);
             ok &= identical(reference, output, magic[mode]); unlink(output);
         }
         unlink(reference);
