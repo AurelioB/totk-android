@@ -134,13 +134,16 @@ static void present_timeline_invalidate_locked(void) {
         adaptive_slots_epoch_ns = runtime_now_ns();
 }
 /* -1 leaves that lifecycle facet unchanged. Record events even before startup
- * admission, since NativeActivity may publish its first window first. */
+ * admission, since NativeActivity may publish its first window first. The stall
+ * watchdog (threads.c) also pauses without a window or in the background. */
 static void present_timeline_lifecycle(int window, int paused) {
     pthread_mutex_lock(&display_mu);
     if (window >= 0) present_timeline_window = window;
     if (paused >= 0) present_timeline_paused = paused;
     present_timeline_invalidate_locked();
+    int watch_paused = !present_timeline_window || present_timeline_paused;
     pthread_mutex_unlock(&display_mu);
+    runtime_progress_pause(watch_paused);
     if (runtime_fps_adaptive_lifecycle) runtime_fps_adaptive_lifecycle(window, paused);
 }
 

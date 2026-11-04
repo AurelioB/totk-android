@@ -1889,7 +1889,7 @@ needs `su`). The folder holds what the adb-shell folder holds:
 | `totk.env` | options, one `NAME=value` per line (`#` comments), e.g. `TOTK_VK_SHOT=300` or `TOTK_FACE_BUTTONS=position`. Read after the launcher menu's `settings.env` (app-private `files/settings.env`, written by the menu; only the menu's own option keys are accepted there, others are logged and ignored), so a line here overrides the menu. |
 | `totk.log` | the log of the last start (`install_app.sh log`) |
 
-### Diagnostics: logcat copy and crash reports
+### Diagnostics: logcat copy, crash reports and the stall watchdog
 
 - **`TOTK_LOGCAT`** (default on; `0` turns it off). `totk.log` stays the primary log (written directly, so a sudden end
   loses nothing); a thread at nice 10 (on the slower CPUs when sysfs shows them) copies its complete lines to logcat with
@@ -1902,6 +1902,13 @@ needs `su`). The folder holds what the adb-shell folder holds:
   there before (`runtime/crash_chain.h`): Android's debuggerd writes a tombstone and a logcat backtrace
   (`adb logcat -b crash`, `/data/tombstones`). A real fault returns and faults again into it with its own siginfo;
   aborts and sent signals are raised again. The process no longer ends with `_exit(128+signal)` but by the signal.
+- **`TOTK_WATCHDOG`** (default on; `0` turns it off) and **`TOTK_WATCH_STALL=<seconds>`** (default unset). From the first
+  presented frame a thread polls every 250 ms; after >= 1 s without a new frame it logs `[totk-watch] no presented frame
+  for … s at stage "…" (frame …): thread dump n/3` and the `TOTK_DUMP_AFTER` thread dump (one per stall, at most 3,
+  >= 10 s apart). Boot, the background (paused or no window) and held stages (host movies, the first-world pipeline
+  warm-up, loading screens where the backend knows them) do not count, unless a held stage lasts 60 s. With
+  `TOTK_WATCH_STALL` a stall that long ends the process with status 142 (128+SIGALRM), for unattended runs. The
+  `[totk-watch] on: …` / `off` line shows the arm (`tests/test_progress_watch.py`).
 
 ### Game data location, game lock and save signals (release app)
 
