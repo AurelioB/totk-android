@@ -1718,7 +1718,6 @@ static int settled_learning(void) {
     CHECK(before[0] == TILES && before[6] == TILES && !before[2] && !before[5], "one prompt landing for each of the 64 baked storages");
     CHECK(!allocation[0] && !allocation[2] && !allocation[3] && allocation[4] == TILES && allocation[1] < 32768,
         "landed tiles retain only small image-free learning metadata, not record capacity or image pins");
-    extern void vk_res_mem(uint64_t v[8]);
     vk_res_mem(resources);
     CHECK(resources[0] && resources[7] && resources[4] == TILES, "landed images stay in the ordinary cache; blocks remain reusable");
 

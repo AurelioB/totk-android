@@ -514,6 +514,7 @@ void vk_wb_test_sweep(uint64_t v[6]); /* interval/peak WB-sweep ns, max bytes/ch
 void vk_wb_test_tile(const tex_t *t, uint64_t v[6]); /* last GPU/landed version, write sub/serial, invalidates/stale entries */
 void vk_wb_test_fresh(uint64_t v[3]); /* landed before base quiet, bytes, relevant copy-fence wait ns */
 uint64_t vk_wb_test_inflight(void); /* exact preflight matches on a synchronous owner's borrowed landing list */
+void vk_res_mem(uint64_t v[8]); /* resource memory summary (also read by the present statistics) */
 #endif
 void vk_res_stats(void);   /* rendered / copied / cleared by the GPU: never re-uploaded from guest memory */
 void vk_upload_threads_init(void);         /* launch-time TOTK_VK_UPLOAD_THREADS, before any upload */
