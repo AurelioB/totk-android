@@ -3,11 +3,29 @@
 All notable changes to TotK Native for Android (`com.aure.totk`). The app follows [semantic versioning](https://semver.org);
 the game version it runs is shown separately. versionCode = major × 10000 + minor × 100 + patch.
 
-## Unreleased
+## 1.0.1 (versionCode 10001), game 1.4.3
+
+A bug-fix release.
+
+### Setup
+- The container route (XCI/NSP + update + `prod.keys`) no longer fails with "Could not create romfs.fifo" when the
+  game data goes to the SD card or to a folder you picked. The merge pipe now always lives in the app's private
+  storage; an interrupted merge's leftover pipe is removed on the next run.
+- Setup errors name the call that failed and its real reason (1.0.0 could report "No such file or directory" for a
+  different error).
+- Time estimates match measured runs: about 2–3 minutes from decrypted files, about 15 minutes from containers, plus the
+  copy time to an SD card.
+
+### Menu
+- The menu no longer reports "The game is running" when it isn't: its own background checks are no longer mistaken
+  for the game.
+- When the game really is still running in the background, the affected actions say so, and a **Close the game**
+  button closes it safely (waiting for an in-progress save) and then carries on with what you chose.
 
 ### Second screen
-- Fused materials use the game's own attachment and common-material names, including world objects that are not pouch
-  items. Older second-screen art updates automatically; unknown objects fall back to readable text without object prefixes.
+- Fused materials use the game's own names (for example "Armor Shard" instead of "Obj Armor Spike B"), including world
+  objects that are not pouch items and the Russian names. Existing second-screen art updates automatically on the next
+  start; unknown objects fall back to readable text.
 
 ## 1.0.0 (versionCode 10000), game 1.4.3
 

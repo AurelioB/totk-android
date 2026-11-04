@@ -1,6 +1,6 @@
 # Installing TotK Native on Android
 
-TotK Native 1.0.0 runs **The Legend of Zelda: Tears of the Kingdom 1.4.3** natively on arm64 Android devices with a
+TotK Native runs **The Legend of Zelda: Tears of the Kingdom 1.4.3** natively on arm64 Android devices with a
 Qualcomm Adreno GPU. Tested on the AYN Thor (QCS8550, Adreno 740), the AYN Odin 3 (CQ8725S, Adreno 830) and the Retroid
 Pocket Duo (CQ7790S, Adreno 722). It is one APK for everyone. The APK contains **no Nintendo files**: no game code, art,
 text, fonts or shaders. On first start it asks for files from **your own copy** of the game and builds everything it
@@ -212,7 +212,7 @@ driver instead; no current Qualcomm system driver passes the game's startup chec
 
 ## Versions
 
-The app has its own version (1.0.0, semantic versioning); the game version it runs (1.4.3) is shown separately. The
+The app has its own version (e.g. 1.0.1, semantic versioning); the game version it runs (1.4.3) is shown separately. The
 Android version code grows with it: major × 10000 + minor × 100 + patch (1.0.0 is 10000, 1.2.3 would be 10203), so an
 update always installs over the previous release. Release APKs are signed with one release key (certificate SHA-256
 `a9e7a2a9fad6fdaede18c45a458e4555c0904658c9d7f4b74a73d9c83b67e2bf`); test builds signed with other keys cannot be

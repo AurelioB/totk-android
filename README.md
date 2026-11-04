@@ -80,8 +80,8 @@ Tested devices:
 
 ## Install and first setup
 
-1. Download `TotK-Native-1.0.0.apk` from the Releases page and install it (allow installs from your browser or file
-   manager).
+1. Download the latest `TotK-Native-<version>.apk` from the Releases page and install it (allow installs from your
+   browser or file manager).
 2. Copy your dump to the device or an SD card.
 3. Open **TotK Native** and press **Begin setup**. Then:
    1. **Storage**: where the game data goes. Internal storage is recommended (fastest); the SD card or a folder you

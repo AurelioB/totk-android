@@ -40,7 +40,7 @@ the reason when the game would not allow the action, for example:
   saving*, *Load a save first* (title screen), *Link isn't in the world right now*;
 - *Your hearts are already full*, *This can't be eaten*, *None left*, *No arrows left*, *Aim your bow to fuse*,
   *Weapons can't be changed right now*;
-- *Not available from the companion yet*: for actions not yet proven on a device. In 1.0.0 these are **energy-recovering
+- *Not available from the companion yet*: for actions not yet proven on a device. In 1.0.1 these are **energy-recovering
   materials** (recharging the battery) and **fusing Zonai devices to arrows**.
 
 Only one action runs at a time; a second tap while one is pending is ignored. The pause menu's *Hold* is not offered.
