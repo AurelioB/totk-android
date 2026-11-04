@@ -103,12 +103,12 @@ built in when Android reports it as built in, or as an unknown connection with t
 screen. External monitors (HDMI, DisplayPort, USB-C), cast and screen-recording displays and the developer *Simulate
 secondary displays* overlay are ignored; the Screen tab then says *External display · companion off* and has no
 *Second screen* option. From the inventory you can, while playing (no game menu open), equip or unequip weapons, bows,
-shields and armor; eat food and edible materials; drink elixirs; take out a material or Zonai device (it is placed in
-front of Link, as the game's own shortcut menu does); and, with your bow drawn, fuse a material to your arrows. Each tap
-does exactly what the game itself would do. Buttons are greyed out with the reason when the game would not allow it:
-with the pause menu or map open ("Close the game menu first"), in cutscenes and conversations, while loading or saving,
-on the title screen, with full hearts (for food that only heals), or for actions not available from the second screen
-yet (fairies, fusing Zonai devices to arrows, energy-recovering materials).
+shields and armor; eat food and edible materials; drink elixirs; use fairies; take out a material or Zonai device (it
+is placed in front of Link, as the game's own shortcut menu does); and, with your bow drawn, fuse a material to your
+arrows. Each tap does exactly what the game itself would do. Buttons are greyed out with the reason when the game would
+not allow it: with the pause menu or map open ("Close the game menu first"), in cutscenes and conversations, while
+loading or saving, on the title screen, with full hearts (for food that only heals), or for actions not available from
+the second screen yet (energy-recovering materials, fusing Zonai devices to arrows). More: [companion.md](companion.md).
 
 ## Where the game data lives (internal storage, SD card or a folder you choose)
 
@@ -227,4 +227,5 @@ in the APK are shown in the app and listed in `THIRD_PARTY_NOTICES.md`.
 
 ## Building the APK yourself
 
-Players do not need to. Developers: `games/totk/android/build_release.py` (no game files; see `games/totk/android/README.md`).
+Players do not need to. Developers: [building.md](building.md) (no game files; details in
+[games/totk/android/README.md](../games/totk/android/README.md)).

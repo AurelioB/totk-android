@@ -1,0 +1,59 @@
+# The dual-screen companion
+
+On handhelds with a built-in second display (AYN Thor, Retroid Pocket Duo), TotK Native shows a companion on that
+display while you play: Link's status, the map and the inventory. This page is the player-facing reference; the
+implementation (snapshot format, polling, the native action checks and the device evidence for each action) is in
+[games/totk/android/APP.md, *Dual-screen companion*](../games/totk/android/APP.md#dual-screen-companion).
+
+## What it shows
+
+- **Adventure**: hearts (in quarters, with gloom and extra hearts), stamina and battery capacity, rupees, the equipped
+  weapon, bow, shield and armor, the sages and a minimap. Tapping an equipped item opens it in its inventory category.
+- **Inventory**: all eight categories (weapons, bows & arrows, shields, armor, materials, food, Zonai devices, key
+  items). Every item is shown under its in-game name and description, also the ones the game names after another item
+  (caught fish and insects, bundles, the opening's Master Sword and Champion's Leathers). Tap an item for its details
+  and actions; swipe sideways for categories, drag to scroll.
+- **Map**: three layers (sky, surface, depths). Drag and pinch to move and zoom, pick a layer by hand; *Recenter* goes
+  back to following Link.
+
+The pictures (map, icons, item art) are made on your device from your own game data during setup (*Second-screen art*)
+and can be rebuilt from *Game data*. They are optional: the game runs without them. Art made by an earlier version of
+the app is updated on its own when the menu opens; the game stays playable meanwhile.
+
+## Item actions
+
+While playing (no game menu open), the selected item offers the actions the game itself would allow:
+
+| Items | Actions |
+|---|---|
+| Weapons, bows, shields, armor | Equip, unequip |
+| Food and edible materials | Eat (when it would have an effect, e.g. not with full hearts for food that only heals) |
+| Elixirs | Drink |
+| Fairies | Use |
+| Materials and Zonai devices | Take out (placed in front of Link, as the game's own shortcut does) |
+| Materials, with the bow drawn | Fuse to arrows |
+
+Each tap does exactly what the game would do, and the result is read back from the game. A button is greyed out with
+the reason when the game would not allow the action, for example:
+
+- *Close the game menu first* (pause menu or map open), *In a cutscene*, *Wait for loading to finish*, *The game is
+  saving*, *Load a save first* (title screen), *Link isn't in the world right now*;
+- *Your hearts are already full*, *This can't be eaten*, *None left*, *No arrows left*, *Aim your bow to fuse*,
+  *Weapons can't be changed right now*;
+- *Not available from the companion yet*: for actions not yet proven on a device. In 1.0.0 these are **energy-recovering
+  materials** (recharging the battery) and **fusing Zonai devices to arrows**.
+
+Only one action runs at a time; a second tap while one is pending is ignored. The pause menu's *Hold* is not offered.
+The optional minus / plus shortcuts only press the game's map / menu buttons.
+
+## Which display is used
+
+The companion uses a display that is built into the device, found among the displays present, never guessed from the
+chip: a display counts as built in when Android reports it as built in, or as an unknown connection with the same panel
+maker's id as the main screen. External monitors (HDMI, DisplayPort, USB-C), cast and screen-recording displays and
+the developer *Simulate secondary displays* overlay are ignored; the Screen tab then says *External display ·
+companion off* and has no *Second screen* option. The companion is shown on one secondary display only (never the
+game's), and only while the game is in front: Home dismisses it and returning shows it again.
+
+*Graphics → Screen → Second screen* turns it off for play. Developers can also disable it with `TOTK_COMPANION=0` in
+`totk.env` ([developer settings](developer-settings.md)).
