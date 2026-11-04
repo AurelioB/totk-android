@@ -105,6 +105,9 @@ typedef struct svc_profile {
     wait_stat_t edge_other;
     struct { uint32_t handle; int prio, core; uint64_t ns; } holder[12];
     uint64_t holder_other_ns;
+    /* Short guest timeouts: zero-timeout polls, timed waits asking under 20 us (bins <1, <2, <5, <10, <20 us) and how
+       many of those timed out, and SleepThread under 20 us. Measurement only. */
+    uint64_t polls, tiny[5], tiny_timeouts, tiny_sleeps;
     int walking;
 } svc_profile_t;
 static _Atomic int g_svc_profile = -1;
@@ -453,8 +456,13 @@ void runtime_svc_profile_frame(uint64_t frame) {
         }
     }
     fprintf(stderr, "[svc-wait] frame=%llu window=300 units=ms object=until-ready dispatch=ready-to-host core=core-take-wall\n", (unsigned long long)frame);
+    uint64_t tiny_all[8] = {0}, tiny_top_n = 0; uint32_t tiny_top = 0;   /* polls, 5 bins, timeouts, sleeps; busiest thread */
     for (thr_t *t = g_all; t; t = t->all) {
         svc_profile_t *p = t->profile; if (!p) continue;
+        const uint64_t tiny[8] = {p->polls, p->tiny[0], p->tiny[1], p->tiny[2], p->tiny[3], p->tiny[4], p->tiny_timeouts, p->tiny_sleeps};
+        uint64_t n = tiny[0] + tiny[1] + tiny[2] + tiny[3] + tiny[4] + tiny[5] + tiny[7];
+        for (int i = 0; i < 8; i++) tiny_all[i] += tiny[i];
+        if (n > tiny_top_n) { tiny_top_n = n; tiny_top = t->handle; }
         int show = p->walking; for (int i = 0; i < 5; i++) if (top[i] == t) show = 1;
         if (show) {
             fprintf(stderr, "[svc-wait] thread=%#x id=%llu tid=%llu walk=%d prio=%d mask=%#llx dispatch_ms=%.3f\n", t->handle, (unsigned long long)t->id, (unsigned long long)host_thread_id(t->pt, t->mport), p->walking, t->prio, (unsigned long long)t->mask, p->dispatch_ns / 1e6);
@@ -466,10 +474,18 @@ void runtime_svc_profile_frame(uint64_t frame) {
             for (int i = 0; i < 12; i++) if (p->holder[i].handle)
                 fprintf(stderr, "[svc-core] thread=%#x holder=%#x prio=%d core=%d snapshot_ms=%.3f\n", t->handle, p->holder[i].handle, p->holder[i].prio, p->holder[i].core, p->holder[i].ns / 1e6);
             if (p->holder_other_ns) fprintf(stderr, "[svc-core] thread=%#x other_snapshot_ms=%.3f\n", t->handle, p->holder_other_ns / 1e6);
+            if (tiny[0] || tiny[1] + tiny[2] + tiny[3] + tiny[4] + tiny[5] || tiny[7])
+                fprintf(stderr, "[svc-tiny] thread=%#x polls=%llu timed_lt1us=%llu lt2us=%llu lt5us=%llu lt10us=%llu lt20us=%llu timed_out=%llu sleep_lt20us=%llu\n",
+                    t->handle, (unsigned long long)tiny[0], (unsigned long long)tiny[1], (unsigned long long)tiny[2], (unsigned long long)tiny[3],
+                    (unsigned long long)tiny[4], (unsigned long long)tiny[5], (unsigned long long)tiny[6], (unsigned long long)tiny[7]);
         }
         int walking = p->walking; uint64_t ready = p->ready_ns; uint32_t waker = p->waker;
         memset(p, 0, sizeof *p); p->walking = walking; p->ready_ns = ready; p->waker = waker;
     }
+    fprintf(stderr, "[svc-tiny] frame=%llu window=300 all threads: polls=%llu timed_lt1us=%llu lt2us=%llu lt5us=%llu lt10us=%llu lt20us=%llu timed_out=%llu sleep_lt20us=%llu busiest=%#x n=%llu\n",
+        (unsigned long long)frame, (unsigned long long)tiny_all[0], (unsigned long long)tiny_all[1], (unsigned long long)tiny_all[2],
+        (unsigned long long)tiny_all[3], (unsigned long long)tiny_all[4], (unsigned long long)tiny_all[5], (unsigned long long)tiny_all[6],
+        (unsigned long long)tiny_all[7], tiny_top, (unsigned long long)tiny_top_n);
     pthread_mutex_unlock(&G);
 }
 
@@ -1002,7 +1018,7 @@ static int reported_core(const thr_t *t) {
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? reported_core(t) : -1; }
 
 static int64_t block(thr_t *t,int kind,int64_t ns) {
-    if (ns == 0) return block_inner(t, kind, ns);
+    if (ns == 0) { if (t->profile) t->profile->polls++; return block_inner(t, kind, ns); }
     int fps_wait = fps_block_begin();
     svc_profile_t *p = t->profile;
     uint64_t start = p ? now_ns() : 0, addr = kind == 2 ? t->wkey : kind == 4 ? (t->nwh == 1 ? t->wh[0] : 0) : t->waddr;
@@ -1019,6 +1035,10 @@ static int64_t block(thr_t *t,int kind,int64_t ns) {
         int k = profile_kind(t->last_svc); p->object[k].n++; p->object[k].ns += elapsed;
         p->dispatch_ns += end - ready; p->total_ns += end - start;
         profile_edge(p, t->last_svc, addr, owner, p->waker, elapsed);
+        if (ns > 0 && ns < 20000) {
+            p->tiny[ns < 1000 ? 0 : ns < 2000 ? 1 : ns < 5000 ? 2 : ns < 10000 ? 3 : 4]++;
+            if (r == R_TIMEOUT) p->tiny_timeouts++;
+        }
     }
     core_take(t);
     fps_block_end(fps_wait);
@@ -1419,7 +1439,7 @@ int svc_thread(int num, uint64_t *regs) {
             pthread_mutex_lock(&G);
             uint64_t elapsed = now_ns() - profile_start - self->profile_sleep_core_ns;
             int k = ns > 0 ? SP_SLEEP : SP_YIELD; svc_profile_t *p = self->profile;
-            p->object[k].n++; p->object[k].ns += elapsed; p->total_ns += elapsed;
+            p->object[k].n++; p->object[k].ns += elapsed; p->total_ns += elapsed; p->tiny_sleeps += ns > 0 && ns < 20000;
             self->profile_yield = self->profile_sleep_active = 0;
             pthread_mutex_unlock(&G);
         }

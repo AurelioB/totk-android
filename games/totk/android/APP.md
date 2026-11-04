@@ -4805,6 +4805,11 @@ can span windows, and closed/exited thread records can disappear before the next
 Profiling is off by default; allocations, clocks and per-wait tables are avoided while disabled.
 Reports take the scheduler lock, so compare instrumented cases to each other, then repeat without profiling.
 
+`[svc-tiny]` (same switch, measurement only) counts short guest timeouts per window: zero-timeout polls,
+timed waits asking under 20 µs in bins `<1/<2/<5/<10/<20 µs` with how many timed out, and `SleepThread` under
+20 µs. Shown threads get a row; one `all threads` row sums every guest and names the busiest handle. Large
+counts mean the game polls with tiny timeouts, which timer slack (`TOTK_TIMER_SLACK_NS`) and wake latency inflate.
+
 `TOTK_READY_CORES=1` opts into ready-at-wake virtual-core competition. A signaled guest queues immediately
 under the scheduler lock and can reserve a free core before Android schedules its host thread. Otherwise
 it requests a strictly higher-effective-priority handover at an existing safe SVC/signal checkpoint.
