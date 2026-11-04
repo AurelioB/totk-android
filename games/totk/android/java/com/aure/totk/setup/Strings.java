@@ -45,9 +45,9 @@ final class Strings {
     static final String DRIVER_BUNDLED_SHORT = "Bundled Turnip driver";
     static final String DRIVER_CUSTOM_SHORT = "Custom driver · ";
     static String shadersReady(int count) { return String.format(Locale.US, "%,d shaders ready", count); }
-    static String dataSummary(String size, boolean companion, boolean artOutdated, boolean shaders) {
-        return size + " · verified · " + (!shaders ? "shaders not built" : companion ? "rebuild shaders or companion art"
-                : artOutdated ? "second-screen art out of date" : "second-screen art not prepared");
+    static String dataSummary(String size, boolean secondScreen, boolean companion, boolean artOutdated, boolean shaders) {
+        return size + " · verified · " + (!shaders ? "shaders not built" : !secondScreen ? "rebuild shaders"
+                : companion ? "rebuild shaders or companion art" : artOutdated ? "second-screen art out of date" : "second-screen art not prepared");
     }
 
     // Graphics
@@ -262,6 +262,16 @@ final class Strings {
     static final String VERIFIED = "verified";
     static final String COMPANION_ROW = "Second-screen art";
     static final String COMPANION_HINT = "Map, inventory and shortcut pictures for the lower display";
+    static final String ART_NOT_NEEDED = "Not needed on this device";
+    static final String ART_NOT_NEEDED_HINT = "No built-in second screen · you can still prepare the art";
+    static final String PREPARE_ART = "Prepare second-screen art";
+    static final String ART_OFFER_TITLE = "Prepare your second screen?";
+    static final String ART_OFFER_BODY = "This device has a built-in second screen, but its map, inventory and shortcut pictures "
+            + "aren't prepared. Building them takes a few minutes, then the game starts.";
+    static final String ART_PREPARE_HINT = "Build from your imported game data, then play";
+    static final String PLAY_WITHOUT_ART = "Play without it";
+    static final String ART_DECLINE_HINT = "Start now · don't ask again for this install";
+    static final String ART_OFFER_FAILED = "The second-screen art wasn't prepared. Start game offers to try again or play without it.";
     static final String SHADERS_ROW = "Shaders";
     static final String SHADERS_HINT = "Required: the game's GPU shaders, prepared from your game data";
     static final String DRIVER = "Graphics driver";
@@ -284,9 +294,9 @@ final class Strings {
     static final String NEEDS_SETUP = "Finish setup first";
     static final String MEASURING = "measuring…", SIZE_UNKNOWN = "size unknown";
     static final String DATA_TEXT = "The game data imported from your own files: rewritten game code, the game's data image and its "
-            + "index, fonts, the shader seed and the second-screen art. Everything was checked against the pinned digests of version 1.4.3.";
+            + "index, fonts and the shader seed, plus optional second-screen art. The import was checked against the pinned digests of version 1.4.3.";
     static final String COMPANION_TEXT = "Pictures for the second-screen companion (map, inventory, shortcuts), generated on this device "
-            + "from your game data. Optional: the game runs without them. Rebuilding takes a few minutes.";
+            + "from your game data. Optional: the game runs without them. Setup skips them without a built-in second screen; you can build them here.";
     static final String SHADERS_TEXT = "The seed of translated GPU shaders generated from your game data. The game needs it: without "
             + "it nothing is drawn. Building takes a few minutes.";
     static final String DRIVER_TEXT = "The Vulkan driver the game uses. The bundled Mesa Turnip build is tested with this app. Pick a "
@@ -593,6 +603,7 @@ final class Strings {
     static final String WAITING = "waiting";
     static final String DONE = "done";
     static final String SKIPPED = "not prepared";
+    static final String ART_SKIPPED = "skipped";
     static final String FAILED = "Failed";
     static final String STARTING = "Starting…";
     // A single stage of the last two, started from Game data (or Home's Build shaders); again: its output exists already

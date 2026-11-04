@@ -20,7 +20,7 @@ final class InstallState {
 
     final JSONObject json;
     private final File game;
-    private Boolean artOutdated;   // read once per snapshot (index.json head)
+    private ArtPolicy.State art;   // read once per snapshot (index.json head)
 
     private InstallState(File game, JSONObject json) { this.game = game; this.json = json; }
 
@@ -38,12 +38,17 @@ final class InstallState {
         return stage == null ? new JSONObject() : stage;
     }
     /** Stage done per install.json; the second-screen art also has to be from this app's generator (artOutdated). */
-    boolean done(String name) { return stage(name).optBoolean("done") && !(OPTIONAL.equals(name) && artOutdated()); }
-    /** The companion stage finished once, but its art is from an older generator (an app update changed the names or
-     * icons) or its index is unreadable: the art still works, and Home updates it (SetupActivity.showUi). */
-    boolean artOutdated() {
-        if (artOutdated == null) artOutdated = stage(OPTIONAL).optBoolean("done") && !CompanionArt.current(new File(game, "companion"));
-        return artOutdated;
+    boolean done(String name) { return OPTIONAL.equals(name) ? artState() == ArtPolicy.State.DONE : stage(name).optBoolean("done"); }
+    /** Old-but-present art remains usable until a dual-screen device updates it. Missing art is offered before play. */
+    boolean artOutdated() { return artState() == ArtPolicy.State.OUTDATED; }
+    boolean skipped(String name) { return stage(name).optBoolean("skipped"); }
+    ArtPolicy.State artState() {
+        if (art == null) {
+            File dir = new File(game, "companion");
+            art = ArtPolicy.state(skipped(OPTIONAL), !errorCode(OPTIONAL).isEmpty(),
+                    new File(dir, "index.json").isFile(), CompanionArt.current(dir));
+        }
+        return art;
     }
     String errorCode(String name) { return stage(name).optString("code", ""); }
     String errorText(String name) { return stage(name).optString("error", ""); }

@@ -57,3 +57,20 @@ game's), and only while the game is in front: Home dismisses it and returning sh
 
 *Graphics → Screen → Second screen* turns it off for play. Developers can also disable it with `TOTK_COMPANION=0` in
 `totk.env` ([developer settings](developer-settings.md)).
+
+## Preparing the pictures
+
+Setup builds the optional second-screen art alongside shaders only on devices with a built-in second screen.
+On single-screen devices, including phones and the Odin 3, the stage is recorded as **skipped**, with **Not needed
+on this device**; no art is generated. External and cast displays do not make the art necessary.
+
+If a built-in second screen is present when you press **Start game**, but the art is missing (skipped, never built,
+failed, or deleted), you can **Prepare second-screen art** before playing or **Play without it** immediately.
+Preparing shows the normal stage progress and starts the game only after the art is ready; a failure or cancellation
+returns to Home. **Play without it** is remembered across launches for this install, so you are not asked again.
+**Game data → Second-screen art** still builds it on demand on any device, and clears that choice. Deleting imported
+data also clears it.
+
+On dual-screen devices, old-but-present art is updated automatically when Home opens, as before; **Play now** can stop
+the update and use the old art. On single-screen devices there is no automatic art update or rebuild reminder.
+

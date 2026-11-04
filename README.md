@@ -94,7 +94,8 @@ Tested devices:
    4. **Prepare**: the game is built on the device. With a decrypted dump on internal storage this took about
       1 minute 45 seconds on an AYN Thor, 1 minute 40 seconds on an Odin 3 and 3 minutes on a Retroid Pocket Duo. The
       container route also merges the base game and update: about 12 minutes on a Thor with the files and the install
-      on an exFAT SD card. The second-screen art is optional: you can start playing before it is done.
+      on an exFAT SD card. The optional second-screen art is skipped on single-screen devices; on dual-screen devices
+      you can start playing before it is done.
    5. **Choose graphics** opens with your device's preset selected. Press **+** to play.
 4. Nothing is uploaded: your files stay on the device.
 
@@ -402,6 +403,10 @@ saving, on the title screen, with full hearts, and for the actions not available
 
 Only a display built into the device is used; external monitors and cast displays are ignored. Turn it off in
 *Graphics → Screen → Second screen*. More: [docs/companion.md](docs/companion.md).
+
+Setup prepares the art only when a built-in second screen is present. If it is missing on a dual-screen device,
+**Start game** offers **Prepare second-screen art** (build it, then play) or **Play without it** (remembered for this
+install). You can prepare it later in **Game data → Second-screen art**, even on a single-screen device.
 
 ## Known limitations
 

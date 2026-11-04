@@ -484,6 +484,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             result = new JSONObject();
         }
         if (SetupService.status.running) screen = Screen.INSTALL;
+        else if (result.has("ok") && Inputs.prefs(this).getBoolean(ArtPolicy.START_AFTER_BUILD, false)) screen = Screen.INSTALL;
         else if (moveNote != null) { history.push(install.installed() ? Screen.HOME : Screen.WELCOME); screen = Screen.DATA; }
         else if (SetupService.jobActive(this)) screen = Screen.INTERRUPTED;
         // A stopped second-screen art stage on an installed game is not a reason to keep the player away from the menu on
@@ -501,6 +502,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         if (screen == Screen.HOME) updateOutdatedArt(install);
         pulledChip = SaveMirror.takePulled(this);
         if (moveNote != null) { note = moveNote; noteOk = moveOk; }
+        if (screen == Screen.INSTALL && !SetupService.status.running && result.has("ok")) main.post(this::finished);
         render();
         startUi();
     }
@@ -531,7 +533,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
      * made again on its own when Home opens, once per launch: the companion stage is optional, so Play now on the install
      * screen stops it and starts the game with the current art, and a failed update stays on Game data's Update row. */
     private void updateOutdatedArt(InstallState install) {
-        if (artUpdateStarted || !install.playable() || !install.artOutdated() || !install.errorCode(InstallState.OPTIONAL).isEmpty()
+        if (artUpdateStarted || !install.playable() || !ArtPolicy.updateAutomatically(SettingsStore.secondaryDisplay(this, getDisplay()), install.artState())
+                || !install.errorCode(InstallState.OPTIONAL).isEmpty()
                 || !InstallState.libraryAvailable() || SetupService.status.running || SetupService.jobActive(this)
                 || !StorageLocation.available(this) || StorageLocation.migrationPending(this, true) || !InstallState.gameState(this).free()) return;
         artUpdateStarted = true;
@@ -549,6 +552,20 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             seedRefused = true;
             if (!ui) showUi();
             replace(Screen.HOME);
+            return;
+        }
+        if (ArtPolicy.offerBeforePlay(SettingsStore.secondaryDisplay(this, getDisplay()), InstallState.read(this).artState(),
+                Inputs.prefs(this).getBoolean(ArtPolicy.DECLINED, false))) {
+            if (!ui) showUi();
+            openChoice("data", Strings.COMPANION_ROW, Strings.ART_OFFER_TITLE, Strings.ART_OFFER_BODY,
+                    new Object[]{"art:prepare", Strings.PREPARE_ART, Strings.ART_PREPARE_HINT, false, (Runnable) () -> {
+                        Inputs.prefs(this).edit().putBoolean(ArtPolicy.START_AFTER_BUILD, true).apply();
+                        buildStage(InstallState.OPTIONAL, true);
+                    }},
+                    new Object[]{"art:without", Strings.PLAY_WITHOUT_ART, Strings.ART_DECLINE_HINT, false, (Runnable) () -> {
+                        Inputs.prefs(this).edit().putBoolean(ArtPolicy.DECLINED, true).apply();
+                        launchGame(anyway);
+                    }});
             return;
         }
         if (settings == null) settings = SettingsStore.load(this);
@@ -581,6 +598,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     /** One of the last two stages alone, from Game data or (shaders, fromHome) Home's Build shaders; a finished build
      * returns to where it was started. */
     private void buildStage(String stage, boolean fromHome) {
+        if (InstallState.OPTIONAL.equals(stage)) Inputs.prefs(this).edit().remove(ArtPolicy.DECLINED).apply();
         homeAfterBuild = fromHome;
         requestNotificationsThen(() -> startSetup(new String[]{stage}));
     }
@@ -908,7 +926,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         homeItem(menu, "home:saves", "save", Strings.SAVES, Strings.savesSummary(liveSlots == null ? 0 : liveSlots.size(),
                 liveSlots == null ? 0 : SaveManager.newest(liveSlots), folderSummary()), v -> go(Screen.SAVES), 88, 8);
         homeItem(menu, "home:data", "data", Strings.GAME_DATA, missing ? StorageLocation.label(this) + " · " + Strings.NOT_AVAILABLE
-                : Strings.dataSummary(Strings.size(dataBytes()), install.done("companion"), install.artOutdated(), install.done("shaders")), v -> go(Screen.DATA), 88, 8);
+                : Strings.dataSummary(Strings.size(dataBytes()), SettingsStore.secondaryDisplay(this, getDisplay()),
+                        install.done("companion"), install.artOutdated(), install.done("shaders")), v -> go(Screen.DATA), 88, 8);
         homeItem(menu, "home:about", "about", Strings.ABOUT, Strings.ABOUT_HINT, v -> go(Screen.ABOUT), 88, 0);
         primary = start;
         // The one-time move of an install made before private storage existed: asked once per visit to the menu.
@@ -1253,11 +1272,13 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                     if (!missing && install.anyDone() && !installed) { showNote(Strings.MOVE_PARTIAL); return; }
                     go(Screen.STORAGE);
                 });
+        boolean secondScreen = SettingsStore.secondaryDisplay(this, getDisplay());
         boolean companion = install.done("companion"), shaders = install.done("shaders") && !seedRefused;
-        Widgets.Row companionRow = dataRow(list, "companion", Strings.COMPANION_ROW, Strings.COMPANION_HINT,
-                companion ? Strings.READY + " · " + Strings.REBUILD : !installed ? Strings.NEEDS_SETUP
+        Widgets.Row companionRow = dataRow(list, "companion", Strings.COMPANION_ROW, secondScreen ? Strings.COMPANION_HINT : Strings.ART_NOT_NEEDED_HINT,
+                !secondScreen ? Strings.ART_NOT_NEEDED + " · " + (companion || install.artOutdated() ? Strings.REBUILD : Strings.BUILD)
+                        : companion ? Strings.READY + " · " + Strings.REBUILD : !installed ? Strings.NEEDS_SETUP
                         : install.artOutdated() ? Strings.OUT_OF_DATE + " · " + Strings.UPDATE : Strings.NOT_PREPARED + " · " + Strings.BUILD,
-                companion ? Theme.ZONAI : Theme.AMBER, v -> buildStage("companion", false));
+                !secondScreen ? Theme.TEXT3 : companion ? Theme.ZONAI : Theme.AMBER, v -> buildStage("companion", false));
         // The shader seed is required: without it Start game is replaced by Build shaders on Home.
         Widgets.Row shaderRow = dataRow(list, "shaders", Strings.SHADERS_ROW, Strings.SHADERS_HINT,
                 shaders ? Strings.variants(install.shaderVariants()) + " · " + Strings.REBUILD : !installed ? Strings.NEEDS_SETUP : Strings.NOT_BUILT + " · " + Strings.BUILD,
@@ -1319,7 +1340,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 break;
             }
             case "access": detailText.setText(Strings.ACCESS_TEXT); break;
-            case "companion": detailText.setText(Strings.COMPANION_TEXT); break;
+            case "companion": detailText.setText((SettingsStore.secondaryDisplay(this, getDisplay()) ? "" : Strings.ART_NOT_NEEDED + ". ") + Strings.COMPANION_TEXT); break;
             case "shaders": detailText.setText(Strings.SHADERS_TEXT); break;
             case "driver": case "driver-reset": detailText.setText(Strings.DRIVER_TEXT); break;
             case "rerun": detailText.setText(Strings.RERUN_TEXT); break;
@@ -1417,7 +1438,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 busy = false; DataSize.invalidate();
                 inputs.clear(getContentResolver());
                 SetupService.clearResult(this);
-                Inputs.prefs(this).edit().remove("jobStages").apply();
+                Inputs.prefs(this).edit().remove("jobStages").remove(ArtPolicy.DECLINED).remove(ArtPolicy.START_AFTER_BUILD).apply();
                 inspection = null;
                 // Nothing playable is left: the menu has nothing to start, so continue on the welcome screen.
                 history.clear(); history.push(Screen.WELCOME);
@@ -2532,6 +2553,10 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         return pending && (stages == null || !Arrays.asList(InstallState.PAIR).containsAll(Arrays.asList(stages)));
     }
     private void launchService(String[] stages) {
+        if (stages == null && !InstallState.read(this).anyDone())
+            Inputs.prefs(this).edit().remove(ArtPolicy.DECLINED).apply();
+        if (stages == null || stages.length != 1 || !InstallState.OPTIONAL.equals(stages[0]))
+            Inputs.prefs(this).edit().remove(ArtPolicy.START_AFTER_BUILD).apply();
         SetupService.clearResult(this);
         installSnapshot = null;
         SetupService.start(this, stages);
@@ -2617,6 +2642,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private void playNow() {
         if (!SetupService.status.running) { if (InstallState.read(this).playable()) launchGame(); return; }
         if (playPrompt == null || playPrompt.getVisibility() != View.VISIBLE || !playPrompt.isEnabled()) return;
+        if (!InstallState.read(this).done(InstallState.OPTIONAL) && !InstallState.read(this).artOutdated())
+            Inputs.prefs(this).edit().putBoolean(ArtPolicy.DECLINED, true).remove(ArtPolicy.START_AFTER_BUILD).apply();
         playAfterStop = true;
         playPrompt.text.setText(Strings.STOPPING); playPrompt.setEnabled(false);
         SetupService.cancel(this);
@@ -2654,6 +2681,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 row.set(Widgets.StageRow.ACTIVE, fraction, known ? Math.round(fraction * 100) + "%" : "…", detail);
             } else if (install.done(stage) || (status.running && currentIndex >= 0 && i < currentIndex && !isPair(stage))) {
                 row.set(Widgets.StageRow.DONE, 1, Strings.DONE, stage.equals("shaders") && install.shaderVariants() > 0 ? Strings.variants(install.shaderVariants()) : Strings.stageDone(stage));
+            } else if (install.skipped(stage)) {
+                row.set(Widgets.StageRow.SKIPPED, 0, Strings.ART_SKIPPED, Strings.ART_NOT_NEEDED);
             } else if (!install.errorCode(stage).isEmpty() && (currentIndex < 0 || i < currentIndex || !status.running || lane != null)) {
                 // A failed shader stage fails setup; the companion stage is only skipped.
                 String why = install.errorText(stage).isEmpty() ? Strings.error(install.errorCode(stage)) : install.errorText(stage);
@@ -2717,6 +2746,14 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             if (install.playable()) { SetupService.clearResult(this); launchGame(); return; }
         }
         if (!result.has("ok")) return;  // service not finished yet (status listener fired before the result was stored)
+        if (Inputs.prefs(this).getBoolean(ArtPolicy.START_AFTER_BUILD, false)) {
+            Inputs.prefs(this).edit().remove(ArtPolicy.START_AFTER_BUILD).apply();
+            SetupService.clearResult(this);
+            if (result.optBoolean("ok") && install.done(InstallState.OPTIONAL) && install.playable()) { launchGame(); return; }
+            replace(Screen.HOME);
+            showNote(Strings.ART_OFFER_FAILED);
+            return;
+        }
         if (SetupService.moving() || "move".equals(result.optString("stage"))) {
             // Back to Game data with the outcome; a failed or cancelled move left the data where it was.
             SetupService.clearResult(this);

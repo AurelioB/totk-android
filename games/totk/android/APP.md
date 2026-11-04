@@ -21,9 +21,18 @@ only the companion art is optional, and *Play without second-screen art* may ski
 with `.spv` modules (`InstallState.seedUsable`). Otherwise Home shows *Shaders not built* and offers *Build shaders*
 (the shader stage alone) in place of *Start game*. Second-screen art from an older generator (its `companion/index.json`
 `"generator"` below `CompanionArt.GENERATOR`, which equals `stage_companion.c` / `make_companion_assets.py`'s
-`GENERATOR_VERSION`), or with an unreadable index, counts as not prepared: when Home opens (once per launch) it starts the
-companion stage alone as *Updating second-screen art*; the old art stays in use until the new tree replaces it, *Play
-now* stops the update and starts the game, and Game data shows *Out of date · Update* (`tests/test_android_companion_art.py`).
+`GENERATOR_VERSION`), or with an unreadable but present index, counts as not prepared: on devices with a built-in second
+screen, Home opens the companion stage alone (once per launch) as *Updating second-screen art*; the old art stays in use
+until the new tree replaces it, *Play now* stops the update and starts the game, and Game data shows *Out of date · Update*
+(`tests/test_android_companion_art.py`). On other devices setup sends `skipCompanion: true`: native setup records
+`stages.companion: {done:false, skipped:true}` (without a failure code) and runs shaders alone. Explicit Game data builds
+still run on any device; automatic art updates and Home's art rebuild reminders are restricted to built-in second screens.
+At every game start, including skip-menu launches, `ArtPolicy` uses the current display classification and actual
+`companion/index.json` presence/currentness, not just the manifest's done flag. Missing art on a dual-screen device opens
+the styled *Prepare second-screen art* / *Play without it* choice. Preparing runs the stage with progress and starts only
+after success with usable art; cancellation/failure returns Home. `artDeclined` persists a skip across launches for this
+install; a Game data build or deleting imported data clears it. `startAfterArt` preserves the requested build-then-play
+through activity/process recreation. Pure-Java decisions are covered by `tests/test_android_art_policy.py`.
 The menu keeps its options in SharedPreferences and writes them, on every
 change and again right before the game starts, to `<private>/settings.env` (`Settings.java` is the option → variable
 mapping; `tests/test_android_settings.py`). The native side refuses to start without a playable install too and
