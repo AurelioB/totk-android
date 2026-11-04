@@ -652,6 +652,10 @@ final class Strings {
     static final String CHANGE_FILES = "Change files";
     static final String CHANGE_FILES_HINT = "Pick other files or the other route";
     static final String DETAILS = "Details: ";
+    static final String SHARE_DETAILS = "Share details";
+    static final String SHARE_DETAILS_HINT = "Share details before Resume to include the logs";
+    static final String SHARE_DETAILS_BUSY = "Preparing details…";
+    static final String SHARE_DETAILS_MISSING = "No app is available to share text.";
 
     static final String CLOSE_GAME = "Close the game";
     static final String WAITING_SAVE = "Waiting for the game to finish saving…";

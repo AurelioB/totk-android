@@ -422,7 +422,10 @@ Only a display built into the device is used; external monitors and cast display
 1.4.3 RomFS with the update applied (all split parts) or the 1.4.3 update NSP, then choose it again. Every check and
 message: [docs/android-install.md](docs/android-install.md).
 
-**Setup was interrupted or stopped.** Open the app again and press *Resume*: finished steps are kept.
+**Setup was interrupted or stopped.** Finished steps are kept; *Resume* continues setup. On **Setup stopped**, use
+**Share details** **before Resume** to include that failed run's logs in a bug report (Resume clears them).
+It opens Android's share sheet with the error, device/build information and bounded, redacted setup logs.
+No game files or keys are included; nothing is sent until you choose an app. Missing logs are marked explicitly.
 
 **Home shows "Shaders not built".** The game would draw nothing without its shaders: press *Build shaders* (a few
 minutes), then start the game.

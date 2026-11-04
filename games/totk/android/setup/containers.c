@@ -141,7 +141,7 @@ int containers_exefs(SetupCtx *c, SetupContainers *s, const char *out_dir) {
     setup_progress(c, "exefs", 0, 0, "extracting the update ExeFS");
     rc = run_with_keys(c, s, "exefs", args, 2, NULL, 0, NULL, 0, "hactool-exefs.log", 0, NULL, &log, &code);
     if (!rc && (code || !hactool_log_ok(log, 0))) {
-        setup_fail(c, "internal", "hactool could not extract the update ExeFS (exit %d; see .import/hactool-exefs.log)", code);
+        setup_fail(c, "internal", "hactool could not extract the update ExeFS (exit %d; use Share details for the log)", code);
         rc = -1;
     }
     free(log);
@@ -184,7 +184,7 @@ int containers_romfs(SetupCtx *c, SetupContainers *s, const char *out_dir, uint6
     setup_progress(c, "romfs", 0, c->pins.romfs_size, "merging base + update");
     rc = run_with_keys(c, s, "romfs", args, 3, fds, 1, env, 2, "hactool-romfs.log", c->pins.romfs_size, &follow, &log, &code);
     if (!rc && (code || !hactool_log_ok(log, 1))) {
-        setup_fail(c, "internal", "The base + update merge did not verify (exit %d; see .import/hactool-romfs.log)", code);
+        setup_fail(c, "internal", "The base + update merge did not verify (exit %d; use Share details for the log)", code);
         rc = -1;
     }
     free(log);

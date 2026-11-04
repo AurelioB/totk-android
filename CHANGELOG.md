@@ -16,6 +16,7 @@ A bug-fix release.
   different error).
 - Time estimates match measured runs: about 2–3 minutes from decrypted files, about 15 minutes from containers, plus the
   copy time to an SD card.
+- Setup stopped: a Share details button sends the error and the setup logs (no game files or keys) through any app, for bug reports.
 
 ### Menu
 - The menu no longer reports "The game is running" when it isn't: its own background checks are no longer mistaken

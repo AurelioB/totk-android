@@ -96,6 +96,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     /** Graphics opened as setup's last step ("Choose graphics"). */
     private boolean setupFinished;
     private boolean ui, playAfterStop, busy;
+    private boolean sharingDetails;
     private String note = "", licence = "";
     private String gameError;
     /** D-pad focus to restore when navigating back to a screen (by view tag). */
@@ -2772,7 +2773,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         String code = result.optString("code", "internal");
         setupHeader(Strings.SETUP_TITLE);
         rail(3, true);
-        Widgets.Panel box = setupMain();
+        Widgets.Panel box = panel(590, 186, 1250, 720, true, 50, 32);
         heading(box, Strings.ERROR_TITLE, 36);
         String stage = result.optString("stage", "");
         if (!stage.isEmpty()) {
@@ -2784,29 +2785,95 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         String message = result.optString("message", "");
         if (!message.isEmpty()) {
             TextView details = add(box, Theme.paragraph(this, Strings.DETAILS + message, 17, Theme.TEXT3), 8);
-            details.setMaxLines(4); details.setEllipsize(TextUtils.TruncateAt.END);
+            details.setMaxLines(2); details.setEllipsize(TextUtils.TruncateAt.END);
         }
+        add(box, Theme.paragraph(this, SetupDetails.PRIVACY, 16, Theme.TEXT3), 8);
         if (!note.isEmpty()) add(box, Theme.paragraph(this, note, 18, Theme.AMBER), 8);
         box.addView(Widgets.space(this), new LinearLayout.LayoutParams(-1, 0, 1));
-        boolean filesProblem = Arrays.asList("hash_mismatch", "bad_keys", "unsupported_version", "permission", "missing_input").contains(code);
-        Widgets.Row resume = resumeRows(box, filesProblem);
+        Widgets.Row resume = resumeRows(box);
+        Widgets.Row share = new Widgets.Row(this, Strings.SHARE_DETAILS,
+                sharingDetails ? Strings.SHARE_DETAILS_BUSY : Strings.SHARE_DETAILS_HINT, 27, 18).icon("export", 56, 28);
+        share.setTag("share-details");
+        share.dimmed(sharingDetails);
+        share.setOnClickListener(v -> { if (!sharingDetails) shareDetails(); });
+        box.addView(share, Widgets.rowParams(76, 8));
         if (code.equals("library")) resume.dimmed(true);
     }
-    /** Resume / Change files / Game data rows; the likelier fix comes first and is focused. */
-    private Widgets.Row resumeRows(LinearLayout box, boolean filesFirst) {
+    /** Resume remains the primary action; sharing details never retries or changes setup. */
+    private Widgets.Row resumeRows(LinearLayout box) {
         Widgets.Row resume = new Widgets.Row(this, Strings.RESUME, Strings.RESUME_HINT, 27, 18).icon("refresh", 56, 28);
         resume.setTag("resume");
-        resume.setOnClickListener(v -> { if (!resume.dimmed()) requestNotificationsThen(() -> startSetup(SetupService.jobStages(this))); });
-        gameControl(resume, "Installing", () -> requestNotificationsThen(() -> startSetup(SetupService.jobStages(this))));
+        resume.setOnClickListener(v -> { if (!sharingDetails && !resume.dimmed()) requestNotificationsThen(() -> startSetup(SetupService.jobStages(this))); });
+        gameControl(resume, "Installing", () -> { if (!sharingDetails) requestNotificationsThen(() -> startSetup(SetupService.jobStages(this))); });
         Widgets.Row change = new Widgets.Row(this, Strings.CHANGE_FILES, Strings.CHANGE_FILES_HINT, 27, 18).icon("folder", 56, 28);
-        change.setTag("change"); change.setOnClickListener(v -> changeFiles());
+        change.setTag("change"); change.setOnClickListener(v -> { if (!sharingDetails) changeFiles(); });
         Widgets.Row data = new Widgets.Row(this, Strings.GAME_DATA, Strings.WELCOME_DATA_HINT, 27, 18).icon("data", 56, 28);
-        data.setTag("data"); data.setOnClickListener(v -> go(Screen.DATA));
-        for (Widgets.Row row : filesFirst ? new Widgets.Row[]{change, resume, data} : new Widgets.Row[]{resume, change, data})
-            box.addView(row, Widgets.rowParams(92, 10));
-        primary = filesFirst ? change : resume;
+        data.setTag("data"); data.setOnClickListener(v -> { if (!sharingDetails) go(Screen.DATA); });
+        for (Widgets.Row row : new Widgets.Row[]{resume, change, data}) {
+            row.dimmed(sharingDetails);
+            box.addView(row, Widgets.rowParams(screen == Screen.ERROR ? 76 : 92, screen == Screen.ERROR ? 8 : 10));
+        }
+        primary = resume;
         prompts(prompt("A", Strings.P_SELECT, v -> selectFocused()), prompt("B", Strings.P_QUIT, v -> finish()));
         return resume;
+    }
+    /** Snapshot on the worker before another setup run can clear .import; only the chooser runs on the UI thread. */
+    private void shareDetails() {
+        if (sharingDetails || SetupService.status.running) return;
+        sharingDetails = true;
+        render();
+        worker.execute(() -> {
+            JSONObject result = SetupService.lastResult(this);
+            Inputs picked = Inputs.load(this);
+            File game = StorageLocation.gameDir(this);
+            List<String> excluded = new ArrayList<>();
+            StringBuilder metadata = new StringBuilder();
+            String version = "?"; long versionCode = 0;
+            try {
+                PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+                version = info.versionName; versionCode = info.getLongVersionCode();
+            } catch (PackageManager.NameNotFoundException impossible) { }
+            metadata.append("App: ").append(version).append(" (versionCode ").append(versionCode).append(")\n")
+                    .append("Build commit: ").append(buildCommit()).append('\n')
+                    .append("Device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n')
+                    .append("Android: ").append(Build.VERSION.RELEASE).append(" (SDK ").append(Build.VERSION.SDK_INT).append(")\n")
+                    .append("SoC: ").append(SettingsStore.soc()).append('\n')
+                    .append("Failed stage: ").append(result.optString("stage", "setup")).append('\n')
+                    .append("Result JSON: ").append(result).append('\n')
+                    .append("Route: ").append(picked.route).append('\n');
+            StoragePaths.Kind kind = StorageLocation.kind(this);
+            metadata.append("Destination: ").append(kind == StoragePaths.Kind.PRIVATE ? "private"
+                    : kind == StoragePaths.Kind.APP ? "SD app folder" : "picked folder").append('\n');
+            metadata.append("Destination free bytes: ").append(game.getUsableSpace()).append('\n')
+                    .append("Private storage free bytes: ").append(getFilesDir().getUsableSpace()).append('\n');
+            for (String role : picked.roles()) {
+                int index = 0;
+                for (Inputs.Item item : picked.get(role)) {
+                    File direct = FileAccess.directFile(this, item.uri, item.size);
+                    excluded.add(item.uri.toString());
+                    excluded.add(item.name);
+                    if (direct != null) excluded.add(direct.getPath());
+                    metadata.append("Source ").append(role).append('[').append(++index).append("]: ")
+                            .append(direct != null ? "direct path" : "provider authority " + item.uri.getAuthority())
+                            .append("; extension ").append(SetupDetails.extension(item.name))
+                            .append("; bytes ").append(direct != null ? direct.length() : item.size).append('\n');
+                }
+                if (index == 0) metadata.append("Source ").append(role).append(": not selected\n");
+            }
+            // Longest first so a filename cannot leave the rest of a containing path or URI behind.
+            excluded.sort((a, b) -> Integer.compare(b.length(), a.length()));
+            String report = SetupDetails.build(metadata.toString(), game, result.optString("stage"), excluded);
+            main.post(() -> {
+                sharingDetails = false;
+                if (isDestroyed() || screen != Screen.ERROR) return;
+                render();
+                Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain")
+                        .putExtra(Intent.EXTRA_SUBJECT, "TotK Native setup details")
+                        .putExtra(Intent.EXTRA_TEXT, report);
+                try { startActivity(Intent.createChooser(send, Strings.SHARE_DETAILS)); }
+                catch (ActivityNotFoundException unavailable) { showNote(Strings.SHARE_DETAILS_MISSING); }
+            });
+        });
     }
     private void changeFiles() {
         SetupService.clearResult(this);
@@ -2824,6 +2891,6 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         lead(box, Strings.INTERRUPTED_BODY, 14);
         if (!note.isEmpty()) add(box, Theme.paragraph(this, note, 18, Theme.AMBER), 8);
         box.addView(Widgets.space(this), new LinearLayout.LayoutParams(-1, 0, 1));
-        resumeRows(box, false);
+        resumeRows(box);
     }
 }

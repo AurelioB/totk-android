@@ -43,6 +43,22 @@ Failed reads leave the previous driver and `driverName` preference intact and re
 The row uses metadata `name` plus `driverVersion`, or the picked filename; *Use the bundled driver* removes the override.
 Host coverage: `tests/test_android_drivers.py`.
 
+### Setup stopped: Share details
+
+The controller-focusable **Share details** row leaves **Resume** primary. It builds a plain-text report on the
+setup worker, then opens Android's `ACTION_SEND` chooser (`text/plain`, no FileProvider or attachments).
+No game files or keys are included; nothing is sent until you choose an app.
+Share details **before Resume**: `setup.c` clears `.import` when the next run starts and removes it on success.
+Failure cleanup keeps the top-level logs, even for private Internal storage that a file picker cannot browse.
+
+`SetupDetails.java` is the pure, host-tested builder (`tests/test_android_setup_details.py`). Its only file reads
+are `.import/hactool-romfs.log`, `.import/hactool-exefs.log`, and, for a shader failure, `.import/shaders.log`.
+Missing/unreadable files are marked; symlinks and non-regular files are excluded. The UTF-8 report is capped at
+64 KiB, retaining each oversized log's beginning and end with a byte-omission marker. Hex runs of 32 or more
+characters are redacted again across the whole report; input names, URIs and absolute paths are scrubbed.
+Metadata includes the result JSON, app version/code/commit, device/Android/SoC, route, destination kind and free
+bytes, plus each input's direct-path/provider-authority access, extension and size only.
+
 ### Supplying your own launcher image
 
 Add `--launcher-icon /absolute/path/outside/repo/logo.png` to `build_android.py ... --apk` (also supported with
