@@ -324,7 +324,8 @@ class ContainerParts(Storage):
         self.update.write_bytes(partition([('program.nca', update), ('meta.cnmt.nca', nca(content=1, title=0x0100F2C0115B6800)), ('a.tik', ticket())]))
         self.lib = self.dir / 'lib'; self.lib.mkdir()
         fake = self.lib / 'libhactool.so'
-        fake.write_text('#!/bin/sh\nfor a in "$@"; do case "$a" in --section*=*) out="${a#*=}";; esac; done\n'
+        # Do not preload the CLI's ASan runtime / fault shim into the unrelated system shell and cat.
+        fake.write_text('#!/usr/bin/env -S -u LD_PRELOAD /bin/sh\nfor a in "$@"; do case "$a" in --section*=*) out="${a#*=}";; esac; done\n'
                         'test -p "$out" || exit 2\nprintf "%s\\n" "$out" > "$TOTK_FIFO_PATH_LOG"\n'
                         'cat "$TOTK_FAKE_IMAGE" > "$out" || exit 1\nfor i in 0 1 2 3 4 5; do echo "Level $i (GOOD)"; done\n')
         fake.chmod(0o755)
