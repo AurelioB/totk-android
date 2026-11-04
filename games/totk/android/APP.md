@@ -1958,6 +1958,7 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_NVN_CALL_NOCOPY` | 0–1 | the next CallCommands / CopyCommands | a recording already holding call markers still expands them at its EndRecording |
 | `TOTK_ADPF_GPU` | 0–1 | the next presented frame | that frame is not reported; the session's target switches with it; no effect with `TOTK_ADPF=0` |
 | `TOTK_ADPF_LOAD_HINT` | 0–1 | the next span report | clears consecutive-frame history, retains the 500 ms rate limit; needs `TOTK_ADPF_GPU=1` |
+| `TOTK_ADPF_CPU_SPLIT` | 0–1 | the next presented frame | queue waits are measured for subsequent frames; total span/GPU unchanged; needs `TOTK_ADPF_GPU=1` and API 35 |
 | `TOTK_RATE_HINT_HOLD` | 0…60000 | the next guest present | ms; a change clears the held rates; no effect without `TOTK_FRAME_RATE_HINT=1` |
 
 `TOTK_IDEAL_CORE_FIX` is startup-only and refused. Another launch-time switch becomes live by adding it, with its
@@ -3918,6 +3919,12 @@ the duration report after three consecutive frames exceed 105 % of target, at mo
 GPU is flagged only when the newest measured GPU duration exceeds 70 % of target. Missing API is a logged no-op.
 Startup/live mode logs and each 300-frame span summary include hints sent/errors. A/B against gpu_feed alone:
 compare fps/p95 and GPU clock residency, with temperature/power held in view.
+
+`TOTK_ADPF_CPU_SPLIT=1` (default 0, live at the next presented frame) reports CPU as the existing span minus
+native present/texture queue wait clipped to that span; acquire/vsync pacing already excluded from the span is
+never subtracted again. Total and GPU are unchanged. API 35 report2 is required; older APIs log a no-op.
+Mode logs identify the arm. Compare CPU clocks/power and p95 against gpu_feed alone; this is wall work minus
+known native waits, not the sum of all hint threads' CPU time.
 
 
 ### FPS60 controller, fallback and diagnostics (1.4.3)

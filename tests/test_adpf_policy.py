@@ -70,6 +70,47 @@ class AdpfPolicy(unittest.TestCase):
             }
         ''')
 
+    def test_cpu_split_policy(self):
+        self.compile_run(r'''
+            #include "games/totk/runtime/adpf_policy.h"
+            #include <assert.h>
+            static int64_t total, cpu, gpu;
+            static unsigned reports;
+            static void start_set(void *w, int64_t n) { (void)w; assert(n > 0); }
+            static void total_set(void *w, int64_t n) { (void)w; total = n; }
+            static void cpu_set(void *w, int64_t n) { (void)w; cpu = n; }
+            static void gpu_set(void *w, int64_t n) { (void)w; gpu = n; }
+            static int report(void *s, void *w) { (void)s; (void)w; reports++; return 0; }
+            static int legacy(void *s, int64_t n) { (void)s; total = n; reports++; return 0; }
+            int main(void) {
+                const uint64_t start = 1000000000, end = start + 20000000;
+                /* 20ms wall, 5ms acquire/vsync pacing already removed = 15ms span.
+                 * A disjoint 3ms texture queue wait removes only CPU work: 12ms, not 7ms. */
+                uint64_t span = totk_adpf_span(start, end, 5000000);
+                totk_adpf_pacing waits = {0};
+                totk_adpf_pacing_add(&waits, start - 9000000, start - 1000000);
+                totk_adpf_pacing_add(&waits, start + 1000000, start + 4000000);
+                uint64_t queue = totk_adpf_pacing_in_span(&waits, start, end);
+                assert(span == 15000000 && queue == 3000000);
+                assert(totk_adpf_cpu(span, queue, 1) == 12000000);
+                assert(totk_adpf_cpu(span, queue, 0) == span);
+                assert(totk_adpf_cpu(span, span, 1) == 0);
+                assert(totk_adpf_cpu(span, UINT64_MAX, 1) == 0);
+                assert(totk_adpf_cpu(0, queue, 1) == 0);
+                totk_adpf_state s = {.session = &s};
+                totk_adpf_api api = {.report = legacy, .report2 = report, .work = &s,
+                    .set_start = start_set, .set_total = total_set, .set_cpu = cpu_set, .set_gpu = gpu_set};
+                assert(!totk_adpf_report_span(&s, &api, start, span, totk_adpf_cpu(span, queue, 1), 8000000));
+                assert(total == 15000000 && cpu == 12000000 && gpu == 8000000 && reports == 1);
+                assert(!totk_adpf_report_span(&s, &api, start, span, 0, 8000000));
+                assert(total == 15000000 && cpu == 0 && gpu == 8000000 && reports == 2);
+                assert(!totk_adpf_report_span(&s, &api, start, span, 0, 0) && reports == 2);
+                api.report2 = 0;
+                assert(!totk_adpf_report_span(&s, &api, start, span, 12000000, 8000000));
+                assert(total == 15000000 && reports == 3); /* pre-35 control unchanged */
+            }
+        ''')
+
 
 if __name__ == '__main__':
     unittest.main()

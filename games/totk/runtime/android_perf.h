@@ -15,6 +15,9 @@ void totk_perf_submit(uint64_t origin_ticks);
 int totk_perf_span(void);
 void totk_perf_pacing(uint64_t begin_ns, uint64_t end_ns);
 void totk_perf_gpu(uint64_t guest_frame, uint64_t gpu_ns);
+/* Bracket native present/texture queue waits only; begin returns 0 when CPU splitting is off. */
+uint64_t totk_perf_wait_begin(void);
+void totk_perf_wait_end(uint64_t begin_ns);
 struct ANativeWindow;
 struct ASurfaceTransaction;
 struct ASurfaceControl;
@@ -31,4 +34,6 @@ static inline void totk_perf_submit(uint64_t origin_ticks) { (void)origin_ticks;
 static inline int totk_perf_span(void) { return 0; }
 static inline void totk_perf_pacing(uint64_t begin, uint64_t end) { (void)begin; (void)end; }
 static inline void totk_perf_gpu(uint64_t frame, uint64_t gpu_ns) { (void)frame; (void)gpu_ns; }
+static inline uint64_t totk_perf_wait_begin(void) { return 0; }
+static inline void totk_perf_wait_end(uint64_t begin) { (void)begin; }
 #endif

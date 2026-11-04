@@ -3022,7 +3022,11 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // 该张上一次出图还没被出图线程处理完（显示跟不上、落后一整轮交换链）：等它归还，再交给游戏画
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t ft_texture_begin = ft_begin ? totk_ft_now() : 0;
-    if (async_replay() && *idx < 4 && g_xp_win == o) x_wait_job(g_xp_job[*idx]);   // TOTK: that image's last present has run (its ticket is set)
+    if (async_replay() && *idx < 4 && g_xp_win == o) {
+        uint64_t begin = totk_perf_wait_begin();
+        x_wait_job(g_xp_job[*idx]);   /* that image's last present has run */
+        totk_perf_wait_end(begin);
+    }
     /* The old async present must take its observation before same-texture
      * replacement. Keep the pre-wait release so only pacing, not replay or
      * texture/resource delay, is excluded from FPSauto demand. */
@@ -3030,7 +3034,11 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         runtime_android_fps_auto_begin((uintptr_t)o->tex[*idx], present_ticks(o),
             auto_release_ns, auto_release_ns - auto_pacing_begin);
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
-    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
+    if (tk) {
+        uint64_t begin = totk_perf_wait_begin(), w0 = now_ns();
+        mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0;
+        totk_perf_wait_end(begin);
+    }
     if (ft_begin) totk_ft_acquire_wait(ft_frame, ft_pace_end - ft_pace_begin,
                                        totk_ft_now() - ft_texture_begin);
     /* TOTK: the acquire sync means "this swapchain texture is no longer read by the display path". mtl_present_wait above

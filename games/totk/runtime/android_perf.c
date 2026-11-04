@@ -45,8 +45,12 @@ static totk_live_cache span_live;
 static int load_launch, load_applied;
 static totk_live_cache load_live;
 static totk_adpf_load load_history;
+static int cpu_split_launch;
+static _Atomic int cpu_split_applied;
+static totk_live_cache cpu_split_live;
 static _Atomic uint64_t frame_start, gpu_published;
 static totk_adpf_pacing span_pacing;
+static totk_adpf_pacing span_queue_wait;
 static totk_adpf_gpu_acc gpu_acc;   /* the completion thread only */
 static uint32_t gpu_seen;
 static struct { unsigned frames, spans, gpus, errors, hints, hint_errors; uint64_t span_sum, span_max, gpu_sum, gpu_max; } span_stats;
@@ -84,6 +88,7 @@ static void configure(void) {
     rate_on = is_one("TOTK_FRAME_RATE_HINT"); fps60 = is_one("TOTK_FPS60");
     span_applied = span_launch = is_one("TOTK_ADPF_GPU");
     load_applied = load_launch = is_one("TOTK_ADPF_LOAD_HINT");
+    cpu_split_applied = cpu_split_launch = is_one("TOTK_ADPF_CPU_SPLIT");
     const char *fg = getenv("TOTK_FRAMEGEN");
     framegen = fg && (!strcmp(fg, "1") || !strcmp(fg, "locked") ||
         !strcmp(fg, "interp") || !strcmp(fg, "hybrid") || !strcmp(fg, "adaptive"));
@@ -140,6 +145,9 @@ static void configure(void) {
     fprintf(stderr, "[totk-perf] TOTK_ADPF_LOAD_HINT=%d (launch, live): %s; needs TOTK_ADPF_GPU=1\n",
         load_applied, !load_applied ? "off" : api.increase ? "3 frames >105%, 500ms limit, GPU >70%" :
         "unavailable (API36 notifyWorkloadIncrease absent), no-op");
+    fprintf(stderr, "[totk-perf] TOTK_ADPF_CPU_SPLIT=%d (launch, live): %s; needs TOTK_ADPF_GPU=1\n",
+        cpu_split_launch, !cpu_split_launch ? "off" : api.work ? "CPU=span minus present/texture queue wait; total unchanged" :
+        "unavailable (no API35 report2), no-op");
     if (mode == 2 && api.manager) key_ready = !pthread_key_create(&thread_key, remove_thread);
     fprintf(stderr, "[totk-perf] ADPF mode=%s api=%d manager=%s create/report/close=%s setThreads=%s updateTarget=%s report2/AWorkDuration=%s; legacy-target=%.3fms\n",
         mode == 2 ? "full" : "legacy", android_get_device_api_level(), api.manager ? "yes" : "no",
@@ -237,6 +245,18 @@ void totk_perf_pacing(uint64_t begin, uint64_t end) {
     totk_adpf_pacing_add(&span_pacing, begin, end);
     pthread_mutex_unlock(&mu);
 }
+/* The acquire thread brackets only native present/texture queue waits, not acquire pacing. */
+uint64_t totk_perf_wait_begin(void) {
+    pthread_once(&config_once, configure);
+    return api.work && atomic_load_explicit(&cpu_split_applied, memory_order_relaxed) && span_on() ? mono_ns() : 0;
+}
+void totk_perf_wait_end(uint64_t begin) {
+    if (!begin) return;
+    uint64_t end = mono_ns();
+    pthread_mutex_lock(&mu);
+    totk_adpf_pacing_add(&span_queue_wait, begin, end);
+    pthread_mutex_unlock(&mu);
+}
 /* The completion thread, once per completed slot in submission order. */
 void totk_perf_gpu(uint64_t frame, uint64_t gpu_ns) {
     pthread_once(&config_once, configure);
@@ -245,7 +265,7 @@ void totk_perf_gpu(uint64_t frame, uint64_t gpu_ns) {
     uint64_t closed = totk_adpf_gpu_slot(&gpu_acc, frame, gpu_ns);
     if (closed) atomic_store_explicit(&gpu_published, closed, memory_order_relaxed);
 }
-static void span_report(uint64_t start, uint64_t span) {   /* mu */
+static void span_report(uint64_t start, uint64_t span, uint64_t queue_wait) {   /* mu */
     int load = totk_live_cached(&load_live, "TOTK_ADPF_LOAD_HINT", load_launch);
     if (load != load_applied) {
         load_applied = load; load_history.over = 0;
@@ -260,7 +280,8 @@ static void span_report(uint64_t start, uint64_t span) {   /* mu */
             if (result) span_stats.hint_errors++;
             else span_stats.hints++;
         }
-        unsigned changes = totk_adpf_report_span(&session, &api, start, span, gpu);
+        unsigned changes = totk_adpf_report_span(&session, &api, start, span,
+            totk_adpf_cpu(span, queue_wait, cpu_split_applied), gpu);
         span_stats.spans++; span_stats.span_sum += span;
         if (span > span_stats.span_max) span_stats.span_max = span;
         if (gpu) {
@@ -312,6 +333,15 @@ void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_i
     pthread_mutex_lock(&mu);
     uint64_t inside = totk_adpf_pacing_in_span(&span_pacing, start, end);
     span_pacing.n = 0;
+    uint64_t queue_wait = totk_adpf_pacing_in_span(&span_queue_wait, start, end);
+    span_queue_wait.n = 0;
+    int split = totk_live_cached(&cpu_split_live, "TOTK_ADPF_CPU_SPLIT", cpu_split_launch);
+    if (split != cpu_split_applied) {
+        atomic_store_explicit(&cpu_split_applied, split, memory_order_relaxed);
+        queue_wait = 0; /* first newly enabled frame has no complete queue-wait history */
+        fprintf(stderr, "[totk-perf] TOTK_ADPF_CPU_SPLIT=%d (live): %s\n", split,
+            api.work ? "CPU=span minus present/texture queue wait; total unchanged" : "unavailable, no-op");
+    }
     if (span != span_applied) {
         span_applied = span; memset(&span_stats, 0, sizeof span_stats);
         load_history.over = 0;
@@ -325,7 +355,7 @@ void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_i
     if (mode == 1) {
         if (session.count && target != session.target)
             log_changes(totk_adpf_sync(&session, &api, session.tids, session.count, target));
-        if (span) span_report(start, totk_adpf_span(start, end, inside));
+        if (span) span_report(start, totk_adpf_span(start, end, inside), queue_wait);
         pthread_mutex_unlock(&mu);
         return;
     }
@@ -357,7 +387,7 @@ void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_i
     } else if (target != session.target) {
         log_changes(totk_adpf_sync(&session, &api, session.tids, session.count, target));
     }
-    if (span) span_report(start, totk_adpf_span(start, end, inside));
+    if (span) span_report(start, totk_adpf_span(start, end, inside), queue_wait);
     else log_changes(totk_adpf_report(&session, &api, work));
     pthread_mutex_unlock(&mu);
 }

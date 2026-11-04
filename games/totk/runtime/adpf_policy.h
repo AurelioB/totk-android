@@ -124,6 +124,12 @@ static inline bool totk_adpf_load_gpu(uint64_t gpu, int64_t target) {
     return target > 0 && gpu > (uint64_t)target * 70 / 100;
 }
 
+/* The span already excludes acquire pacing. Only disjoint present/texture queue
+ * waits still inside that span leave its CPU field; never subtract pacing twice. */
+static inline uint64_t totk_adpf_cpu(uint64_t span, uint64_t queue_wait, int split) {
+    return !split ? span : queue_wait < span ? span - queue_wait : 0;
+}
+
 /* ---------- TOTK_ADPF_GPU: the frame's span and the GPU duration ----------
  * The target is 90 % of the configured frame period (16.7ms native60, else 33.3ms), capped at 33.3ms. It never
  * follows the controller's current interval: after a drop to 30 or 20fps that period as the target would ask for
@@ -183,13 +189,14 @@ static inline uint64_t totk_adpf_gpu_take(uint64_t published, uint32_t *seen) {
     *seen = id;
     return (uint32_t)published;
 }
-/* API35 reports start, total, CPU and GPU; CPU is the span the session's threads carry. Older APIs report the
- * span alone. A zero GPU field means "not measured this report". */
+/* API35 reports start, total, CPU and GPU; older APIs report the span alone.
+ * A zero GPU field means "not measured this report". */
 static inline unsigned totk_adpf_report_span(totk_adpf_state *s, const totk_adpf_api *api, uint64_t start,
-        uint64_t span, uint64_t gpu_ns) {
+        uint64_t span, uint64_t cpu_ns, uint64_t gpu_ns) {
     if (!s->session || !start || !span || span >= 250000000) return 0;
     if (!api->report2 || !api->work) return api->report(s->session, (int64_t)span) ? TOTK_ADPF_REPORT_ERROR : 0;
+    if (!cpu_ns && !gpu_ns) return 0; /* No measured CPU/GPU work: report2 rejects both fields zero. */
     api->set_start(api->work, (int64_t)start); api->set_total(api->work, (int64_t)span);
-    api->set_cpu(api->work, (int64_t)span); api->set_gpu(api->work, (int64_t)gpu_ns);
+    api->set_cpu(api->work, (int64_t)cpu_ns); api->set_gpu(api->work, (int64_t)gpu_ns);
     return api->report2(s->session, api->work) ? TOTK_ADPF_REPORT_ERROR : 0;
 }

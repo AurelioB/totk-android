@@ -89,20 +89,20 @@ static void span_policy(void) {
     totk_adpf_state state = {0}; int32_t tid = 7; unsigned before = reports;
     assert(totk_adpf_sync(&state, &api, &tid, 1, totk_adpf_span_target(1, 0)) == TOTK_ADPF_CREATED);
     assert(target_seen == 15000000);
-    assert(!totk_adpf_report_span(&state, &api, start, 15000000, 8000000));
+    assert(!totk_adpf_report_span(&state, &api, start, 15000000, 15000000, 8000000));
     assert(reports2 == 1 && w_start == (int64_t)start && w_total == 15000000 && w_cpu == 15000000 && w_gpu == 8000000);
-    assert(!totk_adpf_report_span(&state, &api, start, 14000000, 0));
+    assert(!totk_adpf_report_span(&state, &api, start, 14000000, 14000000, 0));
     assert(reports2 == 2 && w_total == 14000000 && w_gpu == 0);
-    assert(!totk_adpf_report_span(&state, &api, 0, 14000000, 0) && !totk_adpf_report_span(&state, &api, start, 0, 0));
-    assert(!totk_adpf_report_span(&state, &api, start, 250000000, 0) && reports2 == 2 && reports == before);
+    assert(!totk_adpf_report_span(&state, &api, 0, 14000000, 14000000, 0) && !totk_adpf_report_span(&state, &api, start, 0, 0, 0));
+    assert(!totk_adpf_report_span(&state, &api, start, 250000000, 250000000, 0) && reports2 == 2 && reports == before);
     refuse_report = 1;
-    assert(totk_adpf_report_span(&state, &api, start, 14000000, 0) == TOTK_ADPF_REPORT_ERROR);
+    assert(totk_adpf_report_span(&state, &api, start, 14000000, 14000000, 0) == TOTK_ADPF_REPORT_ERROR);
     refuse_report = 0;
     api.report2 = NULL; /* below API35: the span alone through reportActualWorkDuration */
-    assert(!totk_adpf_report_span(&state, &api, start, 13000000, 8000000));
+    assert(!totk_adpf_report_span(&state, &api, start, 13000000, 13000000, 8000000));
     assert(reports == before + 1 && actual == 13000000 && reports2 == 3);
     totk_adpf_close(&state, &api);
-    assert(!totk_adpf_report_span(&state, &api, start, 13000000, 0) && reports == before + 1);
+    assert(!totk_adpf_report_span(&state, &api, start, 13000000, 13000000, 0) && reports == before + 1);
 }
 static void rate_hold_policy(void) {
     /* Output rate: the game's interval in 60-Hz units, doubled while frame generation runs (real frames <= 30). */
