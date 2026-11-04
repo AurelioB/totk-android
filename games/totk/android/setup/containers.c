@@ -4,6 +4,7 @@
    hactool exist only while it runs, mode 0600 in <nobackup>/import-keys. */
 #define _GNU_SOURCE 1   /* F_SETPIPE_SZ */
 #include "setup_internal.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
