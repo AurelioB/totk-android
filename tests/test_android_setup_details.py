@@ -68,13 +68,26 @@ class SetupDetailsTests(unittest.TestCase):
         secret = '0123456789aBcDeF' * 4
         short = 'a' * 31
         (self.logs / 'hactool-romfs.log').write_text(f'log {secret} {short}\n/data/user/0/pkg/files/key\ncontent://private/item\nSecret Game.nsp')
-        report = self.report(f'App: {secret}\nResult: {secret}\n/storage/emulated/0/private\nSecret Game.nsp',
+        report = self.report(f'App: {secret}\nResult: {secret}\n/storage/emulated/0/private',
                              excluded=['Secret Game.nsp'])
         self.assertNotRegex(report, r'[0-9a-fA-F]{32,}')
         self.assertIn(short, report)
         self.assertIn('<hex>', report)
         for value in ['Secret Game.nsp', '/data/user', '/storage/', 'content://', secret]:
             self.assertNotIn(value, report)
+
+    def test_input_names_cannot_erase_structural_metadata(self):
+        (self.logs / 'hactool-romfs.log').write_text('Could not open code')
+        report = self.report('Failed stage: code\nSource romfs[1]: direct path; extension (none); bytes 16',
+                             excluded=['code', 'romfs'])
+        self.assertIn('Failed stage: code', report)
+        self.assertIn('Source romfs[1]: direct path', report)
+        self.assertIn('Could not open <input>', report)
+        message = 'Could not read file named romfs at /data/user/0/pkg/files/romfs'
+        result = subprocess.run([self.java, '-cp', str(self.classes), 'com.aure.totk.setup.SetupDetailsProbe',
+                                 'scrub', '/data/user/0/pkg/files/romfs', 'romfs'], input=message,
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout, 'Could not read file named <input> at <input>')
 
     def test_large_logs_keep_each_head_tail_and_omission_count(self):
         for name, token in [('hactool-romfs.log', 'ROMFS'), ('hactool-exefs.log', 'EXEFS'), ('shaders.log', 'SHADER')]:

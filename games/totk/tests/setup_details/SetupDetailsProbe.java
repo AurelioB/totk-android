@@ -12,6 +12,10 @@ public final class SetupDetailsProbe {
             return;
         }
         String metadata = new String(System.in.readAllBytes(), StandardCharsets.UTF_8);
+        if (args[0].equals("scrub")) {
+            System.out.print(SetupDetails.scrub(metadata, Arrays.asList(Arrays.copyOfRange(args, 1, args.length))));
+            return;
+        }
         System.out.print(SetupDetails.build(metadata, new File(args[0]), args[1],
                 Arrays.asList(Arrays.copyOfRange(args, 2, args.length))));
     }

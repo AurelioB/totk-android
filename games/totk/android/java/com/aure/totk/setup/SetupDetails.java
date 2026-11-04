@@ -32,7 +32,8 @@ final class SetupDetails {
     static String build(String metadata, File game, String stage, List<String> excluded) {
         String intro = "TotK Native setup details\n" + PRIVACY + "\n"
                 + "Share details before Resume to include the logs.\n\n";
-        intro += bounded(scrub(metadata, excluded), 8192) + "\n";
+        // Metadata contains summaries only; its result message was scrubbed before JSON encoding by the caller.
+        intro += bounded(scrub(metadata, java.util.Collections.emptyList()), 8192) + "\n";
         String[] names = "shaders".equals(stage)
                 ? new String[]{"hactool-romfs.log", "hactool-exefs.log", "shaders.log"}
                 : new String[]{"hactool-romfs.log", "hactool-exefs.log"};
@@ -87,7 +88,7 @@ final class SetupDetails {
     private static String omitted(long count) { return "\n[… " + count + " bytes omitted …]\n"; }
 
     /** All untrusted text, not just logs, is scrubbed. Do not print exception messages (they can contain paths). */
-    private static String scrub(String text, List<String> excluded) {
+    static String scrub(String text, List<String> excluded) {
         for (String value : excluded) if (value != null && !value.isEmpty()) text = text.replace(value, "<input>");
         text = URI.matcher(text).replaceAll("<uri>");
         text = PATH.matcher(text).replaceAll("<path>");

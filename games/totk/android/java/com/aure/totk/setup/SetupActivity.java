@@ -2876,7 +2876,6 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                     .append("Android: ").append(Build.VERSION.RELEASE).append(" (SDK ").append(Build.VERSION.SDK_INT).append(")\n")
                     .append("SoC: ").append(SettingsStore.soc()).append('\n')
                     .append("Failed stage: ").append(result.optString("stage", "setup")).append('\n')
-                    .append("Result JSON: ").append(result).append('\n')
                     .append("Route: ").append(picked.route).append('\n');
             StoragePaths.Kind kind = StorageLocation.kind(this);
             metadata.append("Destination: ").append(kind == StoragePaths.Kind.PRIVATE ? "private"
@@ -2899,6 +2898,9 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             }
             // Longest first so a filename cannot leave the rest of a containing path or URI behind.
             excluded.sort((a, b) -> Integer.compare(b.length(), a.length()));
+            // Scrub the message before JSON encoding, not the structural stage/code or source summaries.
+            metadata.append("Result JSON: ").append(SetupService.failure(result.optString("stage"), result.optString("code"),
+                    SetupDetails.scrub(result.optString("message"), excluded))).append('\n');
             String report = SetupDetails.build(metadata.toString(), game, result.optString("stage"), excluded);
             main.post(() -> {
                 sharingDetails = false;
