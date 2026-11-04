@@ -1911,6 +1911,12 @@ needs `su`). The folder holds what the adb-shell folder holds:
   warm-up, loading screens where the backend knows them) do not count, unless a held stage lasts 60 s. With
   `TOTK_WATCH_STALL` a stall that long ends the process with status 142 (128+SIGALRM), for unattended runs. The
   `[totk-watch] on: …` / `off` line shows the arm (`tests/test_progress_watch.py`).
+- **`TOTK_THREAD_SAMPLER=1`** (default off; live through `totk.ctl`). Names the threads behind long frames without root
+  or logcat (the Duo's logd drops our lines): a thread at nice 10 (slower CPUs) reads `/proc/self/task/*/schedstat`
+  4 times a second; each frame over 50 ms and every 300 presents log `[totk-threads] long frame F 87.3 ms, window W ms:
+  <name>(tid) run R wait Q, …` to `totk.log`: the 3 threads that ran most in the window (the frame plus at most 250 ms
+  before it) and their run-queue wait. Off, its thread never starts and the frame hook is one compare
+  (`runtime/thread_sampler.h`, `tests/test_thread_sampler.py`). Confirm a named thread with simpleperf (DEBUGGING.md).
 
 ### Live switches (`totk.ctl`)
 
@@ -1944,6 +1950,7 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_VK_SPLIT_PASS_DRAWS` | 0…1000000 | the next render pass opened | |
 | `TOTK_VK_FEEDBACK_CUT` | 0–1 | the next descriptor build | the freeze memo key carries the pass serial while it is on |
 | `TOTK_VK_PREPARE_MASK` | 0–1 | the next draw's uniform preparation | a change marks every register dirty, so that draw prepares in full; `TOTK_VK_OFF=prepare` keeps it off |
+| `TOTK_THREAD_SAMPLER` | 0–1 | the next presented frame | the first switch-on starts the sampler thread; switched off it sleeps until switched on again |
 
 `TOTK_IDEAL_CORE_FIX` is startup-only and refused. Another launch-time switch becomes live by adding it, with its
 range, to `totk_live_switches` in `runtime/live_ctl.h`, reading it through `totk_live_cached` at a point where a change

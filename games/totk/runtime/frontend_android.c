@@ -37,6 +37,7 @@
 #include "thread_place.h"
 #include "log_mirror.h"
 #include "live_ctl.h"
+#include "thread_sampler.h"
 #include "build_kind.h"
 #include <android/api-level.h>
 #include <android/choreographer.h>
@@ -1172,15 +1173,42 @@ static void log_mirror_start(void) {
    written before this start are not replayed. */
 static totk_live_reader g_live_reader;
 static char g_live_path[1100];
-void runtime_live_frame(uint64_t frame) { totk_live_frame(frame); }   /* hle_nvn.c, once per presented frame */
-static void *live_ctl_thread(void *arg) {
-    (void)arg; totk_thread_start("totk-ctl", NULL);
-    errno = 0; int nice_error = setpriority(PRIO_PROCESS, 0, 10) ? errno : 0;
+/* Nice 10 on the slower CPUs, when the device has them: the background threads below. Returns the CPU decision. */
+static const char *background_place(int *nice_error) {
+    errno = 0; *nice_error = setpriority(PRIO_PROCESS, 0, 10) ? errno : 0;
     cpu_set_t allowed, slow; unsigned capacity[CPU_SETSIZE]; const char *source, *decision = "unchanged";
     if (!sched_getaffinity(0, sizeof allowed, &allowed)) {
         totk_thread_background_select("/sys/devices/system/cpu", &allowed, &slow, capacity, &source, &decision);
         if (!CPU_EQUAL(&slow, &allowed) && sched_setaffinity(0, sizeof slow, &slow)) decision = "unchanged (setaffinity failed)";
     }
+    return decision;
+}
+/* Thread sampler (thread_sampler.h): TOTK_THREAD_SAMPLER=1 (default off, live through totk.ctl) names the threads that
+   ran most in each long frame and every 300 presents, in totk.log. The present path starts its thread at the first
+   frame with the switch on; with it off the frame hook is one compare. */
+static totk_sampler g_sampler;
+static int g_sampler_launch;
+static totk_live_cache g_sampler_live;
+static void sampler_thread_init(void) {
+    totk_thread_start("totk-tsample", NULL);
+    int nice_error; const char *decision = background_place(&nice_error);
+    fprintf(stderr, "[totk-threads] sampler thread nice=%d%s cpus=%s\n", getpriority(PRIO_PROCESS, 0),
+            nice_error ? " (setpriority failed)" : "", decision);
+}
+static void thread_sampler_start(void) {   /* after totk.env: the launch value */
+    const char *e = getenv("TOTK_THREAD_SAMPLER"); g_sampler_launch = e && atoi(e) == 1;
+    g_sampler.thread_init = sampler_thread_init;
+    fprintf(stderr, "[totk-threads] TOTK_THREAD_SAMPLER=%d: %s\n", g_sampler_launch, g_sampler_launch ?
+            "long frames (over 50 ms) and every 300 presents name the 3 threads that ran most, from /proc/self/task" :
+            "off (default; live through totk.ctl)");
+}
+void runtime_live_frame(uint64_t frame) {   /* hle_nvn.c, once per presented frame */
+    totk_live_frame(frame);
+    totk_sampler_frame(&g_sampler, frame, totk_live_cached(&g_sampler_live, "TOTK_THREAD_SAMPLER", g_sampler_launch));
+}
+static void *live_ctl_thread(void *arg) {
+    (void)arg; totk_thread_start("totk-ctl", NULL);
+    int nice_error; const char *decision = background_place(&nice_error);
     fprintf(stderr, "[totk-ctl] following %s (set KEY=VALUE, unset KEY, mark <text>; applied at the next presented frame), nice=%d%s cpus=%s\n",
             g_live_path, getpriority(PRIO_PROCESS, 0), nice_error ? " (setpriority failed)" : "", decision);
     live_ctl_run(&g_live_reader);
@@ -1551,6 +1579,7 @@ static int start_game(const ANativeActivity *a) {
     android_driver_env_policy(); /* freeze driver options before any app worker or driver call */
     log_mirror_start();   /* TOTK_LOGCAT is final now */
     live_ctl_start();     /* after totk.env: its values are the launch values a live "unset" returns to */
+    thread_sampler_start();
     totk_thread_game_startup();   /* snapshot the allowed CPUs before any guest narrows its affinity */
     setenv("TOTK_INPUT_FILE_NEW", "1", 0);   /* the command file outlives runs: read newly appended commands only */
     char version[256];
