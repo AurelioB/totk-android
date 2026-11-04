@@ -32,6 +32,7 @@
 #include "../../runtime/frame_fence.h"
 #include "../../runtime/present_predict.h"
 #include "../../runtime/fps_auto_runtime.h"
+#include "../../runtime/android_perf.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -2083,6 +2084,7 @@ static void *completion_thread(void *arg) {
             }
         }
         if (framegen) vk_fg_gpu_sample(s->value,framegen_ms,framegen_valid);
+        totk_perf_gpu(s->guest_frame, gpu_ns);   /* TOTK_ADPF_GPU: per guest frame, in completion order */
         /* The guard cursor publishes its fence observation under g_mu before we can reach this slot.
            Report before CPU post ops: their completion is not GPU finish. gpu_ns covers main buffers, not pre. */
         if (s->ft_frame && totk_ft_on()) totk_ft_slot_gpu(s->ft_frame, s->value, s->ft_gpu_done, gpu_ns);

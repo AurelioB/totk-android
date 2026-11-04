@@ -14,6 +14,96 @@ static void close_session(void *s) { assert(s == &marker); closes++; }
 static int update(void *s, int64_t target) { assert(s == &marker); updates++; target_seen = target; return refuse_update; }
 static int set_threads(void *s, const int32_t *tids, size_t n) { assert(s == &marker && tids[0] > 0 && n); sets++; return refuse_set; }
 static int report(void *s, int64_t ns) { assert(s == &marker); reports++; actual = ns; return refuse_report; }
+/* API35 AWorkDuration fake: one object, its four fields, and reportActualWorkDuration2. */
+static int work_object;
+static int64_t w_start, w_total, w_cpu, w_gpu;
+static unsigned reports2;
+static void set_start(void *w, int64_t v) { assert(w == &work_object); w_start = v; }
+static void set_total(void *w, int64_t v) { assert(w == &work_object); w_total = v; }
+static void set_cpu(void *w, int64_t v) { assert(w == &work_object); w_cpu = v; }
+static void set_gpu(void *w, int64_t v) { assert(w == &work_object); w_gpu = v; }
+static int report2(void *s, void *w) {
+    assert(s == &marker && w == &work_object);
+    assert(w_start > 0 && w_total > 0 && w_cpu >= 0 && w_gpu >= 0 && (w_cpu || w_gpu)); /* the platform's EINVAL rules */
+    reports2++; return refuse_report;
+}
+static void span_policy(void) {
+    /* Target: 90 % of the configured period, capped at 33.3ms; the controller's current interval is not an input,
+     * so a drop to 30 or 20fps (period 33.3/50ms) cannot lower the clocks that would bring it back. */
+    assert(totk_adpf_span_target(1, 0) == 15000000);
+    assert(totk_adpf_span_target(0, 0) == 29999999);
+    assert(totk_adpf_span_target(1, 1) == 29999999); /* framegen: real frames at 30 */
+    assert(totk_adpf_target(50000000, 0, 0) == 33333333 && totk_adpf_span_target(0, 0) < 33333333);
+    /* Span, not period: a 33.3ms present interval whose frame started 20ms before the present, with 5ms of
+     * pacing inside, reports 15ms. The old work measure (interval minus pacing) would say 28.3ms. */
+    const uint64_t present = 1000000000, start = present - 20000000;
+    /* The start: the game's frame origin when it is plausible, else the first submit. */
+    assert(totk_adpf_frame_start(start, start + 4000000) == start);
+    assert(totk_adpf_frame_start(0, start) == start);
+    assert(totk_adpf_frame_start(start + 1, start) == start); /* origin in the future: another clock */
+    assert(totk_adpf_frame_start(start - 250000000, start) == start); /* stale origin (paused/loading) */
+    /* Pacing: the acquire comes before the first submit, so waits are kept and clipped at the present. */
+    totk_adpf_pacing waits = {0};
+    totk_adpf_pacing_add(&waits, start - 9000000, start - 1000000); /* before the frame: not in the span */
+    totk_adpf_pacing_add(&waits, start + 2000000, start + 2000000); /* empty: dropped */
+    totk_adpf_pacing_add(&waits, start + 2000000, start + 6000000);
+    assert(waits.n == 2 && totk_adpf_pacing_in_span(&waits, start, present) == 4000000);
+    totk_adpf_pacing_add(&waits, start - 3000000, start + 1000000); /* straddles the start: 1ms inside */
+    assert(totk_adpf_pacing_in_span(&waits, start, present) == 5000000);
+    assert(totk_adpf_pacing_in_span(&waits, 0, present) == 0); /* no frame start: no span */
+    totk_adpf_pacing_add(&waits, present - 1000000, present + 4000000); /* clipped at the present */
+    assert(waits.n == TOTK_ADPF_PACING && totk_adpf_pacing_in_span(&waits, start, present) == 6000000);
+    totk_adpf_pacing_add(&waits, present + 5000000, present + 6000000); /* full: the last wait grows, no overflow */
+    assert(waits.n == TOTK_ADPF_PACING && waits.end[TOTK_ADPF_PACING - 1] == present + 6000000);
+    uint64_t pacing = 5000000;
+    assert(totk_adpf_span(start, present, pacing) == 15000000);
+    assert(totk_adpf_work(present - 33333333, present, pacing) == 28333333);
+    assert(totk_adpf_span(0, present, 0) == 0 && totk_adpf_span(present, present, 0) == 0);
+    assert(totk_adpf_span(start, present, 20000000) == 0); /* all pacing */
+    assert(totk_adpf_span(present - 250000000, present, 0) == 0 && totk_adpf_span(present - 249999999, present, 0) == 249999999);
+    /* Once-only GPU: frames close in completion order when a later frame's first slot completes. */
+    totk_adpf_gpu_acc acc = {0}; uint32_t seen = 0; uint64_t published = 0;
+    assert(!totk_adpf_gpu_slot(&acc, 5, 9000000)); /* first seen mid-frame: incomplete */
+    assert(!totk_adpf_gpu_slot(&acc, 0, 1000000));
+    assert(!totk_adpf_gpu_take(published, &seen));
+    assert(!totk_adpf_gpu_slot(&acc, 6, 3000000)); /* frame 5 is never published */
+    assert(!totk_adpf_gpu_slot(&acc, 0, 1000000)); /* backend work joins the open frame */
+    assert(!totk_adpf_gpu_slot(&acc, 6, 4000000));
+    published = totk_adpf_gpu_slot(&acc, 7, 2000000);
+    assert(published == ((uint64_t)6 << 32 | 8000000));
+    assert(totk_adpf_gpu_take(published, &seen) == 8000000 && seen == 6);
+    for (int i = 0; i < 3; i++) assert(!totk_adpf_gpu_take(published, &seen)); /* reported once */
+    published = totk_adpf_gpu_slot(&acc, 9, 1000000); /* frame 8 had no slot */
+    assert(published == ((uint64_t)7 << 32 | 2000000));
+    assert(!totk_adpf_gpu_slot(&acc, 9, 250000000));
+    assert(!totk_adpf_gpu_slot(&acc, 10, 0)); /* a >=250ms frame (loading) is not published */
+    assert(!totk_adpf_gpu_slot(&acc, 11, 1)); /* nor one without GPU time (no timestamps) */
+    assert(totk_adpf_gpu_slot(&acc, 12, 0) == ((uint64_t)11 << 32 | 1));
+    assert(totk_adpf_gpu_take(published, &seen) == 2000000 && !totk_adpf_gpu_take(published, &seen));
+    acc = (totk_adpf_gpu_acc){0}; /* a reset (switch off/on) */
+    assert(!totk_adpf_gpu_slot(&acc, 12, 5000000) && !totk_adpf_gpu_slot(&acc, 13, 5000000));
+    assert(totk_adpf_gpu_slot(&acc, 14, 1) == ((uint64_t)13 << 32 | 5000000));
+    /* Reporting: API35 gets start, total = CPU = span and the GPU field; GPU 0 means not measured. */
+    totk_adpf_api api = {.manager=&marker, .create=create, .update=update, .report=report, .close=close_session,
+        .report2=report2, .set_start=set_start, .set_total=set_total, .set_cpu=set_cpu, .set_gpu=set_gpu, .work=&work_object};
+    totk_adpf_state state = {0}; int32_t tid = 7; unsigned before = reports;
+    assert(totk_adpf_sync(&state, &api, &tid, 1, totk_adpf_span_target(1, 0)) == TOTK_ADPF_CREATED);
+    assert(target_seen == 15000000);
+    assert(!totk_adpf_report_span(&state, &api, start, 15000000, 8000000));
+    assert(reports2 == 1 && w_start == (int64_t)start && w_total == 15000000 && w_cpu == 15000000 && w_gpu == 8000000);
+    assert(!totk_adpf_report_span(&state, &api, start, 14000000, 0));
+    assert(reports2 == 2 && w_total == 14000000 && w_gpu == 0);
+    assert(!totk_adpf_report_span(&state, &api, 0, 14000000, 0) && !totk_adpf_report_span(&state, &api, start, 0, 0));
+    assert(!totk_adpf_report_span(&state, &api, start, 250000000, 0) && reports2 == 2 && reports == before);
+    refuse_report = 1;
+    assert(totk_adpf_report_span(&state, &api, start, 14000000, 0) == TOTK_ADPF_REPORT_ERROR);
+    refuse_report = 0;
+    api.report2 = NULL; /* below API35: the span alone through reportActualWorkDuration */
+    assert(!totk_adpf_report_span(&state, &api, start, 13000000, 8000000));
+    assert(reports == before + 1 && actual == 13000000 && reports2 == 3);
+    totk_adpf_close(&state, &api);
+    assert(!totk_adpf_report_span(&state, &api, start, 13000000, 0) && reports == before + 1);
+}
 int main(void) {
     assert(totk_adpf_target(16666667, 0, 0) == 33333333);
     assert(totk_adpf_target(33333333, 0, 1) == 33333333);
@@ -69,6 +159,7 @@ int main(void) {
     state = (totk_adpf_state){0}; api.manager = NULL;
     assert(totk_adpf_sync(&state, &api, tids, 1, 33333333) == TOTK_ADPF_REFUSED);
     assert(!totk_adpf_report(&state, &api, 22000000));
-    puts("ADPF policy: durations, lattice, fake API lifecycle, failures and steady-state passed");
+    span_policy();
+    puts("ADPF policy: durations, lattice, fake API lifecycle, failures and steady-state passed; span target, span vs period, once-only GPU");
     return 0;
 }

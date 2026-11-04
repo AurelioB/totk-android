@@ -2514,6 +2514,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
 #if defined(TOTK_GAME_V143)
     if (g_game_sys) origin_ticks = *(const volatile uint64_t *)(uintptr_t)(g_game_sys + 0xe0);
 #endif
+    totk_perf_submit(origin_ticks);   /* TOTK_ADPF_GPU: the first submit after a present fixes the frame's start */
     uint64_t ft_begin = 0, ft_cpu = 0, ft_frame = 0;
     if (totk_ft_on()) {
         runtime_frame_timeline_walking();
@@ -2972,8 +2973,8 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // Vsync blocks here (real-device NVN: when all textures in the swapchain are waiting for display, wait for the next one to be released), not in present -- the game often calls present while holding a lock
     uint64_t at = 0, wait = 0;
     int fixed_clock = 0, credit_clock = 0;
-    int adpf_full = totk_perf_full();
-    uint64_t ft_pace_begin = ft_begin || adpf_full ? totk_ft_now() : 0;
+    int adpf_pacing = totk_perf_full() || totk_perf_span();
+    uint64_t ft_pace_begin = ft_begin || adpf_pacing ? totk_ft_now() : 0;
     if (!dm_detclock_enabled()) {   // 取图线程登记为时间约束线程（不再只在「来早了」时才登记：热态一直落后时也要声明） | Register the acquire thread as a time-constraint thread (no longer registered only when it "arrived early": it must also declare itself when it is constantly behind in the hot state)
         static uint64_t rt_period; uint64_t period = present_period(o);
         fixed_clock = acquire_clock_on();
@@ -3011,7 +3012,10 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (pace) { if (last && now_ns() < last + step) sleep_until_ns(last + step); last = now_ns(); }
     }
     uint64_t ft_pace_end = ft_pace_begin ? totk_ft_now() : 0;
-    if (adpf_full && ft_pace_end > ft_pace_begin) g_adpf_pacing_ns += ft_pace_end - ft_pace_begin;
+    if (adpf_pacing && ft_pace_end > ft_pace_begin) {
+        g_adpf_pacing_ns += ft_pace_end - ft_pace_begin;
+        totk_perf_pacing(ft_pace_begin, ft_pace_end);
+    }
     uint64_t auto_release_ns = auto_pacing_begin ? now_ns() : 0;
     g_acq_wait_ns += wait;
     trow(g_frame, "@late_ms", !fixed_clock && !credit_clock && wait ? (now_ns() - at) / 1e6 : 0);   /* Callback/credit pacing has no synthetic deadline-lateness metric. */

@@ -1956,6 +1956,7 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_VK_REC_WAKE_BATCH` | 0…2000 | the next chunk enqueue, and the next time a recorder worker finds no work | a worker already polling finishes its current poll; mixed old/new reads during the change only cost a wake or a moment of parallelism, never a queued batch |
 | `TOTK_VK_TEX_MEMO` | 0–1 | the next texture ID lookup and texture registration | memo entries stay keyed by the registry/identity/submission state, so switching back on never reuses a stale one |
 | `TOTK_NVN_CALL_NOCOPY` | 0–1 | the next CallCommands / CopyCommands | a recording already holding call markers still expands them at its EndRecording |
+| `TOTK_ADPF_GPU` | 0–1 | the next presented frame | that frame is not reported; the session's target switches with it; no effect with `TOTK_ADPF=0` |
 
 `TOTK_IDEAL_CORE_FIX` is startup-only and refused. Another launch-time switch becomes live by adding it, with its
 range, to `totk_live_switches` in `runtime/live_ctl.h`, reading it through `totk_live_cached` at a point where a change
@@ -3839,6 +3840,7 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 | `TOTK_ADPF` | Existing render-only session (unset/`legacy`) | `0` disables all CPU hints; `full` opts into the bounded critical-thread group, profile-derived targets and wait-stripped work reporting. |
 | `TOTK_ADPF_TARGET_MS` | `33.3` | Existing render-only target override; nonpositive disables the legacy session. Retained for existing profiles; ignored by `TOTK_ADPF=full`. |
 | `TOTK_FRAME_RATE_HINT` | `0` | `1` requests FIXED_SOURCE content cadence through the window and zero-copy SurfaceControl. It is only a request, never evidence of a panel-mode change. |
+| `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
 
 ### Android performance hints (experimental full mode)
 
@@ -3875,6 +3877,18 @@ Device comparison arms are unchanged default / `TOTK_ADPF=0` /
 `TOTK_ADPF=full` / `TOTK_ADPF=full TOTK_FRAME_RATE_HINT=1`, interleaved on the same
 profile, save, shader seed and cache state. Do not flip the full-mode default without
 per-layer SurfaceFlinger cadence plus performance, power and temperature evidence.
+
+`TOTK_ADPF_GPU=1` (default off; live through `totk.ctl`, applied at the next presented frame, which is not reported)
+changes what the existing session (legacy or full) reports. The span runs from the game's own CPU frame origin, read at
+the frame's first submit (the first submit itself when the origin is unusable), to its present, less the acquire pacing
+inside it, so a frame reads short or long whatever the present interval was. The target is 90 % of the configured
+period and never the controller's current one, so a drop to 30 or 20fps cannot ask for the clocks that keep it there.
+On API 35+ `APerformanceHint_reportActualWorkDuration2` and `AWorkDuration_*` are looked up at run time (the build's
+API level has none of them) and carry start, total, CPU (= span) and the GPU time of the newest frame whose slots all
+completed, each frame once (0 otherwise); below 35 the span alone goes through `reportActualWorkDuration`. Logs:
+`[totk-perf] TOTK_ADPF_GPU=N (launch|live): ...; target T` and every 300 frames `[totk-perf] ADPF span: ...`
+(reported spans, GPU durations, target). Measure on the Odin 3 with in-session ABBA: fps and the sampler's GPU clock
+residency per arm (the GPU sits at its 660 MHz floor 95 % of the time with it off).
 
 ### FPS60 controller, fallback and diagnostics (1.4.3)
 

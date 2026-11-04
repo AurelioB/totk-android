@@ -12,6 +12,11 @@ typedef struct {
     int (*report)(void *, int64_t);
     int (*set_threads)(void *, const int32_t *, size_t);
     void (*close)(void *);
+    /* API35 (TOTK_ADPF_GPU): one AWorkDuration, created once and reused for every report. */
+    int (*report2)(void *, void *);
+    void (*set_start)(void *, int64_t), (*set_total)(void *, int64_t);
+    void (*set_cpu)(void *, int64_t), (*set_gpu)(void *, int64_t);
+    void *work;
 } totk_adpf_api;
 typedef struct {
     void *session;
@@ -71,4 +76,74 @@ static inline unsigned totk_adpf_sync(totk_adpf_state *s, const totk_adpf_api *a
 static inline unsigned totk_adpf_report(totk_adpf_state *s, const totk_adpf_api *api, uint64_t ns) {
     if (!s->session || !ns || ns >= 250000000) return 0;
     return api->report(s->session, (int64_t)ns) ? TOTK_ADPF_REPORT_ERROR : 0;
+}
+
+/* ---------- TOTK_ADPF_GPU: the frame's span and the GPU duration ----------
+ * The target is 90 % of the configured frame period (16.7ms native60, else 33.3ms), capped at 33.3ms. It never
+ * follows the controller's current interval: after a drop to 30 or 20fps that period as the target would ask for
+ * clocks that keep the frame that slow. */
+static inline int64_t totk_adpf_span_target(int fps60, int framegen) {
+    int64_t period = !framegen && fps60 ? 16666667 : 33333333, target = period * 9 / 10;
+    return target < 33333333 ? target : 33333333;
+}
+/* From the frame's start to its present, less the pacing waits inside it. Never the present interval:
+ * that is the period whatever the work took, so every frame would read "on target". */
+static inline uint64_t totk_adpf_span(uint64_t start, uint64_t present, uint64_t pacing) {
+    if (!start || present <= start || pacing >= present - start) return 0;
+    uint64_t span = present - start - pacing;
+    return span < 250000000 ? span : 0; /* background/loading discontinuity */
+}
+/* The frame starts at the game's own CPU frame origin (its controller measures completed work from there), read at
+ * the frame's first submit; without a usable origin (other versions, a deterministic clock) at that submit. */
+static inline uint64_t totk_adpf_frame_start(uint64_t origin_ns, uint64_t now) {
+    return origin_ns && origin_ns <= now && now - origin_ns < 250000000 ? origin_ns : now;
+}
+/* The acquire pacing waits since the previous present. The start is known only at the frame's first submit, which
+ * comes after the acquire, so the waits are kept and clipped to the span at the present. */
+enum { TOTK_ADPF_PACING = 4 };
+typedef struct { uint64_t begin[TOTK_ADPF_PACING], end[TOTK_ADPF_PACING]; unsigned n; } totk_adpf_pacing;
+static inline void totk_adpf_pacing_add(totk_adpf_pacing *p, uint64_t begin, uint64_t end) {
+    if (end <= begin) return;
+    if (p->n == TOTK_ADPF_PACING) { p->end[p->n - 1] = end; return; }   /* more waits: the last one grows */
+    p->begin[p->n] = begin; p->end[p->n] = end; p->n++;
+}
+static inline uint64_t totk_adpf_pacing_in_span(const totk_adpf_pacing *p, uint64_t start, uint64_t present) {
+    uint64_t n = 0;
+    for (unsigned i = 0; start && i < p->n; i++) {
+        uint64_t begin = p->begin[i] > start ? p->begin[i] : start, end = p->end[i] < present ? p->end[i] : present;
+        if (end > begin) n += end - begin;
+    }
+    return n;
+}
+/* GPU busy time per guest frame, fed in completion order by the one completion thread. A frame closes when the
+ * first slot of a later frame completes; slots of no guest frame (backend work) join the open frame. A frame first
+ * seen mid-way (after a reset) is incomplete and never published. Returns 0, or the closed frame packed as
+ * (frame id << 32 | GPU ns) for a single atomic publication. */
+typedef struct { uint64_t frame, gpu_ns; int whole; } totk_adpf_gpu_acc;
+static inline uint64_t totk_adpf_gpu_slot(totk_adpf_gpu_acc *a, uint64_t frame, uint64_t gpu_ns) {
+    uint64_t closed = 0;
+    if (frame > a->frame) {
+        if (a->frame && a->whole && a->gpu_ns && a->gpu_ns < 250000000)
+            closed = (uint64_t)((uint32_t)a->frame ? (uint32_t)a->frame : 1u) << 32 | a->gpu_ns;
+        a->whole = a->frame != 0; a->frame = frame; a->gpu_ns = 0;
+    }
+    if (a->frame) a->gpu_ns += gpu_ns;
+    return closed;
+}
+/* The newest completed frame's GPU ns, once: 0 when it was already reported (or none completed). */
+static inline uint64_t totk_adpf_gpu_take(uint64_t published, uint32_t *seen) {
+    uint32_t id = (uint32_t)(published >> 32);
+    if (!id || id == *seen) return 0;
+    *seen = id;
+    return (uint32_t)published;
+}
+/* API35 reports start, total, CPU and GPU; CPU is the span the session's threads carry. Older APIs report the
+ * span alone. A zero GPU field means "not measured this report". */
+static inline unsigned totk_adpf_report_span(totk_adpf_state *s, const totk_adpf_api *api, uint64_t start,
+        uint64_t span, uint64_t gpu_ns) {
+    if (!s->session || !start || !span || span >= 250000000) return 0;
+    if (!api->report2 || !api->work) return api->report(s->session, (int64_t)span) ? TOTK_ADPF_REPORT_ERROR : 0;
+    api->set_start(api->work, (int64_t)start); api->set_total(api->work, (int64_t)span);
+    api->set_cpu(api->work, (int64_t)span); api->set_gpu(api->work, (int64_t)gpu_ns);
+    return api->report2(s->session, api->work) ? TOTK_ADPF_REPORT_ERROR : 0;
 }
