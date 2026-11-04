@@ -1571,6 +1571,7 @@ static int32_t g_axes[4];
 static int g_pad_seen;
 static overlay_chord g_chord;   /* Minus + R live overlay shortcut (overlay_chord.h); under g_pad_mu */
 static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec; }
+static int64_t game_input_after_ns; /* UI-owned: do not replay queued events or a return-to-game button held across resume */
 static void pad_key_locked(int bit, int down) {
     if (down) { if (!(g_keys >> bit & 1)) g_edges |= 1ull << bit; g_keys |= 1ull << bit; }
     else g_keys &= ~(1ull << bit);
@@ -1621,6 +1622,9 @@ static void chord_trace(unsigned button, unsigned action, unsigned r, unsigned s
 static int handle_input(AInputEvent *ev) {
     if (runtime_android_game_paused()) return 1;
     int type = AInputEvent_getType(ev), src = AInputEvent_getSource(ev);
+    if (type == AINPUT_EVENT_TYPE_KEY &&
+            (AKeyEvent_getEventTime(ev) < game_input_after_ns || AKeyEvent_getDownTime(ev) < game_input_after_ns)) return 1;
+    if (type == AINPUT_EVENT_TYPE_MOTION && AMotionEvent_getEventTime(ev) < game_input_after_ns) return 1;
     int pad = (src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK || (src & AINPUT_SOURCE_DPAD) == AINPUT_SOURCE_DPAD;
     if (type == AINPUT_EVENT_TYPE_KEY) {
         int code = AKeyEvent_getKeyCode(ev), act = AKeyEvent_getAction(ev);
@@ -2180,6 +2184,7 @@ static int game_activity_paused, game_focus_paused;
 static void android_game_pause_update(void) {
     int paused = game_activity_paused || game_focus_paused;
     if (paused == runtime_android_game_paused()) return;
+    game_input_after_ns = (int64_t)mono_ns();
     android_game_pause_set(&game_pause, paused);
     runtime_audio_output_pause(paused);
     runtime_input_clear();
@@ -2201,6 +2206,7 @@ static void on_pause(ANativeActivity *a) { (void)a; android_game_lifecycle_pause
 static void on_stop(ANativeActivity *a) { (void)a; android_game_lifecycle_pause(1); }
 static void on_resume(ANativeActivity *a) {
     (void)a;
+    game_input_after_ns = (int64_t)mono_ns();
     android_game_lifecycle_pause(0);
     /* The focus facet may still hold the gate until the window regains focus. */
     vk_window_resized(g_window, g_window_epoch);
