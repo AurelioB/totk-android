@@ -124,9 +124,16 @@ final class InstallState {
         return total;
     }
 
+    /** Busy/error decisions are operational warnings, not optional INFO chatter. Include effective levels so a plain
+     * `logcat -s TotkSetup` capture can diagnose a device/property filter rather than silently losing the branch. */
+    static void logGameDecision(String message) {
+        android.util.Log.w("TotkSetup", message + " logInfoEnabled=" + android.util.Log.isLoggable("TotkSetup", android.util.Log.INFO)
+                + " logWarnEnabled=" + android.util.Log.isLoggable("TotkSetup", android.util.Log.WARN));
+    }
+
     /** Only an acquired game lock or a live start handshake proves the game is running, not a cached default process. */
     static GameLock.Result gameState(Context context) {
-        GameLock.logger = message -> android.util.Log.i("TotkSetup", message);
+        GameLock.logger = InstallState::logGameDecision;
         ActivityManager manager = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
         boolean alive = false;
         StringBuilder processes = new StringBuilder();
@@ -139,7 +146,7 @@ final class InstallState {
             }
         GameLock.Result result = GameLock.check(context.getFilesDir(), alive);
         if (result.state != GameLock.State.FREE)
-            android.util.Log.i("TotkSetup", "game decision=" + result.state + " checkerPid=" + android.os.Process.myPid()
+            logGameDecision("game decision=" + result.state + " checkerPid=" + android.os.Process.myPid()
                     + (alive ? processes : " defaultProcess=absent") + " " + result.reason);
         return result;
     }

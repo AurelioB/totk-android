@@ -1670,12 +1670,12 @@ void runtime_gamepad_read(RuntimeGamepadState *out) {
     out->connected = g_pad_seen;
     pthread_mutex_unlock(&g_pad_mu);
 }
-void runtime_front_request_close(void) {
+int runtime_front_request_close(void) {
     if (!runtime_fs_begin_close()) {
-        __android_log_print(ANDROID_LOG_INFO, "TotkSetup", "close game: pid=%d save=busy; native exit refused", getpid());
-        return;
+        __android_log_print(ANDROID_LOG_WARN, "TotkSetup", "close game: pid=%d save=busy; native exit refused", getpid());
+        return 0;
     }
-    __android_log_print(ANDROID_LOG_INFO, "TotkSetup", "close game: pid=%d save=idle; native pipeline-cache flush and exit", getpid());
+    __android_log_print(ANDROID_LOG_WARN, "TotkSetup", "close game: pid=%d save=idle; native pipeline-cache flush and exit", getpid());
     fprintf(stderr, "[totk] close requested: flushing pipeline cache and exiting\n"); vk_pcache_shutdown(); _exit(0);
 }
 /* One stat per 500 ms on this non-render thread; no activity launch, task-affinity changes or frame-loop I/O. */
@@ -1687,7 +1687,7 @@ static void *android_close_requests(void *arg) {
     }
     for (;;) {
         int result = android_close_poll(&paths, runtime_front_request_close);
-        if (result) __android_log_print(result < 0 ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "TotkSetup",
+        if (result) __android_log_print(ANDROID_LOG_WARN, "TotkSetup",
                 "close game: pid=%d request=%s errno=%d (%s)", getpid(), result < 0 ? "I/O-error" : "saving-refused",
                 result < 0 ? errno : 0, result < 0 ? strerror(errno) : "save in progress");
         struct timespec pause = {0, 500 * 1000000L};

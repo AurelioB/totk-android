@@ -173,22 +173,32 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private long closeDeadline, closeStartedAt, gameCheckedAt;
     private String closeId = "";
     private TextView gameNotice;
+    private boolean started, uiStarted;
     private Widgets.Action closeGameAction;
 
-    /** Keep disabled actions focusable: selecting a row then Close the game retries precisely that operation. */
+    /** Gated controls remain focusable on handhelds; activation records the intended retry, never the mutation. */
     private void gameControl(View view, String need, Runnable retry) {
-        gameControls.add(view);
-        if (gameState.free()) return;
-        if (view instanceof Widgets.Row && ((Widgets.Row) view).dimmed()) return;
-        if (!view.isEnabled()) return;
-        View.OnFocusChangeListener previous = view.getOnFocusChangeListener();
-        view.setOnFocusChangeListener((v, has) -> {
-            if (previous != null) previous.onFocusChange(v, has);
-            if (has) { blockedAction = retry; blockedNeed = need; updateGameNotice(); }
-        });
+        if (gameState.free()) {
+            if (gameControls.contains(view)) {
+                if (view instanceof Widgets.Row) ((Widgets.Row) view).dimmed(false);
+                else view.setAlpha(1);
+            }
+            return;
+        }
+        if (!gameControls.contains(view)) {
+            if (view instanceof Widgets.Row && ((Widgets.Row) view).dimmed() || !view.isEnabled()) return;
+            gameControls.add(view);
+            View.OnFocusChangeListener previous = view.getOnFocusChangeListener();
+            view.setOnFocusChangeListener((v, has) -> {
+                if (previous != null) previous.onFocusChange(v, has);
+                if (has && !gameState.free()) { blockedAction = retry; blockedNeed = need; updateGameNotice(); }
+            });
+            view.setOnClickListener(v -> {
+                if (!closingGame && needGameClosed(need, retry)) retry.run();
+            });
+        }
         if (view instanceof Widgets.Row) ((Widgets.Row) view).dimmed(true);
         else view.setAlpha(.42f);
-        view.setEnabled(false);
     }
     private boolean needGameClosed(String need, Runnable retry) {
         gameState = InstallState.gameState(this);
@@ -206,7 +216,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         closeGameAction = new Widgets.Action(this, Strings.CLOSE_GAME, false, v -> closeGame());
         closeGameAction.setTag("close-game");
         board.put(closeGameAction, 1840, 930, Widgets.Board.WRAP, Widgets.Board.WRAP, Widgets.Board.END, Widgets.Board.START);
-        if (blockedAction == null && screen == Screen.FILES) { blockedAction = () -> startSetup(null); blockedNeed = "Installing"; }
+        if (blockedAction == null && screen == Screen.FILES) { blockedAction = () -> requestNotificationsThen(() -> startSetup(null)); blockedNeed = "Installing"; }
         updateGameNotice();
     }
     private void updateGameNotice() {
@@ -240,6 +250,16 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         @Override public void run() {
             if (isDestroyed()) return;
             GameLock.Result state = InstallState.gameState(SetupActivity.this);
+            if (state.free()) {
+                try { GameLock.clearClose(getFilesDir(), closeId); }
+                catch (IOException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
+                Runnable retry = blockedAction;
+                closingGame = false; blockedAction = null; gameState = state;
+                render();
+                if (retry != null) retry.run();
+                return;
+            }
+            if (state.state == GameLock.State.ERROR) { closeFailed(Strings.gameLockError(state.reason)); return; }
             boolean saving;
             try {
                 java.nio.file.Files.readAttributes(new File(getFilesDir(), "state/save-busy").toPath(), java.nio.file.attribute.BasicFileAttributes.class);
@@ -251,16 +271,6 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 if (response.equals("saving")) { GameLock.clearClose(getFilesDir(), closeId); closeSent = false; saving = true; }
                 else if (response.startsWith("error:")) { closeFailed(Strings.gameLockError(response)); return; }
             } catch (IOException | SecurityException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
-            if (!saving && state.free()) {
-                try { GameLock.clearClose(getFilesDir(), closeId); }
-                catch (IOException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
-                Runnable retry = blockedAction;
-                closingGame = false; blockedAction = null; gameState = state;
-                render();
-                if (retry != null) retry.run();
-                return;
-            }
-            if (state.state == GameLock.State.ERROR) { closeFailed(Strings.gameLockError(state.reason)); return; }
             if (SystemClock.uptimeMillis() >= closeDeadline) { closeFailed(saving ? Strings.SAVE_WAIT_TIMEOUT : Strings.CLOSE_GAME_TIMEOUT); return; }
             if (!saving && !closeSent) {
                 try {
@@ -318,7 +328,13 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     @Override protected void onStart() {
         super.onStart();
-        if (!ui) return;
+        started = true;
+        startUi();
+    }
+    /** showUi can finish after onStart (a save-folder conflict while skipping the menu). Register exactly once. */
+    private void startUi() {
+        if (!started || !ui || uiStarted) return;
+        uiStarted = true;
         SetupService.listen(this);
         onStatus();
         main.postDelayed(refresh, REFRESH_MS);
@@ -334,9 +350,15 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         if (ui) refreshGameState();
     }
     @Override protected void onStop() {
-        StorageManager storage = getSystemService(StorageManager.class);
-        if (storage != null) storage.unregisterStorageVolumeCallback(volumeChanged);
-        SetupService.unlisten(this); main.removeCallbacks(refresh); super.onStop();
+        started = false;
+        if (uiStarted) {
+            uiStarted = false;
+            StorageManager storage = getSystemService(StorageManager.class);
+            if (storage != null) storage.unregisterStorageVolumeCallback(volumeChanged);
+            SetupService.unlisten(this);
+            main.removeCallbacks(refresh);
+        }
+        super.onStop();
     }
     /** A card mounted, unmounted or removed while the menu is visible: the screens that show where the game data is
      * (Home's missing-card state and Start game, Game data, the storage choices) are rebuilt from the new state. */
@@ -353,13 +375,14 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private static final long REFRESH_MS = 500;
     private final Runnable refresh = new Runnable() {
         @Override public void run() {
+            if (!uiStarted) return;
             if (screen == Screen.INSTALL) onStatus();
             if (cancelArmedAt != 0 && SystemClock.uptimeMillis() - cancelArmedAt > 3000) disarmCancel();
             if (SystemClock.uptimeMillis() - gameCheckedAt >= 1000) {
                 gameCheckedAt = SystemClock.uptimeMillis();
                 refreshGameState();
             }
-            main.postDelayed(this, REFRESH_MS);
+            if (uiStarted) main.postDelayed(this, REFRESH_MS);
         }
     };
     @Override protected void onDestroy() {
@@ -425,6 +448,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         pulledChip = SaveMirror.takePulled(this);
         if (moveNote != null) { note = moveNote; noteOk = moveOk; }
         render();
+        startUi();
     }
     /** A move killed after its copy was committed (the folder choice switched or not, settings.env written or not, the
      * old copy partly removed) is made consistent again: settings.env is rewritten from the folder choice, and when the
@@ -2342,14 +2366,13 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         else statusLine.setText("");
         gameState = InstallState.gameState(this);
         if (!gameState.free()) {
-            ready = false;
             statusLine.setText(gameState.state == GameLock.State.GAME ? Strings.gameRunning("Installing") : Strings.gameLockError(gameState.reason));
             statusLine.setTextColor(Theme.AMBER);
         }
         installAction.setEnabled(ready);
         if (installPrompt != null) installPrompt.setEnabled(ready);
-        if (!gameControls.contains(installAction)) gameControl(installAction, "Installing", () -> startSetup(null));
-        if (installPrompt != null && !gameControls.contains(installPrompt)) gameControl(installPrompt, "Installing", () -> startSetup(null));
+        gameControl(installAction, "Installing", () -> requestNotificationsThen(() -> startSetup(null)));
+        if (installPrompt != null) gameControl(installPrompt, "Installing", () -> requestNotificationsThen(() -> startSetup(null)));
     }
     private boolean lostRoles(String role) {
         JSONArray lost = inspection == null ? null : inspection.optJSONArray("lost");
@@ -2728,7 +2751,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         Widgets.Row resume = new Widgets.Row(this, Strings.RESUME, Strings.RESUME_HINT, 27, 18).icon("refresh", 56, 28);
         resume.setTag("resume");
         resume.setOnClickListener(v -> { if (!resume.dimmed()) requestNotificationsThen(() -> startSetup(SetupService.jobStages(this))); });
-        gameControl(resume, "Installing", () -> startSetup(SetupService.jobStages(this)));
+        gameControl(resume, "Installing", () -> requestNotificationsThen(() -> startSetup(SetupService.jobStages(this))));
         Widgets.Row change = new Widgets.Row(this, Strings.CHANGE_FILES, Strings.CHANGE_FILES_HINT, 27, 18).icon("folder", 56, 28);
         change.setTag("change"); change.setOnClickListener(v -> changeFiles());
         Widgets.Row data = new Widgets.Row(this, Strings.GAME_DATA, Strings.WELCOME_DATA_HINT, 27, 18).icon("data", 56, 28);

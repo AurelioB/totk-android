@@ -167,9 +167,9 @@ static int android_close_reply(const AndroidClosePaths *p, const char *id, const
     if (bad) { unlink(p->temporary); errno = saved; return -1; }
     return 0;
 }
-/* close_game exits on accepted idle admission; returning means a save won the race and the menu must wait/retry.
-   0 absent, 1 consumed/refused with saving response, -1 I/O error (response includes errno when it can be written). */
-__attribute__((unused)) static int android_close_poll(const AndroidClosePaths *p, void (*close_game)(void)) {
+/* 0 absent or accepted, 1 consumed/refused with saving response, -1 I/O error (response includes errno when writable).
+   The Android accepted close exits; accepting/queued frontends may instead return 1. */
+__attribute__((unused)) static int android_close_poll(const AndroidClosePaths *p, int (*close_game)(void)) {
     struct stat st;
     if (stat(p->request, &st)) return errno == ENOENT ? 0 : -1;
     char id[96] = "", why[256]; int fd = open(p->request, O_RDONLY | O_CLOEXEC);
@@ -191,7 +191,7 @@ __attribute__((unused)) static int android_close_poll(const AndroidClosePaths *p
         snprintf(why, sizeof why, "error: consume close-request errno=%d (%s)", saved, strerror(saved));
         android_close_reply(p, id, why); errno = saved; return -1;
     }
-    close_game();
+    if (close_game()) return 0;
     return android_close_reply(p, id, "saving") ? -1 : 1;
 }
 

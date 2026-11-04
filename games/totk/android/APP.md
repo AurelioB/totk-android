@@ -1827,10 +1827,15 @@ needs `su`). The folder holds what the adb-shell folder holds:
   mutex. The game removes it immediately after acquiring the lock, and on refused start. A live default process plus
   marker counts as `GAME`; a cached process alone does not. A local launch bridges the pre-process gap for up to four
   seconds; abandoned markers without a default process are removed. `TotkSetup` logs the decision branch, process
-  pid/name/importance, lock outcome/exception/cause and marker state.
-- **Close the game.** Installing, moving/deleting game data, changing the driver and replacing saves are disabled
-  while `GAME` (errors display their reason instead). The menu re-checks every second and on resume, so controls clear
-  without a restart. *Close the game* waits up to 30 seconds for `state/save-busy` to disappear, then atomically writes
+  pid/name/importance, lock outcome/exception/cause and marker state. Busy/error decisions and native close outcomes
+  use WARN so plain `logcat -s TotkSetup` includes them even when INFO is filtered; Java lines include effective
+  INFO/WARN loggability flags.
+- **Close the game.** Installing, moving/deleting game data, changing the driver and replacing saves are gated
+  while `GAME` (errors display their reason instead). Dimmed controls remain focusable for handheld navigation;
+  activating one records that exact operation and explains the gate, without mutating data. The menu re-checks every
+  second and on resume, so controls clear without a restart. The refresh registers once even when the UI appears
+  asynchronously after `onStart`, and unregisters on stop. *Close the game* waits up to 30 seconds for `state/save-busy`
+  to disappear, then atomically writes
   `state/close-request` with a unique pid/time id. A non-render native thread checks it every 500 ms (one stat when
   absent), consumes it and calls the existing native close path. A saving race is refused with a correlated atomic
   `close-response`; I/O refusal includes errno/reason. The menu waits/retries within its bounded close deadline.
@@ -1838,8 +1843,10 @@ needs `su`). The folder holds what the adb-shell folder holds:
   lose the pending operation. Neither task affinity nor launcher/recents behavior changes.
   `runtime_fs_begin_close` refuses an active/uncommitted save and atomically gates any later save before its first
   change until process exit. The accepted close flushes the Vulkan pipeline cache and exits, never kills the process.
-  The menu waits for the game lock/start marker to clear (bounded), then retries the selected operation. A timeout
-  explains why the game was left running.
+  Diagnostic close input receives an explicit accepted/refused result; refusing during a save keeps reading commands.
+  The menu waits for the game lock/start marker to clear (bounded), then retries the selected operation. Once the
+  game is gone, a stale `save-busy` left by a crash does not block completion. A timeout explains why the game was left
+  running.
 - **Save signals.** `fs_host.c` creates `<private>/state/save-busy` on the first change to save data and, on the
   `Commit` that completes it with every fsync successful, removes it and rewrites `state/save-generation` (counter,
   tmp+rename). The game-process `SaveMirror.Watcher` polls it (1 s), waits 3 s and for `save-busy` to be gone, then

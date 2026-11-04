@@ -130,8 +130,8 @@ JNIEXPORT jstring JNICALL Java_com_aure_totk_setup_GameLockProbe_move(JNIEnv *en
     jstring value = result ? (*env)->NewStringUTF(env, result) : NULL;
     free(result); return value;
 }
-static void close_busy(void) {}
-static void close_accepted(void) { _exit(0); }
+static int close_busy(void) { return 0; }
+static int close_accepted(void) { _exit(0); }
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
     if (!strcmp(argv[1], "finish")) return android_game_start_finished(argv[2]) ? 4 : 0;

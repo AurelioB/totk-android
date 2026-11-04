@@ -163,7 +163,6 @@ static void input_script_start(void) {
    Commands: key <Mac keycode> <milliseconds>, down/up <Mac keycode>, shot <path>, wshot <path>, passdump <frames>, querylog <frames>, anomdump,
    kbtest / kbtype <text> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), close. */
 extern void dm_gfx_shot_at(long frames, const char *path);
-extern void runtime_front_request_close(void);
 static void *input_file(void *arg) {
     totk_thread_start("totk-inputfile", NULL);
     FILE *f = fopen((const char *)arg, "r"); if (!f) runtime_fail("cannot open TOTK_INPUT_FILE");
@@ -236,7 +235,7 @@ static void *input_file(void *arg) {
 #endif
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
-        } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
+        } else if (!strcmp(line, "close\n")) { if (runtime_front_request_close()) break; }
         else runtime_fail("invalid diagnostic input command");
     }
     fclose(f); return NULL;

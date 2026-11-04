@@ -54,6 +54,7 @@ void dm_core_wait_stats(uint64_t *self_ns, uint64_t *all_ns, uint64_t *all_n);
 void runtime_save_probe(void);
 int runtime_fs_save_busy(void);   /* runtime/fs_host.c: the game is writing save data (window close waits) */
 int runtime_fs_begin_close(void); /* Android: refuse busy saves; on success hold new save changes until process exit */
+int runtime_front_request_close(void); /* 1 accepted (possibly queued), 0 refused; diagnostic input keeps reading on refusal */
 uint8_t *runtime_module_base(const char *name);   /* runtime/loader.c: "main", "subsdk0", "sdk" (probes) */
 uint64_t runtime_module_permission(uint64_t address,uint64_t size,unsigned permission);
 uint64_t runtime_module_lock_permission(uint64_t address,uint64_t size,unsigned mask,unsigned attribute);
