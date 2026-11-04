@@ -2941,6 +2941,82 @@ int main(int argc, char **argv) {
         printf("%s: descriptor stock %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
         return fails != 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "--descriptor-stock-live")) {
+        /* TOTK_VK_DESC_STOCK and its ceiling toggled through the live channel every few frames while up to BACKLOG
+           frames are in flight: 64 draws a frame, each into its own 8x8 tile with its own colour UBO (so its own
+           descriptor set), the tile -> UBO assignment rotating per frame. Every frame's pixels are checked once its
+           fence retires, and both owners count, right before they reset or destroy pools, whether every submission
+           that may reference them has retired (vk_test_descriptor_pools_check). */
+        enum { TILES = 64, FRAMES = 240, BACKLOG = 6, READBACK = 64 * 64 * 4 };
+        CHECK(mtl_wait(run(), 5000000000ull), "descriptor stock live fixture warmup completes");
+        uint8_t *colors = cpu_pool + 0x220000, *readbacks = cpu_pool + 0x400000;
+        for (int k = 0; k < TILES; k++) {
+            float c[4] = {(float)(k % 8 + 1) / 8, (float)(k / 8 + 1) / 8, 1, 1};
+            memcpy(colors + k * 256, c, sizeof c);
+        }
+        const float full_tri[6] = {-1, -1, 3, -1, -1, 3};   /* full-target triangle, written before any frame reads it */
+        memcpy(cpu_pool + 0x202000, full_tri, sizeof full_tri);
+        p_bind_vbuf full = vb; full.r[0].address = (uint64_t)(uintptr_t)(cpu_pool + 0x202000);
+        static const char *const toggles[] = {"set TOTK_VK_DESC_STOCK=1\n", "set TOTK_VK_DESC_STOCK_MAX_SETS=16\n",
+            "set TOTK_VK_DESC_STOCK=0\n", "set TOTK_VK_DESC_STOCK=1\nset TOTK_VK_DESC_STOCK_MAX_SETS=1\n",
+            "unset TOTK_VK_DESC_STOCK_MAX_SETS\n", "set TOTK_VK_DESC_STOCK_MAX_SETS=48\n", "unset TOTK_VK_DESC_STOCK\n",
+            "set TOTK_VK_DESC_STOCK=1\nset TOTK_VK_DESC_STOCK_MAX_SETS=0\n"};
+        uint64_t fences[FRAMES], events0[VK_DESC_STOCK_REASONS + 1], events1[VK_DESC_STOCK_REASONS + 1];
+        uint64_t pool_checks0, violations0, pool_checks1, violations1;
+        vk_record_test_stock_events(events0); vk_test_descriptor_pools_stats(&pool_checks0, &violations0);
+        int bad_frames = 0, applied = 0, in_flight = 0;
+        for (int frame = 0; frame < FRAMES + BACKLOG; frame++) {
+            int done = frame - BACKLOG;
+            if (done >= 0) {   /* the frame that used this readback slot: wait for it, then check every tile */
+                CHECK(mtl_wait(fences[done], 30000000000ull), "descriptor stock live frame %d completes", done);
+                const uint8_t *out = readbacks + (done % BACKLOG) * READBACK; int bad = 0;
+                for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+                    int k = ((y / 8) * 8 + x / 8 + done) % TILES;
+                    float r = (float)(k % 8 + 1) / 8, g = (float)(k / 8 + 1) / 8;
+                    const uint8_t *p = out + 4 * (y * 64 + x);
+                    bad += abs(p[0] - (int)(4 * x * r + .5f)) > 2 || abs(p[1] - (int)(4 * y * g + .5f)) > 2 ||
+                        abs(p[2] - 128) > 2 || p[3] != 255;
+                }
+                if (bad && bad_frames++ < 4) printf("descriptor stock live frame %d: %d wrong pixels\n", done, bad);
+            }
+            if (frame >= FRAMES) continue;
+            rn = 0;
+            p_scissor all = {0, 0, 64, 64};
+            op(OP_SET_RT, &srt, sizeof srt); op(OP_SCISSOR, &all, sizeof all); op(OP_CLEAR_COLOR, &cc, sizeof cc);
+            op(OP_BIND_PROGRAM, &bp, sizeof bp); op(OP_BIND_VATTR, &va, sizeof va); op(OP_BIND_VSTREAM, &vs, sizeof vs);
+            op(OP_BIND_UBO, &u0, sizeof u0); op(OP_BIND_TEX, &th, sizeof th); op(OP_VIEWPORTS, &vp, sizeof vp);
+            op(OP_BIND_VBUF, &full, sizeof full);
+            for (int t = 0; t < TILES; t++) {
+                p_bind_buf u = u1; u.addr = (uint64_t)(uintptr_t)(colors + ((t + frame) % TILES) * 256);
+                p_scissor tile = {(t % 8) * 8, (t / 8) * 8, 8, 8};
+                op(OP_BIND_UBO, &u, sizeof u); op(OP_SCISSOR, &tile, sizeof tile); op(OP_DRAW, &dw, sizeof dw);
+            }
+            p_copy_b2t copy = cp; copy.src = (uint64_t)(uintptr_t)(readbacks + (frame % BACKLOG) * READBACK);
+            op(OP_COPY_T2B, &copy, sizeof copy);
+            fences[frame] = run(); in_flight += frame > 0 && !mtl_wait(fences[frame - 1], 0);   /* the previous frame still runs */
+            if (frame % 3 == 2) {   /* stage like totk.ctl; applied at this "presented" frame */
+                const char *lines = toggles[applied++ % (sizeof toggles / sizeof *toggles)];
+                totk_live_lines l = {{0}}; totk_live_feed(&l, lines, strlen(lines));
+            }
+            totk_live_frame((uint64_t)frame);
+        }
+        mtl_drain();
+        vk_record_test_stock_events(events1); vk_test_descriptor_pools_stats(&pool_checks1, &violations1);
+        uint64_t kept[4]; vk_record_test_descriptor_retained(kept);
+        printf("descriptor-stock-live: %d frames (%d committed while the previous one ran), %d toggles, pool checks %llu, violations %llu; resets off/pressure/set-limit/pool-limit %llu/%llu/%llu/%llu, pools destroyed %llu; retained pools %llu+%llu, stock sets %llu\n",
+            FRAMES, in_flight, applied, (unsigned long long)(pool_checks1 - pool_checks0), (unsigned long long)(violations1 - violations0),
+            (unsigned long long)(events1[0] - events0[0]), (unsigned long long)(events1[1] - events0[1]),
+            (unsigned long long)(events1[2] - events0[2]), (unsigned long long)(events1[3] - events0[3]),
+            (unsigned long long)(events1[4] - events0[4]), (unsigned long long)kept[0], (unsigned long long)kept[1],
+            (unsigned long long)kept[2]);
+        CHECK(!bad_frames, "every in-flight frame keeps its own descriptors through live stock toggles (%d bad frames)", bad_frames);
+        CHECK(pool_checks1 > pool_checks0 && violations1 == violations0,
+            "no pool is reset or destroyed while a submission that may reference it is unretired");
+        CHECK(events1[VK_DESC_STOCK_OFF] > events0[VK_DESC_STOCK_OFF] && events1[VK_DESC_STOCK_SET_LIMIT] > events0[VK_DESC_STOCK_SET_LIMIT] &&
+            events1[VK_DESC_STOCK_REASONS] > events0[VK_DESC_STOCK_REASONS], "the toggles exercised live off, the set limit and pool destruction");
+        printf("%s: descriptor stock live %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+        return fails != 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--program-resolve-bench")) {
         CHECK(mtl_wait(run(), 5000000000ull), "program benchmark warmup completes");
         vk_shader *expected[6]; int expected_result = vk_prog_resolve_record(&pg, expected), valid = !expected_result;

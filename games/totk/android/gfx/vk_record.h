@@ -157,6 +157,9 @@ void vk_record_test_descriptor_retained(uint64_t out[4]); /* recorder pools, pri
 void vk_record_test_descriptors(uint64_t out[8]); /* sets, allocate calls, resets, walk ns, list ns/count, template ns/count */
 int vk_record_test_descriptor_stock(void); /* isolated real-driver checkout/recycle/batch/pressure fixture */
 int vk_record_test_descriptor_ceiling(void); /* the stock ceiling on one recorder context, set live at its handoffs */
+void vk_test_descriptor_pools_check(unsigned slot); /* nvn_vk.c: slot's pools may be reset/destroyed now (counted) */
+void vk_test_descriptor_pools_stats(uint64_t *checks, uint64_t *violations);
+void vk_record_test_stock_events(uint64_t out[VK_DESC_STOCK_REASONS + 1]); /* published resets per reason, pools destroyed */
 void vk_record_test_storage(uint64_t values[4]); /* retention budget, reclaimed slots/bytes/secondary CBs */
 void vk_record_test_primary_memory(uint64_t values[2]); /* retained primary CBs, reclaimed primary CBs */
 void vk_record_test_leases(uint64_t values[4]); /* published active leases, summed worker peak, returned leases, cold resets */

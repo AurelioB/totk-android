@@ -1437,6 +1437,22 @@ there at once. Host `--lag-walk-bench 32` (REC_THREADS=2, FRAME_LAG=1, stock on)
 pools 16 in both. `vkdrawtest --descriptor-stock` checks the set limit, reuse under it, live lowering, the pool limit
 and live off on one recorder context, and the primary slots' fallback below the ceiling.
 
+Why a live switch-off (or a ceiling reset) may destroy pools there: `vkDestroyDescriptorPool` and the default policy's
+`vkResetDescriptorPool` need the same thing, that no pending command buffer uses a set of the pool, and both happen at
+the same point. A primary slot reaches `slot_open` only with `busy` (its fence observed by the completion thread),
+`submit_busy` (the async submit owner) clear and no replay pin (`replay_until`: frame-generation owner leases and
+external split continuations, released only once `g_done` reaches the covering ticket); a cancelled optional
+pre-submit never reached the GPU. A recorder context recycles at its first job of the slot's next incarnation, which is
+dispatched only after that open; its secondary leases have returned (`DIE` otherwise) and contexts belong to one slot.
+Frame-generation UI replay re-binds sets of the frame being sealed, and extraction refuses split submissions.
+`vkdrawtest --descriptor-stock-live` toggles `TOTK_VK_DESC_STOCK` and its ceiling through the live channel every three
+frames over 240 frames of 64 draws (each its own UBO, tile and set) with six frames in flight, checks every frame's
+pixels, and counts, at each reset or destroy by either owner, whether the slot's previous ticket had retired (the
+primary one also checks the submit owner and replay pins); `vkreplaypintest` stages a toggle with every churn
+submission while pinned slots are skipped. Both pass at 0/2/3 recorder workers, stock launched off and on, plain and
+under ThreadSanitizer (`LP_NUM_THREADS=0`, no suppressions) with zero violations; no Khronos validation layer is
+installed on the host.
+
 `recorder overhead ...` additionally separates synchronous secondary recording, batched ExecuteCommands, walking
 and worker pool-reset time, and job setup. Reset is a subset of inline/worker busy time, not another additive cost.
 Worker pool resets are lazy on their owner; only generation/version bookkeeping remains in walking slot reset.
@@ -2337,7 +2353,7 @@ recovery and long-session matched-configuration map deltas still require the aut
 | Pipeline map/prewarm keys | Walking thread/startup only, as before. Compiler workers publish entry handles with release/acquire state; recorder workers consume the already-selected handle. |
 | Texture/sampler/view registries and dirty/write-back state | Walking thread under existing resource/recording locks; workers see only Vulkan handles, retained through slot completion by existing retirement rules. |
 | Pool spans and address hints | Walking capture copies each index generation under the pool lock, at most once per version per slot. Packets retain immutable versions until slot reuse; workers never read live span generations/maps and use context-local hints. Linear diagnostic mode preserves original alias/pool order. |
-| Command/descriptor pools, descriptor dedup and bound-state memos | One command pool per recording owner across slots; per-slot lease chains retain handles through actual GPU/submit retirement. Descriptor/dedup/span contexts remain worker/slot-generation scoped and reset on that owner; with `TOTK_VK_DESC_STOCK=1` the owner rewinds its per-layout set stock at that same generation change instead of resetting its pools, and never hands sets to another owner. Vertex/index/pipeline/dynamic memos start empty per secondary; zero buffers remain immutable context allocations. |
+| Command/descriptor pools, descriptor dedup and bound-state memos | One command pool per recording owner across slots; per-slot lease chains retain handles through actual GPU/submit retirement. Descriptor/dedup/span contexts remain worker/slot-generation scoped and reset on that owner; with `TOTK_VK_DESC_STOCK=1` the owner rewinds its per-layout set stock at that same generation change instead of resetting its pools, and never hands sets to another owner; a live switch-off or a `TOTK_VK_DESC_STOCK_MAX_SETS` reset destroys pools only there (`--descriptor-stock-live`). Vertex/index/pipeline/dynamic memos start empty per secondary; zero buffers remain immutable context allocations. |
 | Packet/descriptor slabs and size-class lists | Walking-only allocator per slot. Growth copies only the unpublished job; workers read immutable blocks after queue publication. Old construction pointers do not survive commit/abort. After GPU/submit-owner retirement, pressure pruning clears only cold job references and recycles blocks; slab live counts prevent unmapping referenced arrays, and free-list links are removed before an empty slab is released. ASan poison tracks returned payloads; physical-capacity counters are atomic. |
 | Secondary lease returns and cold-tail maintenance | The final backend busy/submit_busy pin publishes stable completed-slot chain endpoints under rec_mu, once per slot and with no Vulkan calls. Only the recording owner splices these chains into its free list, mutates handle links, resets cold excess or frees/trims the pool. Pending flags protect chains against repeat retirement; a new generation consumes returns before reusing its context. No owner accesses command-pool metadata owned by another recording thread. Counters/timings publish atomically without inspecting owner metadata. |
 | Retired primary/arena BOs and cached texel views | Walking-only metadata; reset requires the slot's busy and submit-owner pins to retire, or the snapshot arena's whole-submission release fence. View invalidation holds the recursive resource mutex, including deferred views with the same source buffer. No old packet, Vulkan descriptor or GPU command can reference a compacted buffer. |

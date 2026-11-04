@@ -2244,7 +2244,38 @@ static void slot_descriptors_trim(slot_t *s, int keep) {
     vk_record_primary_pools(-(int64_t)(s->ndpool - keep));
     s->ndpool = keep;
 }
+#ifdef TOTK_VK_TESTS
+/* Both descriptor owners count, right before they reset or destroy a slot's pools, whether every submission that may
+   reference those sets has retired. The primary slot checks at its open: the previous incarnation's ticket is done,
+   its submit owner returned and no replay pin holds it; that ticket is kept for the recorder contexts of the slot,
+   which recycle at their first job of the new incarnation, when the slot may already hold its next (unretired)
+   ticket: theirs is the kept one. */
+static _Atomic uint64_t g_test_pool_checks, g_test_pool_violations;
+static uint64_t g_test_pool_retired[RING]; /* g_mu */
+static void test_descriptor_pools_open(unsigned slot) {
+    pthread_mutex_lock(&g_mu);
+    const slot_t *s = &g_ring[slot];
+    int idle = s->value <= atomic_load(&g_done) && !s->submit_busy && !replay_until(slot);
+    g_test_pool_retired[slot] = s->value;
+    pthread_mutex_unlock(&g_mu);
+    atomic_fetch_add(&g_test_pool_checks, 1);
+    if (!idle) atomic_fetch_add(&g_test_pool_violations, 1);
+}
+void vk_test_descriptor_pools_check(unsigned slot) {
+    pthread_mutex_lock(&g_mu);
+    int idle = g_test_pool_retired[slot] <= atomic_load(&g_done);
+    pthread_mutex_unlock(&g_mu);
+    atomic_fetch_add(&g_test_pool_checks, 1);
+    if (!idle) atomic_fetch_add(&g_test_pool_violations, 1);
+}
+void vk_test_descriptor_pools_stats(uint64_t *checks, uint64_t *violations) {
+    *checks = atomic_load(&g_test_pool_checks); *violations = atomic_load(&g_test_pool_violations);
+}
+#endif
 static void slot_descriptors_recycle(slot_t *s) {
+#ifdef TOTK_VK_TESTS
+    test_descriptor_pools_open((unsigned)(s - g_ring));
+#endif
     int want = vk_desc_stock_want();
     if (s->dstock_on && !want) {
         vk_desc_stock_free(&s->dstock);

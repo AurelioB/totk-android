@@ -549,6 +549,7 @@ void vk_record_test_descriptor_retained(uint64_t out[4]) {
     out[0] = atomic_load(&memory_dpools); out[1] = atomic_load(&memory_primary_dpools);
     out[2] = atomic_load(&stock_sets_retained); out[3] = desc_pool_bytes();
 }
+void vk_record_test_stock_events(uint64_t out[VK_DESC_STOCK_REASONS + 1]) { stock_totals(out); }
 #endif
 /* Allocates count (1..VK_DESC_STOCK_BATCH) sets, fewer near the end of a pool; never fewer than one. */
 static uint32_t alloc_sets(void *owner, VkDescriptorSetLayout layout, uint32_t count, VkDescriptorSet *out) {
@@ -1001,6 +1002,9 @@ static void record_job(rec_job *j, unsigned worker) {
         uint64_t t0 = host_now_ns();
         (void)commands_recycle(worker);
         if (c->ncb) DIE("recorder slot reused before its secondary leases retired");
+#ifdef TOTK_VK_TESTS
+        vk_test_descriptor_pools_check(j->slot);
+#endif
         descriptors_recycle(c);
         memset(c->cache, 0, sizeof c->cache); c->generation = j->generation; c->spans = NULL;
         #ifdef TOTK_VK_TESTS
