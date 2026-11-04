@@ -1,6 +1,6 @@
 #!/bin/sh
-# pan.sh -s <serial> --device <label> --scene <label> --seconds N [--value 16000] [--first right|left] --out <dir>
-#        [--event /dev/input/eventN] [--display <id>] [--package <pkg>] [--game-dir <dir>]
+# pan.sh -s <serial> --device <label> --scene <label> --seconds N [--value 16000] [--first right|left] [--no-shot]
+#        --out <dir> [--event /dev/input/eventN] [--display <id>] [--package <pkg>] [--game-dir <dir>]
 #
 # Steady horizontal camera pan: the right stick held at --value (of 32767) to the right for the first half of the time,
 # then to the left for the second half (--first left: left, then right), then released, so the view returns. Appends one
@@ -9,15 +9,16 @@
 # (D: 1 right first, -1 left first) and two lines to <out>/freqs.txt, the frequency limits (`bench_input.sh freqs`)
 # just before and just after the pan:
 #   <device> <scene> T0=<epoch s> start|end <cpuN=... gpu_...>
-# and takes a mid-pan screenshot into <out>/shots/<device>-<scene>-pan-<T0>.png. The game must be running. Root
-# commands go through the serial's persistent root shell (rootsh.py), so the pan itself starts no su.
+# and, after the stick is released (outside the measured windows: a screencap costs about a second of CPU), takes a
+# screenshot into <out>/shots/<device>-<scene>-pan-<T0>.png unless --no-shot. The game must be running. Root commands go
+# through the serial's persistent root shell (rootsh.py), so the pan itself starts no su.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die() { echo "pan: $*" >&2; exit 1; }
 
-SER=""; DEV=""; SCENE=""; SECS=""; V=16000; FIRST=right; OUT=""; EV=""; DISP=""; PKG=com.aure.totk; GAME=""
+SER=""; DEV=""; SCENE=""; SECS=""; V=16000; FIRST=right; OUT=""; EV=""; DISP=""; PKG=com.aure.totk; GAME=""; SHOT=1
 while [ $# -gt 0 ]; do
   case $1 in
     -s) SER=${2:?}; shift 2 ;;
@@ -26,6 +27,7 @@ while [ $# -gt 0 ]; do
     --seconds) SECS=${2:?}; shift 2 ;;
     --value) V=${2:?}; shift 2 ;;
     --first) FIRST=${2:?}; shift 2 ;;
+    --no-shot) SHOT=""; shift ;;
     --out) OUT=${2:?}; shift 2 ;;
     --event) EV=${2:?}; shift 2 ;;
     --display) DISP=${2:?}; shift 2 ;;
@@ -58,15 +60,14 @@ trap 'exit 130' INT TERM
 FS=$(input freqs) || die "cannot read the frequency limits"
 T0=$(date +%s)
 input rstick "$((D * V))"
-sleep "$(awk "BEGIN { print $SECS / 4 }")"
-input shot "$OUT/shots/$DEV-$SCENE-pan-$T0.png" >/dev/null || echo "pan: screenshot failed (continuing)" >&2
-sleep "$(awk "BEGIN { print $SECS / 4 }")"
+sleep "$(awk "BEGIN { print $SECS / 2 }")"
 input rstick "$((-D * V))"
 sleep "$(awk "BEGIN { print $SECS / 2 }")"
 F1=$(lastf)
 T1=$(date +%s)
 FE=$(input freqs) || echo "pan: cannot read the frequency limits after the pan" >&2
 input rstick 0
+[ -z "$SHOT" ] || input shot "$OUT/shots/$DEV-$SCENE-pan-$T0.png" >/dev/null || echo "pan: screenshot failed (continuing)" >&2
 trap - EXIT
 printf '%s\n' "$DEV $SCENE T0=$T0 start $FS" "$DEV $SCENE T0=$T0 end $FE" >> "$OUT/freqs.txt"
 echo "$DEV $SCENE F0=$F0 F1=$F1 T0=$T0 T1=$T1 V=$V D=$D" | tee -a "$OUT/pans.txt"

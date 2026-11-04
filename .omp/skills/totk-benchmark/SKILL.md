@@ -32,7 +32,8 @@ All scripts are in `tools/bench/` (paths below are relative to the repository ro
     `rootsh.py -s <serial> stop` or after 30 idle minutes); `sampler.py` keeps its own one. Both pin themselves, and
     so every command they start (`sendevent`, `grep`, `cat`, `screencap`), to the slowest cpufreq cluster with the
     device's `taskset` (`rootsh.py -s <serial> status` and the sampler's start line print the cores; on the Odin 3,
-    whose slowest cluster is six of its eight cores, this only keeps them off the two fastest). A pan then starts no
+    whose slowest cluster is six of its eight cores, this only keeps them off the two fastest). `pan.sh` takes its
+    screenshot after the stick is released, outside the measured windows (`--no-shot` skips it). A pan then starts no
     su at all (Thor: 6 su sessions and su-notify processes per 20 s pan before, 0 after).
 - **Without root nothing is automatic**: `collect.sh` stops with "no root (su)", `sampler.py` with "the root shell never
   started", `pan.sh` / `bench_input.sh` fail with "rootsh: no root shell". There is no non-root source of the frame
@@ -132,8 +133,8 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
    from another shell).
 9. **Pan**: `tools/bench/pan.sh -s <serial> --device <label> --scene <hateno|lookout|rotsumamu> --seconds 48 --out $OUT`
    (right stick at 16000 of 32767, right then left; 48 s gives at least 4 full windows at 30 fps). It also records the
-   frequency limits just before and after the pan in `$OUT/freqs.txt`. Look at the mid-pan screenshot in
-   `$OUT/shots/`. Repeat steps 5–6 and 9 for the other scenes.
+   frequency limits just before and after the pan in `$OUT/freqs.txt`. Look at the screenshot it takes after releasing
+   the stick in `$OUT/shots/`. Repeat steps 5–6 and 9 for the other scenes.
 10. **Stop the sampler** (`kill %1` in the same shell, else `kill <pid>`, or Ctrl-C; it removes its device loop) and
     **collect**: `tools/bench/collect.sh -s <serial> --device <label> --out $OUT`. It must report 0 GPU/SMMU fault
     lines and 0 "device lost"; investigate otherwise.
