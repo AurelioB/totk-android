@@ -1889,7 +1889,7 @@ needs `su`). The folder holds what the adb-shell folder holds:
 | `totk.env` | options, one `NAME=value` per line (`#` comments), e.g. `TOTK_VK_SHOT=300` or `TOTK_FACE_BUTTONS=position`. Read after the launcher menu's `settings.env` (app-private `files/settings.env`, written by the menu; only the menu's own option keys are accepted there, others are logged and ignored), so a line here overrides the menu. |
 | `totk.log` | the log of the last start (`install_app.sh log`) |
 
-### Diagnostics: logcat copy
+### Diagnostics: logcat copy and crash reports
 
 - **`TOTK_LOGCAT`** (default on; `0` turns it off). `totk.log` stays the primary log (written directly, so a sudden end
   loses nothing); a thread at nice 10 (on the slower CPUs when sysfs shows them) copies its complete lines to logcat with
@@ -1897,6 +1897,11 @@ needs `su`). The folder holds what the adb-shell folder holds:
   lines over 1000 bytes are cut and marked ` [...]`. It sleeps on an inotify watch of the file (20 ms polling only
   without inotify), so an idle log costs no wakeup (`tests/test_log_mirror.py` measures it). The log's
   `[totk-logcat] on: ... wake=inotify nice=10` or `[totk-logcat] off` line shows the arm; `adb logcat -s totk` reads it.
+- **Crash reports** (always on). The runtime's SIGSEGV/SIGBUS/SIGILL/SIGTRAP/SIGABRT report (`[totk] signal=` …, `[totk]
+  host abort`) is written by the first crashing thread only (others wait), then the signal goes to the handler that was
+  there before (`runtime/crash_chain.h`): Android's debuggerd writes a tombstone and a logcat backtrace
+  (`adb logcat -b crash`, `/data/tombstones`). A real fault returns and faults again into it with its own siginfo;
+  aborts and sent signals are raised again. The process no longer ends with `_exit(128+signal)` but by the signal.
 
 ### Game data location, game lock and save signals (release app)
 
