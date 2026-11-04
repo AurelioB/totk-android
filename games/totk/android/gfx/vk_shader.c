@@ -23,6 +23,7 @@
 #include "vk_shader_xlate.h"
 #include "vk_seed_io.h"
 #include "vk_load_proof.h"
+#include "vk_subgroup.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <sys/stat.h>
@@ -451,6 +452,25 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
             sh->b[sh->nb++]=(vk_bind){.binding=binding,.count=1,.kind=RB_ALPHA,
                 .dtype=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,.reg=-1,.sreg=-1,.extent=16};
             sh->load_full_outputs=0;
+        }
+    }
+    if (V.subgroup_fix) {
+        size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
+        int fixed = vk_spirv_subgroup32(&words, &nw);
+        spv = (char *)words; spv_len = nw * 4;
+        if (fixed > 0) {
+            sh->required_subgroup_size = vk_subgroup_required(stage_flags(sh->stage), V.subgroup_control,
+                V.subgroup_sizes.requiredSubgroupSizeStages, V.subgroup_sizes.minSubgroupSize, V.subgroup_sizes.maxSubgroupSize);
+            uint32_t physical = sh->required_subgroup_size ? sh->required_subgroup_size : V.subgroup.subgroupSize;
+            if (physical < 32 || physical > 128 || (physical & (physical - 1)) ||
+                !(V.subgroup.supportedStages & stage_flags(sh->stage)) ||
+                !(V.subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT)) fixed = -1;
+            else LOGV("subgroup shader %s: logical 32, physical %u%s", variant, physical,
+                sh->required_subgroup_size ? " (pinned)" : " (fixed default)");
+        }
+        if (fixed < 0) {
+            RED(32, "subgroup shader %s: cannot preserve 32-lane semantics on this device/module; refused", variant);
+            free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
         }
     }
     VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = spv_len, .pCode = (const uint32_t *)spv};

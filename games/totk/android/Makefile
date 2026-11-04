@@ -259,6 +259,12 @@ vktest: $(OUT)/vktest $(OUT)/vkdrawtest $(OUT)/vkrectest $(OUT)/vkrecspantest $(
 vktest: $(OUT)/vkcanvastest
 vktest: $(OUT)/vkseedpacktest $(OUT)/vkseediotest
 vktest: $(OUT)/vkcomputestoretest
+vktest: $(OUT)/vksubgrouptest
+vksubgrouptest: $(OUT)/vksubgrouptest
+$(OUT)/vksubgrouptest: $(TOTK)/android/gfx/test_vk_subgroup.c $(TOTK)/android/gfx/vk_subgroup.h
+	@mkdir -p $(dir $@)
+	$(CC) -std=c11 -O1 -g $(WARN) -o $@ $< -lvulkan
+$(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest vkrectest vkcanvastest): $(TOTK)/android/gfx/vk_subgroup.h
 vktest: $(OUT)/vkreplaypintest
 $(OUT)/vkreplaypintest: $(TOTK)/android/gfx/test_vkreplaypin.c $(VKTEST_SRC) $(TOTK)/android/gfx/vk_int.h $(TOTK)/android/gfx/vk_framegen.h
 	@mkdir -p $(dir $@)
@@ -562,6 +568,7 @@ clean:
 .PHONY: vktest-native-ui
 .PHONY: poolfintest
 .PHONY: vkpipetest screenclassifytest
+.PHONY: vksubgrouptest
 
 # The on-device setup library (libtotk_setup.so, the hactool executable libhactool.so, host totk-setup): targets
 # setup-android / setup-host; it needs HACTOOL_SRC and the capstone prefixes from the setup deps helpers

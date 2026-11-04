@@ -69,6 +69,7 @@ _Static_assert(sizeof totk_live_switches / sizeof *totk_live_switches <= TOTK_LI
 /* Read once at startup by design: changing them inside a session is refused with this reason. */
 static const char *const totk_live_startup_only[][2] = {
     {"TOTK_IDEAL_CORE_FIX", "core bookkeeping of every guest thread is chosen when it is created"},
+    {"TOTK_VK_SUBGROUP_FIX", "device subgroup features and immutable shader modules/pipelines are chosen at startup"},
 };
 
 enum { TOTK_LIVE_SET = 1, TOTK_LIVE_UNSET, TOTK_LIVE_MARK };

@@ -3739,6 +3739,11 @@ static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkP
     VkPipelineShaderStageCreateInfo st[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs->mod, .pName = "main"},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs ? fs->mod : VK_NULL_HANDLE, .pName = "main"}};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = vs->required_subgroup_size},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = fs ? fs->required_subgroup_size : 0}};
+    if (vs->required_subgroup_size) st[0].pNext = &subgroup[0];
+    if (fs && fs->required_subgroup_size) st[1].pNext = &subgroup[1];
     /* depth the fragment shader writes gets the same DEPTH16 nudge as rasterized depth (see d16tie_on) */
     float d16spec = D16_NUDGE_UNITS / 65535.0f; VkSpecializationMapEntry sme = {D16_SPEC_ID, 0, 4}; VkSpecializationInfo spi = {1, &sme, 4, &d16spec};
     if (fs && fs->depth_spec && k->dfmt == VK_FORMAT_D16_UNORM && d16tie_on()) st[1].pSpecializationInfo = &spi;

@@ -646,6 +646,9 @@ static void vk_init_once(void) {
     if ((r && r != VK_INCOMPLETE) || !n) DIE("no Vulkan device");
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
     VkPhysicalDeviceDriverProperties drvp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES, &hostp};
+    V.subgroup = (VkPhysicalDeviceSubgroupProperties){VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    V.subgroup_sizes = (VkPhysicalDeviceSubgroupSizeControlProperties){VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    hostp.pNext = &V.subgroup; V.subgroup.pNext = &V.subgroup_sizes;
     VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &drvp};
     vkGetPhysicalDeviceProperties2(V.pd, &p2);
     V.props = p2.properties;
@@ -751,6 +754,14 @@ static void vk_init_once(void) {
 #undef LINK
     f2.pNext = chain;
     vkGetPhysicalDeviceFeatures2(V.pd, &f2);
+    const char *subgroup_fix = getenv("TOTK_VK_SUBGROUP_FIX");
+    V.subgroup_fix = subgroup_fix && !strcmp(subgroup_fix, "1");
+    V.subgroup_control = V.subgroup_fix && f13.subgroupSizeControl;
+    f13.subgroupSizeControl = V.subgroup_control;
+    f13.computeFullSubgroups = VK_FALSE;
+    LOGV("subgroup fix: %d (startup-only), native %u, range %u-%u, control %d, required stages 0x%x",
+        V.subgroup_fix, V.subgroup.subgroupSize, V.subgroup_sizes.minSubgroupSize,
+        V.subgroup_sizes.maxSubgroupSize, V.subgroup_control, V.subgroup_sizes.requiredSubgroupSizeStages);
     int gpl_supported = gpl_extensions && f_gpl.graphicsPipelineLibrary;
     V.has_pipeline_library = gpl_requested && gpl_supported;
     f_gpl.graphicsPipelineLibrary = V.has_pipeline_library;

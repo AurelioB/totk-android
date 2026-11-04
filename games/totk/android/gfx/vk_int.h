@@ -160,6 +160,9 @@ typedef struct {
     int has_cache_control;   /* pipelineCreationCacheControl: a pipeline can be asked of the pipeline cache alone (vk_draw.c pipe_get) */
     int has_pipeline_library;
     int pipeline_library_fast_linking, pipeline_library_independent_interpolation;
+    int subgroup_fix, subgroup_control;
+    VkPhysicalDeviceSubgroupProperties subgroup;
+    VkPhysicalDeviceSubgroupSizeControlProperties subgroup_sizes;
     VkSampleCountFlags samples;
     VkPipelineCache pcache;
     PFN_vkGetPhysicalDeviceFormatProperties get_format_props;
@@ -563,6 +566,7 @@ typedef struct vk_shader {
     size_t spv_bytes;       /* original seed module size, for opt-in compute diagnostics */
     int stage;              /* NVN stage 0 vertex, 1 fragment, 5 compute */
     VkShaderModule mod;
+    uint32_t required_subgroup_size;
     VkDescriptorSetLayout dsl;
     int nb; vk_bind *b;
     uint8_t *c1; uint32_t c1_len;   /* the shader's own constant bank c1 (from its package) */

@@ -57,6 +57,11 @@ class LiveCtl(unittest.TestCase):
                           'ok unset TOTK_VK_SPLIT_LRZ_SAFE 0 -'])
         self.assertIn('not a decimal in 0..1', self.parse('set TOTK_VK_SPLIT_LRZ_SAFE=2')[0])
 
+    def test_subgroup_fix_is_startup_only(self):
+        got = self.parse('set TOTK_VK_SUBGROUP_FIX=1', 'unset TOTK_VK_SUBGROUP_FIX')
+        self.assertTrue(all('TOTK_VK_SUBGROUP_FIX is startup-only' in line for line in got), got)
+        self.assertTrue(all('set it in totk.env and restart' in line for line in got), got)
+
     def test_malformed_and_refused(self):
         got = self.parse('set TOTK_VK_DESC_STOCK', 'set TOTK_VK_DESC_STOCK=', 'set TOTK_VK_DESC_STOCK=2',
                          'set TOTK_VK_DESC_STOCK=1x', 'set TOTK_TIMER_SLACK_NS=0', 'set TOTK_PRIO_RENDER=-21',

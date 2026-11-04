@@ -63,6 +63,10 @@ static void build(compute_entry *e, int background) {
     VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                   .module = e->shader->mod, .pName = "main"}, .layout = e->layout};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup = {
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .requiredSubgroupSize = e->shader->required_subgroup_size};
+    if (subgroup.requiredSubgroupSize) ci.stage.pNext = &subgroup;
     VkPipeline p = VK_NULL_HANDLE; uint64_t began = host_now_ns();
     VkResult result = vk_pcache_compute(&ci, &p);
     uint64_t elapsed = host_now_ns() - began;

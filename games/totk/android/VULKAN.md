@@ -163,6 +163,59 @@ preparation by actual context changes; it has no valid game camera and cannot
 prove <1ms on Thor. See `APP.md` for raw host measurements, reproduction and the
 exact operator-run generated-count/fence-cadence/latency/video acceptance plan.
 
+## Logical 32-lane subgroups (experimental)
+
+`TOTK_VK_SUBGROUP_FIX=1` reconciles translated Maxwell subgroup operations with
+the Vulkan device; default **off**, startup-only (device features and immutable
+modules/pipelines cannot be switched live). Restart both arms and check the
+`[nvn-vk] subgroup fix:` line plus each `subgroup shader` line for the actual size.
+
+The backend requires Vulkan 1.3, where `VK_EXT_subgroup_size_control` is core.
+It queries the native size, size-control range and required-size stages, enables
+`subgroupSizeControl` only for this experiment, and pins affected stages to 32
+when supported, otherwise 64 when supported. Geometry is never pinned.
+No `ALLOW_VARYING_SUBGROUP_SIZE` or `REQUIRE_FULL_SUBGROUPS` stage flags are used:
+unpinnable stages retain the reported fixed default. No pinning alone can fix
+32-lane code on a 64/128-lane device.
+
+The in-memory SPIR-V rewrite masks lane-id loads to 31, selects the current
+32-lane word from ballots (zeroing the other three words), rebases absolute
+shuffle targets to the physical lane's aligned 32-lane base, and lowers all/any
+to predicate/active ballots within that group. This preserves partial/divergent
+active masks rather than pretending that each invocation is a singleton.
+Only the translator's observed ballot/all/any/shuffle and lane-id/size builtins
+are accepted; other subgroup operations or a physical size outside 32/64/128
+refuse the module with a diagnostic, never silently run an incorrect fallback.
+Shaders without subgroup operations keep their original bytes and unpinned stages.
+Seed files and the seed/reflection format do not change.
+
+Run `android/inventory_subgroups.py <seed>/v143` on a loose seed to enumerate
+actual operations, shader keys, variant names, stages and content hashes (unused
+capabilities do not count; unused builtin declarations are separated from loads).
+Add `--romfs <verified-romfs> --modules <rewritten/v143>`
+for source-package names using the existing seed scanner. Output is local
+game-derived data, not a shader bundle to commit. Package names identify likely
+uses, not proof that a pass executes in any particular scene.
+
+Host census of the prepared 1.4.3 seed: **38/24,751 modules actually use subgroup
+operations**, across 30 raw keys (22 fragment, 11 vertex, 5 compute); one additional
+vertex variant only declares an unused lane builtin and is not rewritten.
+The operations are ballot (21 instructions), all (14), any (14), shuffle (8).
+The 11 vertex shaders come from the tree package; remaining uses come from
+system, application AGL, AGL common and gsys common packages. All 39 candidate
+modules validate after rewriting. The local optimized/overlay seed has 42 actual
+users/25,286 modules (the same 30 raw keys), plus the same unused declaration;
+all 43 candidate modules validate after rewriting. This is shader inventory and
+SPIR-V validation, not evidence of which shaders execute in a particular scene.
+
+`tests/test_vk_subgroup.py` assembles a ballot/shuffle/vote compute fixture,
+validates the rewritten module, executes its emitted instructions in a host
+wave32/64/128 oracle, and checks Vulkan SSBO outputs with lavapipe. A lavapipe
+device smaller than 32 only exercises partial active masks; it does not establish
+Adreno wave64/128 execution. `make ... vksubgrouptest` builds the standalone
+production-rewrite probe (`input.spv output.spv [gpu]`). Device acceptance is a
+restart visual A/B focused on the inventory's passes, not an FPS claim.
+
 ## Offline SPIR-V optimization experiment
 
 `android/optimize_shader_seed.py <seed>/v143 --output .scratch/seed-opt/v143`
