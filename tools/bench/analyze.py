@@ -21,8 +21,8 @@ Each window goes to the generation that covered its whole span, from more than -
 after that generation started (the backend may still record a frame of the previous one); windows straddling a change
 are dropped. A generation belongs to the arm named by its "mark ... arm=<X>" (ab.sh writes "ab arm=X block=n");
 windows of generations without one are dropped too. Per arm: pooled summary metrics over its windows, and per block
-(one generation) the same metrics; the ABBA noise estimate of a metric is the spread (max - min) of its block values
-within the arm. The run gets "ab" in the JSON; abtest.py prints the verdicts.
+(one generation) the same metrics and pan direction (right on odd blocks, left on even blocks for old runs).
+The same-arm spread remains informational; abtest.py compares same-direction blocks within each ABBA quartet.
 
 Inputs per device label (as written by collect.sh / sampler.py / pan.sh): logs/<d>.log, logs/<d>-dmesg.txt,
 samples-<d>.txt, settings-<d>.env, facts-<d>.txt, totk-env-<d>.txt (only when a developer totk.env exists), freqs.txt.
@@ -56,7 +56,7 @@ KNOWN_SCENES = {
 FAULT_RE = re.compile(r'page ?fault|smmu.*fault|context fault|gpu fault|adreno.*fault', re.I)
 CTL_RE = re.compile(r'\[totk-ctl\] gen=(\d+) frame=(\d+) (applied|mark)(?: (.*))?$')
 GUARD_FRAMES = 2
-# Block metrics of the A/B noise estimate: the summary keys abtest.py compares (rates per window).
+# Block metrics compared by abtest.py (rates per window).
 AB_METRICS = ('fps_mean', 'fps_min', 'p50_ms_median', 'p95_ms_max', 'max_ms', 'gpu_ms_mean', 'over50_total', 'long_ge45_total')
 
 
@@ -84,9 +84,14 @@ def parse_log(path):
     return timing, gpu, fps, stut, longf, info
 
 
+def pan_direction(block):
+    """ab.sh alternates the first pan direction, starting right at block 1."""
+    return ('right' if block % 2 else 'left') if isinstance(block, int) and block > 0 else None
+
+
 def parse_ctl(path):
     """The live-switch generations of a log, in order: [{'gen', 'frame', 'applied': [tokens], 'marks': [texts],
-    'arm', 'block'}]. 'arm' / 'block' come from the generation's last mark carrying arm= / block=."""
+    'arm', 'block', 'direction'}]. Missing direction marks in old runs are inferred from the block index."""
     gens = {}
     with open(path, encoding='utf-8', errors='replace') as fh:
         lines = [line.rstrip('\n') for line in fh if '[totk-ctl]' in line]
@@ -94,7 +99,7 @@ def parse_ctl(path):
         if not (m := CTL_RE.search(line)):
             continue
         g = gens.setdefault(int(m[1]), {'gen': int(m[1]), 'frame': int(m[2]), 'applied': [], 'marks': [], 'arm': None,
-                                        'block': None})
+                                        'block': None, 'direction': None})
         if m[3] == 'applied':
             g['applied'].append(m[4] or '')
         else:
@@ -103,6 +108,7 @@ def parse_ctl(path):
             if kv.get('arm'):
                 g['arm'] = kv['arm']
                 g['block'] = int(kv['block']) if kv.get('block', '').isdigit() else None
+                g['direction'] = kv.get('direction', pan_direction(g['block']))
     return [gens[k] for k in sorted(gens)]
 
 
@@ -168,7 +174,8 @@ def arm_analysis(windows, gens, guard=GUARD_FRAMES):
     for gen, (g, ws) in blocks.items():
         s = summarize(ws)
         arms.setdefault(g['arm'], {'blocks': [], 'windows': []})
-        arms[g['arm']]['blocks'].append({'gen': gen, 'block': g['block'], 'frame': g['frame'], 'summary': s,
+        arms[g['arm']]['blocks'].append({'gen': gen, 'block': g['block'], 'frame': g['frame'],
+                                         'direction': g.get('direction', pan_direction(g['block'])), 'summary': s,
                                          'metrics': {k: block_metric(s, k) for k in AB_METRICS}})
         arms[g['arm']]['windows'] += ws
     for a in arms.values():
@@ -180,7 +187,8 @@ def arm_analysis(windows, gens, guard=GUARD_FRAMES):
             vs = [b['metrics'][k] for b in a['blocks'] if b['metrics'][k] is not None]
             a['spread'][k] = round(max(vs) - min(vs), 3) if len(vs) >= 2 else None
     return {'guard_frames': guard, 'windows': counts,
-            'generations': [{k: g[k] for k in ('gen', 'frame', 'applied', 'marks', 'arm', 'block')} for g in gens],
+            'generations': [{**{k: g[k] for k in ('gen', 'frame', 'applied', 'marks', 'arm', 'block')},
+                             'direction': g.get('direction', pan_direction(g['block']))} for g in gens],
             'arms': arms}
 
 
@@ -196,7 +204,8 @@ def print_arms(ab):
               f'>50 ms {s["over50_total"]} ({fmt(block_metric(s, "over50_total"))}/window)')
         for b in a['blocks']:
             m = b['metrics']
-            print(f'    block {b["block"] if b["block"] is not None else "?"} (gen {b["gen"]}, from frame {b["frame"]}): '
+            print(f'    block {b["block"] if b["block"] is not None else "?"} (gen {b["gen"]}, from frame {b["frame"]}, '
+                  f'direction {b["direction"] or "?"}): '
                   f'{b["summary"]["windows"]} windows, fps {fmt(m["fps_mean"])}, p95 {fmt(m["p95_ms_max"])} ms, '
                   f'GPU {fmt(m["gpu_ms_mean"])} ms, >50/window {fmt(m["over50_total"])}')
         if a.get('memory'):

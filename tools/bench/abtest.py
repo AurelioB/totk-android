@@ -4,45 +4,92 @@
 Per device x scene of an in-session A/B (ab.sh, then analyze.py <out> --arms --json <ab.json>): every arm against the
 reference arm (--ref, default A), per metric, with a verdict.
 
-Values: each arm's pooled summary over all of its windows (fps mean, fps min, p50 median, p95 max, worst frame, GPU ms
-mean; the >50 ms and long >=45 ms counts per window). Noise: for each arm, the spread (max - min) of the same metric
-over that arm's blocks (each block is one application of the arm in the ABBA order); the noise of a comparison is the
-larger of the two arms' spreads.
+Values: each arm's pooled summary over its windows. Verdicts use equally weighted B-A block pairs of the same pan
+direction within each complete ABBA (or BAAB) quartet: positions 1 vs 3 and 4 vs 2. Missing directions in old JSON
+are inferred from block indices (odd right, even left). Incomplete/non-ABBA quartets are not paired.
 
-Memory and pressure (sampler.py; MemAvailable minimum, the rest maxima over each arm's windows) are printed beside the
-verdicts, not part of them: an arm that collapses under memory pressure shows it there.
+Report: pooled delta, paired mean delta, per-direction mean delta, sign agreement with the paired mean, and a
+two-sided exact sign test (zero differences are ties, excluded from the test but not from agreement). The old noise
+(larger same-arm max-min block spread) is informational, not a verdict gate. Counts are compared per window.
 
-Verdict rule for one metric, delta = arm - reference (per window for counts):
-  same            |delta| <= the compare.py tolerance of the metric (compare.py --help)
-  within noise    |delta| > tolerance but <= noise: the arm's own blocks differ that much between repeats
-  better / worse  |delta| > tolerance and > noise, by the metric's direction
-  better? worse?  |delta| > tolerance, but an arm has fewer than two blocks: no noise estimate (unconfirmed)
+Verdict rule for one metric:
+  same            |paired delta| <= the compare.py tolerance, or pair signs disagree without p < 0.05 and >=6 pairs
+  better / worse  pooled AND paired deltas beyond tolerance in the same direction, and all pair signs agree
+                  (or exact sign p < 0.05 with >=6 pairs)
+  lean better/worse only the paired delta crosses tolerance, or the pooled delta has the opposite sign; informational
+  better? worse?  fewer than two valid pairs covering both directions (unconfirmed; pooled delta if no pairs)
   n/a             a value is missing
 An arm is worse if any primary metric (fps mean, p50 median, p95 max, GPU ms mean, >50 ms per window) is worse, else
-better if any is better, else inconclusive if any is better? / worse?, else same. Exit 1 when any arm is worse."""
-import argparse, io, json, os, sys
+better if any is better, else inconclusive if any is better? / worse?, else same. Exit 1 when any arm is worse.
+Memory and pressure are informational. Prefer ABBAABBA or longer on 60 fps devices."""
+import argparse, io, json, math, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchlib import METRICS, PRIMARY, guard_output  # noqa: E402
-from analyze import AB_METRICS, MEMORY_FIELDS, block_metric  # noqa: E402
+from analyze import AB_METRICS, MEMORY_FIELDS, block_metric, pan_direction  # noqa: E402
 
 
-def metric_verdict(key, ref, arm):
-    """(delta, tolerance, noise, verdict) for one metric of two arm records ({'summary', 'spread'})."""
+def paired_metric(key, ref, arm):
+    """Equal-weight same-direction block differences within complete ABBA/BAAB quartets."""
+    blocks = {}
+    for label, record in (('ref', ref), ('arm', arm)):
+        for b in record['blocks']:
+            index = b.get('block')
+            if isinstance(index, int) and index > 0:
+                blocks.setdefault(index, []).append((label, b))
+    pairs = []
+    for start in sorted({1 + 4 * ((i - 1) // 4) for i in blocks}):
+        if any(len(blocks.get(i, [])) != 1 for i in range(start, start + 4)):
+            continue
+        quartet = [blocks[i][0] for i in range(start, start + 4)]
+        labels = [label for label, _ in quartet]
+        if labels not in (['ref', 'arm', 'arm', 'ref'], ['arm', 'ref', 'ref', 'arm']):
+            continue
+        for i, j in ((0, 2), (3, 1)):
+            (_, x), (_, y) = quartet[i], quartet[j]
+            r, a = (x, y) if quartet[i][0] == 'ref' else (y, x)
+            direction = r.get('direction', pan_direction(r['block']))
+            if direction not in ('right', 'left') or direction != a.get('direction', pan_direction(a['block'])):
+                continue
+            rv, av = block_metric(r['summary'], key), block_metric(a['summary'], key)
+            if rv is not None and av is not None:
+                pairs.append({'reference_block': r['block'], 'arm_block': a['block'], 'direction': direction,
+                              'delta': av - rv})
+    ds = [p['delta'] for p in pairs]
+    mean = sum(ds) / len(ds) if ds else None
+    positive, negative = sum(d > 0 for d in ds), sum(d < 0 for d in ds)
+    nonzero = positive + negative
+    # Under the null, either sign is equally likely for each independent nonzero block pair.
+    p_value = min(1.0, 2 * sum(math.comb(nonzero, k) for k in range(min(positive, negative) + 1)) / 2 ** nonzero)
+    return {'pairs': pairs, 'delta': mean,
+            'directions': {direction: sum(p['delta'] for p in pairs if p['direction'] == direction) /
+                          sum(p['direction'] == direction for p in pairs)
+                          for direction in ('right', 'left') if any(p['direction'] == direction for p in pairs)},
+            'agreement': sum(d * mean > 0 for d in ds) if mean is not None else 0,
+            'ties': len(ds) - nonzero, 'p_value': p_value if pairs else None}
+
+
+def metric_verdict(key, ref, arm, paired=None):
+    """(paired delta, tolerance, informational spread, verdict); pooled delta if no valid pairs."""
     _, _, direction, kind, (tol_abs, tol_rel) = next(m for m in METRICS if m[0] == key)
     r, a = block_metric(ref['summary'], key), block_metric(arm['summary'], key)
     if r is None or a is None:
         return None, None, None, 'n/a'
-    d = a - r
+    paired = paired_metric(key, ref, arm) if paired is None else paired
+    d = paired['delta'] if paired['delta'] is not None else a - r
     tol = tol_abs if kind == 'abs' else max(tol_abs, tol_rel * abs(r))
     spreads = (ref['spread'].get(key), arm['spread'].get(key))
     noise = None if None in spreads else max(spreads)
     if abs(d) <= tol:
         return d, tol, noise, 'same'
     word = 'better' if d * direction > 0 else 'worse'
-    if noise is None:
+    n = len(paired['pairs'])
+    if n < 2 or len(paired['directions']) < 2:
         return d, tol, noise, word + '?'
-    return d, tol, noise, 'within noise' if abs(d) <= noise else word
+    if abs(a - r) <= tol or (a - r) * d <= 0:
+        return d, tol, noise, 'lean ' + word
+    confirmed = paired['agreement'] == n or (n >= 6 and paired['p_value'] < 0.05)
+    return d, tol, noise, word if confirmed else 'same'
 
 
 def arm_verdict(per):
@@ -83,27 +130,38 @@ def main():
         for name, arm in arms.items():
             if name == a.ref:
                 continue
-            per = {k: metric_verdict(k, ref, arm) for k in AB_METRICS}
+            paired = {k: paired_metric(k, ref, arm) for k in AB_METRICS}
+            per = {k: metric_verdict(k, ref, arm, paired[k]) for k in AB_METRICS}
             v = arm_verdict(per)
             worse += v == 'worse'
             p(f'\n  arm {name} vs {a.ref}: {v.upper()}  ({len(arm["blocks"])} vs {len(ref["blocks"])} blocks, '
               f'{arm["summary"]["windows"]} vs {ref["summary"]["windows"]} windows)')
-            p(f'  {"metric":<16} {a.ref:>9} {name:>9} {"delta":>9} {"tolerance":>9} {"noise":>9}  verdict')
+            p(f'  {"metric":<16} {a.ref:>9} {name:>9} {"pooled Δ":>9} {"paired Δ":>9} {"tolerance":>9} {"spread":>9}  verdict')
             for key, label, *_ in METRICS:
                 if key not in per:
                     continue
-                d, tol, noise, verdict = per[key]
+                _, tol, noise, verdict = per[key]
                 rate = key in ('over50_total', 'long_ge45_total')
                 rv, av = block_metric(ref['summary'], key), block_metric(arm['summary'], key)
+                pooled = av - rv if rv is not None and av is not None else None
                 p(f'  {label + (" /win" if rate else ""):<16} {"-" if rv is None else f"{rv:g}":>9} '
-                  f'{"-" if av is None else f"{av:g}":>9} {fmt(d):>9} {"-" if tol is None else f"{tol:.2f}":>9} '
+                  f'{"-" if av is None else f"{av:g}":>9} {fmt(pooled):>9} {fmt(paired[key]["delta"]):>9} '
+                  f'{"-" if tol is None else f"{tol:.2f}":>9} '
                   f'{"-" if noise is None else f"{noise:.2f}":>9}  {verdict}{" *" if key in PRIMARY else ""}')
+                stats = paired[key]
+                directions = ', '.join(f'{direction} {fmt(delta)}' for direction, delta in stats['directions'].items())
+                probability = '-' if stats['p_value'] is None else f'{stats["p_value"]:.4f}'
+                p(f'    pairs: {len(stats["pairs"])}; direction Δ: {directions or "-"}; '
+                  f'sign agreement {stats["agreement"]}/{len(stats["pairs"])} (ties {stats["ties"]}); '
+                  f'exact sign p={probability}')
             mem = [(name, ref.get('memory', {}).get(name), arm.get('memory', {}).get(name)) for _, name, _, _ in MEMORY_FIELDS]
             if any(r is not None or x is not None for _, r, x in mem):
                 p('  memory / pressure, worst over each arm\'s windows (' + a.ref + ' -> ' + name + '): ' + '; '.join(
                     f'{k} {"-" if r is None else r} -> {"-" if x is None else x}' for k, r, x in mem if r is not None or x is not None))
-        p('\n  * primary metric. Rule: same within the compare.py tolerance; better/worse only beyond both the tolerance '
-          'and the same-arm block spread (noise); "?" = no noise estimate (an arm ran one block).')
+        p('\n  * primary metric. Rule: pooled AND paired deltas beyond the compare.py tolerance in the same direction, '
+          'and (all pair signs agree or exact two-sided sign p < 0.05 with >=6 pairs); at least two pairs covering both '
+          'directions. "lean" = only paired delta crosses tolerance (or pooled sign differs), informational only; '
+          '"?" = insufficient pairs. Same-arm spread is informational. Prefer ABBAABBA or longer at 60 fps.')
     sys.stdout.write(buf.getvalue())
     if a.out:
         with open(a.out, 'w', encoding='utf-8') as f:

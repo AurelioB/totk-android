@@ -4,14 +4,15 @@
 #       [--event /dev/input/eventN] [--display <id>] [--package <pkg>] [--game-dir <dir>]
 #
 # In-session A/B in ONE loaded scene with live switches (tools/bench/live.sh, runtime/live_ctl.h): for each letter of
-# --order, applies that arm's lines and the mark "ab arm=<X> block=<n> scene=<scene>" in one write (one generation),
+# --order, applies that arm's lines and the mark "ab arm=<X> block=<n> scene=<scene> direction=<right|left>" in one write,
 # waits for the game to acknowledge it, settles --settle seconds, then pans with pan.sh (right first on odd blocks, left
 # first on even ones, so the view returns and the direction alternates). Arm lines are live.sh lines separated by
 # commas, e.g. --arms 'A:unset TOTK_VK_DESC_STOCK;B:set TOTK_VK_DESC_STOCK=1'. At the end it applies --restore (if
 # given) with the mark "ab done scene=<scene>".
-# Appends per block to <out>/arms.txt:  <device> <scene> block=<n> arm=<X> gen=<N> frame=<F> T=<epoch s> lines=<...>
+# Appends per block to <out>/arms.txt: <device> <scene> block=<n> arm=<X> direction=<right|left> gen=<N> frame=<F> T=<s> lines=<...>
 # and the pan lines to <out>/pans.txt / freqs.txt (pan.sh). Load and settle the scene and start sampler.py first;
 # collect.sh afterwards, then analyze.py <out> --arms and abtest.py.
+# Use ABBAABBA or longer on 60 fps devices: same-direction pairs separate the switch effect from view content.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
@@ -69,16 +70,16 @@ echo "ab: $n blocks ($ORDER) in $SCENE on $DEV: about $(( n * (SETTLE + PAN + 12
 block=0
 for X in $(printf '%s\n' "$ORDER" | fold -w1); do
   block=$((block + 1))
+  [ $((block % 2)) -eq 1 ] && first=right || first=left
   set --; while IFS= read -r line; do set -- "$@" "$line"; done <<EOF
 $(arm_lines "$X")
 EOF
-  ack=$(live "$@" "mark ab arm=$X block=$block scene=$SCENE"); rc=$?
+  ack=$(live "$@" "mark ab arm=$X block=$block scene=$SCENE direction=$first"); rc=$?
   [ "$rc" -eq 4 ] && die "block $block (arm $X): a line was refused: $ack"
   [ "$rc" -eq 0 ] || die "block $block (arm $X) was not applied: $ack"
   gf=$(printf '%s\n' "$ack" | grep "mark ab arm=$X block=$block " | sed -n 's/.*\] gen=\([0-9]*\) frame=\([0-9]*\) mark.*/gen=\1 frame=\2/p' | tail -n1)
-  echo "$DEV $SCENE block=$block arm=$X $gf T=$(date +%s) lines=$(arm_lines "$X" | paste -sd, -)" | tee -a "$OUT/arms.txt"
+  echo "$DEV $SCENE block=$block arm=$X direction=$first $gf T=$(date +%s) lines=$(arm_lines "$X" | paste -sd, -)" | tee -a "$OUT/arms.txt"
   sleep "$SETTLE"
-  [ $((block % 2)) -eq 1 ] && first=right || first=left
   "$HERE/pan.sh" -s "$SER" --device "$DEV" --scene "$SCENE" --seconds "$PAN" --value "$V" --first "$first" --out "$OUT" \
     --package "$PKG" --game-dir "$GAME" ${EV:+--event "$EV"} ${DISP:+--display "$DISP"} || die "pan of block $block failed"
 done

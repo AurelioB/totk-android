@@ -206,11 +206,11 @@ with `totk.env`.
      --arms 'A:unset TOTK_VK_DESC_STOCK;B:set TOTK_VK_DESC_STOCK=1' \
      --order ABBAABBA --pan-seconds 30 --settle 15 --out $OUT
    ```
-   Per block it writes the arm's lines and `mark ab arm=<X> block=<n> scene=<scene>` to `<game>/totk.ctl` with
-   `live.sh` (one write: one generation, applied at the next presented frame), waits for the game's
+   Per block it writes the arm's lines and `mark ab arm=<X> block=<n> scene=<scene> direction=<right|left>` to
+   `<game>/totk.ctl` with `live.sh` (one write: one generation, applied at the next presented frame), waits for the game's
    `[totk-ctl] gen=N frame=F mark …` acknowledgement (it stops on a refused line or no acknowledgement), settles, then
    pans with `pan.sh` (right first on odd blocks, left first on even ones; the view returns each time). `arms.txt` lists
-   the blocks with their generation and frame. Arm lines are comma-separated `live.sh` lines; an arm may set several
+   the blocks with their generation, frame and direction. Arm lines are comma-separated `live.sh` lines; an arm may set several
    switches (`'A:unset TOTK_VK_DESC_STOCK,unset TOTK_PRIO_RENDER;B:set TOTK_VK_DESC_STOCK=1,set TOTK_PRIO_RENDER=-8'`).
    `unset` returns a switch to its launch value: with no developer `totk.env` that is the default (off).
    One-off changes: `tools/bench/live.sh -s <serial> set KEY=VALUE | unset KEY | mark <text>` prints the game's answer
@@ -219,9 +219,21 @@ with `totk.env`.
    `python3 tools/bench/analyze.py $OUT --arms --json $OUT/ab.json` and `python3 tools/bench/abtest.py $OUT/ab.json`.
    `analyze.py --arms` gives each 300-frame window to the generation that covered all of it (from 2 frames after its
    change, `--guard-frames`) and so to the arm of that generation's mark; windows straddling a change are dropped and
-   counted. `abtest.py` prints each arm against A per metric: pooled value, delta, the compare.py tolerance, the noise
-   (the larger same-arm spread between blocks) and the verdict: *same* within tolerance, *within noise* up to the
-   noise, *better*/*worse* beyond both (`?` when an arm ran a single block). Exit 1 when an arm is worse.
+   counted. Block records in `ab.json` carry the pan direction; old logs/JSON infer it from the block index (odd right,
+   even left). **Keep alternating directions**: different view content alone can move fps by ~8 on the Odin in Hateno.
+   `abtest.py` compares B against A of the **same direction within each complete ABBA quartet**: blocks 1↔3 and 4↔2,
+   then 5↔7 and 8↔6, etc. BAAB quartets work too; incomplete/non-ABBA quartets are not paired. Pairs have equal weight,
+   regardless of window count. The report includes pooled arm values/delta, paired mean delta, per-direction mean
+   deltas, sign agreement with the paired mean (e.g. 4/4), and a two-sided **exact sign test** over the independent
+   block pairs (zero differences are ties: excluded from the test, but prevent unanimous agreement).
+   **Verdict**: *better*/*worse* needs BOTH the pooled and paired deltas beyond the compare.py tolerance in the same
+   direction, AND (all pair signs agreeing OR exact sign `p < 0.05` with at least 6 pairs). At least two pairs covering
+   both directions are required (`?` otherwise, unconfirmed). If only the paired delta crosses tolerance, or the pooled
+   sign differs, the metric is *lean better/worse*, informational only. Otherwise it is *same*. The larger same-arm
+   max−min block spread remains visible as information, never a verdict gate: it mixes the direction effect into noise.
+   Overall: WORSE if any primary metric is worse, else BETTER if any is better, else INCONCLUSIVE if any has `?`,
+   else SAME (leans do not count). Exit 1 when an arm is worse. Prefer **ABBAABBA or longer on 60 fps devices**; a
+   single quartet has only two pairs and unanimous agreement is not itself statistical significance (sign p = 0.5).
    Beside the verdicts both print memory and pressure per arm (sampler: MemAvailable minimum, the game's RSS / swap,
    kgsl memory, PSI cpu / memory, kswapd CPU %): an arm that only fails under memory pressure (the Duo's Lookout
    collapse) shows it there.

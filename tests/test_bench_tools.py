@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BENCH = ROOT / 'tools/bench'
 sys.path[:0] = [str(BENCH)]
 import analyze  # noqa: E402
+import abtest  # noqa: E402
 import benchlib  # noqa: E402
 import check_baselines  # noqa: E402
 import ledger  # noqa: E402
@@ -304,6 +305,16 @@ class InSessionAB(unittest.TestCase):
         self.assertEqual([(g['gen'], g['frame'], g['arm'], g['block']) for g in gens],
                          [(1, 1000, 'A', 1), (2, 2500, 'B', 2), (3, 4000, 'B', 3), (4, 5200, 'A', 4), (5, 6500, None, None)])
         self.assertEqual(gens[1]['applied'], ['TOTK_VK_DESC_STOCK=1'])
+        self.assertEqual([g['direction'] for g in gens], ['right', 'left', 'right', 'left', None])
+
+    def test_explicit_pan_direction(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'x.log'
+            p.write_text('[totk-ctl] gen=1 frame=1000 mark ab arm=A block=1 direction=left\n'
+                         '[totk-ctl] gen=2 frame=2000 mark ab arm=B direction=right\n', encoding='utf-8')
+            gens = analyze.parse_ctl(p)
+        self.assertEqual([g['direction'] for g in gens], ['left', 'right'])
+        self.assertIsNone(analyze.pan_direction(None))
 
     def test_window_generation(self):
         gens = [{'gen': 1, 'frame': 1000, 'arm': 'A'}, {'gen': 2, 'frame': 2500, 'arm': 'B'}]
@@ -345,6 +356,8 @@ class InSessionAB(unittest.TestCase):
             arms = ab['arms']
             self.assertEqual([b['block'] for b in arms['A']['blocks']], [1, 4])
             self.assertEqual([b['block'] for b in arms['B']['blocks']], [2, 3])
+            self.assertEqual([b['direction'] for b in arms['A']['blocks']], ['right', 'left'])
+            self.assertEqual([g['direction'] for g in ab['generations']], ['right', 'left', 'right', 'left', None])
             self.assertEqual(arms['B']['summary']['windows'], 7)   # 5400 straddles the change at frame 5200
             self.assertEqual(arms['A']['summary']['fps_mean'], round((30.0 * 3 + 30.2) / 4, 2))
             self.assertEqual(arms['A']['spread']['fps_mean'], 0.2)
@@ -356,23 +369,194 @@ class InSessionAB(unittest.TestCase):
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)   # B is 2 fps slower, beyond tolerance and noise
             self.assertIn('arm B vs A: WORSE', r.stdout)
             self.assertRegex(r.stdout, r'fps mean .* worse \*')
+            self.assertIn('sign agreement 2/2 (ties 0); exact sign p=0.5000', r.stdout)
             self.assertRegex(r.stdout, r'>50 ms frames /win +1 +2 .* worse \*')
 
-    def test_abtest_noise_and_single_blocks(self):
+    def test_abtest_mixed_signs_and_single_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             self.make_run(d, a_fps=(30.0, 27.0), b_fps=(28.0, 28.4))   # A's own blocks differ by 3 fps
             self.assertEqual(run(BENCH / 'analyze.py', d, '--arms', '--json', d / 'ab.json').returncode, 0)
             r = run(BENCH / 'abtest.py', d / 'ab.json')
-            self.assertRegex(r.stdout, r'fps mean .* within noise')
+            self.assertRegex(r.stdout, r'fps mean .* same \*')
+            self.assertIn('sign agreement 1/2 (ties 0); exact sign p=1.0000', r.stdout)
             doc = json.loads((d / 'ab.json').read_text(encoding='utf-8'))
-            for a in doc['runs'][0]['ab']['arms'].values():   # one block per arm: no noise estimate
+            for a in doc['runs'][0]['ab']['arms'].values():   # incomplete quartet: no direction-matched pairs
                 a['blocks'] = a['blocks'][:1]; a['spread'] = {k: None for k in a['spread']}
             (d / 'one.json').write_text(json.dumps(doc), encoding='utf-8')
             r = run(BENCH / 'abtest.py', d / 'one.json')
             self.assertRegex(r.stdout, r'fps mean .* worse\?')
             self.assertIn('arm B vs A: INCONCLUSIVE', r.stdout)
             self.assertEqual(r.returncode, 0)
+
+    @staticmethod
+    def records(a_rows, b_rows):
+        """Compact block-summary fixtures; old runs intentionally omit direction metadata."""
+        keys = ('windows', 'fps_mean', 'fps_min', 'p50_ms_median', 'p95_ms_max', 'max_ms', 'gpu_ms_mean',
+                'over50_total', 'long_ge45_total')
+        arms = []
+        for positions, rows in (((1, 4), a_rows), ((2, 3), b_rows)):
+            blocks, windows = [], []
+            for i, row in enumerate(rows):
+                summary = dict(zip(keys, row))
+                blocks.append({'block': 4 * (i // 2) + positions[i % 2], 'summary': summary})
+                windows += [dict(fps=summary['fps_mean'], p50_ms=summary['p50_ms_median'],
+                                 p95_ms=summary['p95_ms_max'], max_ms=summary['max_ms'], gpu_ms=summary['gpu_ms_mean'],
+                                 over50=summary['over50_total'] / summary['windows'],
+                                 long_ge45=summary['long_ge45_total'] / summary['windows'])] * summary['windows']
+            spreads = {}
+            for key in analyze.AB_METRICS:
+                values = [analyze.block_metric(b['summary'], key) for b in blocks]
+                spreads[key] = max(values) - min(values) if len(values) > 1 else None
+            pooled = analyze.summarize(windows)
+            pooled['fps_min'] = min(b['summary']['fps_min'] for b in blocks)
+            arms.append({'blocks': blocks, 'summary': pooled, 'spread': spreads})
+        return arms
+
+    def fps_pairs(self, deltas):
+        """Each quartet has a 20 fps view-content effect and two B-A deltas (right, left)."""
+        a, b = [], []
+        for right, left in zip(deltas[::2], deltas[1::2]):
+            a += [[1, fps, 20, 20, 30, 40, 10, 0, 0] for fps in (30, 50)]
+            b += [[1, fps, 20, 20, 30, 40, 10, 0, 0] for fps in (50 + left, 30 + right)]
+        return self.records(a, b)
+
+    def test_direction_confounded_win_and_loss(self):
+        for delta, expected in ((10, 'better'), (-10, 'worse'), (0, 'same')):
+            with self.subTest(delta=delta):
+                ref, arm = self.fps_pairs([delta] * 4)
+                stats = abtest.paired_metric('fps_mean', ref, arm)
+                self.assertEqual([(p['reference_block'], p['arm_block']) for p in stats['pairs']],
+                                 [(1, 3), (4, 2), (5, 7), (8, 6)])
+                self.assertEqual(stats['delta'], delta)
+                self.assertEqual(stats['directions'], {'right': delta, 'left': delta})
+                self.assertEqual(abtest.metric_verdict('fps_mean', ref, arm)[3], expected)
+                self.assertEqual(abtest.arm_verdict({k: abtest.metric_verdict(k, ref, arm)
+                                                    for k in analyze.AB_METRICS}), expected)
+                self.assertGreater(ref['spread']['fps_mean'], abs(delta))
+                if delta:
+                    self.assertEqual(abtest.metric_verdict('fps_mean', arm, ref)[3],
+                                     'worse' if delta > 0 else 'better')
+
+    def test_both_pooled_and_paired_delta_must_cross_tolerance(self):
+        for delta in (10, -10):
+            ref, arm = self.fps_pairs([delta] * 4)
+            arm['summary']['fps_mean'] = ref['summary']['fps_mean']
+            expected = 'lean better' if delta > 0 else 'lean worse'
+            self.assertEqual(abtest.metric_verdict('fps_mean', ref, arm)[3], expected)
+            self.assertEqual(abtest.arm_verdict({'fps_mean': abtest.metric_verdict('fps_mean', ref, arm)}), 'same')
+            arm['summary']['fps_mean'] -= delta
+            self.assertEqual(abtest.metric_verdict('fps_mean', ref, arm)[3], expected)  # opposite pooled sign
+        ref, arm = self.fps_pairs([0] * 4)
+        arm['summary']['fps_mean'] += 10
+        self.assertEqual(abtest.metric_verdict('fps_mean', ref, arm)[3], 'same')
+
+    def test_sign_test_and_unanimity(self):
+        for deltas, expected, probability in (
+                ([4, 4, 4, 0], 'same', 0.25),       # a tie prevents unanimous confirmation
+                ([4, 4, 4, -1], 'same', 0.625),     # mixed signs, too few pairs
+                ([4] * 7 + [-1], 'same', 0.0703125),
+                ([4] * 9 + [-1], 'better', 0.021484375),
+                ([-4] * 9 + [1], 'worse', 0.021484375)):
+            with self.subTest(deltas=deltas):
+                ref, arm = self.fps_pairs(deltas)
+                stats = abtest.paired_metric('fps_mean', ref, arm)
+                self.assertAlmostEqual(stats['p_value'], probability)
+                self.assertEqual(abtest.metric_verdict('fps_mean', ref, arm)[3], expected)
+
+    def test_pairs_require_quartet_and_matching_direction(self):
+        ref, arm = self.fps_pairs([10] * 4)
+        # Explicit direction wins over parity; mismatched directions cannot form a pair.
+        arm['blocks'][1]['direction'] = 'left'
+        stats = abtest.paired_metric('fps_mean', ref, arm)
+        self.assertEqual(len(stats['pairs']), 3)
+        ref['blocks'].pop()  # do not pair across the resulting incomplete quartet
+        self.assertEqual(len(abtest.paired_metric('fps_mean', ref, arm)['pairs']), 1)
+        self.assertEqual(abtest.metric_verdict('fps_mean', ref, arm)[3], 'better?')
+        ref, arm = self.fps_pairs([10] * 4)
+        for record in (ref, arm):
+            for block in record['blocks']:
+                block['block'] = None
+        self.assertEqual(abtest.paired_metric('fps_mean', ref, arm)['pairs'], [])
+
+    def test_odin_plan1_regressions(self):
+        # Observed block summaries from .scratch/bench/live/odin-ab-e2d3609/<name>/ab.json.
+        # Preserve windows/counts and all compared metrics, not only the headline fps values.
+        cases = (
+            ('ab1-split512', 'better', (22.58, 18.06),
+             [[3, 38.63, 36.6, 22.58, 37.33, 42.7, 15.83, 0, 0],
+              [4, 44.55, 34.8, 31.4, 37.79, 43.4, 14.95, 0, 0],
+              [3, 37.1, 33.7, 28.88, 37.44, 44.7, 16.07, 0, 0],
+              [4, 47.17, 38.4, 21.39, 37.37, 41.8, 14.43, 0, 0]],
+             [[5, 54.18, 50.4, 18.27, 32.59, 37.7, 13.94, 0, 0],
+              [4, 48.17, 40, 19.8, 38.77, 95.4, 14.6, 1, 1],
+              [5, 51.16, 35.6, 17.93, 37.34, 42.7, 14.46, 0, 0],
+              [4, 55.28, 54, 17.96, 21.63, 37.9, 13.88, 0, 0]]),
+            ('ab2-prepmask', 'same', (20.64, 21.1),
+             [[3, 37.6, 33.9, 22.02, 37.44, 48, 16.07, 0, 2],
+              [4, 45.05, 31.8, 20.23, 37.44, 41.7, 14.8, 0, 0],
+              [3, 41.43, 36.2, 27.34, 37.64, 52.5, 15.43, 2, 3],
+              [4, 47.75, 38.6, 20.06, 37.02, 41.3, 14.4, 0, 0]],
+             [[3, 42.37, 32.9, 20.4, 37.21, 40.3, 15.27, 0, 0],
+              [3, 39.6, 34.1, 30.55, 37.43, 43, 15.8, 0, 0],
+              [4, 48.05, 37, 20.42, 37.21, 40.2, 14.47, 0, 0],
+              [3, 39.77, 36.4, 21.3, 36.82, 55, 15.47, 4, 8]]),
+            ('ab6-lookout-split512', 'same', (18.04, 18.15),
+             [[4, 53.12, 48.6, 18.23, 33.72, 40.3, 13.53, 0, 0],
+              [5, 53.56, 49.8, 18.04, 22.78, 38, 13.72, 0, 0],
+              [5, 53.64, 49, 18.12, 30.46, 37.4, 13.68, 0, 0],
+              [5, 51.42, 45.2, 17.88, 34.53, 40.5, 13.66, 0, 0]],
+             [[4, 54.6, 50.3, 18.15, 33.77, 39.5, 13.35, 0, 0],
+              [4, 52.4, 48.5, 18.46, 32.74, 40.4, 13.72, 0, 0],
+              [4, 52.75, 46.9, 18.34, 34.61, 37.2, 13.57, 0, 0],
+              [4, 50.42, 44.8, 19.03, 36.35, 42.8, 13.88, 0, 0]]))
+        for name, expected, medians, a_rows, b_rows in cases:
+            with self.subTest(run=name):
+                ref, arm = self.records(a_rows, b_rows)
+                # A pooled median cannot be reconstructed from block medians: retain the observed pooled values.
+                ref['summary']['p50_ms_median'], arm['summary']['p50_ms_median'] = medians
+                per = {k: abtest.metric_verdict(k, ref, arm) for k in analyze.AB_METRICS}
+                self.assertEqual(abtest.arm_verdict(per), expected, per)
+                if name == 'ab6-lookout-split512':
+                    self.assertEqual(per['p50_ms_median'][3], 'lean worse')
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / 'ab.json'
+                    path.write_text(json.dumps({'runs': [{'device': 'odin', 'scene': name, 'ab': {
+                        'windows': {'assigned': ref['summary']['windows'] + arm['summary']['windows'],
+                                    'straddling': 0, 'unlabelled': 0}, 'arms': {'A': ref, 'B': arm}}}]}),
+                                    encoding='utf-8')
+                    result = run(BENCH / 'abtest.py', path)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f'arm B vs A: {expected.upper()}', result.stdout)
+                    if name == 'ab1-split512':
+                        self.assertIn('direction Δ: right +13.86, left +6.81; sign agreement 4/4', result.stdout)
+
+    def test_ab_driver_records_alternating_direction(self):
+        # Exercise the host driver with stand-in scripts only: never touch adb or a device.
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'ab.sh').write_text((BENCH / 'ab.sh').read_text(encoding='utf-8'), encoding='utf-8')
+            for script, text in (
+                    ('live.sh', '#!/bin/sh\nfor line do printf "[totk-ctl] gen=1 frame=1000 %s\\n" "$line"; done\n'),
+                    ('pan.sh', '#!/bin/sh\nprintf "pan args: %s\\n" "$*"\n'),
+                    ('sleep', '#!/bin/sh\nexit 0\n')):
+                (d / script).write_text(text, encoding='utf-8')
+                (d / script).chmod(0o755)
+            result = subprocess.run(['sh', str(d / 'ab.sh'), '-s', 'fake', '--device', 'test', '--scene', 'hateno',
+                                     '--arms', 'A:unset TOTK_VK_DESC_STOCK;B:set TOTK_VK_DESC_STOCK=1',
+                                     '--order', 'ABBA', '--settle', '0', '--event', '/fake', '--display', '0',
+                                     '--out', str(d / 'out')],
+                                    env={**os.environ, 'PATH': str(d) + os.pathsep + os.environ['PATH']},
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = (d / 'out/arms.txt').read_text(encoding='utf-8').splitlines()
+            self.assertEqual(len(lines), 4)
+            for index, direction in enumerate(('right', 'left', 'right', 'left'), 1):
+                self.assertIn(f'block={index} arm={"ABBA"[index - 1]} direction={direction} gen=1 frame=1000', lines[index - 1])
+            pans = [line for line in result.stdout.splitlines() if line.startswith('pan args:')]
+            self.assertEqual(len(pans), 4)
+            for line, direction in zip(pans, ('right', 'left', 'right', 'left')):
+                self.assertIn(f'--first {direction} ', line)
 
     def test_scripts_parse(self):
         for script in ('live.sh', 'ab.sh', 'pan.sh'):
