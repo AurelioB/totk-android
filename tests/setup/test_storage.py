@@ -393,6 +393,30 @@ class ContainerParts(Storage):
         self.assertTrue(fifo.parent.name.startswith('totk-romfs-'))
         self.assertFalse(fifo.parent.exists())
 
+    def test_next_locked_setup_reclaims_dead_process_fifos(self):
+        work = self.nobackup / 'setup-work'; work.mkdir(parents=True)
+        stale = [work / f'romfs-{pid}.fifo' for pid in (2147483646, 2147483647)]
+        for path in stale:
+            os.mkfifo(path, 0o600)
+        regular = work / 'romfs-regular.fifo'; regular.write_bytes(b'keep')
+        other = work / 'other.fifo'; os.mkfifo(other, 0o600)
+        link = work / 'romfs-link.fifo'; link.symlink_to(other)
+        scratch = work / 'shaders-resume'; scratch.mkdir()
+        nested = scratch / stale[0].name; os.mkfifo(nested, 0o600)
+        with (self.nobackup / 'setup.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            p, out = self.run_setup([self.dir / 'romfs.bin'], stages=['romfs'])
+            self.assertFalse(out['ok'], out)
+            self.assertIn('already running', out['message'])
+            self.assertTrue(all(path.exists() for path in stale), 'another setup must not reclaim the active setup’s pipes')
+        p, out = self.run_setup([self.dir / 'romfs.bin'], stages=['romfs'])
+        self.assertTrue(out['ok'], out | {'stderr': p.stderr[-2000:]})
+        self.assertTrue(all(not path.exists() for path in stale), 'the next locked run removes dead process pipes')
+        self.assertEqual(regular.read_bytes(), b'keep')
+        self.assertTrue(other.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(nested.exists(), 'shader resume scratch is not swept recursively')
+
     def test_mkfifo_reports_its_own_error_before_cleanup(self):
         p, out = self.merge(self.game / 'parts', self.part, LD_PRELOAD=self.preload,
                             TOTK_DENY_FIFO_UNDER=str(self.nobackup), TOTK_CLOBBER_CLOSE_ERRNO='1')

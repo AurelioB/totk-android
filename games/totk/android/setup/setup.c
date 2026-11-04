@@ -631,6 +631,32 @@ static void staging_cleanup(SetupCtx *c) {
     closedir(d);
 }
 static void keys_cleanup(SetupCtx *c) { if (c->keydir[0]) st_rmtree(c->keydir); }
+/* The merge pipe is outside .import: reclaim pipes left by a killed process only while setup.lock is held.
+   Do not follow links or remove shader scratch, regular files, or other users of setup-work. */
+static int romfs_fifo_cleanup(SetupCtx *c) {
+    char dir[SETUP_PATH];
+    if (!c->nobackup[0]) return 0;
+    if (st_path(dir, sizeof dir, "%s/setup-work", c->nobackup)) return st_io_fail(c, "open", "setup-work");
+    DIR *d = opendir(dir);
+    if (!d) return errno == ENOENT ? 0 : st_io_fail(c, "open", dir);
+    int rc = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *e = readdir(d);
+        if (!e) { if (errno) rc = st_io_fail(c, "read", dir); break; }
+        size_t n = strlen(e->d_name);
+        if (n <= 11 || strncmp(e->d_name, "romfs-", 6) || strcmp(e->d_name + n - 5, ".fifo")) continue;
+        char path[SETUP_PATH]; struct stat st;
+        if (st_path(path, sizeof path, "%s/%s", dir, e->d_name)) { rc = st_io_fail(c, "remove", e->d_name); break; }
+        if (lstat(path, &st)) {
+            if (errno == ENOENT) continue;
+            rc = st_io_fail(c, "stat", path); break;
+        }
+        if (S_ISFIFO(st.st_mode) && unlink(path) && errno != ENOENT) { rc = st_io_fail(c, "remove", path); break; }
+    }
+    closedir(d);
+    return rc;
+}
 
 static char *result_fail(const char *stage, const char *code, const char *msg) {
     Buf b = {0};
@@ -676,6 +702,7 @@ char *setup_run_json(const char *request, size_t len, SetupProgressFn progress, 
     if (flock(lock, LOCK_EX | LOCK_NB)) { setup_fail(c, "internal", "Setup is already running"); goto fail; }
     /* Stale key files of an interrupted run go first; the directory exists only while hactool needs it. */
     keys_cleanup(c);
+    if (romfs_fifo_cleanup(c)) goto fail;
     if (mkdir(c->keydir, 0700) && errno != EEXIST) { st_io_fail(c, "create", "import-keys"); goto fail; }
     setup_install_load(c->game, &u->st);
     int changed = 0;
