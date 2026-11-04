@@ -113,7 +113,7 @@ Step by step, with every message, the measured times of each route and moving fr
 Measured with release 1.0.0 on each device's **default profile**, panning the camera in three places of the same save
 set (Lookout Landing is the **inside** of the shelter next to Monte). Each number covers 3–7 windows of 300 frames.
 
-| Device · profile | Place | Average fps | fps range | 95 % of frames took at most | Frames over 50 ms |
+| Device · profile | Place | Average fps | Lowest–highest window average | 95 % of frames took at most | Frames over 50 ms |
 |---|---|---|---|---|---|
 | AYN Thor · Balanced (30 fps) | Hateno Village | 30.0 | 30.0–30.1 | 38.9 ms | 1 of 1,200 |
 | | Lookout Landing (indoors) | 30.0 | 30.0 | 39.9 ms | 0 of 1,200 |
@@ -125,7 +125,8 @@ set (Lookout Landing is the **inside** of the shelter next to Monte). Each numbe
 | | Lookout Landing (indoors) | 29.0 | 28.4–29.9 | 49.5 ms | 34 of 1,200 |
 | | Rotsumamu Shrine | 29.9 | 29.9 | 37.8 ms | 1 of 1,200 |
 
-At 30 fps a steady frame takes 33.3 ms, at 60 fps 16.7 ms. No GPU faults and no thermal throttling on any device.
+*Average fps* is the mean of the 300-frame windows; the next column gives the slowest and fastest window. At 30 fps a
+steady frame takes 33.3 ms, at 60 fps 16.7 ms. These sessions had no GPU faults and no thermal throttling.
 
 - **The Odin 3 was CPU-limited**: during this session its CPU clocks were capped at about 2.2 GHz (hardware maximum
   3.5 / 4.3 GHz) by a non-thermal limit (performance mode off, a ClusterTune tile present). Its GPU needed only 13–17 ms
