@@ -50,6 +50,7 @@ static const totk_live_switch totk_live_switches[] = {
     {"TOTK_VK_LOAD_ELIDE", 0, 1},           /* the next render pass opened; never changes an open pass's load ops */
     {"TOTK_VK_FEEDBACK_NARROW", 0, 1},     /* the next render pass opened; outstanding invalidations still drain at its end */
     {"TOTK_VK_ALPHA_TEST", 0, 1},          /* next draw: immutable fragment comparison variant and reference block */
+    {"TOTK_VK_CLEAR_ON_READ", 0, 1},       /* next resource read: resolve an outstanding attachment load-clear */
     {"TOTK_VK_STAGING_RETAIN_MB", 8, 4096},  /* each slot at its next open, after its fence */
     {"TOTK_VK_FEEDBACK_CUT", 0, 1},          /* the next descriptor build */
     {"TOTK_VK_PREPARE_MASK", 0, 1},          /* the next draw's uniform preparation; a change dirties every register */

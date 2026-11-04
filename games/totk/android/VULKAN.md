@@ -560,6 +560,11 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   Alpha rejection runs after the shader and suppresses color/depth/stencil writes; alpha variants use late tests.
   `[alpha-test]` reports enabled and ignored draws every 300 presents **even while off**. Compare cutout/menu pixels,
   not fps; `vkrectest --alpha-clear` checks all comparisons with a checkerboard and inline/worker recording.
+- **Pending clear before read** (`TOTK_VK_CLEAR_ON_READ=1`, default **0**, live at the next texture read): when a
+  sampled/storage image overlaps a pending attachment clear, materialize the load-clear and end its pass before
+  returning the read view, including descriptor-cache hits and storage aliases. Do not cancel the NVN write.
+  `[clear-on-read] forced=N reason=first-read` counts resolutions per 300 presents. Compare menu backdrops;
+  `vkrectest --alpha-clear` checks read-before-attach ordering with both live arms and aliases.
 - **The uniform-update log** drops entries a newer update covers entirely (the game rewrites the same constant blocks
   many times a frame), and `ub_prune` returns at once unless a submission finished. `ub_overlaps` had been a quarter of
   the render thread.

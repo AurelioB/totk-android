@@ -1787,6 +1787,7 @@ int vk_xlate_texture_view_type(vk_tex *x, VkImageView view) {
     return type;
 }
 VkImageView vk_tex_view(vk_tex *x, const tex_t *t, const view_t *v, int attach) {
+    if (!attach) vk_draw_texture_read(0,t);
     if (!attach) vk_tex_native_read(x);
     (void)t;
     pthread_mutex_lock(&g_tex_mu); VkImageView r = x && x->im ? view_get(x, v, attach, -1) : VK_NULL_HANDLE; pthread_mutex_unlock(&g_tex_mu);
@@ -2228,6 +2229,7 @@ static void texmemo_publish(texmemo_t *m) {
     }
 }
 VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out) {
+    vk_draw_texture_read(tid,NULL); /* before either descriptor cache can bypass resource preparation */
     int want = target_out ? *target_out : -1;
     TEX_LOOKUP_COUNT(0);
     texmemo_t *m = T_texmemo;

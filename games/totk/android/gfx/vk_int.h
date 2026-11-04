@@ -654,6 +654,7 @@ void mtl_scan_stats(uint64_t *shader_ns, uint64_t *pso_ns);
 void vk_draw_exec(uint32_t op, const void *a);   /* every op the walker does not handle itself */
 const uint8_t *vk_exec_draw_next(void);          /* next record only while replaying a draw; NULL outside mtl_exec */
 void vk_end_rendering(void);                     /* end the render pass if one is open (transfers, submission end) */
+void vk_draw_texture_read(int tid, const tex_t *texture); /* first sampled/storage read resolves an overlapping load-clear */
 void vk_end_rendering_at(vk_pass_end_kind reason, uint32_t detail);
 void vk_pass_merge_counters(uint64_t out[4]);   /* deferred, retained, hazard splits, avoided boundaries */
 /* the bound state the shader variants are chosen by (vk_shader.c reads it) */

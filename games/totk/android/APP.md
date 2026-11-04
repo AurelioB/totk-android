@@ -1952,6 +1952,7 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_VK_LOAD_ELIDE` | 0–1 | the next render pass opened | default off; only certified full-coverage first draws discard color loads; `[load-elide]` counts proofs and elided passes per 300 presents |
 | `TOTK_VK_FEEDBACK_NARROW` | 0–1 | the next render pass opened | default off; retain read-only attachment feedback across texture-only invalidates; `[feedback-narrow]` counts avoided ends per 300 presents |
 | `TOTK_VK_ALPHA_TEST` | 0–1 | the next draw | default off; alpha comparison fragment variant plus immutable reference UBO; `[alpha-test]` counts enabled/ignored draws even while off |
+| `TOTK_VK_CLEAR_ON_READ` | 0–1 | the next sampled/storage image read | default off; materialize overlapping pending attachment clears before returning a cached/new view; `[clear-on-read]` counts first-read resolutions |
 | `TOTK_VK_STAGING_RETAIN_MB` | 8…4096 | each slot arena at its next open, after its fence | unset returns to the launch value (no cap when unset at launch) |
 | `TOTK_VK_FEEDBACK_CUT` | 0–1 | the next descriptor build | the freeze memo key carries the pass serial while it is on |
 | `TOTK_VK_PREPARE_MASK` | 0–1 | the next draw's uniform preparation | a change marks every register dirty, so that draw prepares in full; `TOTK_VK_OFF=prepare` keeps it off |

@@ -91,6 +91,9 @@ static totk_live_cache g_prepare_mask_live;
 static int g_alpha_launch;
 static totk_live_cache g_alpha_live;
 static uint64_t g_alpha_enabled, g_alpha_ignored;
+static int g_clear_read_launch;
+static totk_live_cache g_clear_read_live;
+static uint64_t g_clear_read_forced;
 static uint16_t g_uniform_prepare_dirty[2] = {UINT16_MAX, UINT16_MAX};
 static uint64_t g_prepare_calls, g_prepare_skips, g_prepare_checks;
 static int prepare_mask_live(void) {
@@ -1091,10 +1094,36 @@ static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
 }
 void vk_end_rendering_at(vk_pass_end_kind reason, uint32_t detail) { VK_REC_DO(VK_REC_S_PASS, end_rendering_inner(reason, detail)); }
 void vk_end_rendering(void) { vk_end_rendering_at(VK_PASS_END_OTHER, 0); }
+/* A pending load-clear is already an NVN write, even before a draw attaches
+ * the target. A descriptor read must not observe the preceding image version.
+ * Resolve via the same attachment path (views, integer formats, native canvas,
+ * MSAA and depth/stencil), rather than clearing an imprecise whole VkImage.
+ * Walking-owner only; the guard excludes diagnostic reads during pass setup. */
+void vk_draw_texture_read(int tid, const tex_t *texture) {
+    static int resolving;
+    if (R.open || resolving || !S.has_rt) return;
+    int pending=R.clear_d || R.clear_s;
+    for (unsigned i=0;i<8;i++) pending|=R.clear_c[i];
+    if (!pending || !totk_live_cached(&g_clear_read_live,"TOTK_VK_CLEAR_ON_READ",g_clear_read_launch)) return;
+    vk_treg registration;
+    if (!texture) {
+        if (!vk_treg_get(tid,&registration)) return;
+        texture=&registration.t;
+    }
+    int overlaps=(R.clear_d || R.clear_s) && S.rt.depth && feedback_overlap(texture,S.rt.depth);
+    for (unsigned i=0;i<8 && !overlaps;i++)
+        overlaps=R.clear_c[i] && S.rt.color[i] && feedback_overlap(texture,S.rt.color[i]);
+    if (!overlaps) return;
+    resolving=1;
+    vk_end_rendering_at(VK_PASS_END_TEXTURE_BARRIER,NVN_BARRIER_INVALIDATE_TEXTURE_BIT);
+    resolving=0;
+    g_clear_read_forced++;
+}
 #ifdef TOTK_VK_TESTS
 void vk_draw_test_correctness_counts(uint64_t out[2]) {
     out[0]=g_alpha_enabled; out[1]=g_alpha_ignored;
 }
+uint64_t vk_draw_test_clear_read_count(void) { return g_clear_read_forced; }
 #endif
 int vk_record_counter_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2 stage) {
     if (!R.open || !R.secondary) return 0;
@@ -3640,6 +3669,8 @@ void vk_draw_switches_init(void) {
     LOGV("[nvn-vk] TOTK_VK_FEEDBACK_NARROW=%d: texture-only feedback boundaries, next pass open",g_feedback_narrow_launch);
     e=getenv("TOTK_VK_ALPHA_TEST"); g_alpha_launch=e && atoi(e)==1;
     LOGV("[nvn-vk] TOTK_VK_ALPHA_TEST=%d: next draw, fragment alpha rejection with immutable reference blocks",g_alpha_launch);
+    e=getenv("TOTK_VK_CLEAR_ON_READ"); g_clear_read_launch=e && atoi(e)==1;
+    LOGV("[nvn-vk] TOTK_VK_CLEAR_ON_READ=%d: next texture read, resolve pending attachment clears",g_clear_read_launch);
     e = getenv("TOTK_VK_FEEDBACK_CUT"); g_feedback_cut_launch = e && atoi(e) == 1;
     atomic_store_explicit(&g_feedback_cut, g_feedback_cut_launch, memory_order_relaxed);
     LOGV("TOTK_VK_FEEDBACK_CUT=%d: %s", g_feedback_cut_launch, g_feedback_cut_launch ?
@@ -10375,6 +10406,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         LOGV("[alpha-test] frame %llu: last 300 presents enabled=%llu ignored=%llu",
              (unsigned long long)n,(unsigned long long)g_alpha_enabled,(unsigned long long)g_alpha_ignored);
         g_alpha_enabled=g_alpha_ignored=0;
+        LOGV("[clear-on-read] frame %llu: last 300 presents forced=%llu reason=first-read",
+             (unsigned long long)n,(unsigned long long)g_clear_read_forced);
+        g_clear_read_forced=0;
 #ifdef TOTK_ANDROID_APP
         if (g_guest_extent_diag && vk_overlay_mode()) {
             static vk_overlay_counters previous;

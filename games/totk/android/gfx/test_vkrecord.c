@@ -154,6 +154,7 @@ int main(int argc, char **argv) {
         int ok=1;
         for (unsigned workers=0;workers<2;workers++) {
             ok &= run(binary,"--alpha-test","unused",workers?"2":"0",0);
+            ok &= run(binary,"--clear-on-read","unused",workers?"2":"0",0);
         }
         rmdir(dir); return !ok;
     }

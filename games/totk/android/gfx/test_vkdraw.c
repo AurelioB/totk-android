@@ -2725,6 +2725,51 @@ int main(int argc, char **argv) {
         printf("%s: alpha-test %d checks, %d failed\n",fails?"FAILED":"ok",checks,fails);
         return fails!=0;
     }
+    if (argc >= 2 && !strcmp(argv[1],"--clear-on-read")) {
+        CHECK(mtl_wait(run(),5000000000ull),"read-before-attach fixture initial draw completes");
+        extern uint64_t vk_draw_test_clear_read_count(void);
+        tex_t alias=rt; alias.serial=103;
+        mtl_reg_tex(2,&rt,NULL); mtl_reg_tex(3,&alias,NULL);
+        for (unsigned fixture=0;fixture<4;fixture++) {
+            int enabled=fixture&1;
+            totk_live_lines lines={0}; const char *setting=enabled ?
+                "set TOTK_VK_CLEAR_ON_READ=1\n" : "set TOTK_VK_CLEAR_ON_READ=0\n";
+            totk_live_feed(&lines,setting,strlen(setting)); totk_live_frame(fixture+1);
+            p_scissor all={0,0,64,64};
+            op(OP_SET_RT,&srt,sizeof srt); op(OP_SCISSOR,&all,sizeof all); op(OP_CLEAR_COLOR,&cc,sizeof cc);
+            CHECK(mtl_wait(run(),5000000000ull),"read-before-attach old contents are blue");
+            uint64_t before=vk_draw_test_clear_read_count();
+            mtl_sub_begin();
+            p_clear_color green={0,15,{0,1,0,1}};
+            vk_draw_exec(OP_SET_RT,&srt); vk_draw_exec(OP_CLEAR_COLOR,&green);
+            int target=1; vk_tex *image=NULL;
+            (void)vk_tex_by_id(1,&target,NULL); /* unrelated reader must not resolve the target */
+            CHECK(vk_draw_test_clear_read_count()==before,"unrelated texture read preserves pending clear");
+            (void)vk_tex_by_id(fixture<2?2:3,&target,&image);
+            (void)vk_tex_by_id(fixture<2?2:3,&target,NULL); /* cached first reader must still order the write */
+            VkBuffer buffer; uint64_t offset=0;
+            CHECK(image && vk_resolve((uint64_t)(uintptr_t)readback,64*64*4,&buffer,&offset),
+                "first read resolves image and readback buffer");
+            vk_barrier_all(vk_cb());
+            VkBufferImageCopy copy={.bufferOffset=offset,.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
+                .imageExtent={64,64,1}};
+            /* Deliberately do not call vk_end_rendering here: that would flush
+             * the pending clear even in the control arm and hide the ordering. */
+            vkCmdCopyImageToBuffer(vk_cb(),vk_tex_image(image),VK_IMAGE_LAYOUT_GENERAL,buffer,1,&copy);
+            vk_barrier_all(vk_cb());
+            CHECK(mtl_wait(mtl_sub_commit(),5000000000ull),"first-read copy completes");
+            CHECK(vk_draw_test_clear_read_count()-before==(unsigned)enabled,
+                "one first-read resolution, including storage alias (%u)",fixture);
+            int bad=0;
+            for (int pixel=0;pixel<64*64;pixel++) {
+                const uint8_t *p=readback+4*pixel;
+                bad+=p[0] || p[1]!=(enabled?255:0) || p[2]!=(enabled?0:255) || p[3]!=255;
+            }
+            CHECK(!bad,"read before any attaching draw sees %s (%d incorrect pixels)",enabled?"NVN clear":"control's old contents",bad);
+        }
+        printf("%s: clear-on-read %d checks, %d failed\n",fails?"FAILED":"ok",checks,fails);
+        return fails!=0;
+    }
     if (argc == 3 && !strcmp(argv[1], "--load-elide")) {
         CHECK(mtl_wait(run(), 5000000000ull), "coverage fixture setup completes");
         shader_binary(0, 37, vctl, vcode, &vlen); memcpy(vc, vcode, vlen);
