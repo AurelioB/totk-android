@@ -1,0 +1,342 @@
+{
+  "schema": "totk-android-benchmark/1",
+  "name": "e2e-thor",
+  "date": "2026-11-04",
+  "build": {
+    "app_version": "1.0.0",
+    "version_code": 10000,
+    "game_version": "1.4.3",
+    "commit": "ddd1e0a1f62a642a796a697a712fe679529b0acb",
+    "apk_sha256": "54732677e7c0c00daa098f7dc9205df079c47241c7de967aa85cb9e8bf04b0eb",
+    "turnip_driver_sha256": "9b87afeb3d8d30c6a0ad5aab3e0703bc1500e0321e9f17a922106fa556389ec6"
+  },
+  "method": {
+    "summary": "Default profile per device (no totk.env). Save loaded from the in-game Load list, ~55 s settle, then the right stick held at half deflection (right, then left) via sendevent on the controller node. Only the runtime's own 300-frame windows that started after the stick was pushed and ended before it was released are counted.",
+    "sources": {
+      "fps": "[nvn-vk] frame N: X fps over the last 300",
+      "frame_time": "计时 至帧 N： 帧时间 p50 / p95 / 最大 (runtime timing line)",
+      "gpu_ms": "[nvn-vk] frame N, per frame: ... GPU X ms",
+      "long_frames": "[长帧] lines (logged only when >20 ms and 40% above the recent 16-frame average: lower bound)",
+      "over33_over50": "[nvn-vk] stutter line counts per window",
+      "thermal": "thermal zones, cooling devices, GPU thermal_pwrlevel and cpufreq limits sampled every 3 s",
+      "freq_limits": "cpufreq policies and the kgsl/devfreq GPU limits read at the start and end of each pan, plus the sampler's scaling_max_freq / max_gpuclk records"
+    }
+  },
+  "devices": {
+    "thor": {
+      "name": "AYN Thor",
+      "soc": "QTI QCS8550",
+      "gpu": "Adreno 740",
+      "android": "13",
+      "profile": null,
+      "screens": "dual",
+      "settings_env": {
+        "TOTK_FPS60": "0",
+        "TOTK_ACQUIRE_SLACK": "1",
+        "TOTK_POST_SCALE": "off",
+        "TOTK_OPERATION_MODE": "handheld",
+        "TOTK_NATIVE_UI": "0",
+        "TOTK_OVERLAY": "off",
+        "TOTK_OVERLAY_POS": "tr",
+        "TOTK_COMPANION": "1",
+        "TOTK_FACE_BUTTONS": "label",
+        "TOTK_AUDIO_PREFILL_MS": "20",
+        "TOTK_RUMBLE": "1",
+        "TOTK_RUMBLE_GAIN": "1.0",
+        "TOTK_GYRO": "1",
+        "TOTK_LOCALE": "en-US"
+      },
+      "serial_sha256": "7087cf2e3a26d0f9",
+      "freq_limits": {
+        "cpu": [
+          {
+            "policy": 0,
+            "related_cpus": [
+              0,
+              1,
+              2
+            ],
+            "scaling_min_khz": 902400,
+            "scaling_max_khz": 2016000,
+            "cpuinfo_max_khz": 2016000
+          },
+          {
+            "policy": 3,
+            "related_cpus": [
+              3,
+              4,
+              5,
+              6
+            ],
+            "scaling_min_khz": 1651200,
+            "scaling_max_khz": 2803200,
+            "cpuinfo_max_khz": 2803200
+          },
+          {
+            "policy": 7,
+            "related_cpus": [
+              7
+            ],
+            "scaling_min_khz": 1843200,
+            "scaling_max_khz": 3187200,
+            "cpuinfo_max_khz": 3187200
+          }
+        ],
+        "gpu": {
+          "max_gpuclk_hz": 680000000,
+          "devfreq_max_hz": 680000000,
+          "available_hz": [
+            680000000,
+            615000000,
+            550000000,
+            475000000,
+            401000000,
+            348000000,
+            295000000,
+            220000000,
+            124800000
+          ],
+          "min_pwrlevel": 4,
+          "max_pwrlevel": 0,
+          "thermal_pwrlevel": 0,
+          "hw_max_hz": 680000000,
+          "cap_hz": 680000000
+        }
+      },
+      "freq_signature": {
+        "sha256": "e52c5e06931d2435cdb53c77b31e5a0bfc2280d2dba5c87fc9e128271885255e",
+        "short": "e52c5e06931d",
+        "caps": "CPU 2.02/2.80/3.19 GHz (max), GPU 680 MHz (max)"
+      }
+    }
+  },
+  "scenes": {
+    "rotsumamu": {
+      "name": "Rotsumamu Shrine",
+      "save_slot": "slot_04",
+      "note": "outdoors at the shrine"
+    }
+  },
+  "runs": [
+    {
+      "device": "thor",
+      "scene": "rotsumamu",
+      "pans": [
+        {
+          "start_frame": 6600,
+          "end_frame": 8100,
+          "start_utc": "2026-11-04T01:47:44+00:00",
+          "end_utc": "2026-11-04T01:48:34+00:00",
+          "stick_value": 16000,
+          "freq_limits": {
+            "start": {
+              "cpu": [
+                {
+                  "policy": 0,
+                  "related_cpus": [
+                    0,
+                    1,
+                    2
+                  ],
+                  "scaling_min_khz": 902400,
+                  "scaling_max_khz": 2016000,
+                  "cpuinfo_max_khz": 2016000
+                },
+                {
+                  "policy": 3,
+                  "related_cpus": [
+                    3,
+                    4,
+                    5,
+                    6
+                  ],
+                  "scaling_min_khz": 1651200,
+                  "scaling_max_khz": 2803200,
+                  "cpuinfo_max_khz": 2803200
+                },
+                {
+                  "policy": 7,
+                  "related_cpus": [
+                    7
+                  ],
+                  "scaling_min_khz": 1843200,
+                  "scaling_max_khz": 3187200,
+                  "cpuinfo_max_khz": 3187200
+                }
+              ],
+              "gpu": {
+                "max_gpuclk_hz": 680000000,
+                "devfreq_max_hz": 680000000,
+                "available_hz": [
+                  680000000,
+                  615000000,
+                  550000000,
+                  475000000,
+                  401000000,
+                  348000000,
+                  295000000,
+                  220000000,
+                  124800000
+                ],
+                "min_pwrlevel": 4,
+                "max_pwrlevel": 0,
+                "thermal_pwrlevel": 0,
+                "hw_max_hz": 680000000,
+                "cap_hz": 680000000
+              }
+            },
+            "end": {
+              "cpu": [
+                {
+                  "policy": 0,
+                  "related_cpus": [
+                    0,
+                    1,
+                    2
+                  ],
+                  "scaling_min_khz": 902400,
+                  "scaling_max_khz": 2016000,
+                  "cpuinfo_max_khz": 2016000
+                },
+                {
+                  "policy": 3,
+                  "related_cpus": [
+                    3,
+                    4,
+                    5,
+                    6
+                  ],
+                  "scaling_min_khz": 1651200,
+                  "scaling_max_khz": 2803200,
+                  "cpuinfo_max_khz": 2803200
+                },
+                {
+                  "policy": 7,
+                  "related_cpus": [
+                    7
+                  ],
+                  "scaling_min_khz": 1843200,
+                  "scaling_max_khz": 3187200,
+                  "cpuinfo_max_khz": 3187200
+                }
+              ],
+              "gpu": {
+                "max_gpuclk_hz": 680000000,
+                "devfreq_max_hz": 680000000,
+                "available_hz": [
+                  680000000,
+                  615000000,
+                  550000000,
+                  475000000,
+                  401000000,
+                  348000000,
+                  295000000,
+                  220000000,
+                  124800000
+                ],
+                "min_pwrlevel": 4,
+                "max_pwrlevel": 0,
+                "thermal_pwrlevel": 0,
+                "hw_max_hz": 680000000,
+                "cap_hz": 680000000
+              }
+            }
+          }
+        }
+      ],
+      "freq_stable": true,
+      "freq_changes": [],
+      "summary": {
+        "windows": 4,
+        "fps_min": 30.0,
+        "fps_max": 30.0,
+        "fps_mean": 30.0,
+        "p50_ms_median": 33.38,
+        "p95_ms_max": 38.04,
+        "max_ms": 49.3,
+        "gpu_ms_mean": 20.38,
+        "long_ge45_total": 1,
+        "long_ge25_total": 1,
+        "over50_total": 0,
+        "cpu_max_c": 74.6,
+        "gpu_max_c": 57.2
+      },
+      "windows": [
+        {
+          "frames": [
+            6901,
+            7200
+          ],
+          "fps": 30.0,
+          "p50_ms": 33.37,
+          "p95_ms": 37.65,
+          "max_ms": 44.1,
+          "gpu_ms": 21.8,
+          "long_ge25": 0,
+          "long_ge45": 0,
+          "over33": 154,
+          "over50": 0
+        },
+        {
+          "frames": [
+            7201,
+            7500
+          ],
+          "fps": 30.0,
+          "p50_ms": 33.44,
+          "p95_ms": 38.04,
+          "max_ms": 49.3,
+          "gpu_ms": 18.7,
+          "long_ge25": 1,
+          "long_ge45": 1,
+          "over33": 153,
+          "over50": 0
+        },
+        {
+          "frames": [
+            7501,
+            7800
+          ],
+          "fps": 30.0,
+          "p50_ms": 33.38,
+          "p95_ms": 37.91,
+          "max_ms": 44.8,
+          "gpu_ms": 21.9,
+          "long_ge25": 0,
+          "long_ge45": 0,
+          "over33": 152,
+          "over50": 0
+        },
+        {
+          "frames": [
+            7801,
+            8100
+          ],
+          "fps": 30.0,
+          "p50_ms": 33.23,
+          "p95_ms": 37.29,
+          "max_ms": 40.0,
+          "gpu_ms": 19.1,
+          "long_ge25": 0,
+          "long_ge45": 0,
+          "over33": 141,
+          "over50": 0
+        }
+      ],
+      "thermal": [
+        {
+          "cpu_max_c": 74.6,
+          "gpu_max_c": 57.2,
+          "cooling_state_max": 0,
+          "gpu_thermal_pwrlevel_max": 0,
+          "cpufreq_caps_khz": [],
+          "samples": 15
+        }
+      ]
+    }
+  ],
+  "caveats": [
+    "long_ge45/long_ge25 counts are lower bounds; during sustained slowdowns the runtime does not log long frames.",
+    "No GPU page faults, SMMU faults or device lost in any run."
+  ]
+}

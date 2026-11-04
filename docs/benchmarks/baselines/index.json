@@ -1,0 +1,102 @@
+{
+  "schema": "totk-android-baselines/1",
+  "baselines": [
+    {
+      "signature": "a489098c776808acb3fd1f727c23b1bca224af78d6d2984c40bea8ea33247408",
+      "short": "a489098c7768",
+      "device": "thor",
+      "model": "AYN Thor",
+      "soc": "QCS8550 (Snapdragon 8 Gen 2 class)",
+      "settings_env_sha256": "427deca9dc9885df65ebe6613a79943a7b06f31d684146acba0cf39369e5e014",
+      "cpu_caps_khz": [
+        2016000,
+        2803200,
+        3187200
+      ],
+      "gpu_cap_hz": null,
+      "cpu_hw_max_khz": [
+        2016000,
+        2803200,
+        3187200
+      ],
+      "gpu_hw_max_hz": null,
+      "caps": "CPU 2.02/2.80/3.19 GHz (max), GPU cap unknown",
+      "file": "baseline-1.0.0.json",
+      "run_id": "2026-11-03-baseline-1.0.0",
+      "recorded_utc": "2026-11-04T01:41:53+00:00",
+      "source": "the 1.0.0 release baseline, registered after the fact: CPU caps (scaling_max_freq per cpufreq policy, constant over the whole session) from its sampler records; GPU cap not recorded (null), so this signature only serves reference-only comparisons"
+    },
+    {
+      "signature": "2b70a5f1be5749718831f9343facb523ae113c4163c5a1ab6f4423ba9e8872b5",
+      "short": "2b70a5f1be57",
+      "device": "odin",
+      "model": "AYN Odin 3",
+      "soc": "CQ8725S (Snapdragon 8 Elite class)",
+      "settings_env_sha256": "f18bf2be51414f875e9ff21278ee38a5bd65249c4edb74a9f7db5d356eab7cbc",
+      "cpu_caps_khz": [
+        2227200,
+        2246400
+      ],
+      "gpu_cap_hz": null,
+      "cpu_hw_max_khz": [
+        3532800,
+        4320000
+      ],
+      "gpu_hw_max_hz": null,
+      "caps": "CPU 2.23/2.25 GHz (hw 3.53/4.32), GPU cap unknown",
+      "file": "baseline-1.0.0.json",
+      "run_id": "2026-11-03-baseline-1.0.0",
+      "recorded_utc": "2026-11-04T01:41:53+00:00",
+      "source": "the 1.0.0 release baseline, registered after the fact: CPU caps (scaling_max_freq per cpufreq policy, constant over the whole session) from its sampler records; GPU cap not recorded (null), so this signature only serves reference-only comparisons"
+    },
+    {
+      "signature": "4e7e5fa71aad6e5c3f4fda37e7c6e2ff4eceda8268aff9bada0ca1919715d21e",
+      "short": "4e7e5fa71aad",
+      "device": "duo",
+      "model": "Retroid Pocket Duo",
+      "soc": "CQ7790S (Snapdragon 7 Gen 4 class)",
+      "settings_env_sha256": "b2c37686e7b462a48388233ec0a45baff3c9386bc014f2e4e472a2e22e94fccd",
+      "cpu_caps_khz": [
+        1843200,
+        2400000,
+        2803200
+      ],
+      "gpu_cap_hz": null,
+      "cpu_hw_max_khz": [
+        1843200,
+        2400000,
+        2803200
+      ],
+      "gpu_hw_max_hz": null,
+      "caps": "CPU 1.84/2.40/2.80 GHz (max), GPU cap unknown",
+      "file": "baseline-1.0.0.json",
+      "run_id": "2026-11-03-baseline-1.0.0",
+      "recorded_utc": "2026-11-04T01:41:53+00:00",
+      "source": "the 1.0.0 release baseline, registered after the fact: CPU caps (scaling_max_freq per cpufreq policy, constant over the whole session) from its sampler records; GPU cap not recorded (null), so this signature only serves reference-only comparisons"
+    },
+    {
+      "signature": "e52c5e06931d2435cdb53c77b31e5a0bfc2280d2dba5c87fc9e128271885255e",
+      "short": "e52c5e06931d",
+      "device": "thor",
+      "model": "AYN Thor",
+      "soc": "QTI QCS8550",
+      "settings_env_sha256": "427deca9dc9885df65ebe6613a79943a7b06f31d684146acba0cf39369e5e014",
+      "cpu_caps_khz": [
+        2016000,
+        2803200,
+        3187200
+      ],
+      "gpu_cap_hz": 680000000,
+      "cpu_hw_max_khz": [
+        2016000,
+        2803200,
+        3187200
+      ],
+      "gpu_hw_max_hz": 680000000,
+      "caps": "CPU 2.02/2.80/3.19 GHz (max), GPU 680 MHz (max)",
+      "file": "baselines/ayn-thor/e52c5e06931d.json",
+      "run_id": "2026-11-03-e2e-thor",
+      "recorded_utc": "2026-11-04T01:48:48+00:00"
+    }
+  ]
+}
