@@ -5018,6 +5018,17 @@ an on-device FPS improvement or guest pointer-lifetime assumptions.
 workloads and counters disabled. It reports wall/process-CPU time for
 wake/block ping-pong and 24-worker fan-out under three-core contention.
 
+### Horizon ideal-core semantics (`TOTK_IDEAL_CORE_FIX`)
+
+Default unset/`0` keeps the old TotK bookkeeping: CreateThread stores ideal core −2/−3 verbatim with mask 7,
+SetThreadCoreMask may leave the ideal core outside the new mask, and GetCurrentProcessorNumber of a thread holding
+no virtual core can report a core outside its mask (or −2). `=1` uses the Horizon rules Breath of the Wild already
+follows (1.4.3 `main.npdm`: ideal core 0, cores 0–2): −2 becomes core 0 with a one-core mask, −1/−3 are invalid at
+creation, mask changes are validated, the main thread starts with mask 1, and a core of the mask is reported. This
+moves −2 threads onto virtual core 0 beside the main thread. Startup logs `[threads] ideal core fix=N
+(TOTK_IDEAL_CORE_FIX)`; `sh tests/ideal_core/run.sh <absolute .scratch>` pins both arms. A/B frame-time p95 and
+`[core-table]` held/wait times on Odin 3 (CPU-bound) before considering it.
+
 ### Synchronous memory-pool finalization without a retained virtual core
 
 The Vulkan `MemoryPoolFinalize` boundary now waits **before** registry teardown,

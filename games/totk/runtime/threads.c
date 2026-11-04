@@ -77,7 +77,6 @@ static inline void fps_block_end(int began) { (void)began; }
 #define R_BAD_HANDLE  0xE401u   // 114
 #define R_BAD_STATE   0xFA01u   // 125
 #define R_OUT_OF_RES  0xCE01u   // 103
-#ifdef GAME_BOTW
 #define R_BAD_CORE    0xE201u   // 113 InvalidCoreId
 #define R_BAD_COMBO   0xE801u   // 116 InvalidCombination
 /* Core ids as Horizon reads them (Atmosphere svc::CreateThread / SetThreadCoreMask, KThread::SetCoreMask): -1 = no ideal
@@ -87,7 +86,8 @@ static inline void fps_block_end(int began) { (void)began; }
    for core -2 (and for the main thread), threads the Switch keeps on core 0 with the main thread ran beside it on cores 1-2. */
 #define PROCESS_IDEAL_CORE 0
 #define PROCESS_CORE_MASK  7u
-#endif
+/* Tears of the Kingdom 1.4.3's main.npdm has the same values (META +0xf default core 0; ACI0 thread info cores 0-2).
+   Its path applies these semantics only with TOTK_IDEAL_CORE_FIX=1 (ideal_core_config). */
 #define WAITERS_BIT   0x40000000u
 #define H_CUR_THREAD  0xFFFF8000u
 
@@ -219,6 +219,42 @@ static void vcore_config(void) {
     e = getenv("TOTK_POOL_STATS"); g_host_wait_pool_timing = e && !strcmp(e, "1");
     fprintf(stderr, "[threads] host vcore release=%d stats=%d (TOTK_VCORE_RELEASE, TOTK_VCORE_STATS)\n",
         g_vcore_release, g_vcore_stats);
+}
+#ifndef GAME_BOTW
+/* TOTK_IDEAL_CORE_FIX=1 gives the TotK path the Horizon core-id semantics Breath of the Wild's has (horizon_cores):
+   CreateThread -2 becomes the process's ideal core with a one-core mask and -1/-3 are invalid, SetThreadCoreMask
+   validates and keeps the ideal core inside the new mask, the main thread starts with a one-core mask, and
+   GetCurrentProcessorNumber reports a core inside the mask. Default 0 keeps the old bookkeeping (-2/-3 stored as the
+   ideal core with mask 7): placement changes can shift load. Resolved under G at main-thread registration. */
+static int g_ideal_core_fix = -1;
+static void ideal_core_config(void) {
+    if (g_ideal_core_fix >= 0) return;
+    const char *e = getenv("TOTK_IDEAL_CORE_FIX"); g_ideal_core_fix = e && !strcmp(e, "1");
+    fprintf(stderr, "[threads] ideal core fix=%d (TOTK_IDEAL_CORE_FIX)\n", g_ideal_core_fix);
+}
+static int horizon_cores(void) { return g_ideal_core_fix > 0; }
+#else
+static void ideal_core_config(void) {}
+static int horizon_cores(void) { return 1; }
+#endif
+/* CreateThread's core: only -2 is adjusted (to the process's ideal core); the new thread's mask is that core alone. */
+static uint32_t horizon_create_core(int c, int *core, uint64_t *mask) {
+    if (c == -2) c = PROCESS_IDEAL_CORE;
+    if (c < 0 || c > 2) return R_BAD_CORE;
+    *core = c; *mask = 1ull << c; return 0;
+}
+/* SetThreadCoreMask, holding G: -2 = the process's ideal core alone, -3 = keep the ideal core (it must be in the new
+   mask), -1 = no ideal core; an explicit ideal core must be in the mask, which must be a nonempty process subset. */
+static uint32_t horizon_set_core_mask(int *core, uint64_t *mask, int c, uint64_t m) {
+    uint32_t r = 0;
+    if (c == -2) { c = PROCESS_IDEAL_CORE; m = 1ull << c; }
+    else if ((m | PROCESS_CORE_MASK) != PROCESS_CORE_MASK) r = R_BAD_CORE;
+    else if (!m) r = R_BAD_COMBO;
+    else if (c >= 0 && c <= 2) { if (!((m >> c) & 1)) r = R_BAD_COMBO; }
+    else if (c == -3) { c = *core; if (c >= 0 && !((m >> c) & 1)) r = R_BAD_COMBO; }
+    else if (c != -1) r = R_BAD_CORE;
+    if (!r) { *core = c; *mask = m; }
+    return r;
 }
 static void vcore_stats_frame(uint64_t frame) {
     if (!g_vcore_stats || !frame || frame % 300) return;
@@ -952,7 +988,18 @@ void runtime_core_checkpoint(void) {
     atomic_store_explicit(&t->kick_safe, 0, memory_order_release);
     pthread_mutex_unlock(&G);
 }
-int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
+/* The core GetCurrentProcessorNumber reports: the virtual core held, else the ideal core. With TOTK_IDEAL_CORE_FIX a
+   thread holding no core (blocked, or TOTK_FREE_CORES) whose ideal core is outside its mask (-1 = none) reports the
+   highest core of its mask instead, as Horizon moves a thread whose core left its mask there. */
+static int reported_core(const thr_t *t) {
+    if (t->cur_core >= 0) return t->cur_core;
+#ifndef GAME_BOTW
+    if (g_ideal_core_fix > 0 && !(t->core >= 0 && t->core < NCORE && ((t->mask >> t->core) & 1)))
+        for (int c = NCORE - 1; c >= 0; c--) if ((t->mask >> c) & 1) return c;
+#endif
+    return t->core;
+}
+int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? reported_core(t) : -1; }
 
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
@@ -1099,15 +1146,13 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon �
 // 主线程登记，返回其句柄（交给 nnosInitialize 作主线程句柄）
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {
-    pthread_mutex_lock(&G); sync_config(); vcore_config(); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); sync_config(); vcore_config(); ideal_core_config(); pthread_mutex_unlock(&G);
     pthread_key_create(&g_keythr, NULL);
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
-#ifdef GAME_BOTW
-    t->started = 1; t->prio = 44; t->core = PROCESS_IDEAL_CORE; t->mask = 1u << PROCESS_IDEAL_CORE; t->pt = pthread_self(); t->mport = host_thread_port_self();
-#else
-    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = host_thread_port_self();
-#endif
+    /* Horizon starts the main thread on the process's ideal core with only that core in its mask. */
+    t->started = 1; t->prio = 44; t->core = PROCESS_IDEAL_CORE; t->mask = horizon_cores() ? 1u << PROCESS_IDEAL_CORE : PROCESS_CORE_MASK;
+    t->pt = pthread_self(); t->mport = host_thread_port_self();
     t->cur_core = -1;
     pthread_mutex_lock(&G); profile_get(t); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
 #ifdef GAME_BOTW
@@ -1314,13 +1359,11 @@ int svc_thread(int num, uint64_t *regs) {
         t->cur_core = -1;
         pthread_cond_init(&t->cv, NULL);
         t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;
-#ifdef GAME_BOTW
-        { int c = (int)regs[5]; if (c == -2) c = PROCESS_IDEAL_CORE;
-          if (c < 0 || c > 2) { free(t); regs[0] = R_BAD_CORE; return 1; }   // Horizon: only -2 is adjusted, other negatives are invalid here
-          t->prio = (int)regs[4]; t->core = c; t->mask = 1ull << c; }
-#else
-        t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
-#endif
+        if (horizon_cores()) {
+            uint32_t r = horizon_create_core((int)regs[5], &t->core, &t->mask);
+            if (r) { free(t); regs[0] = r; return 1; }
+        } else { t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7; }   // old TotK bookkeeping
+        t->prio = (int)regs[4];
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
         pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);   // also the host-service stack of this guest thread
@@ -1388,26 +1431,19 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
     case 0x0E: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
                  regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0;pthread_mutex_unlock(&G); return 1; }
-    case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)：-1 = 用进程缺省、-2/-3 = 不改理想核；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask): -1 = use the process default, -2/-3 = leave the ideal core unchanged; the host only keeps the bookkeeping
+    case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask); the host only keeps the bookkeeping
         pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
-#ifdef GAME_BOTW
-        if (t) { int c = (int)regs[1]; uint64_t m = regs[2]; uint32_t r = 0;
-                 if (c == -2) { c = PROCESS_IDEAL_CORE; m = 1ull << c; }
-                 else if ((m | PROCESS_CORE_MASK) != PROCESS_CORE_MASK) r = R_BAD_CORE;
-                 else if (!m) r = R_BAD_COMBO;
-                 else if (c >= 0 && c <= 2) { if (!((m >> c) & 1)) r = R_BAD_COMBO; }
-                 else if (c == -3) { c = t->core; if (c >= 0 && !((m >> c) & 1)) r = R_BAD_COMBO; }
-                 else if (c != -1) r = R_BAD_CORE;
-                 if (!r) { t->core = c; t->mask = m;
-                           if (t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); } }   // migrate off a core no longer allowed
-                 regs[0] = r; pthread_mutex_unlock(&G); return 1; }
-#else
+        if (t && horizon_cores()) {
+            uint32_t r = horizon_set_core_mask(&t->core, &t->mask, (int)regs[1], regs[2]);
+            if (!r && t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); }   // migrate off a core no longer allowed
+            regs[0] = r; pthread_mutex_unlock(&G); return 1;
+        }
+        // Old TotK bookkeeping: -1 = core 0, -2/-3 = leave the ideal core unchanged, even outside the new mask.
         if (t) { int c = (int)regs[1]; if (c >= 0) t->core = c; else if (c == -1) t->core = 0; if (regs[2]) t->mask = regs[2];
                  if (t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); } }   // migrate off a core no longer allowed
-#endif
         regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1;
     }
-    case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core); return 1; }   // GetCurrentProcessorNumber
+    case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)reported_core(t); return 1; }   // GetCurrentProcessorNumber
     case 0x25: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0;pthread_mutex_unlock(&G); return 1; }
 
     case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
