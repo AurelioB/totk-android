@@ -46,6 +46,7 @@ static const totk_live_switch totk_live_switches[] = {
     {"TOTK_VK_UNWRITTEN_MASK", 0, 1},        /* pipelines built afterwards; built ones keep their masks */
     {"TOTK_VK_SPLIT_PASS_DRAWS", 0, 1000000},/* the next render pass opened */
     {"TOTK_VK_FEEDBACK_CUT", 0, 1},          /* the next descriptor build */
+    {"TOTK_VK_PREPARE_MASK", 0, 1},          /* the next draw's uniform preparation; a change dirties every register */
 };
 enum { TOTK_LIVE_MAX = 16 };
 _Static_assert(sizeof totk_live_switches / sizeof *totk_live_switches <= TOTK_LIVE_MAX, "live switch table");

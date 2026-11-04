@@ -489,6 +489,14 @@ The arena survives the **last game-submission fence**, not one ring slot: more t
 not recycle earlier descriptors. Fresh native capture supplies the base; `g_snap_seq` is its copied-update watermark,
 distinct from an update's Vulkan materialization fence. Full and partial overlays apply in sequence order even after
 chunk seals. No queued original-buffer update or writable lag guard is generated merely for a private UBO update.
+`TOTK_VK_PREPARE_MASK=1` (default unset = off) skips the per-draw pre-render preparation (`vk_lag_uniform_prepare`) of a
+consumed UBO register unless its bound range changed or an overlay/producer/mapping revision advanced since it was last
+prepared; selection, snapshots and guards are unchanged. `TOTK_VK_OFF=prepare` forces it off; `TOTK_VK_PREPARE_CHECK=1`
+runs every skipped preparation and dies on a missed materialization (correctness runs only). Startup logs the value;
+`[prepare-mask]` counts preparations and skips per 300 presents. Host `--lag-walk-bench 6` (lag on, two recorders, 7
+interleaved pairs): whole-walker ns/draw −3.2 % stable, −2.7 % churn, −5.5 % chunk stress (median per pair), 74 % fewer
+preparations; compare walker ms/frame on the Odin. Live (`totk.ctl`): the next draw takes it, and a change dirties
+every register.
 
 Real non-UBO reads/writes/copies, CPU steps/readback and completion-side consumers materialize the relevant updates
 in command order before original storage is consumed. Virtual aliases normalize to physical ownership. True GPU

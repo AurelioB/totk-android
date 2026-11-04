@@ -1049,6 +1049,15 @@ static int lag_walk_bench(int argc, char **argv) {
         streams[chunk] = malloc(WALK_STREAM_BYTES); if (!streams[chunk]) DIE("walking benchmark stream allocation failed");
         handles[chunk] = (uint64_t)(uintptr_t)streams[chunk];
     }
+    if (vk_lag_uniform_private()) {
+        rn = 0; walk_setup(&fixture); walk_bind(&fixture, &banks[0], 0);
+        struct { uint64_t dst, n; uint32_t value[4]; } update = {
+            (uint64_t)(uintptr_t)(banks[0].cpu + 0x28000), 16, {1, 0, 0, 0}};
+        op(OP_UPDATE_UB, &update, sizeof update);
+        mtl_sub_begin(); walk_exec();
+        CHECK(!vk_draw_test_prepare_bench(), "uniform preparation microfixture completes");
+        CHECK(mtl_wait(mtl_sub_commit(), 30000000000ull), "uniform preparation microfixture publishes its private update");
+    }
     walk_measure measured[3] = {0};
     const char *case_names[] = {"stable-binding", "churn-binding", "chunk-stress"};
     const int stress_frames = 2, case_frames = warmup + frames, recorder = vk_record_enabled();
@@ -1205,6 +1214,10 @@ static int lag_walk_bench(int argc, char **argv) {
        but every pixel/zero-wait assertion remains mandatory and the process exits nonzero on any failure. */
     fflush(stdout); /* preserve the measured before/after data even if the bounded strict fixture exits */
     walk_safety(&fixture, &banks[WALK_SETS], output + 0x20000);
+    uint64_t prepare_calls, prepare_skips, prepare_checks;
+    vk_draw_test_prepare_counts(&prepare_calls, &prepare_skips, &prepare_checks);
+    printf("lag-prepare totals: %llu calls, %llu skipped, %llu oracle checks\n",
+        (unsigned long long)prepare_calls, (unsigned long long)prepare_skips, (unsigned long long)prepare_checks);
     for (int chunk = 0; chunk < WALK_CHUNKS; chunk++) free(streams[chunk]);
     /* Drain before releasing alias/view/owner lifetimes. No fixture mapping is retired with worker packets in flight. */
     mtl_drain(); nvn_dirty_remove_range(output); mtl_pool_del(output); munmap(output_mapping, 0x50000);

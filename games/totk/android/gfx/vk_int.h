@@ -294,6 +294,11 @@ void vk_ub_read_record(uint64_t addr, void *dst, size_t size);
 int vk_lag_uniform_read(uint64_t addr, uint64_t size, VkDeviceSize align, VkDescriptorBufferInfo *out);
 /* Ordered pre-render materialization for true original-memory aliases only; never allocates a UBO copy. */
 void vk_lag_uniform_prepare(uint64_t addr, uint64_t size);
+/* TOTK_VK_PREPARE_MASK: walk-owned invalidation for that pre-render materialization, NOT selected-content authority.
+   1 when an overlay, original-memory producer or mapping revision advanced since the last call. The check variant runs
+   a preparation the masks skipped and dies if it still had to materialize (TOTK_VK_PREPARE_CHECK oracle). */
+int vk_lag_uniform_prepare_changed(void);
+void vk_lag_uniform_prepare_check(uint64_t addr, uint64_t size);
 int vk_lag_uniform_private(void);
 /* Walking-only monotonic counter: a capture without stable native writer-watch authority must not enter an outer
    freeze memo. Sample before/after a stage freeze and cache that stage only if the counter did not change. */
@@ -364,6 +369,8 @@ void vk_lag_test_stats_get(vk_lag_test_stats *out); /* no walking thread may mut
 int vk_lag_test_query_bench(void); /* standalone pre-initialization query correctness/timing fixture */
 int vk_draw_test_touch_bench(void); /* standalone reflection-enumeration microbenchmark */
 int vk_draw_test_binding_bench(void); /* standalone exact stage-binding key microbenchmark */
+int vk_draw_test_prepare_bench(void); /* --lag-walk-bench: production preparation over eight bound ranges */
+void vk_draw_test_prepare_counts(uint64_t *calls, uint64_t *skips, uint64_t *checks);
 #endif
 void vk_lag_stats(uint64_t frame);
 int vk_resolve_span(uint64_t addr, VkBuffer *buf, uint64_t *off, uint64_t *avail);   /* the buffer holding addr and the bytes it holds from there */

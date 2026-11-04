@@ -90,7 +90,7 @@ class LiveCtl(unittest.TestCase):
         self.run_mode(self.tsan_probe(), 'core', env=os.environ | {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66'})
 
     def test_switches(self):
-        self.assertIn('ok: 300 batches toggled all 8 live switches', self.run_mode(self.probe, 'switches'))
+        self.assertIn('ok: 300 batches toggled all 9 live switches', self.run_mode(self.probe, 'switches'))
 
     def test_switches_thread_sanitizer(self):
         self.run_mode(self.tsan_probe(), 'switches', env=os.environ | {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66'})

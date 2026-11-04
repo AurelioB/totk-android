@@ -2893,7 +2893,7 @@ does not establish visual correctness on Adreno; that still needs this A/B.
 
 | Setting (`totk.env`) | What it does |
 | --- | --- |
-| `TOTK_VK_OFF=a,b` | turn off backend features: `rename,ds,dyn,block,ts,span,snap,mirshare,present_wait,compalias,passbarrier,condorder,writeback,settledwb,settledbackoff,settledinval,settleddrain,settledseal,settledcpu,texcache,d16tie,storagewrites` or `all` |
+| `TOTK_VK_OFF=a,b` | turn off backend features: `rename,ds,dyn,block,ts,span,snap,mirshare,present_wait,compalias,passbarrier,condorder,writeback,settledwb,settledbackoff,settledinval,settleddrain,settledseal,settledcpu,texcache,d16tie,storagewrites,prepare` or `all` (`prepare` keeps the opt-in `TOTK_VK_PREPARE_MASK` off) |
 | `TOTK_VK_SETTLED_WB_SUBS=N` | positive automatic quiet interval (default60); successful storage landings double the next automatic interval up to4096 submissions; explicit invalidate bypasses both base and learned delays |
 | `TOTK_VK_SETTLED_WB_DETAIL=1` | log at most 64 settled-storage details per 300-frame window (shape/format/levels, serial/storage/pool, bytes, landing count, quiet intervals, idle/invalidate cause) |
 | `TOTK_VK_WB_SERVICE_STATS=1` | default OFF: per300present recording-lock hold max/peak and owner-service delay p50/p99 upper bounds/max; no idle opcode clocks/locks |

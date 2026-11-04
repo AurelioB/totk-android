@@ -5309,6 +5309,23 @@ void vk_lag_uniform_prepare(uint64_t addr, uint64_t size) {
     addr = ub_address(addr, size);
     if (lag_original_pending(addr, size)) vk_ub_touch(addr, size);
 }
+/* TOTK_VK_PREPARE_MASK (vk_draw.c). Preparation only materializes private inline overlays when an original-memory
+   producer overlaps. It does not select bytes, capture memory, or acquire a writer watch. Completion/CPU writes can
+   never introduce such a producer. All new overlays, snapshot resets and original producers advance these walk-owned
+   revisions; mapping changes revoke the physical identity independently. */
+int vk_lag_uniform_prepare_changed(void) {
+    static uint64_t uniform, producer, spans;
+    uint64_t generation = atomic_load_explicit(&g_span_gen, memory_order_acquire);
+    if (uniform == g_ub_gen && producer == g_lag_producer_revision && spans == generation) return 0;
+    uniform = g_ub_gen; producer = g_lag_producer_revision; spans = generation;
+    return 1;
+}
+void vk_lag_uniform_prepare_check(uint64_t addr, uint64_t size) {
+    uint64_t revision = g_ub_gen;
+    vk_lag_uniform_prepare(addr, size);
+    if (revision != g_ub_gen) DIE("lag prepare oracle: skipped required materialization at %#llx+%#llx",
+        (unsigned long long)addr, (unsigned long long)size);
+}
 /* A tiny fixed-way memo shares only owned snapshot bytes. Expansion is at most 2x the requested extent and
    4 KiB, clipped to the captured span: never read unowned neighbouring bytes or blindly copy a dirty unit.
    Entries describe immutable allocations; a new partial overlay appends a new version, never patches an old one.

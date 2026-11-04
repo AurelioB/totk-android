@@ -1943,6 +1943,7 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_VK_UNWRITTEN_MASK` | 0–1 | pipelines and output libraries built afterwards | pipelines already built keep their masks (the key does not carry the switch): compare it with a restart, or read the per-300 count of masked new pipelines |
 | `TOTK_VK_SPLIT_PASS_DRAWS` | 0…1000000 | the next render pass opened | |
 | `TOTK_VK_FEEDBACK_CUT` | 0–1 | the next descriptor build | the freeze memo key carries the pass serial while it is on |
+| `TOTK_VK_PREPARE_MASK` | 0–1 | the next draw's uniform preparation | a change marks every register dirty, so that draw prepares in full; `TOTK_VK_OFF=prepare` keeps it off |
 
 `TOTK_IDEAL_CORE_FIX` is startup-only and refused. Another launch-time switch becomes live by adding it, with its
 range, to `totk_live_switches` in `runtime/live_ctl.h`, reading it through `totk_live_cached` at a point where a change

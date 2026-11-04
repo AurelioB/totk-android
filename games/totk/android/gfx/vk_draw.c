@@ -78,6 +78,21 @@ static uint64_t g_record_bind_revision[6], g_record_freeze_hits, g_record_freeze
 static struct { uint64_t tex[2]; uint32_t img; } g_native_bound[6];
 static uint32_t g_native_bound_any;
 static uint64_t g_native_bound_revision;
+/* TOTK_VK_PREPARE_MASK=1 (default off): pre-render uniform preparation (vk_lag_uniform_prepare) runs only for consumed
+   registers marked dirty here. A register is dirtied when its bound address or size changes; every register is dirtied
+   when an overlay, original-memory producer or mapping revision advances (vk_lag_uniform_prepare_changed). Full bound
+   ranges are prepared, so shader switches need no invalidation: newly consumed registers keep their dirty bits. This
+   skips only pre-render materialization, never lag selection, snapshots or guards. TOTK_VK_OFF=prepare (or all) keeps
+   it off; TOTK_VK_PREPARE_CHECK=1 runs every skipped preparation as an oracle and dies on a missed materialization.
+   Live (runtime/live_ctl.h): read at each draw's preparation; a change dirties every register, so the first draw after
+   it prepares in full. The masks and counters are walking-lock owned. */
+static int g_prepare_mask_launch, g_prepare_off, g_prepare_check, g_prepare_used;
+static totk_live_cache g_prepare_mask_live;
+static uint16_t g_uniform_prepare_dirty[2] = {UINT16_MAX, UINT16_MAX};
+static uint64_t g_prepare_calls, g_prepare_skips, g_prepare_checks;
+static int prepare_mask_live(void) {
+    return !g_prepare_off && totk_live_cached(&g_prepare_mask_live, "TOTK_VK_PREPARE_MASK", g_prepare_mask_launch);
+}
 #ifdef TOTK_VK_TESTS
 static uint64_t g_test_widened;
 void vk_record_test_counts_get(vk_record_test_counts *out) {
@@ -92,6 +107,7 @@ static void state_reset(void) {
     for (int b = 0; b < 2; b++) for (int st = 0; st < 6; st++) g_driver_revision[b][st]++;
     memset(&S, 0, sizeof S);
     memset(g_native_bound,0,sizeof g_native_bound); g_native_bound_any=0; g_native_bound_revision=0;
+    g_uniform_prepare_dirty[0] = g_uniform_prepare_dirty[1] = UINT16_MAX;
     for (int i = 0; i < 8; i++) S.blend[i] = (blend_st){i, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
     S.color = (color_st){0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS}; S.chmask.mask = 0xffffffffu;
     S.poly = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0};
@@ -3352,6 +3368,12 @@ void vk_draw_switches_init(void) {
     LOGV("TOTK_VK_FEEDBACK_CUT=%d: %s", g_feedback_cut_launch, g_feedback_cut_launch ?
          "sampled views of an image the pass renders to stop below the attached level" :
          "sampled views may include the attached level (default)");
+    e = getenv("TOTK_VK_PREPARE_MASK"); g_prepare_off = vk_off("prepare"); g_prepare_mask_launch = e && atoi(e) == 1;
+    e = getenv("TOTK_VK_PREPARE_CHECK"); g_prepare_check = e && atoi(e) == 1;
+    LOGV("TOTK_VK_PREPARE_MASK=%d%s: %s%s", g_prepare_mask_launch, g_prepare_off ? " (TOTK_VK_OFF=prepare)" : "",
+         g_prepare_mask_launch && !g_prepare_off ? "lagged uniform ranges are prepared only after a rebind or invalidation" :
+         "every consumed lagged uniform range is prepared at each draw (default)",
+         g_prepare_check ? "; TOTK_VK_PREPARE_CHECK=1 runs each skipped preparation as an oracle" : "");
 }
 static uint32_t pipe_write_mask(const pipe_key *k) {   /* the key's channel mask minus attachments without an output */
     if (!unwritten_mask_live()) return k->chmask;
@@ -4922,6 +4944,34 @@ static int canvas_draw_prepare(vk_shader *const sh[6], vk_canvas_image *transfer
     if (vk_native_ui_enabled()) native_reads(sh,0,2);
     return transfer;
 }
+/* Reflection is immutable. Enumerate only consumed UBO registers, once each, rather than all of both shaders'
+   image/sampler/driver-bank descriptors on every draw. Storage writers run before every preparation; with
+   TOTK_VK_PREPARE_MASK the dirty masks above keep only "already prepared under these revisions", never contents. */
+static void draw_uniform_prepare(vk_shader *const *sh) {
+    int on = prepare_mask_live();
+    if (on != g_prepare_used) { g_prepare_used = on; g_uniform_prepare_dirty[0] = g_uniform_prepare_dirty[1] = UINT16_MAX; }
+    if (on && vk_lag_uniform_prepare_changed()) g_uniform_prepare_dirty[0] = g_uniform_prepare_dirty[1] = UINT16_MAX;
+    for (int st = 0; st < 2; st++) {
+        unsigned consumed = sh[st] ? sh[st]->uniform_prepare_mask : 0;
+        unsigned pending = consumed & (on ? g_uniform_prepare_dirty[st] : UINT16_MAX);
+        g_prepare_skips += (unsigned)__builtin_popcount(consumed & ~pending);
+        for (unsigned mask = g_prepare_check ? consumed : pending; mask; mask &= mask - 1) {
+            unsigned reg = (unsigned)__builtin_ctz(mask), bit = 1u << reg;
+            const p_bind_buf *u = &S.ubo[st][reg];
+            /* A broad UBO can alias a smaller true producer: materialize its untouched logical neighbours
+               before opening rendering, rather than ending the pass later during descriptor setup. */
+            uint64_t size = MINV(u->size ? u->size : 0x10000, V.props.limits.maxUniformBufferRange);
+            if (pending & bit) {
+                if (u->addr) vk_lag_uniform_prepare(u->addr, size);
+                g_prepare_calls++;
+                g_uniform_prepare_dirty[st] &= (uint16_t)~bit;
+            } else {
+                if (u->addr) vk_lag_uniform_prepare_check(u->addr, size);
+                g_prepare_checks++;
+            }
+        }
+    }
+}
 static void draw_touch(vk_shader *const *sh, const p_draw *dw, const p_draw_idx *di) {
     for (int st = 0; st < 2; st++) storage_touch(st, sh[st], 1);
     for (int st = 0; st < 2; st++) storage_touch(st, sh[st], 0);
@@ -4937,17 +4987,7 @@ static void draw_touch(vk_shader *const *sh, const p_draw *dw, const p_draw_idx 
         if (texture) (void)vk_tex_by_id((int)(texture & 0xfffff), &target, NULL);
     }
     if (!vk_record_updates_pending()) return;
-    /* Reflection is immutable. Enumerate only consumed UBO registers, once each, rather than all of
-       both shaders' image/sampler/driver-bank descriptors on every draw. Storage writers above still
-       run before every preparation; this is not a content/producer memo. */
-    if (vk_lag_uniform_private()) for (int st = 0; st < 2; st++)
-    for (unsigned mask = sh[st] ? sh[st]->uniform_prepare_mask : 0; mask; mask &= mask - 1) {
-        const p_bind_buf *u = &S.ubo[st][__builtin_ctz(mask)];
-        /* A broad UBO can alias a smaller true producer: materialize its untouched logical neighbours
-           before opening rendering, rather than ending the pass later during descriptor setup. */
-        if (u->addr) vk_lag_uniform_prepare(u->addr, MINV(u->size ? u->size : 0x10000,
-            V.props.limits.maxUniformBufferRange));
-    }
+    if (vk_lag_uniform_private()) draw_uniform_prepare(sh);
     uint32_t touched = 0;
     for (int a = 0; a < 16; a++) if ((sh[0]->vin_mask >> a & 1) && a < S.nattr && S.attr[a].fmt) {
         unsigned stream = S.attr[a].stream & 15;
@@ -4998,6 +5038,24 @@ int vk_draw_test_touch_bench(void) {
     printf("%s: lag-touch identical register checksums %llu/%llu\n", failed ? "FAILED" : "ok",
         (unsigned long long)checksums[0], (unsigned long long)checksums[1]);
     return failed;
+}
+/* Called with real registered bindings and an outstanding private inline update by --lag-walk-bench.
+   Isolate the production preparation path from pipeline/descriptor/vertex packet work. */
+int vk_draw_test_prepare_bench(void) {
+    enum { DRAWS = 200000 };
+    vk_shader shader = {.uniform_prepare_mask = 15}, *sh[2] = {&shader, &shader};
+    uint64_t calls = g_prepare_calls, skips = g_prepare_skips, checks = g_prepare_checks;
+    uint64_t start = host_now_ns();
+    for (int draw = 0; draw < DRAWS; draw++) draw_uniform_prepare(sh);
+    uint64_t elapsed = host_now_ns() - start;
+    printf("lag-prepare micro: %.3f ns/draw, %llu calls, %llu skipped, %llu oracle checks (%d draws, eight bound ranges, TOTK_VK_PREPARE_MASK=%d)\n",
+        elapsed / (double)DRAWS, (unsigned long long)(g_prepare_calls - calls),
+        (unsigned long long)(g_prepare_skips - skips), (unsigned long long)(g_prepare_checks - checks), DRAWS, prepare_mask_live());
+    uint64_t expected = prepare_mask_live() ? 8 : (uint64_t)DRAWS * 8;
+    return g_prepare_calls - calls != expected || g_prepare_calls - calls + g_prepare_skips - skips != (uint64_t)DRAWS * 8;
+}
+void vk_draw_test_prepare_counts(uint64_t *calls, uint64_t *skips, uint64_t *checks) {
+    *calls = g_prepare_calls; *skips = g_prepare_skips; *checks = g_prepare_checks;
 }
 #endif
 /* The walk needs clamped vertex ranges and immediate full-index eligibility before hot/copy selection.
@@ -5964,6 +6022,8 @@ void vk_draw_exec(uint32_t op, const void *a) {
                 (old->addr != b->addr || old->size != b->size)) {
                 fg_pass_guard_invalidate(&FGX.guard);
             }
+            if (b->stage < 2 && (old->addr != b->addr || old->size != b->size))
+                g_uniform_prepare_dirty[b->stage] |= (uint16_t)(1u << b->index);
             if (vk_record_enabled() && (old->addr != b->addr || old->size != b->size)) g_record_bind_revision[b->stage]++;
             if (b->stage == 5 && (old->addr != b->addr || (uint32_t)old->size != (uint32_t)b->size)) g_driver_revision[0][5]++;
             *old = *b;
@@ -9961,6 +10021,13 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
             static uint64_t previous[2]; uint64_t c[2] = {g_feedback_cuts, g_feedback_uncut};
             LOGV("[feedback-cut] frame %llu: last 300 presents %llu sampled views cut below an attached level, %llu left whole (based at it)",
                  (unsigned long long)n, (unsigned long long)(c[0] - previous[0]), (unsigned long long)(c[1] - previous[1]));
+            memcpy(previous, c, sizeof previous);
+        }
+        if (g_prepare_mask_launch || prepare_mask_live() || g_prepare_check) {
+            static uint64_t previous[3]; uint64_t c[3] = {g_prepare_calls, g_prepare_skips, g_prepare_checks};
+            LOGV("[prepare-mask] frame %llu: last 300 presents %llu uniform preparations, %llu skipped, %llu oracle checks (TOTK_VK_PREPARE_MASK=%d)",
+                 (unsigned long long)n, (unsigned long long)(c[0] - previous[0]), (unsigned long long)(c[1] - previous[1]),
+                 (unsigned long long)(c[2] - previous[2]), prepare_mask_live());
             memcpy(previous, c, sizeof previous);
         }
         vk_rec_unlock();
