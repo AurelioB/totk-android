@@ -17,7 +17,7 @@ final class CompanionArt {
 
     /** setup/companion/stage_companion.c GENERATOR_VERSION (and scripts/make_companion_assets.py); the host test keeps
      * the three equal. */
-    static final int GENERATOR = 4;
+    static final int GENERATOR = 5;
     /** index.json begins {"schema":1,"generator":N,...}; the rest of the file (hundreds of KB) is never read. */
     private static final int HEAD = 4096;
     private static final Pattern FIELD = Pattern.compile("\"generator\"\\s*:\\s*(\\d{1,9})[\\s,}]");

@@ -3,6 +3,12 @@
 All notable changes to TotK Native for Android (`com.aure.totk`). The app follows [semantic versioning](https://semver.org);
 the game version it runs is shown separately. versionCode = major × 10000 + minor × 100 + patch.
 
+## Unreleased
+
+### Second screen
+- Fused materials use the game's own attachment and common-material names, including world objects that are not pouch
+  items. Older second-screen art updates automatically; unknown objects fall back to readable text without object prefixes.
+
 ## 1.0.0 (versionCode 10000), game 1.4.3
 
 The first public release: one generic, signed APK for arm64 Android 13+ devices with an Adreno GPU. It contains no
