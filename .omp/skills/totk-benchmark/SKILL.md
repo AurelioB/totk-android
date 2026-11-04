@@ -67,6 +67,11 @@ All scripts are in `tools/bench/` (paths below are relative to the repository ro
 ## Prerequisites
 
 - Host: `adb`, POSIX sh, Python 3. Device: root (see Scope).
+- **Test with SELinux enforcing for release/compatibility acceptance.** Record `su -c getenforce` with the device
+  facts; a permissive benchmark is performance evidence only, not proof that setup or gameplay works on stock phones.
+  Root is for the measuring harness, not a game prerequisite. Never change SELinux mode without explicit approval
+  and exclusive device ownership; restore and verify its original mode afterward. For the full setup/runtime/save
+  regression and app-scoped AVC collection, follow [SELinux compatibility](../../../docs/selinux-compatibility.md).
 - The app (`com.aure.totk`) installed and set up, on the device's **default profile**: in the app's Graphics screen the
   preset marked IN USE is the one marked "Recommended for this device" (not Custom), and there is no developer
   `totk.env` (`collect.sh` warns if there is). Start the game with the app's **Start game** (or PLUS): it rewrites
