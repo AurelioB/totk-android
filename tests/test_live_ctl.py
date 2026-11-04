@@ -62,6 +62,11 @@ class LiveCtl(unittest.TestCase):
         self.assertTrue(all('TOTK_VK_SUBGROUP_FIX is startup-only' in line for line in got), got)
         self.assertTrue(all('set it in totk.env and restart' in line for line in got), got)
 
+    def test_core_wait_event_is_startup_only(self):
+        got = self.parse('set TOTK_CORE_WAIT_EVENT=1', 'unset TOTK_CORE_WAIT_EVENT')
+        self.assertTrue(all('TOTK_CORE_WAIT_EVENT is startup-only' in line for line in got), got)
+        self.assertTrue(all('set it in totk.env and restart' in line for line in got), got)
+
     def test_malformed_and_refused(self):
         got = self.parse('set TOTK_VK_DESC_STOCK', 'set TOTK_VK_DESC_STOCK=', 'set TOTK_VK_DESC_STOCK=2',
                          'set TOTK_VK_DESC_STOCK=1x', 'set TOTK_TIMER_SLACK_NS=0', 'set TOTK_PRIO_RENDER=-21',

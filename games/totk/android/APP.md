@@ -5039,14 +5039,30 @@ was not measured by these counters. Retry work includes the timed park/wakeup,
 relocking `G`, scanning masks/effective priorities/starvation, signal send and
 delivery, and the handler's admission check.
 
-Do not infer a near voluntary checkpoint from a host-context refusal. TOTK's
-`runtime_svc` checks at entry, not return; `hle_stack.S` and `gate.S` restore the
-host slot and return directly, with no mandatory post-host checkpoint. A host
-call can reenter guest code or return into a no-SVC spin. Suppressing until the
-next voluntary checkpoint would therefore lack a progress bound and could
-reintroduce the known starvation hangs. The 1-ms retry threshold remains
-unchanged, including after refusal; pending/acknowledged coalescing is not
-extended to a new host-call permission class.
+By default a host-context refusal still has no near voluntary checkpoint:
+`runtime_svc` checks at entry and `gate.S` returns directly. Calls may reenter
+guest code or return into no-SVC spins, so pending/acknowledged coalescing
+alone must not suppress progress retries.
+
+`TOTK_CORE_WAIT_EVENT=1` (startup-only, default `0`) instead parks core waiters
+on the existing owner-release grant/signal, with a 20-ms safety retry rather
+than the kicked owner's 1-ms retry. Top-level HLE return checks pending handoffs
+after host locks are dropped, before restoring the guest stack; nested HLE calls
+do not park, return registers/errno survive, and opaque HLE resumes on the same core.
+The startup `[totk-core-wait] event=...` log proves the arm; compare core parks,
+kick counts and core-wait tails with `TOTK_SYNC_STATS=1` / `TOTK_CORE_DIAG=1`.
+Masks, inherited priorities, protection and starvation remain authoritative;
+refused signals and no-SVC guest/SDK spins retain the bounded 20-ms fallback.
+T7 bounded the old park's Odin critical-path contribution at 0.64–0.87 ms/cycle:
+this is an opt-in latency/CPU experiment, not a claim of a large FPS gain.
+
+The sync-fastpath suite covers both event arms and includes a production-CV
+probe measuring release-to-waiter-running latency (1,024 samples, p50/p95/max
+reported, p95 <200 µs—not a worst-case bound) while asserting that a host-blocked
+owner does not produce millisecond retries. It races owner release against the
+waiter's ownership-check/atomic-park boundary and requires zero safety-timeout
+expiries. It also covers same-core HLE return and stale mask,
+priority-inheritance and protection revalidation. Host scheduling is not realtime.
 
 The same single-run device comparison was 29.82 FPS and 41 controller decisions
 (20 over 32.5 ms) versus texel1's 29.74 FPS and 55 decisions (29 over 32.5 ms),

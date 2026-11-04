@@ -164,6 +164,8 @@ static thr_t *g_all;
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 /* Launch-time kick A/B control and opt-in accounting; scheduler state uses G. */
 static int g_sync_kick = -1;
+/* Also read by the top-level HLE return stub; fixed before workers start. */
+int runtime_core_wait_event;
 static _Atomic int g_sync_stats = -1;
 typedef struct {
     uint64_t wake_issued, block_parks, core_parks;
@@ -178,6 +180,9 @@ static int sync_stats_on(void) {
 static void sync_config(void) { /* holding G; main registration resolves before workers start */
     if (g_sync_kick >= 0) return;
     const char *e = getenv("TOTK_SYNC_KICK"); g_sync_kick = !(e && !strcmp(e, "0"));
+    e = getenv("TOTK_CORE_WAIT_EVENT"); runtime_core_wait_event = e && !strcmp(e, "1");
+    fprintf(stderr, "[totk-core-wait] event=%d safety_retry_us=20000 (TOTK_CORE_WAIT_EVENT, startup-only)\n",
+        runtime_core_wait_event);
     fprintf(stderr, "[threads] sync kick=%d stats=%d (TOTK_SYNC_KICK, TOTK_SYNC_STATS)\n",
         g_sync_kick, sync_stats_on());
 }
@@ -778,11 +783,11 @@ static int tk_async_on(void) {   // holding G
     return g_tk_async;
 }
 /* All contenders share the owner's retry clock, not a clock per waiter.
- * A pending/refused signal never disables retries: an eligible contender still
- * polls at 1 ms, and may resend after 1 ms even without an acknowledgment.
+ * A pending/refused signal never disables retries. Event mode relies on the
+ * core_put grant/signal and the top-level HLE return checkpoint, retaining a
+ * 20 ms safety retry for no-SVC spins/refused signals and starvation checks.
  * core_put invalidates the generation and timestamp before a different owner
- * can run. No signal carries permission to preempt: handler/checkpoint always
- * recompute mask, effective priority, starvation and protection under G. */
+ * can run. Handler/checkpoint always revalidate eligibility under G. */
 #define TK_KICK_RETRY_NS 1000000ull
 static int tk_kick_owner(thr_t *o, uint64_t now) { /* holding G, eligibility already checked */
     __atomic_store_n(&o->preempt, 1, __ATOMIC_RELEASE);
@@ -790,7 +795,7 @@ static int tk_kick_owner(thr_t *o, uint64_t now) { /* holding G, eligibility alr
     if (g_sync_kick && (atomic_load_explicit(&o->kick_safe, memory_order_acquire) ||
         (o->kick_generation == o->core_generation && o->kick_last_ns && now - o->kick_last_ns < TK_KICK_RETRY_NS))) {
         if (sync_stats_on()) g_sync_counts.kick_coalesced++;
-        return 1; /* retain the short retry even though this sender did not issue a syscall */
+        return 1;
     }
     if (g_sync_kick) {
         o->kick_generation = o->core_generation; o->kick_last_ns = now;
@@ -844,7 +849,10 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
             if (!o || !core_allowed(t, i) || !o->pt) continue;
             int may = (tk_prio(o) > tk_prio(t) && now >= o->tk_protect_until) || (st && now - o->core_since >= TK_STARVE_NS && now >= o->tk_protect_until);
             if (may && tk_kick_owner(o, now)) kicked = 1; }
-        struct timespec again = {0, kicked ? 1000000 : 20000000};
+        /* core_put publishes the grant and signals this CV under G: a release
+         * between queueing and park cannot be lost. The timeout is recovery,
+         * not dispatch, when the HLE-return checkpoint is enabled. */
+        struct timespec again = {0, runtime_core_wait_event ? 20000000 : kicked ? 1000000 : 20000000};
         core_wait(t, &again);
         if (!reported && t->cur_core < 0 && dm_core_diag_enabled() && now_ns() - t->core_stats_since >= CORE_DIAG_NS) {
             core_wait_report(t, t->core_stats_since); reported = 1;
@@ -974,7 +982,7 @@ void runtime_host_wait_end(runtime_host_wait *wait) {
     wait->active = 0;
 }
 // Preemption point at SVC entry: a higher-priority thread waits for this core.
-void runtime_core_checkpoint(void) {
+static void core_checkpoint(int pin_resume) {
     thr_t *t = me_or_null();
 #ifdef GAME_BOTW
     /* Breath of the Wild (botw.md): the preempt flag is set when a waiter queues up, but a waiter's mask or priority can
@@ -993,17 +1001,30 @@ void runtime_core_checkpoint(void) {
 #ifndef GAME_BOTW
     sync_config();
     atomic_store_explicit(&t->kick_pending, 0, memory_order_relaxed);
-    if ((g_sync_kick || ready_cores_on()) && !tk_core_should_yield(t)) {
+    if ((runtime_core_wait_event || g_sync_kick || ready_cores_on()) && !tk_core_should_yield(t)) {
         __atomic_store_n(&t->preempt, 0, __ATOMIC_RELEASE);
         if (sync_stats_on()) g_sync_counts.stale++;
     } else
 #endif
     {
+        int resume = t->host_resume;
+        if (pin_resume && t->cur_core >= 0) t->host_resume = t->cur_core + 1;
         __atomic_store_n(&t->preempt, 0, __ATOMIC_RELEASE); core_put(t); core_take(t);
+        t->host_resume = resume;
         if (sync_stats_on()) g_sync_counts.checkpoint_handoffs++;
     }
     atomic_store_explicit(&t->kick_safe, 0, memory_order_release);
     pthread_mutex_unlock(&G);
+}
+void runtime_core_checkpoint(void) { core_checkpoint(0); }
+/* Only the outermost host->guest return calls this, after all host locks are
+ * released but before the host-stack slot admits asynchronous preemption.
+ * HLE is not a guest migration point: reacquire the same virtual core. */
+void runtime_core_hle_return(void) {
+    if (!runtime_core_wait_event) return;
+    int saved = errno;
+    core_checkpoint(1);
+    errno = saved;
 }
 /* The core GetCurrentProcessorNumber reports: the virtual core held, else the ideal core. With TOTK_IDEAL_CORE_FIX a
    thread holding no core (blocked, or TOTK_FREE_CORES) whose ideal core is outside its mask (-1 = none) reports the
