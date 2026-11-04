@@ -89,10 +89,10 @@ Tested devices:
    2. **What you have**: pick your route.
    3. **Choose your files** with the file picker. Each file is checked as soon as you pick it; when everything is
       there, press **+** or *Install*.
-   4. **Prepare**: the game is built on the device. On an AYN Thor with a decrypted dump on internal storage this takes
-      about 1 minute 45 seconds (about 1.5–3 minutes on the Odin 3 and the Duo); the container route merges the base
-      game and update for about 12 minutes more. The
-      second-screen art is optional: you can start playing before it is done.
+   4. **Prepare**: the game is built on the device. With a decrypted dump on internal storage this took about
+      1 minute 45 seconds on an AYN Thor, 1 minute 40 seconds on an Odin 3 and 3 minutes on a Retroid Pocket Duo. The
+      container route also merges the base game and update: about 12 minutes on a Thor with the files and the install
+      on an exFAT SD card. The second-screen art is optional: you can start playing before it is done.
    5. **Choose graphics** opens with your device's preset selected. Press **+** to play.
 4. Nothing is uploaded: your files stay on the device.
 
