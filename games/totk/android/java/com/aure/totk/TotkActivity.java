@@ -49,6 +49,7 @@ public final class TotkActivity extends NativeActivity {
 
     /** The game's rumble and six-axis sensor (runtime/feedback_android.c); null when the game was given neither. */
     private volatile GameFeedback feedback;
+    private boolean resumed;
     static native void nativeMotion(float ax, float ay, float az, float gx, float gy, float gz);
     static native void nativeMotionLive(boolean on, String source);
     private static native int nativeFeedbackEnabled();
@@ -106,6 +107,7 @@ public final class TotkActivity extends NativeActivity {
     }
     @Override protected void onResume() {
         super.onResume();
+        resumed = true;
         GameFeedback f = feedback;
         if (f != null) f.resume();
     }
@@ -116,8 +118,14 @@ public final class TotkActivity extends NativeActivity {
         // Never apply that policy to multi-resume on a second display.
         boolean single = PresentationController.secondScreen(this, getDisplay()) == DisplayClass.NONE;
         nativeGameFocus(focused, single);
+        GameFeedback f = feedback;
+        if (single && f != null) {
+            if (focused && resumed) f.resume();
+            else f.pause();
+        }
     }
     @Override protected void onPause() {
+        resumed = false;
         GameFeedback f = feedback;
         if (f != null) f.pause();   // no motion in the background, and no motor left running
         super.onPause();
