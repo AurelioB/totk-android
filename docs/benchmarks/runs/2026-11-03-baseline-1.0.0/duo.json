@@ -1,0 +1,358 @@
+{
+  "schema": "totk-android-benchmark/1",
+  "name": "baseline-1.0.0",
+  "date": "2026-11-03",
+  "build": {
+    "app_version": "1.0.0",
+    "version_code": 10000,
+    "game_version": "1.4.3",
+    "commit": "edc526df8c95",
+    "apk_sha256": "393576ab9b01b9c2370b5dd515b941e0e0a851c763d16b5b624092aab9f68ad6",
+    "turnip_driver_sha256": "9b87afeb3d8d30c6a0ad5aab3e0703bc1500e0321e9f17a922106fa556389ec6"
+  },
+  "method": {
+    "summary": "Default profile per device (no totk.env). Save loaded from the in-game Load list, ~55 s settle, then the right stick held at half deflection (right, then left) via sendevent on the controller node. Only the runtime's own 300-frame windows that started after the stick was pushed and ended before it was released are counted.",
+    "sources": {
+      "fps": "[nvn-vk] frame N: X fps over the last 300",
+      "frame_time": "计时 至帧 N： 帧时间 p50 / p95 / 最大 (runtime timing line)",
+      "gpu_ms": "[nvn-vk] frame N, per frame: ... GPU X ms",
+      "long_frames": "[长帧] lines (logged only when >20 ms and 40% above the recent 16-frame average: lower bound)",
+      "over33_over50": "[nvn-vk] stutter line counts per window",
+      "thermal": "thermal zones, cooling devices, GPU thermal_pwrlevel and cpufreq limits sampled every 3 s"
+    }
+  },
+  "devices": {
+    "duo": {
+      "name": "Retroid Pocket Duo",
+      "soc": "CQ7790S (Snapdragon 7 Gen 4 class)",
+      "gpu": "Adreno 722",
+      "android": "16",
+      "profile": "Light (30 fps, 960x540, high shadows)",
+      "screens": "dual",
+      "settings_env": {
+        "TOTK_FPS60": "0",
+        "TOTK_RENDER_RES": "960x540",
+        "TOTK_ACQUIRE_SLACK": "1",
+        "TOTK_POST_SCALE": "off",
+        "TOTK_OPERATION_MODE": "handheld",
+        "TOTK_NATIVE_UI": "0",
+        "TOTK_OVERLAY": "off",
+        "TOTK_OVERLAY_POS": "tr",
+        "TOTK_COMPANION": "1",
+        "TOTK_FACE_BUTTONS": "label",
+        "TOTK_AUDIO_PREFILL_MS": "20",
+        "TOTK_LOCALE": "en-US"
+      }
+    }
+  },
+  "scenes": {
+    "hateno": {
+      "name": "Hateno Village",
+      "save_slot": "slot_00",
+      "note": "outdoors in the village"
+    },
+    "lookout": {
+      "name": "Lookout Landing",
+      "save_slot": "slot_02",
+      "note": "arrival point is inside the shelter next to Monte (indoor)"
+    },
+    "rotsumamu": {
+      "name": "Rotsumamu Shrine",
+      "save_slot": "slot_04",
+      "note": "outdoors at the shrine"
+    }
+  },
+  "runs": [
+    {
+      "device": "duo",
+      "scene": "hateno",
+      "pans": [
+        {
+          "start_frame": 4800,
+          "end_frame": 6000,
+          "start_utc": "2026-11-03T23:34:22+00:00",
+          "end_utc": "2026-11-03T23:35:13+00:00",
+          "stick_value": 16000
+        }
+      ],
+      "summary": {
+        "windows": 3,
+        "fps_min": 27.6,
+        "fps_max": 29.0,
+        "fps_mean": 28.2,
+        "p50_ms_median": 34.91,
+        "p95_ms_max": 46.89,
+        "max_ms": 117.1,
+        "gpu_ms_mean": 24.53,
+        "long_ge45_total": 8,
+        "long_ge25_total": 8,
+        "over50_total": 22,
+        "cpu_max_c": 71.1,
+        "gpu_max_c": 65.8
+      },
+      "windows": [
+        {
+          "frames": [
+            5101,
+            5400
+          ],
+          "fps": 27.6,
+          "p50_ms": 34.91,
+          "p95_ms": 46.25,
+          "max_ms": 117.1,
+          "gpu_ms": 24.7,
+          "long_ge25": 5,
+          "long_ge45": 5,
+          "over33": 201,
+          "over50": 10
+        },
+        {
+          "frames": [
+            5401,
+            5700
+          ],
+          "fps": 29.0,
+          "p50_ms": 33.33,
+          "p95_ms": 46.89,
+          "max_ms": 58.4,
+          "gpu_ms": 23.9,
+          "long_ge25": 3,
+          "long_ge45": 3,
+          "over33": 149,
+          "over50": 7
+        },
+        {
+          "frames": [
+            5701,
+            6000
+          ],
+          "fps": 28.0,
+          "p50_ms": 35.36,
+          "p95_ms": 42.98,
+          "max_ms": 54.9,
+          "gpu_ms": 25.0,
+          "long_ge25": 0,
+          "long_ge45": 0,
+          "over33": 209,
+          "over50": 5
+        }
+      ],
+      "thermal": [
+        {
+          "cpu_max_c": 71.1,
+          "gpu_max_c": 65.8,
+          "cooling_state_max": 0,
+          "gpu_thermal_pwrlevel_max": 0,
+          "cpufreq_caps_khz": [],
+          "samples": 15
+        }
+      ]
+    },
+    {
+      "device": "duo",
+      "scene": "lookout",
+      "pans": [
+        {
+          "start_frame": 11400,
+          "end_frame": 12900,
+          "start_utc": "2026-11-03T23:38:22+00:00",
+          "end_utc": "2026-11-03T23:39:16+00:00",
+          "stick_value": 16000
+        }
+      ],
+      "summary": {
+        "windows": 4,
+        "fps_min": 28.4,
+        "fps_max": 29.9,
+        "fps_mean": 28.95,
+        "p50_ms_median": 33.68,
+        "p95_ms_max": 49.54,
+        "max_ms": 213.1,
+        "gpu_ms_mean": 23.2,
+        "long_ge45_total": 15,
+        "long_ge25_total": 15,
+        "over50_total": 34,
+        "cpu_max_c": 78.3,
+        "gpu_max_c": 69.9
+      },
+      "windows": [
+        {
+          "frames": [
+            11701,
+            12000
+          ],
+          "fps": 28.6,
+          "p50_ms": 33.45,
+          "p95_ms": 44.9,
+          "max_ms": 213.1,
+          "gpu_ms": 23.1,
+          "long_ge25": 4,
+          "long_ge45": 4,
+          "over33": 154,
+          "over50": 9
+        },
+        {
+          "frames": [
+            12001,
+            12300
+          ],
+          "fps": 29.9,
+          "p50_ms": 33.04,
+          "p95_ms": 37.85,
+          "max_ms": 41.6,
+          "gpu_ms": 23.3,
+          "long_ge25": 0,
+          "long_ge45": 0,
+          "over33": 137,
+          "over50": 0
+        },
+        {
+          "frames": [
+            12301,
+            12600
+          ],
+          "fps": 28.4,
+          "p50_ms": 33.88,
+          "p95_ms": 49.54,
+          "max_ms": 62.3,
+          "gpu_ms": 22.7,
+          "long_ge25": 7,
+          "long_ge45": 7,
+          "over33": 168,
+          "over50": 13
+        },
+        {
+          "frames": [
+            12601,
+            12900
+          ],
+          "fps": 28.9,
+          "p50_ms": 33.68,
+          "p95_ms": 48.3,
+          "max_ms": 55.1,
+          "gpu_ms": 23.7,
+          "long_ge25": 4,
+          "long_ge45": 4,
+          "over33": 164,
+          "over50": 12
+        }
+      ],
+      "thermal": [
+        {
+          "cpu_max_c": 78.3,
+          "gpu_max_c": 69.9,
+          "cooling_state_max": 0,
+          "gpu_thermal_pwrlevel_max": 0,
+          "cpufreq_caps_khz": [],
+          "samples": 16
+        }
+      ]
+    },
+    {
+      "device": "duo",
+      "scene": "rotsumamu",
+      "pans": [
+        {
+          "start_frame": 16200,
+          "end_frame": 17700,
+          "start_utc": "2026-11-03T23:41:09+00:00",
+          "end_utc": "2026-11-03T23:42:05+00:00",
+          "stick_value": 16000
+        }
+      ],
+      "summary": {
+        "windows": 4,
+        "fps_min": 29.9,
+        "fps_max": 29.9,
+        "fps_mean": 29.9,
+        "p50_ms_median": 33.5,
+        "p95_ms_max": 37.75,
+        "max_ms": 58.5,
+        "gpu_ms_mean": 16.35,
+        "long_ge45_total": 1,
+        "long_ge25_total": 1,
+        "over50_total": 1,
+        "cpu_max_c": 76.3,
+        "gpu_max_c": 67.4
+      },
+      "windows": [
+        {
+          "frames": [
+            16501,
+            16800
+          ],
+          "fps": 29.9,
+          "p50_ms": 33.39,
+          "p95_ms": 37.75,
+          "max_ms": 58.5,
+          "gpu_ms": 15.8,
+          "long_ge25": 1,
+          "long_ge45": 1,
+          "over33": 155,
+          "over50": 1
+        },
+        {
+          "frames": [
+            16801,
+            17100
+          ],
+          "fps": 29.9,
+          "p50_ms": 33.5,
+          "p95_ms": 37.17,
+          "max_ms": 41.6,
+          "gpu_ms": 16.8,
+          "long_ge25": 0,
+          "long_ge45": 0,
+          "over33": 158,
+          "over50": 0
+        },
+        {
+          "frames": [
+            17101,
+            17400
+          ],
+          "fps": 29.9,
+          "p50_ms": 33.58,
+          "p95_ms": 37.34,
+          "max_ms": 41.7,
+          "gpu_ms": 17.4,
+          "long_ge25": 0,
+          "long_ge45": 0,
+          "over33": 163,
+          "over50": 0
+        },
+        {
+          "frames": [
+            17401,
+            17700
+          ],
+          "fps": 29.9,
+          "p50_ms": 33.4,
+          "p95_ms": 37.03,
+          "max_ms": 39.0,
+          "gpu_ms": 15.4,
+          "long_ge25": 0,
+          "long_ge45": 0,
+          "over33": 152,
+          "over50": 0
+        }
+      ],
+      "thermal": [
+        {
+          "cpu_max_c": 76.3,
+          "gpu_max_c": 67.4,
+          "cooling_state_max": 0,
+          "gpu_thermal_pwrlevel_max": 0,
+          "cpufreq_caps_khz": [],
+          "samples": 17
+        }
+      ]
+    }
+  ],
+  "caveats": [
+    "Odin 3 CPU clocks were capped at 2.23/2.25 GHz (hardware max 3.53/4.32 GHz) for the whole session by a non-thermal cap (performance mode off; a ClusterTune Performance tile was present). Its Hateno and Lookout Landing numbers are CPU-cap-limited.",
+    "Lookout Landing slot_02 arrives indoors (shelter).",
+    "long_ge45/long_ge25 counts are lower bounds; during sustained slowdowns the runtime does not log long frames.",
+    "No GPU page faults, SMMU faults or device lost in any run."
+  ]
+}

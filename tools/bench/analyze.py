@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""analyze.py <out-dir> [--json FILE] [--name NAME] [--date YYYY-MM-DD] [--commit SHA] [--meta FILE] [--new-baseline]
+
+Per device x scene, the runtime's own 300-frame windows recorded while panning: from <out>/pans.txt, the windows whose
+end frame is in [F0+600, F1] (started after the stick was pushed, finished before it was released), read from
+<out>/logs/<device>.log, plus the max CPU / GPU zone temperature, cooling / GPU throttle state and cpufreq caps from
+<out>/samples-<device>.txt over [T0, T1]. Prints the windows and a results table; --json writes the result in the
+totk-android-benchmark/1 schema (the shape of docs/benchmarks/baseline-1.0.0.json).
+
+Inputs per device label (as written by collect.sh / sampler.py / pan.sh): logs/<d>.log, logs/<d>-dmesg.txt,
+samples-<d>.txt, settings-<d>.env, facts-<d>.txt, totk-env-<d>.txt (only when a developer totk.env exists).
+pans.txt lines with the same device and scene (a trailing repeat number is ignored: hateno2 = hateno) form one run.
+--meta: a JSON object deep-merged over the generated document (curated device names / profiles, build fields);
+its "caveats" are appended to the generated ones.
+Never writes docs/benchmarks/baseline-* unless --new-baseline (then only to a file that does not exist yet)."""
+import argparse, collections, datetime, json, os, re, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from benchlib import SCHEMA, guard_output  # noqa: E402
+
+METHOD_SUMMARY = ('Default profile per device (no totk.env). Save loaded from the in-game Load list, ~55 s settle, then the '
+                  'right stick held at {stick} (right, then left) via sendevent on the controller node. Only the runtime\'s own '
+                  '300-frame windows that started after the stick was pushed and ended before it was released are counted.')
+METHOD_SOURCES = {
+    'fps': '[nvn-vk] frame N: X fps over the last 300',
+    'frame_time': '计时 至帧 N： 帧时间 p50 / p95 / 最大 (runtime timing line)',
+    'gpu_ms': '[nvn-vk] frame N, per frame: ... GPU X ms',
+    'long_frames': '[长帧] lines (logged only when >20 ms and 40% above the recent 16-frame average: lower bound)',
+    'over33_over50': '[nvn-vk] stutter line counts per window',
+    'thermal': 'thermal zones, cooling devices, GPU thermal_pwrlevel and cpufreq limits sampled every 3 s',
+}
+KNOWN_SCENES = {
+    'hateno': {'name': 'Hateno Village', 'save_slot': 'slot_00', 'note': 'outdoors in the village'},
+    'lookout': {'name': 'Lookout Landing', 'save_slot': 'slot_02',
+                'note': 'arrival point is inside the shelter next to Monte (indoor)'},
+    'rotsumamu': {'name': 'Rotsumamu Shrine', 'save_slot': 'slot_04', 'note': 'outdoors at the shrine'},
+}
+FAULT_RE = re.compile(r'page ?fault|smmu.*fault|context fault|gpu fault|adreno.*fault', re.I)
+
+
+def parse_log(path):
+    timing, gpu, fps, stut, longf, info = {}, {}, {}, {}, [], {}
+    for line in open(path, encoding='utf-8', errors='replace'):
+        if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):
+            timing[int(m[1])] = tuple(float(x) for x in m.groups()[1:])
+        if m := re.search(r'\[nvn-vk\] frame (\d+), per frame: recording ([\d.]+) ms, waiting for the GPU ([\d.]+) ms, GPU ([\d.]+) ms', line):
+            gpu[int(m[1])] = float(m[4])
+        if m := re.search(r'\[nvn-vk\] frame (\d+): ([\d.]+) fps over the last 300', line):
+            fps[int(m[1])] = float(m[2])
+        if m := re.search(r'\[nvn-vk\] frame (\d+), stutter: longest frame ([\d.]+) ms, (\d+) frames over (\d+) ms, (\d+) over (\d+) ms', line):
+            stut[int(m[1])] = (int(m[3]), int(m[4]), int(m[5]), int(m[6]))
+        if m := re.search(r'\[长帧\] 帧 (\d+)（([\d.]+) s）整帧 ([\d.]+) ms', line):
+            longf.append((int(m[1]), float(m[3])))
+        if 'game_version' not in info and (m := re.search(r'^\[totk\] game version (\S+)', line)):
+            info['game_version'] = m[1]
+        if 'turnip' not in info and (m := re.search(r'driver sha256=([0-9a-f]{64})', line)):
+            info['turnip'] = m[1]
+        if 'settings' not in info and (m := re.search(r'^\[totk-app\] settings\.env \([^)]*\): (.*)$', line)):
+            info['settings'] = dict(kv.split('=', 1) for kv in m[1].split() if '=' in kv)
+        if 'device lost' in line.lower():
+            info['device_lost'] = info.get('device_lost', 0) + 1
+    return timing, gpu, fps, stut, longf, info
+
+
+def parse_samples(path, t0, t1):
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    for line in open(path, encoding='utf-8', errors='replace'):
+        p = line.split()
+        if len(p) < 2 or 'caps=' not in line:
+            continue
+        try:
+            if not (t0 <= float(p[0]) <= t1):
+                continue
+        except ValueError:
+            continue
+        d = dict(x.split('=', 1) for x in p[1:7] if '=' in x)
+        num = lambda k: int(d[k]) if d.get(k, '').lstrip('-').isdigit() else None
+        caps = []
+        for c in line.split('caps=', 1)[1].split():
+            s, _, m = c.partition('/')
+            if s.isdigit() and m.isdigit():
+                caps.append((int(s), int(m)))
+        rows.append({'cpu': num('cpu'), 'gpu': num('gpu'), 'cool': num('cool'), 'tpl': num('tpl'), 'caps': caps})
+    return rows
+
+
+def read_kv(path, comments=True):
+    out = {}
+    if os.path.exists(path):
+        for line in open(path, encoding='utf-8', errors='replace'):
+            line = line.strip()
+            if not line or (comments and line.startswith('#')) or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            out[k] = v
+    return out
+
+
+def mx(values):
+    values = [v for v in values if v is not None]
+    return max(values) if values else None
+
+
+def deep_merge(base, over):
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            deep_merge(base[k], v)
+        elif k == 'caveats' and isinstance(base.get(k), list):
+            base[k] += [c for c in v if c not in base[k]]
+        else:
+            base[k] = v
+    return base
+
+
+def utc(t):
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    ap.add_argument('out', help='the benchmark output directory (pans.txt, logs/, samples-*.txt, ...)')
+    ap.add_argument('--json', help='write the result JSON here')
+    ap.add_argument('--name', help='result name (default: the out directory name)')
+    ap.add_argument('--date', help='measurement date (default: UTC date of the first pan)')
+    ap.add_argument('--commit', help='source commit of the measured APK (its assets/build.txt)')
+    ap.add_argument('--meta', help='JSON object deep-merged over the result (device names, profiles, extra caveats)')
+    ap.add_argument('--new-baseline', action='store_true', help='allow writing a NEW docs/benchmarks/baseline-*.json')
+    a = ap.parse_args()
+    if a.json:
+        guard_output(a.json, a.new_baseline)
+    out = a.out
+    meta = json.load(open(a.meta, encoding='utf-8')) if a.meta else {}
+
+    pans = collections.OrderedDict()
+    pans_path = os.path.join(out, 'pans.txt')
+    if not os.path.exists(pans_path):
+        sys.exit(f'{pans_path} missing: run pan.sh for each device and scene first')
+    for line in open(pans_path, encoding='utf-8'):
+        p = line.split()
+        if len(p) < 3:
+            continue
+        kv = dict(x.split('=', 1) for x in p[2:])
+        pans.setdefault((p[0], re.sub(r'(?<=[A-Za-z_-])\d+$', '', p[1])), []).append({k: int(v) for k, v in kv.items()})
+    if not pans:
+        sys.exit(f'{out}/pans.txt has no pans')
+    order = list(dict.fromkeys(list(meta.get('devices', {})) + [d for d, _ in pans]))
+    order = [d for d in order if any(k[0] == d for k in pans)]
+    scenes = list(dict.fromkeys(s for _, s in pans))
+
+    logs, facts, devices, caveats = {}, {}, {}, []
+    for dev in order:
+        lp = os.path.join(out, 'logs', f'{dev}.log')
+        if not os.path.exists(lp):
+            sys.exit(f'missing {lp} (run collect.sh for {dev})')
+        logs[dev] = parse_log(lp)
+        info = logs[dev][5]
+        facts[dev] = read_kv(os.path.join(out, f'facts-{dev}.txt'))
+        senv = read_kv(os.path.join(out, f'settings-{dev}.env')) or dict(info.get('settings', {}))
+        senv.pop('TOTK_DATA_DIR', None)
+        f = facts[dev]
+        displays = f.get('displays')
+        devices[dev] = {
+            'name': f.get('model') or None, 'soc': f.get('soc') or None, 'gpu': f.get('gpu') or None,
+            'android': f.get('android') or None, 'profile': None,
+            'screens': {'1': 'single', '2': 'dual'}.get(displays, displays) if displays else None,
+            'settings_env': senv,
+        }
+        if f.get('serial_sha256'):
+            devices[dev]['serial_sha256'] = f['serial_sha256']
+        if os.path.exists(os.path.join(out, f'totk-env-{dev}.txt')):
+            caveats.append(f'{dev}: a developer totk.env was present: not a default-profile run.')
+
+    build_vals = collections.defaultdict(set)
+    for dev in order:
+        info, f = logs[dev][5], facts[dev]
+        for key, val in (('app_version', f.get('app_version')), ('version_code', f.get('version_code')),
+                         ('game_version', info.get('game_version')), ('apk_sha256', f.get('apk_sha256')),
+                         ('turnip_driver_sha256', info.get('turnip'))):
+            if val:
+                build_vals[key].add(val)
+    for key, vals in build_vals.items():
+        if len(vals) > 1:
+            caveats.append(f'devices disagree on {key}: {", ".join(sorted(vals))}.')
+    one = lambda k: sorted(build_vals[k])[0] if build_vals.get(k) else None
+    vc = one('version_code')
+    build = {'app_version': one('app_version'), 'version_code': int(vc) if vc and vc.isdigit() else vc,
+             'game_version': one('game_version'), 'commit': a.commit, 'apk_sha256': one('apk_sha256'),
+             'turnip_driver_sha256': one('turnip_driver_sha256')}
+
+    runs, table = [], []
+    for dev in order:
+        timing, gpu, fps, stut, longf, info = logs[dev]
+        for scene in scenes:
+            plist = pans.get((dev, scene))
+            if not plist:
+                continue
+            print(f'\n## {dev} / {scene}')
+            print('window          fps    p50    p95    max   GPU ms  long>=25  long>=45  over33/over50(stutter line)')
+            windows, thermal = [], []
+            for kv in plist:
+                f0, f1 = kv['F0'], kv['F1']
+                for f in sorted(x for x in timing if f0 + 600 <= x <= f1):
+                    lf = [x for x in longf if f - 300 < x[0] <= f]
+                    st = stut.get(f)
+                    w = {'frames': [f - 299, f], 'fps': fps.get(f), 'p50_ms': timing[f][0], 'p95_ms': timing[f][1],
+                         'max_ms': round(timing[f][2], 1), 'gpu_ms': gpu.get(f), 'long_ge25': sum(x[1] >= 25 for x in lf),
+                         'long_ge45': sum(x[1] >= 45 for x in lf), 'over33': st[0] if st else None,
+                         'over50': st[2] if st else None}
+                    windows.append(w)
+                    print(f'{f-299:>6}-{f:<6} {w["fps"] or 0:5.1f} {w["p50_ms"]:6.2f} {w["p95_ms"]:6.2f} {w["max_ms"]:6.1f} '
+                          f'{w["gpu_ms"] if w["gpu_ms"] is not None else float("nan"):7.1f}  {w["long_ge25"]:>6}    '
+                          f'{w["long_ge45"]:>6}    {st[0] if st else "-"}/{st[2] if st else "-"} '
+                          f'(>{st[1] if st else "-"}/>{st[3] if st else "-"})')
+                rows = parse_samples(os.path.join(out, f'samples-{dev}.txt'), kv['T0'], kv['T1'])
+                if rows:
+                    capped = sorted({c for r in rows for c in r['caps'] if c[0] != c[1]})
+                    t = {'cpu_max_c': mx(r['cpu'] for r in rows), 'gpu_max_c': mx(r['gpu'] for r in rows),
+                         'cooling_state_max': mx(r['cool'] for r in rows),
+                         'gpu_thermal_pwrlevel_max': mx(r['tpl'] for r in rows),
+                         'cpufreq_caps_khz': [{'scaling_max': s, 'cpuinfo_max': m} for s, m in capped],
+                         'samples': len(rows)}
+                    for k in ('cpu_max_c', 'gpu_max_c'):
+                        t[k] = t[k] / 1000 if t[k] is not None else None
+                    thermal.append(t)
+                    print(f'  temps over pan: CPU max {t["cpu_max_c"]} C, GPU max {t["gpu_max_c"]} C; thermal cooling '
+                          f'states max {t["cooling_state_max"]}, GPU thermal_pwrlevel max {t["gpu_thermal_pwrlevel_max"]}; '
+                          f'cpufreq scaling_max<cpuinfo_max: {[f"{s}/{m}" for s, m in capped] or "none"} ({len(rows)} samples)')
+                else:
+                    print(f'  no samples over the pan {utc(kv["T0"])} .. {utc(kv["T1"])}')
+            vals = lambda k: [w[k] for w in windows if w[k] is not None]
+            p50s = sorted(vals('p50_ms'))
+            summary = {
+                'windows': len(windows),
+                'fps_min': min(vals('fps'), default=None), 'fps_max': max(vals('fps'), default=None),
+                'fps_mean': round(sum(vals('fps')) / len(vals('fps')), 2) if vals('fps') else None,
+                'p50_ms_median': p50s[len(p50s) // 2] if p50s else None,
+                'p95_ms_max': max(vals('p95_ms'), default=None), 'max_ms': max(vals('max_ms'), default=None),
+                'gpu_ms_mean': round(sum(vals('gpu_ms')) / len(vals('gpu_ms')), 2) if vals('gpu_ms') else None,
+                'long_ge45_total': sum(vals('long_ge45')), 'long_ge25_total': sum(vals('long_ge25')),
+                'over50_total': sum(vals('over50')),
+                'cpu_max_c': mx(t['cpu_max_c'] for t in thermal), 'gpu_max_c': mx(t['gpu_max_c'] for t in thermal),
+            }
+            runs.append({'device': dev, 'scene': scene,
+                         'pans': [{'start_frame': kv['F0'], 'end_frame': kv['F1'], 'start_utc': utc(kv['T0']),
+                                   'end_utc': utc(kv['T1']), 'stick_value': kv['V']} for kv in plist],
+                         'summary': summary, 'windows': windows, 'thermal': thermal})
+            table.append((dev, scene, summary, windows))
+
+    for dev in order:
+        capped = sorted({(c['scaling_max'], c['cpuinfo_max']) for r in runs if r['device'] == dev
+                         for t in r['thermal'] for c in t['cpufreq_caps_khz']})
+        if capped:
+            caveats.append(f'{dev}: cpufreq limited below the hardware maximum during the pans (scaling_max/cpuinfo_max '
+                           f'kHz {", ".join(f"{s}/{m}" for s, m in capped)}); compare only runs with the same limits.')
+        hot = [r['scene'] for r in runs if r['device'] == dev for t in r['thermal']
+               if (t['cooling_state_max'] or 0) > 0 or (t['gpu_thermal_pwrlevel_max'] or 0) > 0]
+        if hot:
+            caveats.append(f'{dev}: thermal throttling engaged during {", ".join(dict.fromkeys(hot))}.')
+    faults = {}
+    for dev in order:
+        dm = os.path.join(out, 'logs', f'{dev}-dmesg.txt')
+        n = sum(1 for l in open(dm, encoding='utf-8', errors='replace') if FAULT_RE.search(l)) if os.path.exists(dm) else None
+        faults[dev] = (n, logs[dev][5].get('device_lost', 0))
+    bad = [f'{d} ({n} dmesg fault lines, {lost} device lost)' for d, (n, lost) in faults.items() if n or lost]
+    missing = [d for d, (n, _) in faults.items() if n is None]
+    caveats.append('long_ge45/long_ge25 counts are lower bounds; during sustained slowdowns the runtime does not log long frames.')
+    if bad:
+        caveats.append(f'GPU faults or device lost: {"; ".join(bad)}.')
+    elif not missing:
+        caveats.append('No GPU page faults, SMMU faults or device lost in any run.')
+    if missing:
+        caveats.append(f'no dmesg collected for {", ".join(missing)}: GPU faults not checked there.')
+
+    sticks = {kv['V'] for plist in pans.values() for kv in plist}
+    stick = 'half deflection' if sticks == {16000} else f'value {"/".join(map(str, sorted(sticks)))} of 32767'
+    first_t0 = min(kv['T0'] for plist in pans.values() for kv in plist)
+    doc = {
+        'schema': SCHEMA,
+        'name': a.name or os.path.basename(os.path.normpath(out)),
+        'date': a.date or utc(first_t0)[:10],
+        'build': build,
+        'method': {'summary': METHOD_SUMMARY.format(stick=stick), 'sources': dict(METHOD_SOURCES)},
+        'devices': devices,
+        'scenes': {s: dict(KNOWN_SCENES.get(s, {'name': s, 'save_slot': None, 'note': None})) for s in scenes},
+        'runs': runs,
+        'caveats': caveats,
+    }
+    deep_merge(doc, meta)
+
+    print('\n| Device | Scene | Windows | fps | p50 ms | p95 ms | Worst ms | GPU ms | ≥45 ms | >50 ms | Max CPU / GPU °C |')
+    print('|---|---|---|---|---|---|---|---|---|---|---|')
+    rng = lambda xs, nd: '-' if not xs else (f'{min(xs):.{nd}f}' if min(xs) == max(xs) else f'{min(xs):.{nd}f}–{max(xs):.{nd}f}')
+    for dev, scene, s, ws in table:
+        g = lambda k: [w[k] for w in ws if w[k] is not None]
+        print(f'| {doc["devices"][dev].get("name") or dev} | {doc["scenes"][scene]["name"]} | {s["windows"]} | {rng(g("fps"), 1)} | '
+              f'{rng(g("p50_ms"), 2)} | {rng(g("p95_ms"), 1)} | {s["max_ms"]} | {rng(g("gpu_ms"), 1)} | {s["long_ge45_total"]} | '
+              f'{s["over50_total"]} | {s["cpu_max_c"]} / {s["gpu_max_c"]} |')
+    print('\nCaveats:\n' + '\n'.join(f'- {c}' for c in doc['caveats']))
+    if a.json:
+        os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
+        with open(a.json, 'x' if a.new_baseline else 'w', encoding='utf-8') as fh:
+            json.dump(doc, fh, ensure_ascii=False, indent=2)
+            fh.write('\n')
+        print(f'\nwrote {a.json}')
+
+
+if __name__ == '__main__':
+    main()
