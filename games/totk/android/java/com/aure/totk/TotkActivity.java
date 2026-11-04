@@ -111,6 +111,10 @@ public final class TotkActivity extends NativeActivity {
         GameFeedback f = feedback;
         if (f != null) f.resume();
     }
+    @Override public void onTopResumedActivityChanged(boolean top) {
+        super.onTopResumedActivityChanged(top);
+        if (companion != null) companion.ownerTopResumed(top);
+    }
     @Override public void onWindowFocusChanged(boolean focused) {
         super.onWindowFocusChanged(focused);
         // Quickstep can leave the live recents tile RESUMED. On one display,

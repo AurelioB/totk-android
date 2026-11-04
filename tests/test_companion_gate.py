@@ -96,6 +96,7 @@ public class NativeActivity extends Context {
     public Window getWindow() { return new Window(); }
     public android.view.Display getDisplay() { return new android.view.Display(); }
     public void onWindowFocusChanged(boolean focused) {}
+    public void onTopResumedActivityChanged(boolean top) {}
 }''',
     'com/aure/totk/companion/AssetStore.java': '''package com.aure.totk.companion;
 import android.content.Context;
@@ -137,6 +138,7 @@ public final class PresentationController {
         if (!NativeActivity.initialized) throw new AssertionError("controller constructed before native initialization");
         created++;
     }
+    public void ownerTopResumed(boolean top) {}
     public void close() { closed++; }
 }''',
     'com/aure/totk/companion/Snapshot.java': '''package com.aure.totk.companion;
