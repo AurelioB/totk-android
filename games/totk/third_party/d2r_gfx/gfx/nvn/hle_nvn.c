@@ -3547,7 +3547,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         int loading = g_nvn_loadscreen_up && g_nvn_loadscreen_up(), movie = movie_host_active && movie_host_active();
         runtime_progress_mark(loading ? "loading screen" : movie ? "host movie" : "present", loading || movie);
     }
-    totk_perf_frame(t0, present_period(o), g_adpf_pacing_ns);
+    totk_perf_frame(t0, present_period(o), g_adpf_pacing_ns, o->interval);
     runtime_fps_hybrid_present(t0,auto_scene_draws,
         (g_nvn_loadscreen_up && g_nvn_loadscreen_up()) || (movie_host_active && movie_host_active()));
     if (runtime_fps_adaptive_selected())

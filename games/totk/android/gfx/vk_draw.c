@@ -8722,6 +8722,7 @@ static void *presenter(void *arg) {
         if (resize) { g_win_w = b->w; g_win_h = b->h; }
         pthread_mutex_unlock(&g_win_mu);
 #ifdef __ANDROID__
+        if (b->generated) totk_perf_generated();   /* TOTK_RATE_HINT_HOLD: frame generation is running */
         unsigned requested_rate = totk_perf_rate();
         if (w && requested_rate != hinted_rate) {
             totk_perf_window(w);

@@ -1957,6 +1957,7 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_VK_TEX_MEMO` | 0–1 | the next texture ID lookup and texture registration | memo entries stay keyed by the registry/identity/submission state, so switching back on never reuses a stale one |
 | `TOTK_NVN_CALL_NOCOPY` | 0–1 | the next CallCommands / CopyCommands | a recording already holding call markers still expands them at its EndRecording |
 | `TOTK_ADPF_GPU` | 0–1 | the next presented frame | that frame is not reported; the session's target switches with it; no effect with `TOTK_ADPF=0` |
+| `TOTK_RATE_HINT_HOLD` | 0…60000 | the next guest present | ms; a change clears the held rates; no effect without `TOTK_FRAME_RATE_HINT=1` |
 
 `TOTK_IDEAL_CORE_FIX` is startup-only and refused. Another launch-time switch becomes live by adding it, with its
 range, to `totk_live_switches` in `runtime/live_ctl.h`, reading it through `totk_live_cached` at a point where a change
@@ -3840,6 +3841,7 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 | `TOTK_ADPF` | Existing render-only session (unset/`legacy`) | `0` disables all CPU hints; `full` opts into the bounded critical-thread group, profile-derived targets and wait-stripped work reporting. |
 | `TOTK_ADPF_TARGET_MS` | `33.3` | Existing render-only target override; nonpositive disables the legacy session. Retained for existing profiles; ignored by `TOTK_ADPF=full`. |
 | `TOTK_FRAME_RATE_HINT` | `0` | `1` requests FIXED_SOURCE content cadence through the window and zero-copy SurfaceControl. It is only a request, never evidence of a panel-mode change. |
+| `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
 | `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
 
 ### Android performance hints (experimental full mode)
@@ -3872,6 +3874,14 @@ parent window, and permits seamless switches only. No custom display-mode overri
 set. Panel offerings, request acceptance and actual per-layer SurfaceFlinger cadence must
 be measured separately on each handheld. A successful window return/void transaction or
 our fence diagnostics does not prove 60Hz physical scanout.
+
+`TOTK_RATE_HINT_HOLD=<ms>` (default unset/0 = the configured rate above; 5000 is the design value; live through
+`totk.ctl` at the next guest present; needs `TOTK_FRAME_RATE_HINT=1`) requests the window's output rate instead: the
+game's own interval in 60-Hz units (60/30/20), doubled while frame generation queues generated frames (real frames at
+most 30, so 20 real + generated asks for 40, not a forced 60), at least 60 on the present lattice, and the highest such
+rate of the last `<ms>`: up at once, down only after the lower rate held that long. Never the measured present period,
+which follows a panel that took a lower request. Logs `[totk-perf] TOTK_RATE_HINT_HOLD=N ms (launch|live)`; each
+change still logs `window frame-rate hint=`. Measure the number of those lines and fps dips after 60→30→60 per arm.
 
 Device comparison arms are unchanged default / `TOTK_ADPF=0` /
 `TOTK_ADPF=full` / `TOTK_ADPF=full TOTK_FRAME_RATE_HINT=1`, interleaved on the same

@@ -54,6 +54,7 @@ static const totk_live_switch totk_live_switches[] = {
     {"TOTK_VK_TEX_MEMO", 0, 1},              /* the next texture ID lookup (entries are kept: their key is the registry state) */
     {"TOTK_NVN_CALL_NOCOPY", 0, 1},          /* the next CallCommands/CopyCommands; markers already recorded still expand */
     {"TOTK_ADPF_GPU", 0, 1},                 /* the next presented frame; that frame is not reported */
+    {"TOTK_RATE_HINT_HOLD", 0, 60000},       /* the next guest present (ms; 0 = the configured rate); needs TOTK_FRAME_RATE_HINT=1 */
 };
 enum { TOTK_LIVE_MAX = 16 };
 _Static_assert(sizeof totk_live_switches / sizeof *totk_live_switches <= TOTK_LIVE_MAX, "live switch table");

@@ -30,6 +30,13 @@ static int64_t legacy_target;
 static unsigned logged, frames;
 static uint64_t previous_frame, sample_time;
 static _Atomic unsigned content_rate = 60;
+/* TOTK_RATE_HINT_HOLD (ms; 0 = the configured rate as before): launch value, live cache, the guest present thread's
+ * hold state, the value it last logged, and generated outputs the presenter queued (frame generation is running). */
+static int hold_launch, hold_logged = -1;
+static totk_live_cache hold_live;
+static totk_rate_hold rate_hold;
+static _Atomic uint64_t generated_presents;
+static uint64_t generated_seen;
 /* TOTK_ADPF_GPU: launch value, live cache, the value the session last ran with, the frame's start and the pacing
  * waits since the last present (mu; CLOCK_MONOTONIC), the newest completed frame's GPU time and the last reported. */
 static int span_launch;
@@ -82,6 +89,19 @@ static void configure(void) {
     lattice |= pace && !strcmp(pace, "display");
     lattice |= slack && strcmp(slack, "0");
     atomic_store_explicit(&content_rate, totk_frame_rate(fps60 ? 60 : 30, framegen, lattice), memory_order_relaxed);
+    const char *hold = getenv("TOTK_RATE_HINT_HOLD");
+    while (hold && isspace((unsigned char)*hold)) hold++;
+    if (hold && *hold && !totk_live_decimal(hold, 0, 60000, &hold_launch)) {
+        fprintf(stderr, "[totk-perf] TOTK_RATE_HINT_HOLD=%s ignored: not a decimal in 0..60000 ms\n", hold);
+        hold_launch = 0;
+    }
+    if (rate_on || hold_launch) {
+        fprintf(stderr, "[totk-perf] TOTK_RATE_HINT_HOLD=%d ms (launch, live): %s\n", hold_launch,
+            !rate_on ? "no effect without TOTK_FRAME_RATE_HINT=1" : hold_launch ?
+            "the window's output rate from the game's interval and frame generation, highest of the hold window" :
+            "off, the configured rate");
+        hold_logged = hold_launch;
+    }
     if (!mode && !rate_on) { if (span_launch) log_span(1, "launch"); return; }
     void *lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
     if (rate_on) {
@@ -237,11 +257,28 @@ static void span_report(uint64_t start, uint64_t span) {   /* mu */
         span_stats.gpu_max / 1e6, session.target / 1e6, span_stats.errors);
     memset(&span_stats, 0, sizeof span_stats);
 }
-void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing) {
+void totk_perf_generated(void) { atomic_fetch_add_explicit(&generated_presents, 1, memory_order_relaxed); }
+/* The rate hint, once per guest present: the configured rate, or with TOTK_RATE_HINT_HOLD the output rate held. */
+static void rate_frame(int guest_interval, int64_t target) {
+    int hold_ms = totk_live_cached(&hold_live, "TOTK_RATE_HINT_HOLD", hold_launch);
+    if (hold_ms != hold_logged) {
+        fprintf(stderr, "[totk-perf] TOTK_RATE_HINT_HOLD=%d ms (live)\n", hold_ms);
+        hold_logged = hold_ms; memset(&rate_hold, 0, sizeof rate_hold);
+    }
+    unsigned hz = totk_frame_rate(target == 16666667 ? 60 : 30, framegen, lattice);
+    if (hold_ms > 0) {
+        uint64_t generated = atomic_load_explicit(&generated_presents, memory_order_relaxed);
+        int generating = generated != generated_seen;
+        generated_seen = generated;
+        hz = totk_rate_hold_step(&rate_hold, totk_output_rate(guest_interval, generating, lattice),
+            mono_ns(), (uint64_t)hold_ms * 1000000);
+    }
+    atomic_store_explicit(&content_rate, hz, memory_order_relaxed);
+}
+void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_interval) {
     pthread_once(&config_once, configure);
     int64_t target = totk_adpf_target(period, fps60, framegen);
-    if (rate_on) atomic_store_explicit(&content_rate,
-        totk_frame_rate(target == 16666667 ? 60 : 30, framegen, lattice), memory_order_relaxed);
+    if (rate_on) rate_frame(guest_interval, target);
     if (!mode) return;
     int span = span_on();
     if (mode != 2 && !span && !span_applied) return;   /* the legacy session reports from totk_perf_render */

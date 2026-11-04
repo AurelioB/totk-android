@@ -37,6 +37,34 @@ static inline unsigned totk_frame_rate(unsigned real_hz, int framegen, int latti
     /* A 30-Hz physical mode would turn the two-slot 30fps lattice into 15fps. */
     return framegen || lattice || real_hz >= 60 ? 60 : 30;
 }
+/* TOTK_RATE_HINT_HOLD: the window's output rate from the game's own interval (60-Hz units), never from the measured
+ * present period, which follows the panel: a panel that took a 30 Hz request would otherwise read as a 30 fps game
+ * forever. Host floors (cutscenes, FPS auto) only lower what is shown, so leaving them out can only ask for more.
+ * Frame generation doubles real frames of at most 30fps; the 30fps lattice keeps its 60 Hz clock. */
+static inline unsigned totk_output_rate(int guest_interval, int generating, int lattice) {
+    unsigned real = 60u / (unsigned)(guest_interval > 0 ? guest_interval : 1);
+    if (!real) real = 1;
+    if (generating && real > 30) real = 30;
+    unsigned out = generating ? real * 2 : real;
+    return lattice && out < 60 ? 60 : out;
+}
+/* The highest rate requested within the last hold_ns: up at once, down only after the lower rate has held that
+ * long. A few distinct rates are ever in use; the least recently used entry is replaced. */
+enum { TOTK_RATE_HOLD_RATES = 8 };
+typedef struct { unsigned hz[TOTK_RATE_HOLD_RATES]; uint64_t last[TOTK_RATE_HOLD_RATES]; } totk_rate_hold;
+static inline unsigned totk_rate_hold_step(totk_rate_hold *h, unsigned hz, uint64_t now, uint64_t hold_ns) {
+    unsigned slot = TOTK_RATE_HOLD_RATES, victim = 0;
+    for (unsigned i = 0; i < TOTK_RATE_HOLD_RATES && slot == TOTK_RATE_HOLD_RATES; i++) {
+        if (h->hz[i] == hz) slot = i;
+        else if (h->hz[victim] && (!h->hz[i] || h->last[i] < h->last[victim])) victim = i;   /* empty, else LRU */
+    }
+    if (slot == TOTK_RATE_HOLD_RATES) slot = victim;
+    h->hz[slot] = hz; h->last[slot] = now;
+    unsigned held = hz;
+    for (unsigned i = 0; i < TOTK_RATE_HOLD_RATES; i++)
+        if (h->hz[i] > held && now - h->last[i] < hold_ns) held = h->hz[i];
+    return held;
+}
 static inline uint64_t totk_adpf_work(uint64_t previous, uint64_t now, uint64_t pacing) {
     if (!previous || now <= previous || pacing >= now - previous) return 0;
     uint64_t work = now - previous - pacing;

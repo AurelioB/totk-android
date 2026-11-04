@@ -104,6 +104,41 @@ static void span_policy(void) {
     totk_adpf_close(&state, &api);
     assert(!totk_adpf_report_span(&state, &api, start, 13000000, 0) && reports == before + 1);
 }
+static void rate_hold_policy(void) {
+    /* Output rate: the game's interval in 60-Hz units, doubled while frame generation runs (real frames <= 30). */
+    assert(totk_output_rate(1, 0, 0) == 60 && totk_output_rate(2, 0, 0) == 30 && totk_output_rate(3, 0, 0) == 20);
+    assert(totk_output_rate(0, 0, 0) == 60 && totk_output_rate(-1, 0, 0) == 60 && totk_output_rate(61, 0, 0) == 1);
+    assert(totk_output_rate(2, 1, 0) == 60);
+    assert(totk_output_rate(3, 1, 0) == 40); /* not a forced 60: 20 real + 20 generated */
+    assert(totk_output_rate(1, 1, 0) == 60); /* generation runs from at most 30 real frames */
+    assert(totk_output_rate(2, 0, 1) == 60 && totk_output_rate(3, 1, 1) == 60); /* the 60 Hz present lattice */
+    assert(totk_frame_rate(30, 1, 0) == 60); /* the configured rate (switch off) is unchanged */
+    /* Hold: up at once, down only after the lower rate held for the whole window. */
+    const uint64_t s = 1000000000, hold = 5 * s;
+    totk_rate_hold h = {0};
+    assert(totk_rate_hold_step(&h, 60, 10 * s, hold) == 60);
+    assert(totk_rate_hold_step(&h, 30, 11 * s, hold) == 60);
+    assert(totk_rate_hold_step(&h, 30, 14 * s, hold) == 60);
+    assert(totk_rate_hold_step(&h, 30, 15 * s - 1, hold) == 60);
+    assert(totk_rate_hold_step(&h, 30, 15 * s, hold) == 30); /* 60 last used 5 s ago */
+    assert(totk_rate_hold_step(&h, 60, 16 * s, hold) == 60); /* up at once */
+    assert(totk_rate_hold_step(&h, 20, 17 * s, hold) == 60);
+    assert(totk_rate_hold_step(&h, 30, 19 * s, hold) == 60);
+    assert(totk_rate_hold_step(&h, 20, 21 * s, hold) == 30); /* 60 expired; 30 (19 s) is the highest still held */
+    assert(totk_rate_hold_step(&h, 20, 24 * s, hold) == 20);
+    /* A 60->30->60 flap within the window never requests 30. */
+    totk_rate_hold flap = {0};
+    for (uint64_t t = 0; t < 60; t++)
+        assert(totk_rate_hold_step(&flap, t % 7 >= 4 ? 30 : 60, 100 * s + t * s / 2, hold) == 60);
+    /* hold 0: the requested rate itself. */
+    totk_rate_hold none = {0};
+    assert(totk_rate_hold_step(&none, 60, s, 0) == 60 && totk_rate_hold_step(&none, 30, s + 1, 0) == 30);
+    /* More distinct rates than entries: the least recently used is replaced, the newest are kept. */
+    totk_rate_hold many = {0};
+    for (unsigned i = 0; i < 3 * TOTK_RATE_HOLD_RATES; i++) totk_rate_hold_step(&many, 10 + i, s + i, hold);
+    assert(totk_rate_hold_step(&many, 1, s + 100, hold) == 10 + 3 * TOTK_RATE_HOLD_RATES - 1);
+    for (unsigned i = 0; i < TOTK_RATE_HOLD_RATES; i++) assert(many.hz[i] != 10 + 2 * TOTK_RATE_HOLD_RATES);
+}
 int main(void) {
     assert(totk_adpf_target(16666667, 0, 0) == 33333333);
     assert(totk_adpf_target(33333333, 0, 1) == 33333333);
@@ -160,6 +195,7 @@ int main(void) {
     assert(totk_adpf_sync(&state, &api, tids, 1, 33333333) == TOTK_ADPF_REFUSED);
     assert(!totk_adpf_report(&state, &api, 22000000));
     span_policy();
-    puts("ADPF policy: durations, lattice, fake API lifecycle, failures and steady-state passed; span target, span vs period, once-only GPU");
+    rate_hold_policy();
+    puts("ADPF policy: durations, lattice, fake API lifecycle, failures and steady-state passed; span target, span vs period, once-only GPU, rate hold");
     return 0;
 }
