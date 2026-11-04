@@ -2583,6 +2583,21 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--settled-wb")) return settled_suite();
     if (argc == 3 && !strcmp(argv[1], "--settled-wb-child")) return settled_child(!strcmp(argv[2], "off"));
     if (argc == 1 && settled_suite()) return 1;
+    /* TOTK_NVN_CALL_NOCOPY: production command probes, a call/release/EndRecording race (TSan) and the
+       CallCommands + EndRecording microbenchmark in both arms; no Vulkan needed. */
+    if (argc >= 2 && !strcmp(argv[1], "--nvn-call")) {
+        extern int test_nvn_call_nocopy(int nocopy, int rounds);
+        extern double test_nvn_call_bench(int nocopy, int frames, size_t *bytes_out);
+        int bad = 0; for (int arm = 0; arm < 2; arm++) bad += test_nvn_call_nocopy(arm, 2000);
+        int frames = argc >= 3 ? atoi(argv[2]) : 2000; size_t bytes[2] = {0};
+        for (int rep = 0; rep < 3 && frames > 0; rep++) for (int arm = 0; arm < 2; arm++) {
+            int a = rep % 2 ? 1 - arm : arm;
+            double ns = test_nvn_call_bench(a, frames, &bytes[a]);
+            printf("bench nvn-call-nocopy%d ns/draw=%.1f (ns per frame: 64 called lists into one caller, %zu bytes)\n", a, ns, bytes[a]);
+        }
+        if (bytes[0] != bytes[1]) bad++;
+        printf("%s: nvn call nocopy %d failed\n", bad ? "FAILED" : "ok", bad); return bad != 0;
+    }
     if (argc >= 2 && !strcmp(argv[1], "--lag-walk-bench")) return lag_walk_bench(argc, argv);
     if (argc == 2 && !strcmp(argv[1], "--texcopy")) return texcopy_suite();
     if (argc == 2 && !strcmp(argv[1], "--texcopy-child")) return texcopy_child();
