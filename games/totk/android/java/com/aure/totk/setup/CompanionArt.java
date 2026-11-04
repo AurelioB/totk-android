@@ -10,8 +10,8 @@ import java.util.regex.Pattern;
 
 /** Whether the second-screen art in <game>/companion was made by this app's generator. The art is generated on the
  * device once (setup's companion stage); an app update that changes the generator (names, icons) leaves the old art in
- * place, so InstallState treats art from an older generator, or an unreadable index, as not done and Home updates it.
- * Plain Java without Android types so the host test can run it (tests/test_android_companion_art.py). */
+ * place. InstallState distinguishes missing art from old-but-present art, which Home updates only on dual-screen
+ * devices. Plain Java without Android types so the host test can run it (tests/test_android_companion_art.py). */
 final class CompanionArt {
     private CompanionArt() { }
 

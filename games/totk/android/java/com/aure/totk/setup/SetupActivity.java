@@ -902,6 +902,11 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             why.setGravity(Gravity.CENTER_HORIZONTAL);
             ready.addView(why, Widgets.margins(Widgets.size(-1, -2), 0, 18, 0, 0));
         }
+        if (!note.isEmpty()) {
+            TextView why = Theme.paragraph(this, note, 19, Theme.AMBER);
+            why.setGravity(Gravity.CENTER_HORIZONTAL);
+            ready.addView(why, Widgets.margins(Widgets.size(-1, -2), 0, 18, 0, 0));
+        }
         board.put(ready, 440, 700, 700, Widgets.Board.WRAP, Widgets.Board.CENTER, Widgets.Board.START);
 
         Widgets.Panel menu = panel(880, 150, 920, 740, true, 56, 50);

@@ -71,6 +71,10 @@ returns to Home. **Play without it** is remembered across launches for this inst
 **Game data → Second-screen art** still builds it on demand on any device, and clears that choice. Deleting imported
 data also clears it.
 
+On a Retroid Pocket Duo with the imported game on internal storage, preparing the art alone took **12.8 seconds**
+(about 15 seconds; warm filesystem cache, measured from the choice to the committed art on 2026-11-04), producing
+35.3 MB. Other devices and slower storage may take longer.
+
 On dual-screen devices, old-but-present art is updated automatically when Home opens, as before; **Play now** can stop
 the update and use the old art. On single-screen devices there is no automatic art update or rebuild reminder.
 

@@ -60,7 +60,8 @@ refused with an explanation. Other versions are not supported.
 3. Setup runs in the foreground (a notification shows progress; keep the device charged). It rewrites the game code for
    Android, copies and verifies the RomFS (reading, hashing and writing overlap, so the copy runs at the storage's
    speed), indexes it, writes the shared fonts from the bundled open Noto Sans font, then builds the Vulkan shader seed
-   and the dual-screen companion's drawings at the same time (each shows its own progress). The game needs the shader
+   and, on devices with a built-in second screen, the companion's drawings at the same time (each shows its own progress).
+   Without a built-in second screen, the drawings are marked *skipped · Not needed on this device*. The game needs the shader
    seed (without it nothing is drawn), so setup is finished only once it is built; if it fails, setup stops with the
    reason and *Resume*. Only the companion's drawings are optional: once the seed is done, *Play without second-screen
    art* stops that step and starts the game (build it later from *Game data*). Setup can be cancelled and resumed.
@@ -109,6 +110,11 @@ arrows. Each tap does exactly what the game itself would do. Buttons are greyed 
 not allow it: with the pause menu or map open ("Close the game menu first"), in cutscenes and conversations, while
 loading or saving, on the title screen, with full hearts (for food that only heals), or for actions not available from
 the second screen yet (energy-recovering materials, fusing Zonai devices to arrows). More: [companion.md](companion.md).
+
+If the art is missing on a dual-screen device, **Start game** offers **Prepare second-screen art** (with progress, then
+the game starts) or **Play without it** (remembered for this install, including after app restarts). You can build it
+later from **Game data → Second-screen art**, even on a single-screen device. Outdated art is updated automatically
+only on dual-screen devices; single-screen devices get no art rebuild reminder.
 
 ## Where the game data lives (internal storage, SD card or a folder you choose)
 

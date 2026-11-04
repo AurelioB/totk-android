@@ -267,7 +267,7 @@ final class Strings {
     static final String PREPARE_ART = "Prepare second-screen art";
     static final String ART_OFFER_TITLE = "Prepare your second screen?";
     static final String ART_OFFER_BODY = "This device has a built-in second screen, but its map, inventory and shortcut pictures "
-            + "aren't prepared. Building them takes a few minutes, then the game starts.";
+            + "aren't prepared. Building took about 15 seconds on a Pocket Duo; other devices may take longer. The game starts when it's ready.";
     static final String ART_PREPARE_HINT = "Build from your imported game data, then play";
     static final String PLAY_WITHOUT_ART = "Play without it";
     static final String ART_DECLINE_HINT = "Start now · don't ask again for this install";
