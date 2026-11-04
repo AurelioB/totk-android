@@ -167,15 +167,17 @@ static int verify(Move *m) {
 }
 /* The game data of dir, install.json first so that a folder half-way through removal is never playable. */
 static int remove_game_data(const char *dir, int with_staging) {
-    char p[SETUP_PATH]; int rc = 0;
-    if (st_path(p, sizeof p, "%s/install.json", dir) || (unlink(p) && errno != ENOENT)) rc = -1;
+    char p[SETUP_PATH]; int e = 0;
+    if (st_path(p, sizeof p, "%s/install.json", dir) || (unlink(p) && errno != ENOENT)) e = errno;
     st_fsync_dir(dir);
-    for (int i = 0; i < NENTRIES; i++) if (st_path(p, sizeof p, "%s/%s", dir, entries[i]) || st_rmtree(p)) rc = -1;
+    for (int i = 0; i < NENTRIES; i++)
+        if (st_path(p, sizeof p, "%s/%s", dir, entries[i]) || st_rmtree(p)) { if (!e) e = errno; }
     if (with_staging) {
-        if (st_path(p, sizeof p, "%s/.import", dir) || st_rmtree(p)) rc = -1;
-        if (st_path(p, sizeof p, "%s/.move", dir) || st_rmtree(p)) rc = -1;
+        if (st_path(p, sizeof p, "%s/.import", dir) || st_rmtree(p)) { if (!e) e = errno; }
+        if (st_path(p, sizeof p, "%s/.move", dir) || st_rmtree(p)) { if (!e) e = errno; }
     }
-    return rc;
+    if (e) { errno = e; return -1; }
+    return 0;
 }
 /* The game lock (runtime/frontend_android.c holds it while the game runs): an open-file-description lock, so it also
    conflicts with the launcher's FileChannel.tryLock. -1 with errno EAGAIN when the game holds it. */

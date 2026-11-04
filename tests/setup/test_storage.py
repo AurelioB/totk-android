@@ -84,6 +84,11 @@ int close(int fd) {
     if (getenv("TOTK_CLOBBER_CLOSE_ERRNO")) errno = ENOENT;
     return rc;
 }
+int unlink(const char *path) {
+    const char *deny = getenv("TOTK_DENY_UNLINK");
+    if (deny && !strcmp(path, deny)) { errno = EPERM; return -1; }
+    return ((int (*)(const char *))dlsym(RTLD_NEXT, "unlink"))(path);
+}
 '''
 
 
@@ -306,8 +311,8 @@ class ContainerParts(Storage):
         cls.fifo_shim = WORK / 'fifo-shim.so'
         subprocess.run([cc, '-shared', '-fPIC', str(source), '-o', str(cls.fifo_shim), '-ldl'], check=True)
         # ASan must be first even when the test injects a filesystem failure through LD_PRELOAD.
-        cls.preload = ([subprocess.check_output([cc, '-print-file-name=libasan.so'], text=True).strip()] if cls.sanitize else [])
-        cls.preload = ':'.join([*cls.preload, str(cls.fifo_shim)])
+        preload = ([subprocess.check_output([cc, '-print-file-name=libasan.so'], text=True).strip()] if cls.sanitize else [])
+        cls.preload = ':'.join([*preload, str(cls.fifo_shim)])
 
     def setUp(self):
         super().setUp()
@@ -419,6 +424,20 @@ class ContainerParts(Storage):
                 self.assertIn(os.strerror(28), out['message'])   # ENOSPC
                 self.assertFalse((self.game / '.import/import-keys').exists())
                 self.assertEqual(list((self.nobackup / 'setup-work').glob('*.fifo')), [])
+
+    def test_remove_keeps_first_error_while_cleaning_other_data(self):
+        self.game.mkdir()
+        install = self.game / 'install.json'; install.write_text('{}')
+        extracted = self.game / 'extracted'; extracted.mkdir(); (extracted / 'stale').write_bytes(b'x')
+        env = dict(os.environ, LD_PRELOAD=self.preload, TOTK_DENY_UNLINK=str(install), TOTK_CLOBBER_CLOSE_ERRNO='1',
+                   ASAN_OPTIONS='detect_leaks=1:abort_on_error=0', UBSAN_OPTIONS='print_stacktrace=1')
+        p = subprocess.run([str(self.cli), 'remove', '--dir', str(self.game)], capture_output=True, text=True, env=env)
+        self.assertNotIn('Sanitizer', p.stderr, p.stderr)
+        out = json.loads(p.stdout)
+        self.assertEqual((p.returncode, out['ok'], out['code']), (1, False, 'io'), out)
+        self.assertIn(os.strerror(1), out['message'])
+        self.assertTrue(install.exists())
+        self.assertFalse(extracted.exists())
 
 
 class Move(Storage):

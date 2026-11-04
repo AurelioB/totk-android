@@ -60,7 +60,8 @@ int st_mkdirs(const char *path) {
     for (char *p = tmp + 1; *p; p++) if (*p == '/') { *p = 0; if (mkdir(tmp, 0775) && errno != EEXIST) return -1; *p = '/'; }
     if (mkdir(tmp, 0775) && errno != EEXIST) return -1;
     struct stat st;
-    if (stat(tmp, &st) || !S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
+    if (stat(tmp, &st)) return -1;
+    if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
     return 0;
 }
 static int rm_one(const char *path, const struct stat *st, int type, struct FTW *f) {
