@@ -12,6 +12,14 @@ int main(void) {
     pristine = malloc(IMAGE_SIZE);
     if (!pristine) return 2;
     memcpy(pristine, image, IMAGE_SIZE);
+    const char *off[] = {NULL, "0", "", "invalid", "01"};
+    for (unsigned i = 0; i < sizeof off / sizeof *off; i++) {
+        set_env("TOTK_THERMAL_STEP", off[i]);
+        CHECK(run(patch_thermal_step), "disabled thermal gate refused");
+        CHECK(!memcmp(image, pristine, IMAGE_SIZE),
+              "off/unset thermal gate changed controller, veneer or data bytes");
+    }
+    set_env("TOTK_THERMAL_STEP", "1");
     const uint64_t thermal_stub = TEXT_END + 916;
     /* Refuse mismatches and occupied code/data BEFORE writing any part. */
     const uint64_t bad[] = {fps60[1].off, fps60[6].off, fps60[4].off,

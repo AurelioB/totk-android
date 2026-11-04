@@ -339,12 +339,14 @@ static void patch_fps60_hardening(Module *m){
 
 /* The FPS60 selects override stored min=2. Clamp their RESULTS, not the stored
  * bounds, so the game's own candidate/current update and NVN interval setter
- * stay authoritative. Installed in Android FPS60 even when off: floor=1 is
- * exactly the seven-word policy. No executable code changes during live A/B.
+ * stay authoritative. Installed only with startup TOTK_THERMAL_STEP=1; off
+ * retains the original seven-word policy and allocates no thermal veneer.
  * Each veneer preserves incoming NZCV and x16/x17, replaying its select first.
  * The aligned literal is a single machine-word publication, with no side data. */
 #if (defined(__ANDROID__) && defined(TOTK_ANDROID_APP)) || defined(TOTK_THERMAL_PATCH_TEST)
 static void patch_thermal_step(Module *m) {
+    const char *enabled = getenv("TOTK_THERMAL_STEP");
+    if (!enabled || strcmp(enabled, "1")) return;
     const unsigned indices[] = {1, 6, 4};
     const unsigned destinations[] = {10, 21, 12};
     enum { WORDS = 9, COUNT = 3, FLOOR_SLOT = 144 };

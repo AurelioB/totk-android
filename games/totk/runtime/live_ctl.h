@@ -63,7 +63,6 @@ static const totk_live_switch totk_live_switches[] = {
     {"TOTK_ADPF_CPU_SPLIT", 0, 1},           /* the next presented frame; only subsequent frames have complete queue-wait history */
     {"TOTK_ADPF_TARGET_PCT", 50, 100},       /* the next presented frame; update target before its duration report */
     {"TOTK_RATE_HINT_HOLD", 0, 60000},       /* the next guest present (ms; 0 = the configured rate); needs TOTK_FRAME_RATE_HINT=1 */
-    {"TOTK_THERMAL_STEP", 0, 1},            /* next guest present; release/publish the game's controller floor */
 };
 enum { TOTK_LIVE_MAX = 32 };
 _Static_assert(sizeof totk_live_switches / sizeof *totk_live_switches <= TOTK_LIVE_MAX, "live switch table");
@@ -71,6 +70,7 @@ _Static_assert(sizeof totk_live_switches / sizeof *totk_live_switches <= TOTK_LI
 static const char *const totk_live_startup_only[][2] = {
     {"TOTK_IDEAL_CORE_FIX", "core bookkeeping of every guest thread is chosen when it is created"},
     {"TOTK_VK_SUBGROUP_FIX", "device subgroup features and immutable shader modules/pipelines are chosen at startup"},
+    {"TOTK_THERMAL_STEP", "guest controller veneers and thermal sampling are installed only at startup"},
 };
 
 enum { TOTK_LIVE_SET = 1, TOTK_LIVE_UNSET, TOTK_LIVE_MARK };

@@ -2,7 +2,6 @@
 #include "android_thermal.h"
 #if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
 #include "thermal_step.h"
-#include "live_ctl.h"
 #include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
@@ -18,8 +17,7 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static struct { uint64_t ns; int status; float headroom; } reading;
 static _Atomic uint32_t *guest_floor; /* bound before the game starts */
-static int launch, applied;
-static totk_live_cache live;
+static int launch;
 static totk_thermal_policy policy;
 static unsigned frames, transitions;
 static uint64_t mono_ns(void) {
@@ -59,9 +57,10 @@ static void *sample_thread(void *unused) {
 }
 static void configure(void) {
     const char *e = getenv("TOTK_THERMAL_STEP");
-    applied = launch = e && !strcmp(e, "1");
-    fprintf(stderr, "[totk-thermal] TOTK_THERMAL_STEP=%d (launch, live); guest-floor=%s; severe or headroom>=1.0; recovery 30s below moderate and headroom<0.8\n",
+    launch = e && !strcmp(e, "1");
+    fprintf(stderr, "[totk-thermal] TOTK_THERMAL_STEP=%d (startup-only); guest-floor=%s; severe or headroom>=1.0; recovery 30s below moderate and headroom<0.8\n",
         launch, guest_floor ? "available" : "unavailable (requires v143 FPS60)");
+    if (!launch) return;
     pthread_t thread;
     int error = pthread_create(&thread, NULL, sample_thread, NULL);
     if (!error) pthread_detach(thread);
@@ -73,6 +72,7 @@ void runtime_thermal_bind(_Atomic uint32_t *floor) {
 }
 void runtime_thermal_frame(unsigned interval) {
     pthread_once(&once, configure);
+    if (!launch) return;
     static uint64_t sample;
     static int status = -1;
     static float headroom = NAN;
@@ -81,25 +81,20 @@ void runtime_thermal_frame(unsigned interval) {
         if (sample) { status = reading.status; headroom = reading.headroom; }
         pthread_mutex_unlock(&mu);
     }
-    int enabled = totk_live_cached(&live, "TOTK_THERMAL_STEP", launch);
-    if (enabled != applied) {
-        applied = enabled;
-        fprintf(stderr, "[totk-thermal] TOTK_THERMAL_STEP=%d (live)\n", enabled);
-    }
     uint64_t now = mono_ns();
     int fresh = sample && now >= sample && now - sample <= 2 * TOTK_THERMAL_POLL_NS;
     if (!fresh) policy.cooling = 0;
-    if (totk_thermal_step(&policy, enabled && guest_floor, interval,
+    if (totk_thermal_step(&policy, guest_floor != NULL, interval,
             fresh ? sample : policy.sample_ns, fresh ? status : -1, fresh ? headroom : NAN)) {
         transitions++;
         fprintf(stderr, "[totk-thermal] transition floor=%u status=%d headroom=%.3f forecast=10s enabled=%d; guest controller decision, no present delay\n",
-            policy.capped ? 2u : 1u, status, headroom, enabled);
+            policy.capped ? 2u : 1u, status, headroom, launch);
     }
     if (guest_floor) atomic_store_explicit(guest_floor, policy.capped ? 2 : 1, memory_order_release);
     if (++frames == 300) {
         fprintf(stderr, "[totk-thermal] last300 status=%d headroom=%.3f forecast=10s age_ms=%.0f fresh=%d enabled=%d floor=%u guest_interval=%u transitions=%u\n",
             status, headroom, sample && now >= sample ? (now - sample) / 1e6 : -1., fresh,
-            enabled, policy.capped ? 2u : 1u, interval, transitions);
+            launch, policy.capped ? 2u : 1u, interval, transitions);
         frames = transitions = 0;
     }
 }

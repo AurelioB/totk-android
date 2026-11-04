@@ -39,6 +39,9 @@ class ThermalStep(unittest.TestCase):
     def test_policy(self):
         self.compile_run('tests/test_thermal_step.c')
 
+    def test_startup_thread_gate(self):
+        self.compile_run('tests/test_thermal_startup.c')
+
     def test_patch_installation(self):
         payload = json.loads(self.compile_run('games/totk/runtime/test_thermal_patch.c', patch=True))
         self.assertEqual(len(bytes.fromhex(payload['code'])), 108)

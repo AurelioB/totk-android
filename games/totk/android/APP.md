@@ -1965,9 +1965,8 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_ADPF_CPU_SPLIT` | 0–1 | the next presented frame | queue waits are measured for subsequent frames; total span/GPU unchanged; needs `TOTK_ADPF_GPU=1` and API 35 |
 | `TOTK_ADPF_TARGET_PCT` | 50…100 | the next presented frame | default 90 (unchanged); updates the session target before reporting; needs `TOTK_ADPF_GPU=1` |
 | `TOTK_RATE_HINT_HOLD` | 0…60000 | the next guest present | ms; a change clears the held rates; no effect without `TOTK_FRAME_RATE_HINT=1` |
-| `TOTK_THERMAL_STEP` | 0–1 | the next guest present | default off; v143 FPS60 controller floor; 1 Hz thermal sampling, 30 s cool recovery; see “Thermal frame step” |
 
-`TOTK_IDEAL_CORE_FIX` is startup-only and refused. Another launch-time switch becomes live by adding it, with its
+`TOTK_IDEAL_CORE_FIX` and `TOTK_THERMAL_STEP` are startup-only and refused. Another launch-time switch becomes live by adding it, with its
 range, to `totk_live_switches` in `runtime/live_ctl.h`, reading it through `totk_live_cached` at a point where a change
 is safe, and adding its row here. Each switch's per-300 report shows the value in use.
 
@@ -3965,23 +3964,25 @@ Stored `min/max=2/3` with FPS60 enabled is **expected**: the patch changes compa
 instructions, not those configuration words. Native emulation explicitly checks that interval 1 is
 selected while the stored words remain 2/3; seeing 2/3 is not evidence that the patch is absent.
 
-**Thermal frame step (Android, opt-in):** `TOTK_THERMAL_STEP=1` (default `0`, live at guest present)
+**Thermal frame step (Android, opt-in):** `TOTK_THERMAL_STEP=1` (default `0`, startup-only)
 raises the v143 FPS60 controller's minimum result to two 60-Hz ticks when the running interval is one
 and thermal status reaches SEVERE (3), or the 10-second headroom forecast reaches 1.0.
 A nice-10 sampler calls the optional NDK status/headroom APIs via `dlsym` at most once per second,
-including with the policy off for matched-arm diagnostics. API30 status-only devices can cap;
-unavailable/NaN headroom cannot prove recovery. No platform thermal settings are written.
+only when enabled. Off/unset installs no thermal veneers and starts no sampler; the original FPS60
+controller bytes stay unchanged. API30 status-only devices can cap; unavailable/NaN headroom cannot
+prove recovery. No platform thermal settings are written.
 Recovery releases our floor only after 30 continuous seconds of samples below MODERATE (2) and
-headroom below 0.8; missing/stale samples restart that evidence. Disabling releases the floor immediately.
+headroom below 0.8; missing/stale samples restart that evidence. Change the switch only between launches.
 The existing game controller still owns cooldown, vetoes, simulation step, and window interval:
 no present delay, forced-60 recovery, or shortening of game-requested slower intervals is introduced.
-The three FPS60 select veneers are installed once at launch, with an aligned live floor word; shipping
-30 (`TOTK_FPS60=0`) and other game versions have no thermal guest-floor hook.
+The three FPS60 select veneers are installed only at enabled launches, with an aligned floor word;
+shipping 30 (`TOTK_FPS60=0`) and other game versions have no thermal guest-floor hook.
 
 Host-side device check (when devices are free): keep the 60fps preset and one loaded scene, collect
-a sustained five-minute off/on run with the existing bench sampler (its thermal-zone temperatures),
-and join `totk.log`'s `[totk-thermal] last300 status=... headroom=... floor=... guest_interval=...
-transitions=...` lines to the `[fps-policy]` game/window decisions. Status uses NDK values (-1 unavailable,
+separate sustained five-minute off/on launches with the existing bench sampler (its thermal-zone
+temperatures), and join the enabled arm's `totk.log` `[totk-thermal] last300 status=... headroom=...
+floor=... guest_interval=... transitions=...` lines to `[fps-policy]` game/window decisions.
+The off arm has no thermal sampler/last300 lines. Status uses NDK values (-1 unavailable,
 0 none, 1 light, 2 moderate, 3 severe, 4 critical, 5 emergency, 6 shutdown); headroom is the forecast,
 not a temperature. Expect a 60→30 game interval at the hot threshold, no extra presenter hold, and
 no release before 30 seconds of qualifying cool readings. Count transition chatter and compare

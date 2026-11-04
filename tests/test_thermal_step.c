@@ -41,8 +41,8 @@ int main(void) {
     assert(!totk_thermal_step(&s, 1, 1, 84 * second, 0, -1.f));
     assert(totk_thermal_step(&s, 1, 1, 85 * second, 0, 1.f));
     totk_live_op op; char why[240];
-    assert(totk_live_parse("set TOTK_THERMAL_STEP=1", &op, why, sizeof why) == 1);
-    assert(totk_live_parse("set TOTK_THERMAL_STEP=2", &op, why, sizeof why) == -1);
-    assert(totk_live_parse("unset TOTK_THERMAL_STEP", &op, why, sizeof why) == 1);
+    assert(totk_live_parse("set TOTK_THERMAL_STEP=1", &op, why, sizeof why) == -1);
+    assert(strstr(why, "startup-only"));
+    assert(totk_live_parse("unset TOTK_THERMAL_STEP", &op, why, sizeof why) == -1);
     return 0;
 }
