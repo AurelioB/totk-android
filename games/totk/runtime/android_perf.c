@@ -42,11 +42,14 @@ static uint64_t generated_seen;
 static int span_launch;
 static _Atomic int span_applied;
 static totk_live_cache span_live;
+static int load_launch, load_applied;
+static totk_live_cache load_live;
+static totk_adpf_load load_history;
 static _Atomic uint64_t frame_start, gpu_published;
 static totk_adpf_pacing span_pacing;
 static totk_adpf_gpu_acc gpu_acc;   /* the completion thread only */
 static uint32_t gpu_seen;
-static struct { unsigned frames, spans, gpus, errors; uint64_t span_sum, span_max, gpu_sum, gpu_max; } span_stats;
+static struct { unsigned frames, spans, gpus, errors, hints, hint_errors; uint64_t span_sum, span_max, gpu_sum, gpu_max; } span_stats;
 /* Bounded registry; pthread CPU clocks avoid /proc parsing/allocations. */
 static struct { int32_t tid; clockid_t clock; uint64_t cpu, used; int critical; } registry[256];
 static int is_one(const char *name) { const char *s = getenv(name); return s && !strcmp(s, "1"); }
@@ -80,6 +83,7 @@ static void configure(void) {
     if (mode == 1 && !legacy_target) mode = 0;
     rate_on = is_one("TOTK_FRAME_RATE_HINT"); fps60 = is_one("TOTK_FPS60");
     span_applied = span_launch = is_one("TOTK_ADPF_GPU");
+    load_applied = load_launch = is_one("TOTK_ADPF_LOAD_HINT");
     const char *fg = getenv("TOTK_FRAMEGEN");
     framegen = fg && (!strcmp(fg, "1") || !strcmp(fg, "locked") ||
         !strcmp(fg, "interp") || !strcmp(fg, "hybrid") || !strcmp(fg, "adaptive"));
@@ -131,6 +135,11 @@ static void configure(void) {
             api.work = work_create();   /* one object for the process, reused by every report */
         if (!api.work) api.report2 = NULL;
     }
+    if (android_get_device_api_level() >= 36 && lib)
+        api.increase = dlsym(lib, "APerformanceHint_notifyWorkloadIncrease");
+    fprintf(stderr, "[totk-perf] TOTK_ADPF_LOAD_HINT=%d (launch, live): %s; needs TOTK_ADPF_GPU=1\n",
+        load_applied, !load_applied ? "off" : api.increase ? "3 frames >105%, 500ms limit, GPU >70%" :
+        "unavailable (API36 notifyWorkloadIncrease absent), no-op");
     if (mode == 2 && api.manager) key_ready = !pthread_key_create(&thread_key, remove_thread);
     fprintf(stderr, "[totk-perf] ADPF mode=%s api=%d manager=%s create/report/close=%s setThreads=%s updateTarget=%s report2/AWorkDuration=%s; legacy-target=%.3fms\n",
         mode == 2 ? "full" : "legacy", android_get_device_api_level(), api.manager ? "yes" : "no",
@@ -237,9 +246,20 @@ void totk_perf_gpu(uint64_t frame, uint64_t gpu_ns) {
     if (closed) atomic_store_explicit(&gpu_published, closed, memory_order_relaxed);
 }
 static void span_report(uint64_t start, uint64_t span) {   /* mu */
+    int load = totk_live_cached(&load_live, "TOTK_ADPF_LOAD_HINT", load_launch);
+    if (load != load_applied) {
+        load_applied = load; load_history.over = 0;
+        fprintf(stderr, "[totk-perf] TOTK_ADPF_LOAD_HINT=%d (live): %s\n", load,
+            api.increase ? "API available; needs TOTK_ADPF_GPU=1" : "unavailable, no-op");
+    }
     span_stats.frames++;
     if (span && session.session) {
         uint64_t gpu = api.work ? totk_adpf_gpu_take(atomic_load_explicit(&gpu_published, memory_order_relaxed), &gpu_seen) : 0;
+        if (load && api.increase && totk_adpf_load_step(&load_history, mono_ns(), span, session.target)) {
+            int result = api.increase(session.session, true, totk_adpf_load_gpu(gpu, session.target), "totk-frame-load");
+            if (result) span_stats.hint_errors++;
+            else span_stats.hints++;
+        }
         unsigned changes = totk_adpf_report_span(&session, &api, start, span, gpu);
         span_stats.spans++; span_stats.span_sum += span;
         if (span > span_stats.span_max) span_stats.span_max = span;
@@ -250,11 +270,12 @@ static void span_report(uint64_t start, uint64_t span) {   /* mu */
         span_stats.errors += !!changes;
         log_changes(changes);
     }
+    else load_history.over = 0;
     if (span_stats.frames < 300) return;
-    fprintf(stderr, "[totk-perf] ADPF span: %u frames, %u reported, span avg %.2f max %.2f ms; GPU %u reported, avg %.2f max %.2f ms; target %.3fms; %u report errors\n",
+    fprintf(stderr, "[totk-perf] ADPF span: %u frames, %u reported, span avg %.2f max %.2f ms; GPU %u reported, avg %.2f max %.2f ms; target %.3fms; %u report errors; increase hints %u sent, %u errors\n",
         span_stats.frames, span_stats.spans, span_stats.spans ? span_stats.span_sum / 1e6 / span_stats.spans : 0.0,
         span_stats.span_max / 1e6, span_stats.gpus, span_stats.gpus ? span_stats.gpu_sum / 1e6 / span_stats.gpus : 0.0,
-        span_stats.gpu_max / 1e6, session.target / 1e6, span_stats.errors);
+        span_stats.gpu_max / 1e6, session.target / 1e6, span_stats.errors, span_stats.hints, span_stats.hint_errors);
     memset(&span_stats, 0, sizeof span_stats);
 }
 void totk_perf_generated(void) { atomic_fetch_add_explicit(&generated_presents, 1, memory_order_relaxed); }
@@ -293,6 +314,7 @@ void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_i
     span_pacing.n = 0;
     if (span != span_applied) {
         span_applied = span; memset(&span_stats, 0, sizeof span_stats);
+        load_history.over = 0;
         /* A GPU frame published before the switch is not this session's to report. */
         gpu_seen = (uint32_t)(atomic_load_explicit(&gpu_published, memory_order_relaxed) >> 32);
         log_span(span, "live");

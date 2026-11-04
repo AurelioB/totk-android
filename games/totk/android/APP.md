@@ -1957,6 +1957,7 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_VK_TEX_MEMO` | 0–1 | the next texture ID lookup and texture registration | memo entries stay keyed by the registry/identity/submission state, so switching back on never reuses a stale one |
 | `TOTK_NVN_CALL_NOCOPY` | 0–1 | the next CallCommands / CopyCommands | a recording already holding call markers still expands them at its EndRecording |
 | `TOTK_ADPF_GPU` | 0–1 | the next presented frame | that frame is not reported; the session's target switches with it; no effect with `TOTK_ADPF=0` |
+| `TOTK_ADPF_LOAD_HINT` | 0–1 | the next span report | clears consecutive-frame history, retains the 500 ms rate limit; needs `TOTK_ADPF_GPU=1` |
 | `TOTK_RATE_HINT_HOLD` | 0…60000 | the next guest present | ms; a change clears the held rates; no effect without `TOTK_FRAME_RATE_HINT=1` |
 
 `TOTK_IDEAL_CORE_FIX` is startup-only and refused. Another launch-time switch becomes live by adding it, with its
@@ -3911,6 +3912,13 @@ completed, each frame once (0 otherwise); below 35 the span alone goes through `
 `[totk-perf] TOTK_ADPF_GPU=N (launch|live): ...; target T` and every 300 frames `[totk-perf] ADPF span: ...`
 (reported spans, GPU durations, target). Measure on the Odin 3 with in-session ABBA: fps and the sampler's GPU clock
 residency per arm (the GPU sits at its 660 MHz floor 95 % of the time with it off).
+
+`TOTK_ADPF_LOAD_HINT=1` (default 0, live at the next span report) sends an API 36 workload-increase hint before
+the duration report after three consecutive frames exceed 105 % of target, at most every 500 ms. CPU is flagged;
+GPU is flagged only when the newest measured GPU duration exceeds 70 % of target. Missing API is a logged no-op.
+Startup/live mode logs and each 300-frame span summary include hints sent/errors. A/B against gpu_feed alone:
+compare fps/p95 and GPU clock residency, with temperature/power held in view.
+
 
 ### FPS60 controller, fallback and diagnostics (1.4.3)
 

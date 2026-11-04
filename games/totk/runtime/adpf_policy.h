@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdbool.h>
 
 enum { TOTK_ADPF_MAX_THREADS = 16 };
 typedef struct {
@@ -17,6 +18,8 @@ typedef struct {
     void (*set_start)(void *, int64_t), (*set_total)(void *, int64_t);
     void (*set_cpu)(void *, int64_t), (*set_gpu)(void *, int64_t);
     void *work;
+    /* API36; resolved dynamically even when the build targets API33. */
+    int (*increase)(void *, bool, bool, const char *);
 } totk_adpf_api;
 typedef struct {
     void *session;
@@ -104,6 +107,21 @@ static inline unsigned totk_adpf_sync(totk_adpf_state *s, const totk_adpf_api *a
 static inline unsigned totk_adpf_report(totk_adpf_state *s, const totk_adpf_api *api, uint64_t ns) {
     if (!s->session || !ns || ns >= 250000000) return 0;
     return api->report(s->session, (int64_t)ns) ? TOTK_ADPF_REPORT_ERROR : 0;
+}
+
+/* Three consecutive valid spans above 105 % of target, at most one request per 500ms.
+ * Record attempts, not just successes: platform refusal must not cause a per-frame retry storm. */
+typedef struct { unsigned over; uint64_t last; int attempted; } totk_adpf_load;
+static inline int totk_adpf_load_step(totk_adpf_load *s, uint64_t now, uint64_t span, int64_t target) {
+    if (target <= 0 || !span || span >= 250000000 || span <= (uint64_t)target * 105 / 100) {
+        s->over = 0; return 0;
+    }
+    if (s->over < 3) s->over++;
+    if (s->over < 3 || (s->attempted && (now < s->last || now - s->last < 500000000))) return 0;
+    s->last = now; s->attempted = 1; return 1;
+}
+static inline bool totk_adpf_load_gpu(uint64_t gpu, int64_t target) {
+    return target > 0 && gpu > (uint64_t)target * 70 / 100;
 }
 
 /* ---------- TOTK_ADPF_GPU: the frame's span and the GPU duration ----------
