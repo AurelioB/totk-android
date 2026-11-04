@@ -4706,6 +4706,7 @@ Set launch overrides in `totk.env` and restart:
 | `TOTK_AFFINITY_RECW` | Affinity of every recorder chunk worker at startup; the same mask applies to each. |
 | `TOTK_AFFINITY_GAME` | Android main/created guest affinity: unset or `auto` selects the capacity policy below; `all` makes no affinity request; a CPU list/mask overrides auto. WALK still overrides it on an actual submission thread. |
 | `TOTK_PRIO_WALK` | Linux per-tid nice value, decimal **−20…19**, on first submission. Unset leaves the inherited/current nice untouched. |
+| `TOTK_PRIO_RENDER` | Linux per-tid nice value, decimal **−20…19**, at the start of each frame-critical host thread: the walker (`totk-walk`, applied before `TOTK_PRIO_WALK`, which wins), `totk-recw*`, `totk-submit`, `totk-gpufence`, `totk-post`, `totk-present`, `totk-vsync`. Never compile/seed/cache/translator workers (they keep +10) or guests (−8). Unset leaves the inherited nice untouched. |
 | `TOTK_UCLAMP_WALK` | Linux utilization-clamp minimum, decimal **0…1024**, on first submission. Zero clears that minimum; this is not a frequency in MHz or a percentage. |
 | `TOTK_TIMER_SLACK_NS` | Linux per-thread timer slack, decimal **1…50000** ns, at the start of every guest thread (`g-*`) and frame-critical host thread (`totk-walk`, `totk-recw*`, `totk-submit`, `totk-gpufence`, `totk-post`, `totk-present`, `totk-vsync`). Unset keeps the kernel's inherited 50 µs; `0`/out-of-range log `EINVAL`. Logs the first application once (`TOTK_TIMER_SLACK_NS=1 result=1`). |
 
@@ -4723,6 +4724,13 @@ waits. The display/acquire/slot pacing waits are untimed condition waits release
 do not change. `sh tests/timer_slack/run.sh <absolute .scratch>` checks the switch and prints host `nanosleep`
 lateness (x86 host: 10/100/1000 µs sleeps woke ~52/52/54 µs late at p50 with 50 µs slack, ~1.6/1.9/3.8 µs with 1).
 On device, compare `[svc-wait]` `SleepThread` time and frame-time p95 / >50 ms counts with it unset and `=1`.
+
+Without `TOTK_PRIO_RENDER`, host threads keep the nice of the thread that created them (Linux inherits it).
+Guests start at −8 (`host_thread_boost_self`), but `g-main` is never boosted and keeps the boot thread's nice.
+So the walker (a guest), and the recorder workers and `totk-submit` it creates, run at −8, as does the
+presenter when a guest presents, while `totk-post` and `totk-gpufence`, created by `g-main` in
+`nv::InitializeGraphics`, stay at the boot thread's nice (normally 0) behind the −8 guests. Measure with
+`TOTK_PRIO_RENDER=-8` / `-10` against unset: frame-time p95, >50 ms counts and `[svc-wait]`/present-stage times.
 
 Android snapshots the startup thread's current allowed set once, after reading `totk.env` and before launching
 the game. It reads `cpuN/cpu_capacity` for **every allowed CPU**. If any capacity is absent/unreadable/invalid,

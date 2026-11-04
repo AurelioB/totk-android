@@ -238,6 +238,15 @@ static inline void totk_thread_affinity(const char *key) {
     else if (sched_setaffinity(0, sizeof set, &set)) error = errno;
     totk_thread_setting_log(key, value, error ? -1 : 0, error);
 }
+/* Linux per-tid nice from a decimal -20..19 setting. Unset leaves the inherited/current nice untouched. */
+static inline void totk_thread_nice(const char *key) {
+    const char *value = getenv(key); if (!value) return;
+    int nice, error = 0;
+    if (!totk_thread_integer(value, -20, 19, &nice)) error = EINVAL;
+    else if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), nice)) error = errno;
+    int result = getpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid));
+    totk_thread_setting_log(key, value, result, error);
+}
 /* One process-wide flag for every translation unit that includes this header (a weak definition is merged). */
 __attribute__((weak)) int totk_thread_slack_logged;
 /* TOTK_TIMER_SLACK_NS=1..50000: per-thread timer slack of game and frame-critical threads (Linux defaults to
@@ -264,7 +273,9 @@ static inline void totk_thread_start(const char *name, const char *affinity_key)
     if (!strncmp(name, "g-", 2) || !strncmp(name, "totk-recw", 9) || !strcmp(name, "totk-submit") ||
         !strcmp(name, "totk-present"))
         totk_perf_thread(name);
-    if (totk_thread_frame_critical(name) || !strncmp(name, "g-", 2)) totk_thread_timer_slack();
+    int frame = totk_thread_frame_critical(name);
+    if (frame || !strncmp(name, "g-", 2)) totk_thread_timer_slack();
+    if (frame) totk_thread_nice("TOTK_PRIO_RENDER");
     totk_thread_affinity(affinity_key); errno = saved;
 }
 /* Linux UAPI sched_attr v1. KEEP_POLICY/PARAMS preserve the caller's scheduler and nice value. */
@@ -291,15 +302,8 @@ static inline int totk_thread_uclamp_get(void) {
 static inline void totk_thread_walk(void) {
     static _Thread_local int identified; if (identified) return; identified = 1;
     int saved = errno; totk_thread_start("totk-walk", "TOTK_AFFINITY_WALK");
-    const char *value = getenv("TOTK_PRIO_WALK");
-    if (value) {
-        int nice, error = 0;
-        if (!totk_thread_integer(value, -20, 19, &nice)) error = EINVAL;
-        else if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), nice)) error = errno;
-        int result = getpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid));
-        totk_thread_setting_log("TOTK_PRIO_WALK", value, result, error);
-    }
-    value = getenv("TOTK_UCLAMP_WALK");
+    totk_thread_nice("TOTK_PRIO_WALK");   /* after TOTK_PRIO_RENDER: the walker's own setting wins */
+    const char *value = getenv("TOTK_UCLAMP_WALK");
     if (value) {
         int minimum, error;
         if (!totk_thread_integer(value, 0, 1024, &minimum)) error = EINVAL;
