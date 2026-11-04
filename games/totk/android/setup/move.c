@@ -81,7 +81,7 @@ static int copy_file(Move *m, Item *it) {
     if (in < 0) return st_io_fail(m->c, "open", src);
     struct stat st;
     if (fstat(in, &st) || (uint64_t)st.st_size != it->size) { close(in); setup_fail(m->c, "io", "%s changed while the game data was being moved", it->rel); return -1; }
-    if ((out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) { close(in); return st_io_fail(m->c, "create", dst); }
+    if ((out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) { rc = st_io_fail(m->c, "create", dst); close(in); return rc; }
     Sha256 sha; sha256_init(&sha); StCache cache = {0, 0, 0};
     for (uint64_t pos = 0; pos < it->size && !rc;) {
         if ((rc = cancelled(m))) break;

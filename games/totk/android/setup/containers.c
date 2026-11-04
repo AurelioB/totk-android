@@ -90,9 +90,12 @@ static int write_title_keys(SetupCtx *c, const SetupContainers *s, const char *p
         text[n++] = '\n';
     }
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600), rc = 0;
-    int bad = fd < 0 || st_write(fd, text, n);
-    if (fd >= 0 && close(fd)) bad = 1;
-    if (bad) { rc = st_io_fail(c, "write the temporary title-key file", path); unlink(path); }
+    if (fd < 0) rc = st_io_fail(c, "open the temporary title-key file", path);
+    else {
+        if (st_write(fd, text, n)) rc = st_io_fail(c, "write the temporary title-key file", path);
+        if (close(fd) && !rc) rc = st_io_fail(c, "close the temporary title-key file", path);
+    }
+    if (rc) unlink(path);
     memset(text, 0, cap); free(text);
     return rc;
 }
@@ -164,9 +167,9 @@ int containers_romfs(SetupCtx *c, SetupContainers *s, const char *out_dir, uint6
     }
     if (unlink(fifo_path) && errno != ENOENT) { rc = st_io_fail(c, "remove", fifo_path); goto directory_out; }
     if (romfs_writer_open(c, &w, out_dir, c->pins.romfs_size, part_bytes)) { rc = -1; goto directory_out; }
-    if (mkfifo(fifo_path, 0600) || (fifo = open(fifo_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)) < 0) {
-        romfs_writer_abort(&w); unlink(fifo_path); rc = st_io_fail(c, "create", fifo_path); goto directory_out;
-    }
+    /* st_io_fail snapshots errno before any close, unlink or writer-thread cleanup can change it. */
+    if (mkfifo(fifo_path, 0600)) { rc = st_io_fail(c, "mkfifo", fifo_path); goto out; }
+    if ((fifo = open(fifo_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)) < 0) { rc = st_io_fail(c, "open", fifo_path); goto out; }
     fcntl(fifo, F_SETPIPE_SZ, 1 << 20);   /* fewer wake-ups per GB; the default 64 KiB also works */
     follow.pipe = fifo;
     if (st_path(sec_arg, sizeof sec_arg, "--section%d=%s", s->update.bktr_section, fifo_path)) { rc = st_io_fail(c, "create", fifo_path); goto out; }

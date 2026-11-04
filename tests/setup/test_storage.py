@@ -49,13 +49,40 @@ FIFO_SHIM = r'''
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 int mkfifo(const char *path, mode_t mode) {
     const char *root = getenv("TOTK_DENY_FIFO_UNDER");
     if (root && !strncmp(path, root, strlen(root)) && path[strlen(root)] == '/') { errno = EPERM; return -1; }
     return ((int (*)(const char *, mode_t))dlsym(RTLD_NEXT, "mkfifo"))(path, mode);
+}
+int open(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap); }
+    if (getenv("TOTK_DENY_FIFO_OPEN") && strstr(path, "/romfs-") && strstr(path, ".fifo")) { errno = EACCES; return -1; }
+    return ((int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open"))(path, flags, mode);
+}
+ssize_t write(int fd, const void *buf, size_t n) {
+    const char *name = getenv("TOTK_DENY_KEY_WRITE");
+    if (name) {
+        char link[64], path[4096]; snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+        ssize_t len = readlink(link, path, sizeof path - 1);
+        if (len >= 0) {
+            path[len] = 0; const char *base = strrchr(path, '/');
+            if (base && !strcmp(base + 1, name)) { errno = ENOSPC; return -1; }
+        }
+    }
+    return ((ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write"))(fd, buf, n);
+}
+int close(int fd) {
+    int rc = ((int (*)(int))dlsym(RTLD_NEXT, "close"))(fd);
+    if (getenv("TOTK_CLOBBER_CLOSE_ERRNO")) errno = ENOENT;
+    return rc;
 }
 '''
 
@@ -359,6 +386,38 @@ class ContainerParts(Storage):
         self.assertEqual(fifo.parent.parent, Path('/tmp'))
         self.assertTrue(fifo.parent.name.startswith('totk-romfs-'))
         self.assertFalse(fifo.parent.exists())
+
+    def test_mkfifo_reports_its_own_error_before_cleanup(self):
+        p, out = self.merge(self.game / 'parts', self.part, LD_PRELOAD=self.preload,
+                            TOTK_DENY_FIFO_UNDER=str(self.nobackup), TOTK_CLOBBER_CLOSE_ERRNO='1')
+        self.assertEqual((p.returncode, out['ok'], out['code']), (1, False, 'io'), out)
+        self.assertIn('mkfifo romfs-', out['message'])
+        self.assertIn(os.strerror(1), out['message'])   # EPERM, not unlink's ENOENT
+        self.assertNotIn(os.strerror(2), out['message'])
+        self.assertEqual(image_files(self.game / 'parts'), [])
+        self.assertEqual(list((self.nobackup / 'setup-work').glob('*.fifo')), [])
+
+    def test_fifo_open_reports_its_own_error_before_cleanup(self):
+        p, out = self.merge(self.game / 'parts', self.part, LD_PRELOAD=self.preload,
+                            TOTK_DENY_FIFO_OPEN='1', TOTK_CLOBBER_CLOSE_ERRNO='1')
+        self.assertEqual((p.returncode, out['ok'], out['code']), (1, False, 'io'), out)
+        self.assertIn('open romfs-', out['message'])
+        self.assertIn(os.strerror(13), out['message'])   # EACCES
+        self.assertNotIn('mkfifo', out['message'])
+        self.assertEqual(image_files(self.game / 'parts'), [])
+        self.assertEqual(list((self.nobackup / 'setup-work').glob('*.fifo')), [])
+
+    def test_temporary_key_write_error_survives_close(self):
+        for name in ('hactool.keys', 'title.keys'):
+            with self.subTest(name=name):
+                p, out = self.merge(self.game / 'parts', self.part, LD_PRELOAD=self.preload,
+                                    TOTK_DENY_KEY_WRITE=name, TOTK_CLOBBER_CLOSE_ERRNO='1')
+                self.assertEqual((p.returncode, out['ok'], out['code']), (1, False, 'no_space'), out)
+                self.assertIn('write the temporary', out['message'])
+                self.assertIn(name, out['message'])
+                self.assertIn(os.strerror(28), out['message'])   # ENOSPC
+                self.assertFalse((self.game / '.import/import-keys').exists())
+                self.assertEqual(list((self.nobackup / 'setup-work').glob('*.fifo')), [])
 
 
 class Move(Storage):
