@@ -30,10 +30,10 @@ static int report2(void *s, void *w) {
 static void span_policy(void) {
     /* Target: 90 % of the configured period, capped at 33.3ms; the controller's current interval is not an input,
      * so a drop to 30 or 20fps (period 33.3/50ms) cannot lower the clocks that would bring it back. */
-    assert(totk_adpf_span_target(1, 0) == 15000000);
-    assert(totk_adpf_span_target(0, 0) == 29999999);
-    assert(totk_adpf_span_target(1, 1) == 29999999); /* framegen: real frames at 30 */
-    assert(totk_adpf_target(50000000, 0, 0) == 33333333 && totk_adpf_span_target(0, 0) < 33333333);
+    assert(totk_adpf_span_target(1, 0, 90) == 15000000);
+    assert(totk_adpf_span_target(0, 0, 90) == 29999999);
+    assert(totk_adpf_span_target(1, 1, 90) == 29999999); /* framegen: real frames at 30 */
+    assert(totk_adpf_target(50000000, 0, 0) == 33333333 && totk_adpf_span_target(0, 0, 90) < 33333333);
     /* Span, not period: a 33.3ms present interval whose frame started 20ms before the present, with 5ms of
      * pacing inside, reports 15ms. The old work measure (interval minus pacing) would say 28.3ms. */
     const uint64_t present = 1000000000, start = present - 20000000;
@@ -87,7 +87,7 @@ static void span_policy(void) {
     totk_adpf_api api = {.manager=&marker, .create=create, .update=update, .report=report, .close=close_session,
         .report2=report2, .set_start=set_start, .set_total=set_total, .set_cpu=set_cpu, .set_gpu=set_gpu, .work=&work_object};
     totk_adpf_state state = {0}; int32_t tid = 7; unsigned before = reports;
-    assert(totk_adpf_sync(&state, &api, &tid, 1, totk_adpf_span_target(1, 0)) == TOTK_ADPF_CREATED);
+    assert(totk_adpf_sync(&state, &api, &tid, 1, totk_adpf_span_target(1, 0, 90)) == TOTK_ADPF_CREATED);
     assert(target_seen == 15000000);
     assert(!totk_adpf_report_span(&state, &api, start, 15000000, 15000000, 8000000));
     assert(reports2 == 1 && w_start == (int64_t)start && w_total == 15000000 && w_cpu == 15000000 && w_gpu == 8000000);

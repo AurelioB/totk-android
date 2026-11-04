@@ -111,6 +111,34 @@ class AdpfPolicy(unittest.TestCase):
             }
         ''')
 
+    def test_target_percentage_policy(self):
+        self.compile_run(r'''
+            #define _GNU_SOURCE
+            #include "games/totk/runtime/adpf_policy.h"
+            #include "games/totk/runtime/live_ctl.h"
+            #include <assert.h>
+            int main(void) {
+                for (int pct = 50; pct <= 100; pct++) {
+                    assert(totk_adpf_span_target(1, 0, pct) == 16666667LL * pct / 100);
+                    assert(totk_adpf_span_target(0, 0, pct) == 33333333LL * pct / 100);
+                    assert(totk_adpf_span_target(1, 1, pct) == 33333333LL * pct / 100);
+                }
+                assert(totk_adpf_span_target(1, 0, 80) == 13333333);
+                assert(totk_adpf_span_target(1, 0, 90) == 15000000);
+                assert(totk_adpf_span_target(0, 0, 90) == 29999999);
+                assert(totk_adpf_span_target(0, 0, 100) == 33333333);
+                assert(totk_adpf_span_target(1, 0, 49) == 15000000);
+                assert(totk_adpf_span_target(1, 0, 101) == 15000000);
+                assert(totk_adpf_span_target(1, 0, 0) == 15000000);
+                int parsed;
+                assert(totk_live_decimal("50", 50, 100, &parsed) && parsed == 50);
+                assert(totk_live_decimal("100", 50, 100, &parsed) && parsed == 100);
+                const char *bad[] = {"49", "101", "80junk", "80.0", "-80", "0x50", "", "99999999999999"};
+                for (size_t i = 0; i < sizeof bad / sizeof *bad; i++)
+                    assert(!totk_live_decimal(bad[i], 50, 100, &parsed));
+            }
+        ''')
+
 
 if __name__ == '__main__':
     unittest.main()

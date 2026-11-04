@@ -48,6 +48,8 @@ static totk_adpf_load load_history;
 static int cpu_split_launch;
 static _Atomic int cpu_split_applied;
 static totk_live_cache cpu_split_live;
+static int target_pct_launch = 90, target_pct_applied = 90;
+static totk_live_cache target_pct_live;
 static _Atomic uint64_t frame_start, gpu_published;
 static totk_adpf_pacing span_pacing;
 static totk_adpf_pacing span_queue_wait;
@@ -63,7 +65,7 @@ static uint64_t mono_ns(void) {
 }
 static int span_on(void) { return mode && totk_live_cached(&span_live, "TOTK_ADPF_GPU", span_launch) != 0; }
 static void log_span(int on, const char *when) {
-    int64_t target = !mode ? 0 : on ? totk_adpf_span_target(fps60, framegen) : mode == 1 ? legacy_target : session.target;
+    int64_t target = !mode ? 0 : on ? totk_adpf_span_target(fps60, framegen, target_pct_applied) : mode == 1 ? legacy_target : session.target;
     fprintf(stderr, "[totk-perf] TOTK_ADPF_GPU=%d (%s): %s; target %.3fms%s\n", on, when,
         !mode ? "no ADPF session (TOTK_ADPF=0)" :
         !on ? (mode == 2 ? "off, wait-stripped present interval" : "off, raw present interval") :
@@ -79,6 +81,16 @@ static void remove_thread(void *value) {
     }
     pthread_mutex_unlock(&mu);
 }
+static void log_refinements(void) {
+    fprintf(stderr, "[totk-perf] TOTK_ADPF_LOAD_HINT=%d (launch, live): %s; needs TOTK_ADPF_GPU=1\n",
+        load_applied, !mode ? "no ADPF session, no-op" : !load_applied ? "off" : api.increase ?
+        "3 frames >105%, 500ms limit, GPU >70%" : "unavailable (API36 notifyWorkloadIncrease absent), no-op");
+    fprintf(stderr, "[totk-perf] TOTK_ADPF_CPU_SPLIT=%d (launch, live): %s; needs TOTK_ADPF_GPU=1\n",
+        cpu_split_launch, !mode ? "no ADPF session, no-op" : !cpu_split_launch ? "off" : api.work ?
+        "CPU=span minus present/texture queue wait; total unchanged" : "unavailable (no API35 report2), no-op");
+    fprintf(stderr, "[totk-perf] TOTK_ADPF_TARGET_PCT=%d (launch, live): configured period margin; needs TOTK_ADPF_GPU=1%s\n",
+        target_pct_applied, mode ? "" : "; no ADPF session, no-op");
+}
 static void configure(void) {
     const char *request = getenv("TOTK_ADPF"), *target = getenv("TOTK_ADPF_TARGET_MS");
     mode = request && !strcmp(request, "0") ? 0 : request && !strcmp(request, "full") ? 2 : 1;
@@ -89,6 +101,13 @@ static void configure(void) {
     span_applied = span_launch = is_one("TOTK_ADPF_GPU");
     load_applied = load_launch = is_one("TOTK_ADPF_LOAD_HINT");
     cpu_split_applied = cpu_split_launch = is_one("TOTK_ADPF_CPU_SPLIT");
+    const char *pct = getenv("TOTK_ADPF_TARGET_PCT");
+    while (pct && isspace((unsigned char)*pct)) pct++;
+    if (pct && *pct && !totk_live_decimal(pct, 50, 100, &target_pct_launch)) {
+        fprintf(stderr, "[totk-perf] TOTK_ADPF_TARGET_PCT=%s ignored: not a decimal in 50..100\n", pct);
+        target_pct_launch = 90;
+    }
+    target_pct_applied = target_pct_launch;
     const char *fg = getenv("TOTK_FRAMEGEN");
     framegen = fg && (!strcmp(fg, "1") || !strcmp(fg, "locked") ||
         !strcmp(fg, "interp") || !strcmp(fg, "hybrid") || !strcmp(fg, "adaptive"));
@@ -111,7 +130,7 @@ static void configure(void) {
             "off, the configured rate");
         hold_logged = hold_launch;
     }
-    if (!mode && !rate_on) { if (span_launch) log_span(1, "launch"); return; }
+    if (!mode && !rate_on) { log_refinements(); if (span_launch) log_span(1, "launch"); return; }
     void *lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
     if (rate_on) {
         window_rate = lib ? dlsym(lib, "ANativeWindow_setFrameRate") : NULL;
@@ -120,7 +139,7 @@ static void configure(void) {
             window_rate ? "yes" : "no", surface_rate ? "yes" : "no", atomic_load(&content_rate),
             lattice && !fps60 && !framegen ? " (30fps content, retaining 60Hz present lattice)" : "");
     }
-    if (!mode) { if (span_launch) log_span(1, "launch"); return; }
+    if (!mode) { log_refinements(); if (span_launch) log_span(1, "launch"); return; }
     void *(*get_manager)(void) = lib ? dlsym(lib, "APerformanceHint_getManager") : NULL;
     api.create = lib ? dlsym(lib, "APerformanceHint_createSession") : NULL;
     api.update = lib ? dlsym(lib, "APerformanceHint_updateTargetWorkDuration") : NULL;
@@ -142,12 +161,7 @@ static void configure(void) {
     }
     if (android_get_device_api_level() >= 36 && lib)
         api.increase = dlsym(lib, "APerformanceHint_notifyWorkloadIncrease");
-    fprintf(stderr, "[totk-perf] TOTK_ADPF_LOAD_HINT=%d (launch, live): %s; needs TOTK_ADPF_GPU=1\n",
-        load_applied, !load_applied ? "off" : api.increase ? "3 frames >105%, 500ms limit, GPU >70%" :
-        "unavailable (API36 notifyWorkloadIncrease absent), no-op");
-    fprintf(stderr, "[totk-perf] TOTK_ADPF_CPU_SPLIT=%d (launch, live): %s; needs TOTK_ADPF_GPU=1\n",
-        cpu_split_launch, !cpu_split_launch ? "off" : api.work ? "CPU=span minus present/texture queue wait; total unchanged" :
-        "unavailable (no API35 report2), no-op");
+    log_refinements();
     if (mode == 2 && api.manager) key_ready = !pthread_key_create(&thread_key, remove_thread);
     fprintf(stderr, "[totk-perf] ADPF mode=%s api=%d manager=%s create/report/close=%s setThreads=%s updateTarget=%s report2/AWorkDuration=%s; legacy-target=%.3fms\n",
         mode == 2 ? "full" : "legacy", android_get_device_api_level(), api.manager ? "yes" : "no",
@@ -214,7 +228,7 @@ void totk_perf_render(uint64_t interval_ns) {
     unsigned changes = 0;
     if (!session.attempted) {
         int32_t tid = (int32_t)syscall(SYS_gettid);
-        changes = totk_adpf_sync(&session, &api, &tid, 1, span_applied ? totk_adpf_span_target(fps60, framegen) : legacy_target);
+        changes = totk_adpf_sync(&session, &api, &tid, 1, span_applied ? totk_adpf_span_target(fps60, framegen, target_pct_applied) : legacy_target);
     }
     /* Legacy accepted intervals up to one second, including intentional pacing. */
     if (!span_applied && session.session && interval_ns && interval_ns < 1000000000ull && api.report(session.session, (int64_t)interval_ns))
@@ -342,6 +356,12 @@ void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_i
         fprintf(stderr, "[totk-perf] TOTK_ADPF_CPU_SPLIT=%d (live): %s\n", split,
             api.work ? "CPU=span minus present/texture queue wait; total unchanged" : "unavailable, no-op");
     }
+    int pct = totk_live_cached(&target_pct_live, "TOTK_ADPF_TARGET_PCT", target_pct_launch);
+    if (pct != target_pct_applied) {
+        target_pct_applied = pct; load_history.over = 0;
+        fprintf(stderr, "[totk-perf] TOTK_ADPF_TARGET_PCT=%d (live): target %.3fms; needs TOTK_ADPF_GPU=1\n",
+            pct, totk_adpf_span_target(fps60, framegen, pct) / 1e6);
+    }
     if (span != span_applied) {
         span_applied = span; memset(&span_stats, 0, sizeof span_stats);
         load_history.over = 0;
@@ -350,7 +370,7 @@ void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_i
         log_span(span, "live");
         start = 0;   /* this frame's start may predate the switch: the next frame is the first whole one */
     }
-    if (span) target = totk_adpf_span_target(fps60, framegen);
+    if (span) target = totk_adpf_span_target(fps60, framegen, target_pct_applied);
     else if (mode == 1) target = legacy_target;
     if (mode == 1) {
         if (session.count && target != session.target)

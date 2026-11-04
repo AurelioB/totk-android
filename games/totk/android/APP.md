@@ -1959,6 +1959,7 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_ADPF_GPU` | 0–1 | the next presented frame | that frame is not reported; the session's target switches with it; no effect with `TOTK_ADPF=0` |
 | `TOTK_ADPF_LOAD_HINT` | 0–1 | the next span report | clears consecutive-frame history, retains the 500 ms rate limit; needs `TOTK_ADPF_GPU=1` |
 | `TOTK_ADPF_CPU_SPLIT` | 0–1 | the next presented frame | queue waits are measured for subsequent frames; total span/GPU unchanged; needs `TOTK_ADPF_GPU=1` and API 35 |
+| `TOTK_ADPF_TARGET_PCT` | 50…100 | the next presented frame | default 90 (unchanged); updates the session target before reporting; needs `TOTK_ADPF_GPU=1` |
 | `TOTK_RATE_HINT_HOLD` | 0…60000 | the next guest present | ms; a change clears the held rates; no effect without `TOTK_FRAME_RATE_HINT=1` |
 
 `TOTK_IDEAL_CORE_FIX` is startup-only and refused. Another launch-time switch becomes live by adding it, with its
@@ -3905,10 +3906,10 @@ per-layer SurfaceFlinger cadence plus performance, power and temperature evidenc
 `TOTK_ADPF_GPU=1` (default off; live through `totk.ctl`, applied at the next presented frame, which is not reported)
 changes what the existing session (legacy or full) reports. The span runs from the game's own CPU frame origin, read at
 the frame's first submit (the first submit itself when the origin is unusable), to its present, less the acquire pacing
-inside it, so a frame reads short or long whatever the present interval was. The target is 90 % of the configured
+inside it, so a frame reads short or long whatever the present interval was. The target defaults to 90 % of the configured
 period and never the controller's current one, so a drop to 30 or 20fps cannot ask for the clocks that keep it there.
 On API 35+ `APerformanceHint_reportActualWorkDuration2` and `AWorkDuration_*` are looked up at run time (the build's
-API level has none of them) and carry start, total, CPU (= span) and the GPU time of the newest frame whose slots all
+API level has none of them) and carry start, total, CPU (= span unless CPU splitting is enabled) and the GPU time of the newest frame whose slots all
 completed, each frame once (0 otherwise); below 35 the span alone goes through `reportActualWorkDuration`. Logs:
 `[totk-perf] TOTK_ADPF_GPU=N (launch|live): ...; target T` and every 300 frames `[totk-perf] ADPF span: ...`
 (reported spans, GPU durations, target). Measure on the Odin 3 with in-session ABBA: fps and the sampler's GPU clock
@@ -3926,6 +3927,10 @@ never subtracted again. Total and GPU are unchanged. API 35 report2 is required;
 Mode logs identify the arm. Compare CPU clocks/power and p95 against gpu_feed alone; this is wall work minus
 known native waits, not the sum of all hint threads' CPU time.
 
+`TOTK_ADPF_TARGET_PCT=50..100` (default 90, unchanged) sets the span-mode target to that percentage of the
+configured period; `80` gives 13.333 ms at native60 or 26.667 ms at real30. It never follows a controller slowdown.
+Live changes apply at the next presented frame, before reporting, and clear the load-hint streak. Invalid launch
+values log and retain 90. Compare fps/p95, GPU clocks and sustained temperature/power against the 90-percent control.
 
 ### FPS60 controller, fallback and diagnostics (1.4.3)
 

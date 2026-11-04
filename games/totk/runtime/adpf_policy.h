@@ -131,11 +131,12 @@ static inline uint64_t totk_adpf_cpu(uint64_t span, uint64_t queue_wait, int spl
 }
 
 /* ---------- TOTK_ADPF_GPU: the frame's span and the GPU duration ----------
- * The target is 90 % of the configured frame period (16.7ms native60, else 33.3ms), capped at 33.3ms. It never
+ * The target defaults to 90 % of the configured frame period (16.7ms native60, else 33.3ms), capped at 33.3ms. It never
  * follows the controller's current interval: after a drop to 30 or 20fps that period as the target would ask for
  * clocks that keep the frame that slow. */
-static inline int64_t totk_adpf_span_target(int fps60, int framegen) {
-    int64_t period = !framegen && fps60 ? 16666667 : 33333333, target = period * 9 / 10;
+static inline int64_t totk_adpf_span_target(int fps60, int framegen, int pct) {
+    if (pct < 50 || pct > 100) pct = 90;
+    int64_t period = !framegen && fps60 ? 16666667 : 33333333, target = period * pct / 100;
     return target < 33333333 ? target : 33333333;
 }
 /* From the frame's start to its present, less the pacing waits inside it. Never the present interval:
