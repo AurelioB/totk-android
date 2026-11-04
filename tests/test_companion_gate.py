@@ -70,6 +70,7 @@ public interface AttachedSurfaceControl {
     void addOnBufferTransformHintChangedListener(OnBufferTransformHintChangedListener listener);
     void removeOnBufferTransformHintChangedListener(OnBufferTransformHintChangedListener listener);
 }''',
+    'android/view/Display.java': 'package android.view; public final class Display {}',
     'android/view/View.java': '''package android.view;
 public class View {
     public boolean isAttachedToWindow() { return false; }
@@ -93,6 +94,8 @@ public class NativeActivity extends Context {
     protected void onDestroy() { destroy.run(); }
     public boolean isFinishing() { return false; }
     public Window getWindow() { return new Window(); }
+    public android.view.Display getDisplay() { return new android.view.Display(); }
+    public void onWindowFocusChanged(boolean focused) {}
 }''',
     'com/aure/totk/companion/AssetStore.java': '''package com.aure.totk.companion;
 import android.content.Context;
@@ -124,8 +127,12 @@ final class TextEntry {
 }''',
     'com/aure/totk/companion/PresentationController.java': '''package com.aure.totk.companion;
 import android.app.NativeActivity;
+import android.content.Context;
+import android.view.Display;
 public final class PresentationController {
     public static int created, closed;
+    public static int secondScreenKind;
+    public static int secondScreen(Context context, Display own) { return secondScreenKind; }
     public PresentationController(NativeActivity owner, DataSource source) {
         if (!NativeActivity.initialized) throw new AssertionError("controller constructed before native initialization");
         created++;
@@ -180,6 +187,7 @@ class CompanionGate(unittest.TestCase):
             'com/aure/totk/TextRules.java',
             'com/aure/totk/companion/CompanionNative.java',
             'com/aure/totk/companion/DataSource.java',
+            'com/aure/totk/companion/DisplayClass.java',
             'com/aure/totk/companion/ItemActions.java',
             'com/aure/totk/companion/SnapshotPoller.java',
         ))
