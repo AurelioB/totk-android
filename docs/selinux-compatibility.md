@@ -28,6 +28,52 @@ The FIFO placement fix is in `games/totk/android/setup/containers.c`; helper spa
 APK rather than introducing a writable-directory fallback. Preserve the original `errno` in filesystem diagnostics
 before cleanup, so a permission failure is not reported as a different error.
 
+## Odin 3 audit, 4 November 2026
+
+This is a bounded observation, **not an enforcing-mode pass**. The Android 15 build fingerprint was
+`qti/sun/sun:15/AQ3A.250728.001/eng.Odin3.20260204.171202:user/dev-keys`. The clean source build was
+`e654bcfcf549`, including the private-FIFO fix, repacked as the separate release-signed `com.aure.totk.test`
+application. Its APK SHA-256 was `a321ba3a9835647e8707e93386857aafb072d17c11918ec7579103c9afea9512`.
+
+| Flow | Permissive result | Enforcing result |
+| --- | --- | --- |
+| Decrypted dump → private internal storage, including shaders/companion | Completed; 24,783 shaders ready | Not exercised |
+| Start game → load Hateno Village → 60 seconds of camera movement in gameplay | Completed | Not exercised |
+| Saves Export / Import through document pickers | Export contained 32 save payloads; import completed and made a backup | Not exercised |
+| Base + update + keys → picked internal shared folder, All files access granted in Settings | Completed; container-route manifest marked all stages done | Not exercised |
+| Base + update + keys → SD (RP5), `/storage/AAAA-AAAA` | Completed; same verified container-route install manifest | Not exercised |
+
+The test app's observed source context was `u:r:untrusted_app_32:s0:c175,c257,c512,c768`. After deduplicating logcat's
+two copies and dmesg by audit event number, 16 delivered app-context AVC events had only these two signatures:
+
+| Target context | Class / permission | Processes / target | Classification |
+| --- | --- | --- | --- |
+| `u:object_r:shell_test_data_file:s0` | `dir` / `search` | `libhactool.so`, `libtotk_xlate.s`; directory named `tests` | Optional startup probe candidate; no app feature failed in permissive mode. Full path and enforcing outcome were not established. |
+| `u:object_r:postinstall_mnt_dir:s0` | `dir` / `getattr` | Same helpers; `/postinstall` | Optional platform-linker probe candidate, not a required game-data path; enforcing outcome unverified. |
+
+**[INFERENCE]** These identical helper-startup patterns are consistent with Android's dynamic-linker namespace
+configuration, rather than a .NET-only or game-data dependency. The
+[Android 15 linker implementation](https://android.googlesource.com/platform/bionic/+/refs/heads/android15-release/linker/linker_config.cpp?format=HTML)
+explicitly tolerates failed path canonicalization, including `/postinstall`, and retains the unresolved path.
+No syscall stack was captured to prove the callsite on this ROM. Do not add permissions or a policy exception for
+these paths, and do not hide future helper failures on the strength of this classification.
+
+No delivered app AVC concerned FIFO creation; both container destinations completed with the private-FIFO fix.
+The kernel audit stream also reported rate limiting and lost records amid unrelated OEM/root-service denials, so
+the delivered list is not proof that every denied operation was logged.
+
+At device time **03:12:16** the authorized `setenforce 1` transition succeeded and `getenforce` returned `Enforcing`.
+The test package was removed for a fresh installation, but before it could be reinstalled the OEM
+`com.odin.gameassistant` entered a crash loop. Its `system_app` domain was denied setting
+`persist.vendor.debug.mode` (`vendor_default_prop`, `property_service`, `set`) and finding `PServerBinder`
+(`default_android_service`, `service_manager`, `find`). At **03:12:36.623** Android logged
+`Rebooting, reason: RescueParty`; adb disconnected and TCP port 5555 stopped accepting connections. An attempted
+`adb reboot` could not run because the device was offline. These are device/ROM failures, not denials attributed to
+the test app. No application setup, gameplay, or saves flow was observed under enforcement.
+
+This ROM cannot be treated as an enforcing acceptance device merely by toggling its global mode. Do not weaken its
+policy, suppress the vendor crashes in app code, or claim stock-phone compatibility from its permissive results.
+
 ## Test on an enforcing device
 
 Use a stock enforcing device for release acceptance where possible. A rooted permissive device is useful for finding
@@ -40,6 +86,8 @@ SELinux mode on a shared test device without explicit authorization and exclusiv
 2. Clear `logcat -b all -c`, record the current dmesg position, and collect both logs for the whole run. Record the
    test app's UID and complete process SELinux context, including its MLS categories, from `ps -AZ`. The main and
    `:setup` processes and their children must be attributed to the test app, not just matched by a short `comm` name.
+   Record audit rate-limit/lost-record warnings too; if the kernel dropped records, report that coverage limitation
+   rather than calling a filtered list exhaustive.
 3. On a permissive test device, first exercise all flows with logging only. Keep every matching
    `avc: denied ... permissive=1` record, including the full source/target context, class, permission set, path, and
    process name. Classify each as an unnecessary probe, a feature blocker (name the feature), or a known fixed path.
