@@ -49,7 +49,7 @@ static double total_ms, render_ms, compute_ms;
 static const char *const end_names[] = {
     "other", "nvn-barrier", "texture-barrier", "attachment-change", "clear",
     "copy-blit", "query-report", "compute-dispatch", "cpu-wait", "submission-end",
-    "uniform-flush", "present", "diagnostic", "deferred-barrier-hazard"
+    "uniform-flush", "present", "diagnostic", "deferred-barrier-hazard", "early-submit-split"
 };
 
 static uint64_t hash_bytes(uint64_t h, const void *data, size_t n) {

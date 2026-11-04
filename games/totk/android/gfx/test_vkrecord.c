@@ -192,5 +192,26 @@ int main(int argc, char **argv) {
         ok &= identical(output[0][0], output[1][0], magic[mode]);
         for (int widen = 0; widen < 2; widen++) for (int i = 0; i < 3; i++) unlink(output[widen][i]);
     }
+    /* TOTK_VK_SPLIT_PASS_DRAWS: the same bytes with the split off, every 64 draws and every draw, inline and with
+       workers; the fixture itself checks the split/pass arithmetic. The lag arm reuses the chunk/lag submission path. */
+    for (int arm = 0; arm < 4; arm++) {
+        const char *split[] = {NULL, "64", "1"}, *workers = arm == 3 ? "2" : threads[arm];
+        if (arm == 3) setenv("TOTK_FRAME_LAG", "1", 1);
+        char output[3][PATH_MAX];
+        for (int s = 0; s < 3; s++) {
+            snprintf(output[s], sizeof output[s], "%s/split-%d-%d.bin", dir, arm, s);
+            if (split[s]) setenv("TOTK_VK_SPLIT_PASS_DRAWS", split[s], 1); else unsetenv("TOTK_VK_SPLIT_PASS_DRAWS");
+            if (!run(binary, "--split-pass", output[s], workers, 0)) {
+                fprintf(stderr, "--split-pass failed with %s workers, split=%s%s\n", workers, split[s] ? split[s] : "off", arm == 3 ? ", lag" : "");
+                ok = 0;
+            }
+        }
+        unsetenv("TOTK_VK_SPLIT_PASS_DRAWS"); unsetenv("TOTK_FRAME_LAG");
+        for (int s = 1; s < 3; s++) {
+            printf("--split-pass threads=%s%s off vs every %s draws: ", workers, arm == 3 ? " lag" : "", split[s]);
+            ok &= identical(output[0], output[s], 0x53504c4954504153ull);
+        }
+        for (int s = 0; s < 3; s++) unlink(output[s]);
+    }
     rmdir(dir); return !ok;
 }

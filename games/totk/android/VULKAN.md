@@ -525,6 +525,13 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   Explicit positive thresholds and `0` (disable automatic chunking) win. At a render-pass start, after that many draws, recorded work goes to the GPU
   while the rest of the frame is recorded. The once-only `[totk-gfx] frame policy: FPS60=… FRAME_LAG=… CHUNK_DRAWS=…`
   startup line records resolved values. One submission per frame made the frame recording + GPU time.
+- **Early submit inside long passes** (`TOTK_VK_SPLIT_PASS_DRAWS=<n>`, default **0** = off): the chunk threshold is
+  only checked when a pass opens, so a pass of hundreds of draws starts on the GPU only after it is fully recorded.
+  With `n` set, the next draw after `n` draws in a still-open pass ends it, the reopen submits that part through the
+  same chunk path, and the same targets reopen with `loadOp=LOAD`. Refused (counted) for passes with a `DONT_CARE`
+  store, native/canvas UI, framegen extraction or pass diagnostics; nothing splits with chunking off (`CHUNK_DRAWS=0`).
+  **Cost:** each split stores and reloads every attachment on a tiler (GMEM), so it stays off. Try `512`, then `256`;
+  `[split-pass]` logs splits, extra passes and refusals per 300 presents. Compare p95/GPU-busy overlap, not just fps.
 - **The uniform-update log** drops entries a newer update covers entirely (the game rewrites the same constant blocks
   many times a frame), and `ub_prune` returns at once unless a submission finished. `ub_overlaps` had been a quarter of
   the render thread.

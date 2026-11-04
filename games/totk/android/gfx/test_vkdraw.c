@@ -3307,6 +3307,79 @@ int main(int argc, char **argv) {
         printf("%s: job reuse %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
         return fails != 0;
     }
+    /* TOTK_VK_SPLIT_PASS_DRAWS: one 300-draw pass per submission with overlapping textured stripes (draw order decides
+       every column) and a partial in-pass clear between the would-be parts. Fresh processes with the split on and off
+       must write identical bytes (vkrectest); pass counts are checked here against the exact split arithmetic. */
+    if (argc == 3 && !strcmp(argv[1], "--split-pass")) {
+        FILE *out = fopen(argv[2], "wb"); if (!out) { perror(argv[2]); return 1; }
+        tex_t tx2 = tx; tx2.serial = 10012; tx2.mem = cpu_pool + 0x20000;
+        for (int i = 0; i < 64 * 64; i++) { lin[i * 4] = 255 - lin[i * 4]; lin[i * 4 + 1] = 255 - lin[i * 4 + 1]; }
+        nvn_swizzle(&tx2.d, 0, 0, lin, 256, tx2.mem); mtl_reg_tex(2, &tx2, NULL); mtl_reg_samp(2, &sp);
+        const float full[] = {-1, -1, 3, -1, -1, 3}; memcpy(cpu_pool + 0x202000, full, sizeof full);
+        p_bind_vbuf full_vb = vb; full_vb.r[0].address = (uint64_t)(uintptr_t)(cpu_pool + 0x202000);
+        fub[0] = 1; fub[1] = 0.5f; fub[2] = 1; fub[3] = 1;
+        const char *e = getenv("TOTK_VK_SPLIT_PASS_DRAWS"); long n = e && *e ? atol(e) : 0;
+        const int draws = 300, hole_at = 150;
+        uint64_t splits = n > 0 ? (uint64_t)(draws - 1) / (uint64_t)n : 0;
+        p_scissor all = {0, 0, 64, 64}, hole = {16, 16, 8, 8};
+        p_clear_color red = {0, 0xf, {1, 0, 0, 1}};
+        for (int round = 0; round < 12; round++) {
+            vk_record_test_counts count0, count1; vk_record_test_counts_get(&count0);
+            uint64_t split0[3], split1[3]; vk_draw_test_split_counts(split0);
+            uint8_t expect[64][64][4];
+            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) { expect[y][x][0] = expect[y][x][1] = 0; expect[y][x][2] = expect[y][x][3] = 255; }
+            rn = 0; op(OP_SCISSOR, &all, sizeof all); op(OP_SET_RT, &srt, sizeof srt); op(OP_CLEAR_COLOR, &cc, sizeof cc);
+            op(OP_BIND_PROGRAM, &bp, sizeof bp); op(OP_BIND_VATTR, &va, sizeof va); op(OP_BIND_VSTREAM, &vs, sizeof vs);
+            op(OP_BIND_VBUF, &full_vb, sizeof full_vb); op(OP_BIND_UBO, &u0, sizeof u0); op(OP_BIND_UBO, &u1, sizeof u1);
+            op(OP_VIEWPORTS, &vp, sizeof vp);
+            for (int i = 0; i < draws; i++) {
+                if (i == hole_at) {
+                    op(OP_SCISSOR, &hole, sizeof hole); op(OP_CLEAR_COLOR, &red, sizeof red);
+                    for (int y = 16; y < 24; y++) for (int x = 16; x < 24; x++) { expect[y][x][0] = 255; expect[y][x][1] = 0; expect[y][x][2] = 0; }
+                }
+                int which = (i + round) & 1, x0 = (i * 37 + round * 11) & 63;
+                p_scissor stripe = {x0, 0, 3, 64};
+                p_bind_handles texture = th, sampler = th;
+                texture.h[0] = (uint64_t)(1 + which) | ((uint64_t)(1 + which) << 20);
+                sampler.h[0] = (uint64_t)(1 + which) << 20;
+                op(OP_SCISSOR, &stripe, sizeof stripe);
+                op(OP_BIND_TEX, &texture, offsetof(p_bind_handles, h) + sizeof texture.h[0]);
+                op(OP_BIND_SAMP, &sampler, offsetof(p_bind_handles, h) + sizeof sampler.h[0]);
+                op(OP_DRAW, &dw, sizeof dw);
+                for (int x = x0; x < x0 + 3 && x < 64; x++) for (int y = 0; y < 64; y++) {
+                    expect[y][x][0] = (uint8_t)(which ? 255 - 4 * x : 4 * x);
+                    expect[y][x][1] = (uint8_t)(which ? (255 - 4 * y) / 2 : 2 * y); expect[y][x][2] = 128;
+                }
+            }
+            op(OP_SCISSOR, &all, sizeof all); op(OP_COPY_T2B, &cp, sizeof cp);
+            uint64_t fence0 = mtl_last_fence(), fence = run();
+            CHECK(mtl_wait(fence, 5000000000ull), "split round %d completes", round);
+            CHECK(fence - fence0 == 1 + splits, "split round %d: %llu GPU submissions, expected one per part (%llu)", round,
+                (unsigned long long)(fence - fence0), (unsigned long long)(1 + splits));
+            vk_record_test_counts_get(&count1); vk_draw_test_split_counts(split1);
+            CHECK(count1.draws - count0.draws == (uint64_t)draws, "split round %d records every draw (%llu)", round,
+                (unsigned long long)(count1.draws - count0.draws));
+            CHECK(split1[0] - split0[0] == splits && split1[1] - split0[1] == splits && split1[2] == split0[2],
+                "split round %d: %llu splits, %llu reopened parts, %llu refused; expected %llu", round,
+                (unsigned long long)(split1[0] - split0[0]), (unsigned long long)(split1[1] - split0[1]),
+                (unsigned long long)(split1[2] - split0[2]), (unsigned long long)splits);
+            CHECK(count1.passes - count0.passes == 1 + splits, "split round %d actual passes %llu, expected %llu", round,
+                (unsigned long long)(count1.passes - count0.passes), (unsigned long long)(1 + splits));
+            int bad = 0;
+            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+                const uint8_t *p = readback + 4 * (y * 64 + x);
+                for (int c = 0; c < 4; c++) bad += abs(p[c] - expect[y][x][c]) > 2;
+            }
+            CHECK(!bad, "split round %d pixels follow draw order across parts and the in-pass clear (%d wrong)", round, bad);
+            uint64_t actual = count1.draws - count0.draws;
+            CHECK(fwrite(&actual, sizeof actual, 1, out) == 1 && fwrite(readback, 64 * 64 * 4, 1, out) == 1, "write split identity");
+            int crop[] = {0, 0, 0, 0}; mtl_present(&rt, 1.0 / 60, crop);
+        }
+        const uint64_t footer[] = {0x53504c4954504153ull, 12};
+        CHECK(fwrite(footer, sizeof footer, 1, out) == 1 && !fclose(out), "close split identity output");
+        printf("%s: split pass (TOTK_VK_SPLIT_PASS_DRAWS=%ld) %d checks, %d failed\n", fails ? "FAILED" : "ok", n, checks, fails);
+        return fails != 0;
+    }
     if (argc == 3 && !strcmp(argv[1], "--rec-identity")) {
         FILE *out = fopen(argv[2], "wb"); if (!out) { perror(argv[2]); return 1; }
         tex_t tx2 = tx; tx2.serial = 10002; tx2.mem = cpu_pool + 0x20000;

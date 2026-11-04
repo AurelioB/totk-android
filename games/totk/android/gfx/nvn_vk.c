@@ -3106,6 +3106,7 @@ static int fg_adaptive_chunk_on(void) {
 #ifdef TOTK_VK_TESTS
 void vk_record_test_chunk_selector_reset(void) { g_fg_adaptive_chunk=-1; }
 #endif
+int vk_submit_chunk_possible(void) { return g_in_sub && g_cur; }
 void vk_submit_chunk(void) {
     if (!g_in_sub || !g_cur) return;
     int chunk=__builtin_expect(atomic_load_explicit(&vk_fg_slot_boundary_active,memory_order_relaxed),0) &&

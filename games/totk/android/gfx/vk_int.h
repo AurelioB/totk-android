@@ -249,6 +249,7 @@ void vk_wait_fence(uint64_t ticket); /* wait this already-submitted ticket, not 
 uint64_t vk_submit_readback(void); /* seal/queue an open stream before CPU readback ownership, without a global GPU wait */
 uint64_t vk_present_ready_ns(uint64_t ticket); /* predict/framegen exact CPU completion observation; 0 if missing/expired */
 void vk_submit_chunk(void);     /* inside a game submission: submit what is recorded so far (render pass starts) */
+int vk_submit_chunk_possible(void); /* vk_submit_chunk would submit: inside a game submission with an open slot */
 void vk_gpu_time_guest_submit(uint64_t ns, uint64_t origin_ticks, uint64_t frame); /* next walk's immutable guest entry context */
 int vk_gpu_time_hardware(void);
 uint64_t vk_gpu_time_controller_end(uint64_t addr, uint64_t timestamp, uint64_t origin); /* v143 FPS END getter only; returns ns preserving producer work */
@@ -515,6 +516,7 @@ void vk_wb_test_tile(const tex_t *t, uint64_t v[6]); /* last GPU/landed version,
 void vk_wb_test_fresh(uint64_t v[3]); /* landed before base quiet, bytes, relevant copy-fence wait ns */
 uint64_t vk_wb_test_inflight(void); /* exact preflight matches on a synchronous owner's borrowed landing list */
 void vk_res_mem(uint64_t v[8]); /* resource memory summary (also read by the present statistics) */
+void vk_draw_test_split_counts(uint64_t out[3]); /* TOTK_VK_SPLIT_PASS_DRAWS splits, reopened parts, refused passes */
 #endif
 void vk_res_stats(void);   /* rendered / copied / cleared by the GPU: never re-uploaded from guest memory */
 void vk_upload_threads_init(void);         /* launch-time TOTK_VK_UPLOAD_THREADS, before any upload */
@@ -578,7 +580,7 @@ typedef enum {
     VK_PASS_END_ATTACHMENTS, VK_PASS_END_CLEAR, VK_PASS_END_COPY, VK_PASS_END_QUERY,
     VK_PASS_END_COMPUTE, VK_PASS_END_CPU_WAIT, VK_PASS_END_SUBMISSION,
     VK_PASS_END_UNIFORM, VK_PASS_END_PRESENT, VK_PASS_END_DIAGNOSTIC,
-    VK_PASS_END_MERGE_HAZARD
+    VK_PASS_END_MERGE_HAZARD, VK_PASS_END_SPLIT
 } vk_pass_end_kind;
 extern int vk_gpuprof_on;   /* initialized once at first slot; off hot paths are a single branch */
 void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb);

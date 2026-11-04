@@ -117,6 +117,7 @@ static struct {
     unsigned c0_level, c0_layer; int c0_cleared; uint64_t c0_serial; int c0_fmt; uint64_t draws0;   /* pass probe */
     VkSampleCountFlagBits samples;
     uint32_t merge_pending, merge_armed, merge_storage, merge_continued;
+    int store_discard, split_refused;           /* a storeOp DONT_CARE was chosen at begin; the split was refused once */
 } R;
 static VkPipeline g_bound_pipe; static int g_dyn_dirty = 1;
 static vk_record_draw *g_record_draw;  /* walking-only packet under construction, NULL on original path */
@@ -1117,6 +1118,28 @@ long vk_frame_chunk_limit(void) {
     if (explicit_limit) return configured_limit;
     return lag_requested && !nvn_dirty_lag_vma_pressure() ? 600 : 75;
 }
+/* TOTK_VK_SPLIT_PASS_DRAWS=<n> (default 0 = off): the chunk threshold above is only evaluated when a pass opens, so a
+   long pass (the main scene pass, hundreds of draws) reaches the GPU only after its last draw is recorded. With n set,
+   the n-th draw since the pass (or its previous part) opened ends the pass; the next pass start submits the recorded
+   part through the same chunk submission and reopens the same targets with loadOp LOAD (the clears were consumed by
+   the first part). Each split costs one extra store and load of every attachment on a tiler, so it stays opt-in.
+   Refused (once per pass) where the open pass cannot be resumed as it was: a store chosen DONT_CARE at its start,
+   native/canvas UI passes, framegen extraction, pass dumps/probes. Nothing is split while chunking is disabled
+   (TOTK_VK_CHUNK_DRAWS=0) or outside a game submission, since there would be nothing to submit. */
+static uint32_t g_split_draws = UINT32_MAX;
+static int g_split_submit;   /* the next pass start submits the recorded part (and reopens the split targets) */
+static uint64_t g_split_count, g_split_reopen, g_split_refused;
+static uint32_t split_pass_draws(void) {
+    if (g_split_draws == UINT32_MAX) {
+        const char *e = getenv("TOTK_VK_SPLIT_PASS_DRAWS"); long n = e && *e ? atol(e) : 0;
+        g_split_draws = n <= 0 ? 0 : n > 1000000 ? 1000000 : (uint32_t)n;
+        LOGV("split pass draws: %u (TOTK_VK_SPLIT_PASS_DRAWS; 0 = off: long passes reach the GPU only when they end)", g_split_draws);
+    }
+    return g_split_draws;
+}
+#ifdef TOTK_VK_TESTS
+void vk_draw_test_split_counts(uint64_t out[3]) { out[0] = g_split_count; out[1] = g_split_reopen; out[2] = g_split_refused; }
+#endif
 static unsigned view_level(const view_t *v, int has) { return has && v->set_levels ? v->base_level : 0; }
 /* Open the pass for the current targets with the pending clears as load operations. 0 when nothing can be attached. */
 static int begin_rendering_inner(int draw_tail) {
@@ -1125,7 +1148,9 @@ static int begin_rendering_inner(int draw_tail) {
     /* The default follows resolved lag, including the native-pressure cutover.
        An explicit threshold (including disabled=0) remains authoritative. */
     { long lim = vk_frame_chunk_limit();
-      if (lim > 0 && g_chunk_draws >= (uint64_t)lim) { g_chunk_draws = 0; vk_submit_chunk(); } }
+      g_split_reopen += (uint64_t)g_split_submit;
+      if (lim > 0 && (g_chunk_draws >= (uint64_t)lim || g_split_submit)) { g_chunk_draws = 0; vk_submit_chunk(); }
+      g_split_submit = 0; }
     VkRenderingAttachmentInfo ca[8], da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, sa = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     uint32_t w = 16384, h = 16384, nc = 0; int have = 0;
     g_pipe_dirty = 1;
@@ -1220,7 +1245,7 @@ static int begin_rendering_inner(int draw_tail) {
     for (uint32_t i = 0; i < nc; i++) if (ca[i].imageView && (discard >> i & 1)) { ca[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; g_store_clear_c++; discarded = 1; }
     if (da.imageView && (discard >> 8 & 1)) { da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; g_store_clear_ds++; discarded = 1; }
     if (sa.imageView && (discard >> 9 & 1)) { sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; g_store_clear_ds++; discarded = 1; }
-    g_store_clear_pass += discarded;
+    g_store_clear_pass += discarded; R.store_discard = discarded; R.split_refused = 0;
     VkCommandBuffer cb = vk_cb();
     vk_barrier_all(cb);
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {R.host_w, R.host_h}}, .layerCount = 1, .colorAttachmentCount = nc, .pColorAttachments = ca,
@@ -3294,6 +3319,7 @@ void vk_draw_switches_init(void) {
     LOGV("TOTK_VK_UNWRITTEN_MASK=%d: %s", g_unwritten_mask, g_unwritten_mask ?
          "colour attachments the fragment shader does not output get colorWriteMask 0" :
          "colour write masks follow the game's channel mask only (default)");
+    (void)split_pass_draws();
 }
 static uint32_t pipe_write_mask(const pipe_key *k) {   /* the key's channel mask minus attachments without an output */
     if (!g_unwritten_mask) return k->chmask;
@@ -5165,6 +5191,20 @@ static void shader_xlate_first_command(vk_shader *sh, const char *kind) {
          (double)(host_now_ns() - sh->xlate_miss_ns) / 1e6);
     sh->xlate_miss_ns = 0;
 }
+/* TOTK_VK_SPLIT_PASS_DRAWS: end a long pass before its next draw so its recorded part reaches the GPU at the reopen
+   (begin_rendering). Only at a draw on the same, still-open targets; never with a DONT_CARE store, UI/canvas passes,
+   framegen extraction or pass diagnostics. Deferred merge barriers are emitted at this end like at a hazard split. */
+static void split_pass_check(vk_shader *const sh[6], int canvas_transfer) {
+    uint32_t n = split_pass_draws();
+    if (!n || !R.open || R.split_refused || g_stat_draws - R.draws0 < n) return;
+    if (vk_frame_chunk_limit() <= 0 || !vk_submit_chunk_possible()) return;   /* nothing would be submitted */
+    if (R.store_discard || R.native || R.canvas || canvas_transfer || sh[0]->canvas_ui || vk_fg_extract_active ||
+        FGX.writer.open || FGX.authority_span.open || PD.active || probe_on() || serial_draws()) {
+        R.split_refused = 1; g_split_refused++; return;
+    }
+    vk_end_rendering_at(VK_PASS_END_SPLIT, n);
+    g_split_submit = 1; g_split_count++;
+}
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     int prim = dw ? dw->prim : di->prim;
     if (!S.prog) { g_stat_skips[0]++; return; }
@@ -5185,6 +5225,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         uint32_t pending = R.merge_pending; g_merge_hazards++;
         vk_end_rendering_at(VK_PASS_END_MERGE_HAZARD, pending);
     }
+    split_pass_check(sh, canvas_transfer);
     VK_REC_DO(VK_REC_S_TOUCH, draw_touch(sh, dw, di));
     if (!begin_rendering(1)) { g_stat_skips[5]++; return; }
     if (S.has_sc) { int32_t x1 = MINV((int32_t)R.w, S.sc.x + S.sc.w), y1 = MINV((int32_t)R.h, S.sc.y + S.sc.h); if (x1 <= MAXV(0, S.sc.x) || y1 <= MAXV(0, S.sc.y)) { g_stat_skips[6]++; pd_draw_note("      draw skipped: empty scissor"); return; } }
@@ -9725,6 +9766,14 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
             LOGV("[pass-merge] frame %llu: deferred %.2f retained %.2f barriers/frame; late hazard splits %.2f/frame; avoided %.2f pass boundaries/frame (not a GMEM traffic counter)",
                  (unsigned long long)n, (c[0] - previous[0]) / 300.0, (c[1] - previous[1]) / 300.0,
                  (c[2] - previous[2]) / 300.0, (c[3] - previous[3]) / 300.0);
+            memcpy(previous, c, sizeof previous);
+        }
+        if (split_pass_draws()) {
+            static uint64_t previous[3]; uint64_t c[3] = {g_split_count, g_split_reopen, g_split_refused};
+            LOGV("[split-pass] frame %llu: last 300 presents %llu splits, %llu extra passes (reopened parts), %llu refused passes; per frame %.2f/%.2f/%.2f (TOTK_VK_SPLIT_PASS_DRAWS=%u)",
+                 (unsigned long long)n, (unsigned long long)(c[0] - previous[0]), (unsigned long long)(c[1] - previous[1]),
+                 (unsigned long long)(c[2] - previous[2]), (c[0] - previous[0]) / 300.0, (c[1] - previous[1]) / 300.0,
+                 (c[2] - previous[2]) / 300.0, split_pass_draws());
             memcpy(previous, c, sizeof previous);
         }
         vk_rec_unlock();
