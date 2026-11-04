@@ -1043,7 +1043,7 @@ static void display_vsync(const AChoreographerFrameCallbackData *data, void *arg
 }
 static void *display_thread(void *arg) {
     (void)arg;
-    pthread_setname_np(pthread_self(), "totk-vsync");
+    totk_thread_start("totk-vsync", NULL);
     if (!ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS)) runtime_fail("display Looper");
     AChoreographer *choreographer = AChoreographer_getInstance();
     if (!choreographer) runtime_fail("display Choreographer");

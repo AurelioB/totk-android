@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -237,12 +238,33 @@ static inline void totk_thread_affinity(const char *key) {
     else if (sched_setaffinity(0, sizeof set, &set)) error = errno;
     totk_thread_setting_log(key, value, error ? -1 : 0, error);
 }
+/* One process-wide flag for every translation unit that includes this header (a weak definition is merged). */
+__attribute__((weak)) int totk_thread_slack_logged;
+/* TOTK_TIMER_SLACK_NS=1..50000: per-thread timer slack of game and frame-critical threads (Linux defaults to
+   50 us, which every timed sleep or timeout of that thread may overshoot by). Unset leaves it untouched. */
+static inline void totk_thread_timer_slack(void) {
+    const char *value = getenv("TOTK_TIMER_SLACK_NS"); if (!value) return;
+    int ns, error = 0;
+    if (!totk_thread_integer(value, 1, 50000, &ns)) error = EINVAL;
+    else if (prctl(PR_SET_TIMERSLACK, (unsigned long)ns, 0, 0, 0)) error = errno;
+    if (error || !__atomic_exchange_n(&totk_thread_slack_logged, 1, __ATOMIC_RELAXED))
+        totk_thread_setting_log("TOTK_TIMER_SLACK_NS", value, (int)prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0), error);
+}
+/* Host threads on the frame path: walker/submission, recorder workers, ordered submit, GPU-fence and completion
+   (post) threads, the presenter and the display callback thread. Compile, seed, cache and translator workers are not. */
+static inline int totk_thread_frame_critical(const char *name) {
+    return !strcmp(name, "totk-walk") || !strncmp(name, "totk-recw", 9) || !strcmp(name, "totk-submit") ||
+        !strcmp(name, "totk-gpufence") || !strcmp(name, "totk-post") || !strcmp(name, "totk-present") ||
+        !strcmp(name, "totk-vsync");
+}
 static inline void totk_thread_start(const char *name, const char *affinity_key) {
     int saved = errno; char short_name[16]; snprintf(short_name, sizeof short_name, "%s", name);
     int error = pthread_setname_np(pthread_self(), short_name);
     totk_thread_setting_log("name", short_name, error ? -1 : 0, error);
-    if (!strncmp(name, "g-", 2) || !strncmp(name, "totk-recw", 9) || !strcmp(name, "totk-submit"))
+    if (!strncmp(name, "g-", 2) || !strncmp(name, "totk-recw", 9) || !strcmp(name, "totk-submit") ||
+        !strcmp(name, "totk-present"))
         totk_perf_thread(name);
+    if (totk_thread_frame_critical(name) || !strncmp(name, "g-", 2)) totk_thread_timer_slack();
     totk_thread_affinity(affinity_key); errno = saved;
 }
 /* Linux UAPI sched_attr v1. KEEP_POLICY/PARAMS preserve the caller's scheduler and nice value. */

@@ -8169,8 +8169,7 @@ static void black_check(const pres_buf *b) {
 static void *presenter(void *arg) {
     (void)arg;
 #ifdef __ANDROID__
-    pthread_setname_np(pthread_self(), "totk-present");
-    totk_perf_thread("totk-present");
+    totk_thread_start("totk-present", NULL);   /* name, performance hint and frame-thread settings */
     ASurfaceControl *surface = NULL; ASurfaceTransaction *tx = NULL; uint64_t surface_generation = 0; int current = -1;
     int backpressure_policy=VK_PRESENT_BP_SERIAL;
     static pres_complete completion = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};

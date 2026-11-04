@@ -4707,6 +4707,7 @@ Set launch overrides in `totk.env` and restart:
 | `TOTK_AFFINITY_GAME` | Android main/created guest affinity: unset or `auto` selects the capacity policy below; `all` makes no affinity request; a CPU list/mask overrides auto. WALK still overrides it on an actual submission thread. |
 | `TOTK_PRIO_WALK` | Linux per-tid nice value, decimal **−20…19**, on first submission. Unset leaves the inherited/current nice untouched. |
 | `TOTK_UCLAMP_WALK` | Linux utilization-clamp minimum, decimal **0…1024**, on first submission. Zero clears that minimum; this is not a frequency in MHz or a percentage. |
+| `TOTK_TIMER_SLACK_NS` | Linux per-thread timer slack, decimal **1…50000** ns, at the start of every guest thread (`g-*`) and frame-critical host thread (`totk-walk`, `totk-recw*`, `totk-submit`, `totk-gpufence`, `totk-post`, `totk-present`, `totk-vsync`). Unset keeps the kernel's inherited 50 µs; `0`/out-of-range log `EINVAL`. Logs the first application once (`TOTK_TIMER_SLACK_NS=1 result=1`). |
 
 CPU values are lists/ranges such as `7`, `3-6` or `3-6,7`, or explicitly `0x`-prefixed hexadecimal masks:
 `0x80` means CPU 7 and `0x78` means CPUs 3–6. A bare `7` is **CPU 7**, not mask 7; `0` is CPU 0, not disabled.
@@ -4715,6 +4716,13 @@ Each name/setting logs `[totk-thread] tid=… name=… <setting>=… result=… 
 **resulting kernel affinity**, not merely the requested value. Nice/clamp `result` is the queried current value.
 Permission errors, including `EPERM`, are visible and do not silently enable a substitute policy. Settings are
 attempted once; correct the env and restart after an error.
+
+Timer slack only moves **timed** sleeps/timeouts of the thread that sleeps: guest `SleepThread`, timed guest waits
+and core rechecks, the opt-in yield back-off, the predicted-acquire, adaptive-commit and present-retire deadline
+waits. The display/acquire/slot pacing waits are untimed condition waits released by the `totk-vsync` callback and
+do not change. `sh tests/timer_slack/run.sh <absolute .scratch>` checks the switch and prints host `nanosleep`
+lateness (x86 host: 10/100/1000 µs sleeps woke ~52/52/54 µs late at p50 with 50 µs slack, ~1.6/1.9/3.8 µs with 1).
+On device, compare `[svc-wait]` `SleepThread` time and frame-time p95 / >50 ms counts with it unset and `=1`.
 
 Android snapshots the startup thread's current allowed set once, after reading `totk.env` and before launching
 the game. It reads `cpuN/cpu_capacity` for **every allowed CPU**. If any capacity is absent/unreadable/invalid,
