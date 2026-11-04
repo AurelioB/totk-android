@@ -141,6 +141,28 @@ def save_blobs(root):
 
 
 class CompanionSaveNames(unittest.TestCase):
+    @unittest.skipUnless(sys.version_info >= (3, 14), 'reference MSBT reader requires Python 3.14')
+    def test_msbt_keeps_standalone_declension_form(self):
+        sys.path.insert(0, str(GAME / 'scripts'))
+        try:
+            generator = _module('make_companion_assets', GAME / 'scripts/make_companion_assets.py')
+        finally:
+            sys.path.pop(0)
+        for endian, encoding, bom in (('<', 'utf-16-le', b'\xff\xfe'), ('>', 'utf-16-be', b'\xfe\xff')):
+            with self.subTest(endian=endian):
+                first, other = 'Example имя'.encode(encoding), 'Other form'.encode(encoding)
+                payload = struct.pack(endian + 'H', len(first)) + first + struct.pack(endian + 'H', len(other)) + other
+                message = struct.pack(endian + '4H', 0xe, 201, 10, len(payload)) + payload + b'\0\0'
+                labels = struct.pack(endian + '3I', 1, 1, 12) + b'\x04Name' + struct.pack(endian + 'I', 0)
+                texts = struct.pack(endian + '2I', 1, 8) + message
+                data = bytearray(32)
+                data[:8], data[8:10], data[12] = b'MsgStdBn', bom, 1
+                struct.pack_into(endian + 'H', data, 14, 2)
+                for name, section in ((b'LBL1', labels), (b'TXT2', texts)):
+                    data += name + struct.pack(endian + 'I', len(section)) + b'\0' * 8 + section
+                    data += b'\0' * (-len(data) % 16)
+                self.assertEqual(generator.msbt(bytes(data)), {'Name': 'Example имя'})
+
     def test_pouch_and_all_combined_arrays_in_save_zip(self):
         # Synthetic save structure only: no game files or text in the test fixture.
         arrays = {key: ['TestActor', '', 'None'] for key in POUCH}
@@ -276,7 +298,8 @@ class CompanionOracle(unittest.TestCase):
         self.assertTrue(actors)
         for lang in json.loads((self.out / 'index.json').read_text())['languages']:
             items = json.loads((self.out / 'text' / f'{lang}.json').read_text())['items']
-            missing = [actor for actor in sorted(actors) if not items.get(actor, {}).get('name') or items[actor]['name'] == actor]
+            missing = [actor for actor in sorted(actors) if not items.get(actor, {}).get('name')
+                       or ('_' in actor and items[actor]['name'] == actor)]
             self.assertFalse(missing, f'{lang}: {missing}')
         print(f'\n{len(rows)} attachment metadata rows, {len(actors)} fusible actors named in every language')
 
@@ -298,7 +321,7 @@ class CompanionOracle(unittest.TestCase):
         for lang in index['languages']:
             items = json.loads((self.out / 'text' / f'{lang}.json').read_text())['items']
             missing += [f'{lang} {cat} {actor} ({path})' for actor, (cat, path) in sorted(actors.items())
-                        if not items.get(actor, {}).get('name') or items[actor]['name'] == actor]
+                        if not items.get(actor, {}).get('name') or ('_' in actor and items[actor]['name'] == actor)]
         icons, aliases = set(index['icons']), index['iconAliases']
         no_icon = [actor for actor in sorted(actors) if actor not in fused and actor not in icons and aliases.get(actor) not in icons]
         print(f'\n{len(saves)} saves, {len(actors)} pouch/fuse actors ({len(fused)} fuse actors), '

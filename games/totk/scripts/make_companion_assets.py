@@ -127,8 +127,9 @@ def msbt(data):
     """LBL1 bucket labels -> TXT2 strings, dropping formatting/control payloads.
 
     MSBT 0x0e tags carry group, type and a byte-length payload; 0x0f closing
-    tags carry group/type only. Skip those structures rather than decoding
-    parameter bytes as UTF-16. Preserve ordinary text/newlines and ruby base text.
+    tags carry group/type only. Skip formatting parameters; declension tags
+    (201/10) contain length-prefixed grammatical forms: keep the first, the standalone/nominative name.
+    Preserve ordinary text/newlines and ruby base text.
     """
     if data[:8] != b'MsgStdBn':
         raise ValueError('Expected MSBT')
@@ -152,7 +153,12 @@ def msbt(data):
             pos += 2
             if ch == 0: break
             if ch == 0xe:
-                length = struct.unpack_from(endian + 'H', texts, pos + 4)[0]
+                group, kind, length = struct.unpack_from(endian + '3H', texts, pos)
+                if group == 201 and kind == 10:
+                    size = struct.unpack_from(endian + 'H', texts, pos + 6)[0]
+                    if length < 2 or size % 2 or size > length - 2 or pos + 6 + length > len(texts):
+                        raise ValueError('Invalid MSBT declension')
+                    pieces += texts[pos + 8:pos + 8 + size]
                 pos += 6 + length
             elif ch == 0xf:
                 pos += 4
