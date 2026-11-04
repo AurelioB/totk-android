@@ -1424,6 +1424,19 @@ and 140/1 → 0/0. Live (`totk.ctl`): each recorder context and primary slot swi
 where it used to reset its pools; switched off, it frees its stock and destroys its pools, returning the retained sets'
 memory (the off policy grows pools again as needed). `descriptor stock: on/off (live; ...)` logs the change once.
 
+`TOTK_VK_DESC_STOCK_MAX_SETS=N` (default unset = no ceiling, today's stock; logs `descriptor stock ceiling: N sets
+per owner ...` or `descriptor stock ceiling: none`) is a hard per-owner ceiling for the stock arm: an owner's stock
+never holds more than N sets, a checkout past N is allocated outside the stock, and at the handoff an owner that
+needed more (set limit) or holds more than ⌈N / pool sets⌉ + 1 pools (pool limit: 1,024-set recorder and 4,096-set
+primary pools) resets its pools and destroys those past the limit, so the arm falls back to reset-and-allocate and
+never keeps more than that. The descriptors line adds `stock sets S (ceiling N/owner)` and `stock resets
+off/pressure/set-limit/pool-limit a/b/c/d pools-destroyed e` per frame: steady `set-limit` or `pools-destroyed`
+above 0 means N is below the scene's demand (each such generation allocates as the off arm does, and pool churn costs a
+pool create per destroy). Live (`totk.ctl`, 0…1048576, 0 = none) at the same generation handoff; a lower value applies
+there at once. Host `--lag-walk-bench 32` (REC_THREADS=2, FRAME_LAG=1, stock on): stock sets 8,000 → 859 at N=128,
+pools 16 in both. `vkdrawtest --descriptor-stock` checks the set limit, reuse under it, live lowering, the pool limit
+and live off on one recorder context, and the primary slots' fallback below the ceiling.
+
 `recorder overhead ...` additionally separates synchronous secondary recording, batched ExecuteCommands, walking
 and worker pool-reset time, and job setup. Reset is a subset of inline/worker busy time, not another additive cost.
 Worker pool resets are lazy on their owner; only generation/version bookkeeping remains in walking slot reset.

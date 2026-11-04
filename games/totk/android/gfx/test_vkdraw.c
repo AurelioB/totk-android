@@ -2887,6 +2887,7 @@ int main(int argc, char **argv) {
         mtl_drain();
         int stock = vk_desc_stock_enabled();
         CHECK(vk_record_test_descriptor_stock(), "layout-isolated stock checkout, retirement, batching and pressure rebuild");
+        CHECK(vk_record_test_descriptor_ceiling(), "stock ceiling: set limit, reuse under it, live lowering, pool limit and live off");
         /* The pool shape: a layout with one binding of every declared type comes from a fresh real pool (it used to
            need SAMPLER no more than one per set); a type no pool declares is refused before it could reach one. */
         {
@@ -2928,7 +2929,11 @@ int main(int argc, char **argv) {
         printf("descriptor-stock primary stock=%d 16 warm submissions: sets=%llu calls=%llu resets=%llu\n", stock,
             (unsigned long long)sets, (unsigned long long)calls, (unsigned long long)resets);
         CHECK(unique, "primary slot never issues one set twice in a submission");
-        if (stock) CHECK(!sets && !calls && !resets, "warm primary stock needs no allocations or pool resets (%llu/%llu/%llu)",
+        uint32_t ceiling = vk_desc_stock_ceiling();
+        if (stock && ceiling && ceiling < 100)   /* every submission needs more than the ceiling: reset-and-allocate */
+            CHECK(sets == 1600 && resets >= 16, "a ceiling below each submission's 100 sets falls back to allocating every set and resetting per slot (%llu/%llu/%llu)",
+                (unsigned long long)sets, (unsigned long long)calls, (unsigned long long)resets);
+        else if (stock) CHECK(!sets && !calls && !resets, "warm primary stock needs no allocations or pool resets (%llu/%llu/%llu)",
             (unsigned long long)sets, (unsigned long long)calls, (unsigned long long)resets);
         else CHECK(sets == 1600 && calls == 1600 && resets >= 16, "default primary path allocates per set and resets per slot (%llu/%llu/%llu)",
             (unsigned long long)sets, (unsigned long long)calls, (unsigned long long)resets);

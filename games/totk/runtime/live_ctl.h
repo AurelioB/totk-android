@@ -43,6 +43,7 @@ static const totk_live_switch totk_live_switches[] = {
     {"TOTK_PRIO_RENDER", -20, 19},           /* at the application, by tid on the registered render threads */
     {"TOTK_TIMER_SLACK_NS", 1, 50000},       /* each game / frame thread before its next timed wait */
     {"TOTK_VK_DESC_STOCK", 0, 1},            /* each descriptor owner at its next slot generation */
+    {"TOTK_VK_DESC_STOCK_MAX_SETS", 0, 1048576}, /* the same handoff; 0 = no ceiling */
     {"TOTK_VK_UNWRITTEN_MASK", 0, 1},        /* pipelines built afterwards; built ones keep their masks */
     {"TOTK_VK_SPLIT_PASS_DRAWS", 0, 1000000},/* the next render pass opened */
     {"TOTK_VK_FEEDBACK_CUT", 0, 1},          /* the next descriptor build */

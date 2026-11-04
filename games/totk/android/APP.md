@@ -1946,6 +1946,7 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_PRIO_RENDER` | −20…19 | at the application, by tid on every registered render thread | unset returns each to the nice it inherited; the walker keeps `TOTK_PRIO_WALK` when that is set; render threads started later take the live value |
 | `TOTK_TIMER_SLACK_NS` | 1…50000 | each game / frame thread before its next timed wait (the presenting thread at once) | unset returns to the launch value, else the thread's default (50 µs) |
 | `TOTK_VK_DESC_STOCK` | 0–1 | each recorder context and primary slot at its next slot generation | switched off, an owner frees its stock and destroys its descriptor pools, so the retained memory goes back |
+| `TOTK_VK_DESC_STOCK_MAX_SETS` | 0…1048576 | each recorder context and primary slot at its next slot generation | 0 = no ceiling; lowered below an owner's stock, that owner resets its pools and destroys those past the limit at once |
 | `TOTK_VK_UNWRITTEN_MASK` | 0–1 | pipelines and output libraries built afterwards | pipelines already built keep their masks (the key does not carry the switch): compare it with a restart, or read the per-300 count of masked new pipelines |
 | `TOTK_VK_SPLIT_PASS_DRAWS` | 0…1000000 | the next render pass opened | |
 | `TOTK_VK_FEEDBACK_CUT` | 0–1 | the next descriptor build | the freeze memo key carries the pass serial while it is on |

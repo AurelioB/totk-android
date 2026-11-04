@@ -133,21 +133,30 @@ extern const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES];
 int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size);
 /* Descriptor-set stock (TOTK_VK_DESC_STOCK=1, read once with the recorder controls). One stock per owner that
    used to reset its pools each slot generation: take only checks out sets not yet issued this generation (the
-   caller rewrites every one), retire rewinds them at that same retirement point and returns 1 when the owner must
-   reset the pools it used since the last rebuild (long-lived low use; the stock is already invalidated). */
-enum { VK_DESC_STOCK_BATCH = 32 };
+   caller rewrites every one), retire rewinds them at that same retirement point and returns a reason when the owner
+   must reset the pools it used since the last rebuild (the stock is already invalidated).
+   TOTK_VK_DESC_STOCK_MAX_SETS (vk_desc_stock_ceiling, live at the same handoff) is a hard per-owner ceiling: the stock
+   never holds more sets; a checkout past it is allocated outside the stock, and the handoff then resets the owner
+   (set limit). An owner also keeps at most vk_desc_stock_pool_limit pools: one with more resets and destroys the rest
+   (pool limit). Reasons are counted on the descriptors line. */
+enum { VK_DESC_STOCK_BATCH = 32, VK_DESC_PRIMARY_POOL_SETS = 4096 /* a primary slot's pool (nvn_vk.c) */ };
+enum { VK_DESC_STOCK_OFF, VK_DESC_STOCK_PRESSURE, VK_DESC_STOCK_SET_LIMIT, VK_DESC_STOCK_POOL_LIMIT, VK_DESC_STOCK_REASONS };
 typedef struct vk_desc_stock vk_desc_stock;
 typedef uint32_t (*vk_desc_stock_alloc)(void *owner, VkDescriptorSetLayout layout, uint32_t count, VkDescriptorSet *out); /* 1..count */
 int vk_desc_stock_enabled(void);   /* the launch value */
 int vk_desc_stock_want(void);      /* the live value an owner takes at its generation handoff (runtime/live_ctl.h) */
+uint32_t vk_desc_stock_ceiling(void);   /* live sets per owner, 0: no ceiling */
+uint32_t vk_desc_stock_pool_limit(uint32_t ceiling, uint32_t pool_sets);   /* pools an owner keeps; UINT32_MAX without a ceiling */
 VkDescriptorSet vk_desc_stock_take(vk_desc_stock **stock, VkDescriptorSetLayout layout, vk_desc_stock_alloc alloc, void *owner);
-int vk_desc_stock_retire(vk_desc_stock *stock);
+int vk_desc_stock_retire(vk_desc_stock *stock, uint32_t ceiling, uint32_t pools, uint32_t pool_sets); /* 0: keep */
 void vk_desc_stock_free(vk_desc_stock **stock);   /* the owner switched the stock off: its bookkeeping, not its pools */
+void vk_record_descriptor_stock_event(unsigned reason, uint64_t pools_destroyed); /* serialized primary owner */
 int vk_record_counter_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2 stage);
 #ifdef TOTK_VK_TESTS
 void vk_record_test_descriptor_retained(uint64_t out[4]); /* recorder pools, primary pools, stock sets, bytes per pool */
 void vk_record_test_descriptors(uint64_t out[8]); /* sets, allocate calls, resets, walk ns, list ns/count, template ns/count */
 int vk_record_test_descriptor_stock(void); /* isolated real-driver checkout/recycle/batch/pressure fixture */
+int vk_record_test_descriptor_ceiling(void); /* the stock ceiling on one recorder context, set live at its handoffs */
 void vk_record_test_storage(uint64_t values[4]); /* retention budget, reclaimed slots/bytes/secondary CBs */
 void vk_record_test_primary_memory(uint64_t values[2]); /* retained primary CBs, reclaimed primary CBs */
 void vk_record_test_leases(uint64_t values[4]); /* published active leases, summed worker peak, returned leases, cold resets */

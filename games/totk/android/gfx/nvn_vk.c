@@ -2235,20 +2235,37 @@ static void slot_begin_inner(void) {
    at the same point the pools used to be reset: busy and submit_busy have retired, replay pins have released the
    slot, or a cancelled optional pre-submit never reached the GPU. Every caller writes the set it gets.
    A live TOTK_VK_DESC_STOCK (vk_desc_stock_want) switches the slot here too; switched off, the slot frees its stock and
-   destroys its pools (nothing of the retired generation is in use), and grows pools again as the off policy needs. */
+   destroys its pools (nothing of the retired generation is in use), and grows pools again as the off policy needs.
+   With TOTK_VK_DESC_STOCK_MAX_SETS the stock is capped (vk_record.h): a reset for the ceiling also destroys the pools
+   past vk_desc_stock_pool_limit, at this same point. */
+static void slot_descriptors_trim(slot_t *s, int keep) {
+    if (keep >= s->ndpool) return;
+    for (int i = keep; i < s->ndpool; i++) vkDestroyDescriptorPool(V.dev, s->dpools[i], NULL);
+    vk_record_primary_pools(-(int64_t)(s->ndpool - keep));
+    s->ndpool = keep;
+}
 static void slot_descriptors_recycle(slot_t *s) {
     int want = vk_desc_stock_want();
     if (s->dstock_on && !want) {
         vk_desc_stock_free(&s->dstock);
-        for (int i = 0; i < s->ndpool; i++) vkDestroyDescriptorPool(V.dev, s->dpools[i], NULL);
-        vk_record_primary_pools(-(int64_t)s->ndpool);
-        s->ndpool = s->curdpool = s->curdsets = 0; s->dstock_on = 0;
+        vk_record_descriptor_stock_event(VK_DESC_STOCK_OFF, (uint64_t)s->ndpool);
+        slot_descriptors_trim(s, 0);
+        s->curdpool = s->curdsets = 0; s->dstock_on = 0;
         return;
     }
-    if (s->dstock_on && !vk_desc_stock_retire(s->dstock)) return;
+    uint32_t ceiling = want ? vk_desc_stock_ceiling() : 0, limit = vk_desc_stock_pool_limit(ceiling, VK_DESC_PRIMARY_POOL_SETS);
+    int keep = s->ndpool, reason = 0;
+    if (s->dstock_on) {
+        reason = vk_desc_stock_retire(s->dstock, ceiling, (uint32_t)s->ndpool, VK_DESC_PRIMARY_POOL_SETS);
+        if (!reason) return;
+    } else if (want && (uint32_t)s->ndpool > limit) reason = VK_DESC_STOCK_POOL_LIMIT;   /* switched on live over the limit */
+    if (reason && reason != VK_DESC_STOCK_PRESSURE && (uint32_t)keep > limit) keep = (int)limit;
     int dirty = s->dstock_on ? (s->ndpool ? s->curdpool + 1 : 0) : s->ndpool;   /* a stock rebuild: pools used since the last */
+    if (dirty > keep) dirty = keep;
     for (int i = 0; i < dirty; i++) VKCHECK(vkResetDescriptorPool(V.dev, s->dpools[i], 0));
     vk_record_descriptor_primary(0, 0, (uint64_t)dirty);
+    if (reason) vk_record_descriptor_stock_event((unsigned)reason, (uint64_t)(s->ndpool - keep));
+    slot_descriptors_trim(s, keep);
     s->curdpool = 0; s->curdsets = 0;
     s->dstock_on = want;   /* switched on: the stock starts empty on reset pools */
 }
@@ -2381,7 +2398,7 @@ void *vk_transient(size_t size, size_t align, VkBuffer *buf, VkDeviceSize *off) 
     if (!g_cur) slot_begin();
     return arena_alloc(&g_cur->ar, size, align, buf, off);
 }
-#define DPOOL_SETS 4096
+#define DPOOL_SETS VK_DESC_PRIMARY_POOL_SETS
 /* Allocates count (1..VK_DESC_STOCK_BATCH) sets from slot s, fewer near the end of a pool; never fewer than one. */
 static uint32_t slot_alloc_sets(void *owner, VkDescriptorSetLayout layout, uint32_t count, VkDescriptorSet *out) {
     slot_t *s = owner;
