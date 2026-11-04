@@ -61,6 +61,9 @@ static AndroidGamePause game_pause = ANDROID_GAME_PAUSE_INIT;
 int runtime_android_game_paused(void) {
     return atomic_load_explicit(&game_pause.paused, memory_order_acquire);
 }
+AndroidGameSuspension runtime_android_game_suspension(void) {
+    return android_game_pause_suspension(&game_pause);
+}
 void runtime_android_game_pause_wait(void) {
     if (!runtime_android_game_paused() || runtime_fs_save_pending()) return;
     uint64_t begin = runtime_now_ns();

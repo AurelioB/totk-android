@@ -1903,8 +1903,12 @@ needs `su`). The folder holds what the adb-shell folder holds:
   The AAudio callback mutes immediately and discards pre-pause samples. Its device worker requests pause then flush,
   and restarts only after flush completes, with fresh prefill; no queued background audio plays on return. The renderer
   keeps signalling its frame event at the normal 5-ms cadence, without advancing voices or holding its lock across a
-  pause wait. Guest/host monotonic clocks continue; the existing realtime frame-step producer rejects intervals over
-  250 ms and resets its five-frame history rather than feeding the background interval into physics.
+  pause wait. The pause gate accumulates monotonic suspension time (including an ongoing pause); VP9 movies
+  shift their first-frame deadline by each new suspended interval under the decoder lock and release no video
+  during save-completion frames while audio is frozen. Resume therefore preserves the next movie PTS instead
+  of dropping queued video as late. `[movie] resume` reports the applied shift, next PTS and cumulative dropped
+  frames. Guest/host monotonic clocks themselves continue; the existing realtime frame-step producer rejects
+  intervals over 250 ms and resets its five-frame history rather than feeding the background interval into physics.
 - **Save signals.** `fs_host.c` creates `<private>/state/save-busy` on the first change to save data and, on the
   `Commit` that completes it with every fsync successful, removes it and rewrites `state/save-generation` (counter,
   tmp+rename). The game-process `SaveMirror.Watcher` polls it (1 s), waits 3 s and for `save-busy` to be gone, then
