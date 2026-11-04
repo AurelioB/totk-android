@@ -27,7 +27,6 @@ public final class Handler {
     public Handler(Looper looper) {}
     public boolean post(Runnable callback) { return true; }
     public boolean postDelayed(Runnable callback, long delay) { return true; }
-    public void removeCallbacks(Runnable callback) {}
     public void removeCallbacksAndMessages(Object token) {}
 }''',
     'android/os/HandlerThread.java': '''package android.os;
@@ -41,21 +40,15 @@ public final class HandlerThread {
     'android/os/SystemClock.java': '''package android.os;
 public final class SystemClock {
     public static long elapsedRealtime() { return 0; }
-    public static long uptimeMillis() { return 0; }
 }''',
-    'android/os/Process.java': '''package android.os;
-public final class Process { public static int myPid() { return 123; } }
-''',
     'android/content/Context.java': '''package android.content;
 public class Context {
     public void startActivity(Intent intent) { throw new AssertionError("the probe reports no game error"); }
-    public java.io.File getFilesDir() { return new java.io.File(System.getProperty("java.io.tmpdir")); }
 }''',
     'android/content/Intent.java': '''package android.content;
 public class Intent {
     public Intent setClassName(Context context, String name) { return this; }
     public Intent putExtra(String name, String value) { return this; }
-    public boolean getBooleanExtra(String name, boolean fallback) { return fallback; }
 }''',
     'com/aure/totk/setup/SetupActivity.java': '''package com.aure.totk.setup;
 public final class SetupActivity {
@@ -68,7 +61,6 @@ public final class Build {
     'android/util/Log.java': '''package android.util;
 public final class Log {
     public static int w(String tag, String message) { return 0; }
-    public static int i(String tag, String message) { return 0; }
     public static int w(String tag, String message, Throwable error) { return 0; }
 }''',
     'android/view/AttachedSurfaceControl.java': '''package android.view;
@@ -95,9 +87,6 @@ public class NativeActivity extends Context {
     public static Runnable initialize, destroy;
     public static boolean initialized;
     protected void onCreate(Bundle state) { initialize.run(); initialized = true; }
-    protected void onNewIntent(android.content.Intent intent) {}
-    public void setIntent(android.content.Intent intent) {}
-    public android.content.Intent getIntent() { return new android.content.Intent(); }
     protected void onResume() {}
     protected void onPause() {}
     protected void onStop() {}

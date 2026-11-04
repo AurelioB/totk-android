@@ -1830,8 +1830,12 @@ needs `su`). The folder holds what the adb-shell folder holds:
   pid/name/importance, lock outcome/exception/cause and marker state.
 - **Close the game.** Installing, moving/deleting game data, changing the driver and replacing saves are disabled
   while `GAME` (errors display their reason instead). The menu re-checks every second and on resume, so controls clear
-  without a restart. *Close the game* waits up to 30 seconds for `state/save-busy` to disappear, then sends an internal
-  intent to non-exported `TotkActivity`; `onNewIntent` waits/checks again and calls the native window-close path.
+  without a restart. *Close the game* waits up to 30 seconds for `state/save-busy` to disappear, then atomically writes
+  `state/close-request` with a unique pid/time id. A non-render native thread checks it every 500 ms (one stat when
+  absent), consumes it and calls the existing native close path. A saving race is refused with a correlated atomic
+  `close-response`; I/O refusal includes errno/reason. The menu waits/retries within its bounded close deadline.
+  This deliberately does **not** start non-exported, `singleTask` `TotkActivity`: that would pop/destroy the menu and
+  lose the pending operation. Neither task affinity nor launcher/recents behavior changes.
   `runtime_fs_begin_close` refuses an active/uncommitted save and atomically gates any later save before its first
   change until process exit. The accepted close flushes the Vulkan pipeline cache and exits, never kills the process.
   The menu waits for the game lock/start marker to clear (bounded), then retries the selected operation. A timeout

@@ -118,6 +118,7 @@ static void driver_setup(const char *private_dir) {
 }
 ''' + native + '''
 static int android_all_files_access(const ANativeActivity *a) { (void)a; return 0; }
+static void android_close_requests_start(const char *private_dir) { (void)private_dir; }
 #define pthread_create create_hook
 #define pthread_detach detach_hook
 ''' + startup + constructors + r'''

@@ -170,7 +170,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private Runnable blockedAction;
     private String blockedNeed = "Installing";
     private boolean closingGame, closeSent;
-    private long closeDeadline, gameCheckedAt;
+    private long closeDeadline, closeStartedAt, gameCheckedAt;
+    private String closeId = "";
     private TextView gameNotice;
     private Widgets.Action closeGameAction;
 
@@ -229,7 +230,9 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private void closeGame() {
         if (closingGame) return;
         closingGame = true; closeSent = false;
-        closeDeadline = SystemClock.uptimeMillis() + 30_000;
+        closeStartedAt = SystemClock.uptimeMillis();
+        closeDeadline = closeStartedAt + 30_000;
+        closeId = android.os.Process.myPid() + ":" + System.nanoTime();
         updateGameNotice();
         main.post(closePoll);
     }
@@ -243,7 +246,14 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 saving = true;
             } catch (java.nio.file.NoSuchFileException idle) { saving = false; }
             catch (IOException | SecurityException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
+            try {
+                String response = GameLock.closeResponse(getFilesDir(), closeId);
+                if (response.equals("saving")) { GameLock.clearClose(getFilesDir(), closeId); closeSent = false; saving = true; }
+                else if (response.startsWith("error:")) { closeFailed(Strings.gameLockError(response)); return; }
+            } catch (IOException | SecurityException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
             if (!saving && state.free()) {
+                try { GameLock.clearClose(getFilesDir(), closeId); }
+                catch (IOException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
                 Runnable retry = blockedAction;
                 closingGame = false; blockedAction = null; gameState = state;
                 render();
@@ -254,17 +264,18 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             if (SystemClock.uptimeMillis() >= closeDeadline) { closeFailed(saving ? Strings.SAVE_WAIT_TIMEOUT : Strings.CLOSE_GAME_TIMEOUT); return; }
             if (!saving && !closeSent) {
                 try {
-                    startActivity(new Intent(SetupActivity.this, TotkActivity.class).putExtra(TotkActivity.EXTRA_CLOSE_GAME, true)
-                            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION));
+                    GameLock.requestClose(getFilesDir(), closeId);
                     closeSent = true;
-                    closeDeadline = SystemClock.uptimeMillis() + 35_000;
-                } catch (RuntimeException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
+                    closeDeadline = Math.min(SystemClock.uptimeMillis() + 35_000, closeStartedAt + 65_000);
+                } catch (IOException | RuntimeException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
             }
             updateGameNotice();
             main.postDelayed(this, 200);
         }
     };
     private void closeFailed(String message) {
+        try { GameLock.clearClose(getFilesDir(), closeId); }
+        catch (IOException failed) { android.util.Log.w("TotkSetup", "close game: request cleanup failed", failed); }
         closingGame = false; blockedAction = null;
         note = message; noteOk = false;
         render();
@@ -482,6 +493,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         overridePendingTransition(0, 0);
     }
     private void startGame() {
+        if (closingGame) return;
         if (SetupService.status.running) { if (screen == Screen.INSTALL) playNow(); return; }
         if (!StorageLocation.available(this) || !InstallState.read(this).playable()) return;
         // A sync with the save folder in progress may be bringing in newer saves: start once it is done.

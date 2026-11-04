@@ -50,7 +50,6 @@ void runtime_input_key_synthetic(unsigned code, int down) {
 void runtime_android_present_transform_hint(uint64_t epoch, int hint) { (void)epoch; (void)hint; }
 /* TotkActivity's text dialog and rumble/motion bridges (frontend_android.c, feedback_android.c): not part of this probe. */
 void runtime_android_text_done(JNIEnv *env, jclass cls, jlong serial, jbyteArray utf8) { (void)env; (void)cls; (void)serial; (void)utf8; }
-jboolean runtime_android_request_close(JNIEnv *env, jclass cls) { (void)env; (void)cls; return JNI_FALSE; }
 void runtime_android_motion(JNIEnv *env, jclass cls, jfloat ax, jfloat ay, jfloat az, jfloat gx, jfloat gy, jfloat gz) {
     (void)env; (void)cls; (void)ax; (void)ay; (void)az; (void)gx; (void)gy; (void)gz;
 }

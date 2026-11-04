@@ -88,6 +88,27 @@ public final class GameLockProbe {
                 check(!new File(dir, "state/game-starting").exists(), "refused launch left marker");
                 System.out.println("FREE"); break;
             }
+            case "close-transport": {
+                check(GameLock.check(dir, false).free(), "initial lock");
+                File request = new File(dir, "state/close-request");
+                GameLock.requestClose(dir, "123:456");
+                check(Files.readString(request.toPath()).equals("123:456\n"), "atomic request payload");
+                check(!new File(dir, "state/close-request.tmp").exists(), "request temp left behind");
+                Process busy = new ProcessBuilder(args[2], "close-busy", dir.getPath()).start();
+                check(busy.waitFor() == 0, "busy poll did not run");
+                check(!request.exists() && GameLock.closeResponse(dir, "123:456").equals("saving"), "missing correlated saving refusal");
+                check(GameLock.closeResponse(dir, "another").isEmpty(), "old refusal applied to another request");
+                GameLock.clearClose(dir, "123:456");
+                GameLock.requestClose(dir, "123:789");
+                Process accepted = new ProcessBuilder(args[2], "close-accepted", dir.getPath()).start();
+                check(accepted.waitFor() == 0 && !request.exists(), "accepted close did not consume request before exit");
+                check(GameLock.closeResponse(dir, "123:789").isEmpty(), "accepted close left a refusal");
+                Files.createDirectory(request.toPath());
+                Process failed = new ProcessBuilder(args[2], "close-error", dir.getPath()).start();
+                check(failed.waitFor() == 0, "I/O error poll did not run");
+                check(GameLock.closeResponse(dir, "123:789").contains("error: read close-request errno="), "I/O error lost its reason/errno");
+                System.out.println("atomic marker close transport complete"); break;
+            }
         }
     }
 }
@@ -109,9 +130,17 @@ JNIEXPORT jstring JNICALL Java_com_aure_totk_setup_GameLockProbe_move(JNIEnv *en
     jstring value = result ? (*env)->NewStringUTF(env, result) : NULL;
     free(result); return value;
 }
+static void close_busy(void) {}
+static void close_accepted(void) { _exit(0); }
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
     if (!strcmp(argv[1], "finish")) return android_game_start_finished(argv[2]) ? 4 : 0;
+    if (!strncmp(argv[1], "close-", 6)) {
+        AndroidClosePaths paths;
+        if (android_close_paths(&paths, argv[2])) return 5;
+        int result = android_close_poll(&paths, !strcmp(argv[1], "close-accepted") ? close_accepted : close_busy);
+        return !strcmp(argv[1], "close-error") ? (result == -1 ? 0 : 6) : (result == 1 ? 0 : 7);
+    }
     char why[600];
     int fd = android_game_lock(argv[2], 0, why, sizeof why);
     if (fd < 0) { puts(why); return 3; }
@@ -176,6 +205,9 @@ class GameLockTests(unittest.TestCase):
     def test_marker_launch_gap_and_game_removal(self):
         self.assertEqual(self.probe('handshake', self.exe), 'marker handshake complete')
         self.assertEqual(self.probe('refused'), 'FREE')
+
+    def test_atomic_close_marker_busy_error_and_accepted_exit(self):
+        self.assertEqual(self.probe('close-transport', self.exe), 'atomic marker close transport complete')
 
     def test_stale_marker_is_removed_without_default_process(self):
         (self.case / 'state').mkdir()

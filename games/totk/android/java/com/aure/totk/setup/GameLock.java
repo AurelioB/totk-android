@@ -122,6 +122,8 @@ final class GameLock {
             if (!state.isDirectory() && !state.mkdirs() && !state.isDirectory()) throw new IOException("cannot create " + state);
             File marker = new File(state, "game-starting");
             String key = marker.getCanonicalPath();
+            Files.deleteIfExists(new File(state, "close-request").toPath());
+            Files.deleteIfExists(new File(state, "close-response").toPath());
             Files.write(marker.toPath(), ("time=" + time + " pid=" + pid + "\n").getBytes(StandardCharsets.US_ASCII));
             launching.put(key, System.nanoTime() + 4_000_000_000L);
             logger.log("game start marker written time=" + time + " pid=" + pid);
@@ -129,5 +131,33 @@ final class GameLock {
             catch (RuntimeException failed) { launching.remove(key); Files.deleteIfExists(marker.toPath()); throw failed; }
         }
     }
+    /** Private cross-process close transport: unlike a SINGLE_TASK activity intent, it cannot destroy the menu. */
+    static void requestClose(File filesDir, String id) throws IOException {
+        synchronized (MUTEX) {
+            File state = new File(filesDir, "state");
+            Files.deleteIfExists(new File(state, "close-response").toPath());
+            Settings.writeAtomic(state, "close-request", id + "\n");
+            logger.log("close game: request=" + id + " marker=published");
+        }
+    }
+    static String closeResponse(File filesDir, String id) throws IOException {
+        String response;
+        try { response = new String(Files.readAllBytes(new File(filesDir, "state/close-response").toPath()), StandardCharsets.US_ASCII); }
+        catch (java.nio.file.NoSuchFileException none) { return ""; }
+        if (response.startsWith(id + "\n")) return response.substring(id.length() + 1).trim();
+        return response.startsWith("\nerror:") ? response.trim() : "";
+    }
+    static void clearClose(File filesDir, String id) throws IOException {
+        synchronized (MUTEX) {
+            File request = new File(filesDir, "state/close-request"), response = new File(filesDir, "state/close-response");
+            try { if (new String(Files.readAllBytes(request.toPath()), StandardCharsets.US_ASCII).trim().equals(id)) Files.deleteIfExists(request.toPath()); }
+            catch (java.nio.file.NoSuchFileException gone) { }
+            try {
+                String text = new String(Files.readAllBytes(response.toPath()), StandardCharsets.US_ASCII);
+                if (text.startsWith(id + "\n") || text.startsWith("\nerror:")) Files.deleteIfExists(response.toPath());
+            } catch (java.nio.file.NoSuchFileException gone) { }
+        }
+    }
+
     private GameLock() { }
 }

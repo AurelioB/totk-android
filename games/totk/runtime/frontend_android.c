@@ -1374,6 +1374,7 @@ static void driver_setup(const char *private_dir) {
 static char g_rewritten[1200];
 /* All files access right now (start_game; defined with the activity callbacks, which own the JNI calls). */
 static int android_all_files_access(const ANativeActivity *a);
+static void android_close_requests_start(const char *private_files);
 static void *game_thread(void *arg) {
     (void)arg;
     totk_thread_start("totk-boot", NULL);
@@ -1542,6 +1543,7 @@ static int start_game(const ANativeActivity *a) {
     pthread_t t; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 64u << 20);
     if (pthread_create(&t, &at, game_thread, NULL)) { fprintf(stderr, "[totk-app] game thread: %s\n", strerror(errno)); return 0; }
     pthread_attr_destroy(&at); pthread_detach(t);
+    android_close_requests_start(priv);
     return 1;
 }
 
@@ -1676,14 +1678,27 @@ void runtime_front_request_close(void) {
     __android_log_print(ANDROID_LOG_INFO, "TotkSetup", "close game: pid=%d save=idle; native pipeline-cache flush and exit", getpid());
     fprintf(stderr, "[totk] close requested: flushing pipeline cache and exiting\n"); vk_pcache_shutdown(); _exit(0);
 }
-/* The menu has already waited for save-busy. Check in the game too, closing the cross-process observation gap. */
-jboolean runtime_android_request_close(JNIEnv *env, jclass cls) {
-    (void)env; (void)cls;
-    const char *busy = getenv("TOTK_SAVE_BUSY");
-    struct stat st;
-    if (runtime_fs_save_busy() || (busy && (!stat(busy, &st) || errno != ENOENT))) return JNI_FALSE;
-    runtime_front_request_close();
-    return JNI_FALSE;   /* only reached when a save won native close admission; the activity retries */
+/* One stat per 500 ms on this non-render thread; no activity launch, task-affinity changes or frame-loop I/O. */
+static void *android_close_requests(void *arg) {
+    AndroidClosePaths paths;
+    if (android_close_paths(&paths, arg)) {
+        __android_log_print(ANDROID_LOG_ERROR, "TotkSetup", "close game: path error errno=%d (%s)", errno, strerror(errno));
+        return NULL;
+    }
+    for (;;) {
+        int result = android_close_poll(&paths, runtime_front_request_close);
+        if (result) __android_log_print(result < 0 ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "TotkSetup",
+                "close game: pid=%d request=%s errno=%d (%s)", getpid(), result < 0 ? "I/O-error" : "saving-refused",
+                result < 0 ? errno : 0, result < 0 ? strerror(errno) : "save in progress");
+        struct timespec pause = {0, 500 * 1000000L};
+        while (nanosleep(&pause, &pause) && errno == EINTR) { }
+    }
+}
+static void android_close_requests_start(const char *private_files) {
+    pthread_t thread;
+    int error = pthread_create(&thread, NULL, android_close_requests, (void *)private_files);
+    if (!error) pthread_detach(thread);
+    else __android_log_print(ANDROID_LOG_ERROR, "TotkSetup", "close game: poller unavailable errno=%d (%s)", error, strerror(error));
 }
 
 /* ---------- text entry (nn::swkbd, runtime/swkbd_host.c) ----------

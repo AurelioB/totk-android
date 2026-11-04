@@ -17,33 +17,6 @@ import java.nio.charset.StandardCharsets;
 /** The game remains a NativeActivity; only eligible external displays get a Java UI.
  * SetupActivity (process ":setup") starts it once install.json is playable; the game process never loads the setup library. */
 public final class TotkActivity extends NativeActivity {
-    /** Internal, non-exported activity command from the menu; the native side checks saving again before exiting. */
-    public static final String EXTRA_CLOSE_GAME = "com.aure.totk.CLOSE_GAME";
-    private static native boolean nativeRequestClose();
-    private final android.os.Handler closeHandler = new android.os.Handler(android.os.Looper.getMainLooper());
-    private long closeDeadline;
-    private final Runnable closeWhenIdle = new Runnable() {
-        @Override public void run() {
-            if (android.os.SystemClock.uptimeMillis() >= closeDeadline) {
-                Log.w("TotkSetup", "close game: save still busy after 30 s; leaving game running");
-                return;
-            }
-            if (new java.io.File(getFilesDir(), "state/save-busy").exists() || !nativeRequestClose()) {
-                Log.i("TotkSetup", "close game: waiting for save-busy/native save writers");
-                closeHandler.postDelayed(this, 200);
-            }
-        }
-    };
-    @Override protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        setIntent(intent);
-        if (intent.getBooleanExtra(EXTRA_CLOSE_GAME, false)) {
-            Log.i("TotkSetup", "close game: graceful request pid=" + android.os.Process.myPid());
-            closeDeadline = android.os.SystemClock.uptimeMillis() + 30_000;
-            closeHandler.removeCallbacks(closeWhenIdle);
-            closeHandler.post(closeWhenIdle);
-        }
-    }
     private PresentationController companion;
     /** Copies the saves to the player's save folder after each in-game save (null when no folder is set). */
     private SaveMirror.Watcher saves;
@@ -121,10 +94,6 @@ public final class TotkActivity extends NativeActivity {
     }
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
-        if (getIntent().getBooleanExtra(EXTRA_CLOSE_GAME, false)) {
-            closeDeadline = android.os.SystemClock.uptimeMillis() + 30_000;
-            closeHandler.post(closeWhenIdle);
-        }
         // NativeActivity synchronously loads totk.env in ANativeActivity_onCreate.
         // Query only after super, before constructing a controller or display listener.
         // The companion art is generated on the device by the optional setup stage; without it the companion stays off.
@@ -149,7 +118,6 @@ public final class TotkActivity extends NativeActivity {
         super.onStop();
     }
     @Override protected void onDestroy() {
-        closeHandler.removeCallbacks(closeWhenIdle);
         updatePresentPrerotate(0);
         if (companion != null) { companion.close(); companion = null; }
         if (saves != null) { saves.close(1500); saves = null; }
