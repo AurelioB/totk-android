@@ -155,6 +155,11 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(service[(A, 'foregroundServiceType')], (0x11, 1))
         self.assertEqual(service[(A, 'exported')], FALSE)
         self.assertEqual(service[(A, 'process')], (3, ':setup'))
+        control = by_name(m, 'service', 'com.aure.totk.GameControlService')
+        self.assertEqual(control[(A, 'exported')], FALSE)
+        self.assertNotIn((A, 'process'), control)
+        self.assertNotIn((A, 'foregroundServiceType'), control)
+        self.assertNotIn((A, 'process'), app)
         # One launcher entry: the setup screen; the game is started by it once install.json says playable.
         tags = [t for t, _ in m['all']]
         self.assertEqual(tags.count('intent-filter'), 1)

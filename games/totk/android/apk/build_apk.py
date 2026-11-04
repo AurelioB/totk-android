@@ -29,6 +29,7 @@ LABEL = 'TotK Native'
 SETUP_ACTIVITY = 'com.aure.totk.setup.SetupActivity'
 SETUP_SERVICE = 'com.aure.totk.setup.SetupService'
 GAME_ACTIVITY = 'com.aure.totk.TotkActivity'
+GAME_CONTROL_SERVICE = 'com.aure.totk.GameControlService'
 SETUP_PROCESS = ':setup'
 # MANAGE_EXTERNAL_STORAGE: optional All files access (direct file access, as Azahar's non-Play build); the app works
 # without it through the Storage Access Framework. The APK is distributed outside Google Play (see the Azahar notes in
@@ -120,6 +121,7 @@ def manifest_tree(package, label, version_code, version_name, min_sdk, target_sd
             ]),
             ('service', [(A, 'name', 'str', SETUP_SERVICE), (A, 'exported', 'bool', False), (A, 'process', 'str', SETUP_PROCESS),
                          (A, 'foregroundServiceType', 'hex', FOREGROUND_DATA_SYNC)], []),
+            ('service', [(A, 'name', 'str', GAME_CONTROL_SERVICE), (A, 'exported', 'bool', False)], []),
         ]),
     ])
 

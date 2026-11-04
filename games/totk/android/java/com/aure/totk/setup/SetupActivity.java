@@ -3,8 +3,10 @@ package com.aure.totk.setup;
 import android.Manifest;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
+import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.content.ServiceConnection;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ShortcutInfo;
@@ -20,6 +22,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.os.storage.StorageManager;
@@ -40,6 +43,7 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import com.aure.totk.TotkActivity;
+import com.aure.totk.GameControlService;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -172,6 +176,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private boolean closingGame, closeSent;
     private long closeDeadline, closeStartedAt, gameCheckedAt;
     private String closeId = "";
+    private ServiceConnection closeConnection;
     private TextView gameNotice;
     private boolean started, uiStarted;
     private Widgets.Action closeGameAction;
@@ -236,25 +241,70 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             render();
         }
     }
-    /** No signals, kills or force-stop while a save is busy. The game also re-checks it in its own process. */
+    /** A foreground binding thaws a cached game before waiting for its save. Only the lock decides whether it closed;
+     * binding can create an empty default process if the game dies between the check and bindService. */
     private void closeGame() {
-        if (closingGame) return;
+        if (closingGame || !started) return;
         closingGame = true; closeSent = false;
         closeStartedAt = SystemClock.uptimeMillis();
         closeDeadline = closeStartedAt + 30_000;
         closeId = android.os.Process.myPid() + ":" + System.nanoTime();
+        gameState = InstallState.gameState(this);
+        if (gameState.state == GameLock.State.GAME) {
+            closeConnection = new ServiceConnection() {
+                private void changed() {
+                    if (closeConnection != this || !closingGame) return;
+                    main.removeCallbacks(closePoll);
+                    main.post(closePoll);
+                }
+                @Override public void onServiceConnected(ComponentName name, IBinder service) { changed(); }
+                // Android reports remote binder death here. A disconnect alone is not proof that the lock is free.
+                @Override public void onServiceDisconnected(ComponentName name) { changed(); }
+                @Override public void onBindingDied(ComponentName name) { changed(); }
+                @Override public void onNullBinding(ComponentName name) { changed(); }
+            };
+            try {
+                // The ordinary binding inherits the visible client's importance; no ABOVE_CLIENT/IMPORTANT, activity
+                // start, foreground service or notification is needed, and the service never starts the runtime.
+                if (!bindService(new Intent(this, GameControlService.class), closeConnection, BIND_AUTO_CREATE)) {
+                    closeFailed(Strings.gameLockError("Could not bind the game control service"));
+                    return;
+                }
+            } catch (RuntimeException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
+        }
         updateGameNotice();
         main.post(closePoll);
     }
+    private void releaseCloseBinding() {
+        ServiceConnection connection = closeConnection;
+        closeConnection = null;
+        if (connection != null) {
+            try { unbindService(connection); }
+            catch (IllegalArgumentException absent) { /* A refused/failed bind may not have registered the connection. */ }
+        }
+    }
+    /** Stopping/recreating the menu abandons the pending action, not the game's save-safe native close protocol. */
+    private void cancelClose() {
+        main.removeCallbacks(closePoll);
+        if (closingGame) {
+            try { GameLock.clearClose(getFilesDir(), closeId); }
+            catch (IOException failed) { android.util.Log.w("TotkSetup", "close game: request cleanup failed", failed); }
+            closingGame = false; blockedAction = null;
+        }
+        releaseCloseBinding();
+        updateGameNotice();
+    }
     private final Runnable closePoll = new Runnable() {
         @Override public void run() {
-            if (isDestroyed()) return;
+            if (!closingGame || !started || isDestroyed()) return;
             GameLock.Result state = InstallState.gameState(SetupActivity.this);
             if (state.free()) {
                 try { GameLock.clearClose(getFilesDir(), closeId); }
                 catch (IOException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
                 Runnable retry = blockedAction;
                 closingGame = false; blockedAction = null; gameState = state;
+                main.removeCallbacks(closePoll);
+                releaseCloseBinding();
                 render();
                 if (retry != null) retry.run();
                 return;
@@ -287,6 +337,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         try { GameLock.clearClose(getFilesDir(), closeId); }
         catch (IOException failed) { android.util.Log.w("TotkSetup", "close game: request cleanup failed", failed); }
         closingGame = false; blockedAction = null;
+        main.removeCallbacks(closePoll);
+        releaseCloseBinding();
         note = message; noteOk = false;
         render();
         if (gameNotice != null) gameNotice.setText(message);
@@ -351,6 +403,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     @Override protected void onStop() {
         started = false;
+        cancelClose();
         if (uiStarted) {
             uiStarted = false;
             StorageManager storage = getSystemService(StorageManager.class);
@@ -386,7 +439,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         }
     };
     @Override protected void onDestroy() {
-        main.removeCallbacks(closePoll);
+        cancelClose();
         worker.shutdownNow();
         saveWorker.shutdown();   // never interrupted: an upload or swap in progress finishes (FileChannels close on interrupt)
         super.onDestroy();

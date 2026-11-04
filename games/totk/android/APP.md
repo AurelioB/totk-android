@@ -1834,8 +1834,14 @@ needs `su`). The folder holds what the adb-shell folder holds:
   while `GAME` (errors display their reason instead). Dimmed controls remain focusable for handheld navigation;
   activating one records that exact operation and explains the gate, without mutating data. The menu re-checks every
   second and on resume, so controls clear without a restart. The refresh registers once even when the UI appears
-  asynchronously after `onStart`, and unregisters on stop. *Close the game* waits up to 30 seconds for `state/save-busy`
-  to disappear, then atomically writes
+  asynchronously after `onStart`, and unregisters on stop. *Close the game* binds to the non-exported default-process
+  `GameControlService` with `BIND_AUTO_CREATE` only while the lock says `GAME`. The foreground menu's ordinary binding
+  lifts the game out of Android's cached-app freezer **before** waiting for a save, allowing both the save and the
+  native poller to progress. The service returns an inert Binder and never initializes the runtime, starts an activity,
+  or posts a notification. A disconnect/death merely triggers another lock check: the lock, not the existence of a
+  bound default process, decides whether the game is running. The binding is released on success, failure/timeout,
+  and activity stop/destruction; a recreated menu never retains the old connection or its pending action.
+  It waits up to 30 seconds for `state/save-busy` to disappear, then atomically writes
   `state/close-request` with a unique pid/time id. A non-render native thread checks it every 500 ms (one stat when
   absent), consumes it and calls the existing native close path. A saving race is refused with a correlated atomic
   `close-response`; I/O refusal includes errno/reason. The menu waits/retries within its bounded close deadline.

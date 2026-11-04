@@ -45,6 +45,17 @@ class Widgets {
     }
 }
 class SystemClock { static long now; static long uptimeMillis() { return now; } }
+class ComponentName {}
+interface IBinder {}
+interface ServiceConnection {
+    void onServiceConnected(ComponentName name, IBinder service);
+    void onServiceDisconnected(ComponentName name);
+    void onBindingDied(ComponentName name);
+    void onNullBinding(ComponentName name);
+}
+class GameControlService {}
+class Intent { Intent(Object context, Class<?> service) {} }
+class TextView { void setText(String text) {} }
 class StorageManager {
     int registered, removed;
     void registerStorageVolumeCallback(Object executor, Runnable callback) { registered++; }
@@ -66,6 +77,7 @@ class Handler {
     final Set<Runnable> pending = new HashSet<>();
     int posted;
     void postDelayed(Runnable value, long delay) { pending.add(value); posted++; }
+    void post(Runnable value) { pending.add(value); posted++; }
     void removeCallbacks(Runnable value) { pending.remove(value); }
 }
 class InstallState {
@@ -77,11 +89,18 @@ JAVA_ACTIVITY = r'''
 }
 public final class SetupActivity extends BaseActivity {
     enum Screen { HOME, SAVES, WELCOME, DATA, STORAGE, SETUP_STORAGE, INSTALL }
-    boolean ui, started, uiStarted, closingGame, closeSent;
+    boolean ui, started = true, uiStarted, closingGame, closeSent, noteOk;
     GameLock.Result gameState = InstallState.next;
     final List<View> gameControls = new ArrayList<>();
     Runnable blockedAction;
-    String blockedNeed = "", closeId = "probe", failed = "";
+    String blockedNeed = "", closeId = "probe";
+    String note = "";
+    TextView gameNotice;
+    ServiceConnection closeConnection;
+    static final int BIND_AUTO_CREATE = 1;
+    int binds, unbinds, bindFlags;
+    boolean bindAccepted = true;
+    Runnable duringBind;
     long closeDeadline = 10000, closeStartedAt, gameCheckedAt, cancelArmedAt;
     final Handler main = new Handler();
     final StorageManager storage = new StorageManager();
@@ -95,7 +114,12 @@ public final class SetupActivity extends BaseActivity {
     boolean isDestroyed() { return false; }
     void render() { renders++; }
     void updateGameNotice() { notices++; }
-    void closeFailed(String reason) { failed = reason; closingGame = false; }
+    boolean bindService(Intent intent, ServiceConnection connection, int flags) {
+        binds++; bindFlags = flags;
+        if (duringBind != null) duringBind.run();
+        return bindAccepted;
+    }
+    void unbindService(ServiceConnection connection) { unbinds++; }
     void onStatus() { statuses++; }
     void syncMirror(boolean manual) { syncs++; }
     void refreshGameState() { checks++; }
@@ -152,7 +176,7 @@ JAVA_TESTS = r'''
                 activity.closingGame = true; activity.blockedAction = () -> mutations[0]++;
                 InstallState.next = new GameLock.Result(GameLock.State.FREE, "lock=free marker=absent");
                 activity.closePoll.run();
-                require(mutations[0] == 1 && !activity.closingGame && activity.failed.isEmpty(), "stale save-busy blocked completion after game death");
+                require(mutations[0] == 1 && !activity.closingGame && activity.note.isEmpty(), "stale save-busy blocked completion after game death");
                 require(activity.main.pending.isEmpty(), "completed close kept waiting for the dead game's save");
                 break;
             }
@@ -186,6 +210,89 @@ JAVA_TESTS = r'''
                 require(activity.storage.registered == 2 && activity.main.pending.size() == 1, "resume failed to register exactly one timer");
                 break;
             }
+            case "bind-save": {
+                Files.createDirectories(new File(activity.files, "state").toPath());
+                Path saving = new File(activity.files, "state/save-busy").toPath();
+                Files.writeString(saving, "saving");
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.closeGame();
+                require(activity.binds == 1 && activity.bindFlags == BIND_AUTO_CREATE, "foreground binding missing or over-prioritized");
+                activity.closePoll.run();
+                require(!activity.closeSent && activity.closeConnection != null, "save was not allowed to progress while bound");
+                Files.delete(saving);
+                activity.closePoll.run();
+                require(activity.closeSent && Files.exists(new File(activity.files, "state/close-request").toPath()), "finished save did not proceed to native close");
+                require(activity.unbinds == 0, "binding released before native close finished");
+                break;
+            }
+            case "disconnect": {
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.blockedAction = () -> mutations[0]++;
+                activity.closeGame();
+                ServiceConnection connection = activity.closeConnection;
+                connection.onServiceDisconnected(null);
+                activity.closePoll.run();
+                require(activity.closingGame && mutations[0] == 0, "disconnect bypassed the lock");
+                InstallState.next = new GameLock.Result(GameLock.State.FREE, "lock=free");
+                connection.onServiceDisconnected(null);
+                activity.main.pending.remove(activity.closePoll); activity.closePoll.run();
+                require(!activity.closingGame && activity.unbinds == 1 && mutations[0] == 1, "game death did not release binding and retry");
+                connection.onBindingDied(null);
+                require(activity.main.pending.isEmpty(), "late death callback restarted a completed close");
+                break;
+            }
+            case "bind-race": {
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.duringBind = () -> InstallState.next = new GameLock.Result(GameLock.State.FREE, "empty default process, no lock");
+                activity.blockedAction = () -> mutations[0]++;
+                activity.closeGame();
+                activity.main.pending.remove(activity.closePoll); activity.closePoll.run();
+                require(activity.binds == 1 && activity.unbinds == 1 && mutations[0] == 1, "empty service process was mistaken for GAME");
+                require(!new File(activity.files, "state/close-request").exists(), "empty process received a close request");
+                break;
+            }
+            case "bind-failure": {
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.bindAccepted = false;
+                activity.closeGame();
+                require(!activity.closingGame && activity.closeConnection == null && activity.unbinds == 1, "refused bind leaked close state");
+                require(!activity.note.isEmpty() && activity.main.pending.isEmpty(), "refused bind silently kept polling");
+                break;
+            }
+            case "close-timeout": {
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.closeGame(); activity.closePoll.run();
+                SystemClock.now = activity.closeDeadline;
+                activity.closePoll.run();
+                require(!activity.closingGame && activity.unbinds == 1 && activity.closeConnection == null, "timeout leaked foreground binding");
+                require(!new File(activity.files, "state/close-request").exists() && activity.main.pending.isEmpty(), "timeout left its request/poller behind");
+                break;
+            }
+            case "stop-close": {
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.blockedAction = () -> mutations[0]++;
+                activity.closeGame(); activity.closePoll.run();
+                ServiceConnection old = activity.closeConnection;
+                activity.onStop();
+                require(!activity.closingGame && activity.closeConnection == null && activity.unbinds == 1, "stop/recreation leaked binding");
+                require(!new File(activity.files, "state/close-request").exists() && activity.main.pending.isEmpty(), "stop leaked request/poller");
+                old.onServiceConnected(null, null);
+                activity.closePoll.run();
+                require(activity.main.pending.isEmpty() && mutations[0] == 0, "old activity retried an abandoned action");
+                activity.onStart();
+                activity.closeGame();
+                require(activity.binds == 2 && activity.closeConnection != old, "resumed activity reused old connection");
+                old.onServiceDisconnected(null);
+                require(activity.closingGame, "old disconnect changed a new close");
+                break;
+            }
+            case "already-free": {
+                activity.blockedAction = () -> mutations[0]++;
+                activity.closeGame();
+                activity.main.pending.remove(activity.closePoll); activity.closePoll.run();
+                require(activity.binds == 0 && mutations[0] == 1 && !activity.closingGame, "FREE lock spawned a service process");
+                break;
+            }
             case "logging": {
                 InstallState.logGameDecision("game decision=GAME branch=lock pid=42 marker=absent");
                 require(android.util.Log.lines.size() == 1, "branch log was filtered out with INFO disabled");
@@ -207,6 +314,7 @@ public final class Log {
     public static final List<String> lines = new ArrayList<>();
     public static boolean isLoggable(String tag, int level) { return level >= WARN; }
     public static int w(String tag, String text) { if (isLoggable(tag, WARN)) lines.add(tag + ": " + text); return 0; }
+    public static int w(String tag, String text, Throwable failed) { return w(tag, text); }
 }
 '''
 
@@ -252,7 +360,7 @@ class SetupControlTests(unittest.TestCase):
         source = (JAVA / 'SetupActivity.java').read_text()
         state = (JAVA / 'InstallState.java').read_text()
         methods = section(source, '    private void gameControl(', '    private void gameBanner(')
-        close = section(source, '    private final Runnable closePoll', '    private void closeFailed(')
+        close = section(source, '    private void closeGame()', '    // ---------- lifecycle')
         start = section(source, '    @Override protected void onStart()', '    @Override protected void onResume()')
         stop = section(source, '    @Override protected void onStop()', '    /** A card mounted,')
         refresh = section(source, '    private final Runnable refresh', '    @Override protected void onDestroy()')
@@ -263,8 +371,10 @@ class SetupControlTests(unittest.TestCase):
         probe.write_text(JAVA_PRELUDE + logger + JAVA_ACTIVITY + methods + close + start + stop + refresh
                          + '    private void showUi() { ui = true; render();' + show_tail + JAVA_TESTS)
         log = cls.work / 'android/util/Log.java'; log.parent.mkdir(parents=True); log.write_text(LOG)
+        process = cls.work / 'android/os/Process.java'; process.parent.mkdir(parents=True)
+        process.write_text('package android.os; public class Process { public static int myPid() { return 42; } }')
         cls.classes = cls.work / 'classes'
-        cls.command([javac, '--release', '17', '-d', cls.classes, probe, log,
+        cls.command([javac, '--release', '17', '-d', cls.classes, probe, log, process,
                      *[JAVA / name for name in ('GameLock.java', 'SaveManager.java', 'Settings.java')]])
         native = cls.work / 'input.c'
         input_source = (GAME / 'runtime/input.c').read_text()
@@ -303,6 +413,11 @@ int main(int argc, char **argv) {
 
     def test_live_game_save_still_blocks_close_request(self):
         self.probe('live-save')
+
+    def test_close_binding_lifecycle_and_save_progress(self):
+        for mode in ('bind-save', 'disconnect', 'bind-race', 'bind-failure', 'close-timeout', 'stop-close', 'already-free'):
+            with self.subTest(mode=mode):
+                self.probe(mode)
 
     def test_ui_created_after_onstart_registers_one_refresh_and_removes_it(self):
         self.probe('late-ui')

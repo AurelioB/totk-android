@@ -20,7 +20,8 @@ A bug-fix release.
 - The menu no longer reports "The game is running" when it isn't: its own background checks are no longer mistaken
   for the game.
 - When the game really is still running in the background, the affected actions say so, and a **Close the game**
-  button closes it safely (waiting for an in-progress save) and then carries on with what you chose.
+  button closes it safely (waiting for an in-progress save) and then carries on with what you chose. This also works
+  after Android freezes the background game: a temporary menu binding wakes it without bringing its task forward.
 
 ### Second screen
 - Fused materials use the game's own names (for example "Armor Shard" instead of "Obj Armor Spike B"), including world
