@@ -190,6 +190,7 @@ static void core(const char *dir) {
 /* ---------- every live switch toggled ---------- */
 enum { RENDER = 4, SLACKERS = 4, TOGGLES = 300 };
 static _Atomic int render_tid[RENDER + 1], render_nice[RENDER + 1], render_started, stop_all;
+static _Atomic int slack_started;
 static _Atomic uint32_t applied_gen;
 static int hook_nice(int tid, int nice) {   /* totk_live_set_nice: records instead of needing CAP_SYS_NICE */
     for (int i = 0; i <= RENDER; i++) if (atomic_load(&render_tid[i]) == tid) { atomic_store(&render_nice[i], nice); return 0; }
@@ -205,8 +206,11 @@ static void *render_thread(void *arg) {
 }
 static void *slack_thread(void *arg) {
     int *bad = arg; char name[16]; snprintf(name, sizeof name, "g-%d", (int)(intptr_t)bad % 97);
+    /* Capture inheritance before startup can apply a live value. Do not publish
+     * any toggles until every worker has recorded that same pre-toggle baseline. */
+    long base = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
     totk_thread_start(name, NULL);
-    long base = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);   /* no launch value: the thread's default */
+    atomic_fetch_add(&slack_started, 1);
     while (!atomic_load(&stop_all)) {
         /* A value is stored just before its slack generation is published: a mismatch counts only if it outlives a
            few further ticks with the generation unchanged. */
@@ -254,6 +258,7 @@ static void switches(void) {
     for (int i = 0; i <= RENDER; i++) pthread_create(&render[i], NULL, render_thread, (void *)(intptr_t)i);
     while (atomic_load(&render_started) < RENDER + 1) usleep(1000);   /* registered, the walker pinned */
     for (int i = 0; i < SLACKERS; i++) pthread_create(&slackers[i], NULL, slack_thread, &slack_bad[i]);
+    while (atomic_load(&slack_started) < SLACKERS) usleep(1000);
     for (int i = 0; i < 2; i++) pthread_create(&readers[i], NULL, switch_reader, &read_bad[i]);
     pthread_create(&frames, NULL, frame_thread, NULL);
     uint32_t s = 0x9e3779b9u; unsigned n = sizeof totk_live_switches / sizeof *totk_live_switches, prio_bad = 0, pinned_bad = 0;
