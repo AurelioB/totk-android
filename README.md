@@ -358,8 +358,8 @@ Options: Device language, English, 日本語, Deutsch, Français, Español, Ital
 <summary><b>Game data</b> and <b>About</b></summary>
 
 *Game data* shows the installed game (verified against the 1.4.3 digests), where it is stored, and lets you rebuild the
-shaders or the second-screen art, choose another graphics driver (or go back to the bundled one), run setup again
-(finished steps are kept) or delete the imported data (saves, settings and the driver are kept).
+shaders or the second-screen art, choose another graphics driver (a Turnip AdrenoTools `.zip` or 64-bit ARM `.so`, or
+go back to the bundled one), run setup again (finished steps are kept) or delete the imported data (saves, settings and the driver are kept).
 
 <img src="docs/images/game-data.webp" width="640" alt="Game data">
 
@@ -443,6 +443,7 @@ kept; progress since the last save is lost. The details are in `totk.log`; pleas
 game directly next time* with **X**.
 
 **Can I use my phone's own GPU driver or another Turnip build?** Another Turnip build: *Game data → Graphics driver*.
+Pick its AdrenoTools `.zip` as downloaded, or the 64-bit ARM `.so` inside it; *Use the bundled driver* resets it.
 The system driver does not work (see [Requirements](#requirements)).
 
 ## For developers

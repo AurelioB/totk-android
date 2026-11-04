@@ -265,11 +265,13 @@ final class Strings {
     static final String SHADERS_ROW = "Shaders";
     static final String SHADERS_HINT = "Required: the game's GPU shaders, prepared from your game data";
     static final String DRIVER = "Graphics driver";
-    static final String DRIVER_HINT = "The bundled Turnip build, or one you choose";
+    static final String DRIVER_HINT = "The bundled Turnip build, or a Turnip .zip / .so you choose";
     static final String DRIVER_RESET_ROW = "Use the bundled driver";
     static final String DRIVER_RESET_HINT = "Removes the custom driver file";
     static final String DRIVER_BUNDLED = "Bundled";
-    static final String DRIVER_BAD = "That file is not a 64-bit ARM Vulkan driver (.so).";
+    static final String DRIVER_BAD = "That file is not a Vulkan driver: pick a Turnip .zip (AdrenoTools) or its .so (64-bit ARM).";
+    static final String DRIVER_ZIP_BAD = "That zip has no usable driver. Its meta.json must name an existing libraryName, or it must "
+            + "contain exactly one .so (64-bit ARM, up to 128 MiB; at most 256 entries).";
     static final String RERUN = "Run setup again";
     static final String RERUN_HINT = "Choose your files again; finished steps are kept";
     static final String DELETE_ROW = "Delete imported data";
@@ -287,8 +289,8 @@ final class Strings {
             + "from your game data. Optional: the game runs without them. Rebuilding takes a few minutes.";
     static final String SHADERS_TEXT = "The seed of translated GPU shaders generated from your game data. The game needs it: without "
             + "it nothing is drawn. Building takes a few minutes.";
-    static final String DRIVER_TEXT = "The Vulkan driver the game uses. The bundled Mesa Turnip build is tested with this app; a custom "
-            + "build you pick is copied into the game folder and used instead.";
+    static final String DRIVER_TEXT = "The Vulkan driver the game uses. The bundled Mesa Turnip build is tested with this app. Pick a "
+            + "Turnip .zip (AdrenoTools format) or a 64-bit ARM .so; only the driver library is copied into the game folder and used instead.";
     static final String RERUN_TEXT = "Opens setup again to pick different files. Steps that are already finished and still match "
             + "are kept.";
     static final String DELETE_TEXT = "Removes the imported game data from this device. Saves, menu settings and a custom driver stay. "

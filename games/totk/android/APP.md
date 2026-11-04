@@ -34,6 +34,15 @@ ones (`assets/expected-v1.4.3.json`). Vulkan driver: `<game>/driver.so` (copied 
 driver. A `shaders/v143/seed.vkpack` selects the indexed seed IO (`TOTK_VK_SEED_IO=1`). Developer builds fill the same
 folder over USB with `install_app.sh data` (install.json goes last). The rest of this file is the development history.
 
+*Game data → Graphics driver* accepts a bare ELF64 AArch64 `.so` or an AdrenoTools Turnip `.zip`, detected by content.
+`DriverImport.java` stages a bounded archive privately, reads `meta.json` (up to 64 KiB) and selects its exact
+`libraryName` entry (including nested paths); without metadata exactly one `.so` is required. Other entries are
+never extracted. Archives are limited to 160 MiB / 256 entries, libraries to 128 MiB; the library's ELF header,
+uncompressed length and CRC are checked before `driver.so.tmp` replaces `driver.so` under `GameLock`.
+Failed reads leave the previous driver and `driverName` preference intact and remove staging files.
+The row uses metadata `name` plus `driverVersion`, or the picked filename; *Use the bundled driver* removes the override.
+Host coverage: `tests/test_android_drivers.py`.
+
 ### Supplying your own launcher image
 
 Add `--launcher-icon /absolute/path/outside/repo/logo.png` to `build_android.py ... --apk` (also supported with
@@ -1751,7 +1760,7 @@ needs `su`). The folder holds what the adb-shell folder holds:
 | `rewritten/<version>/` | the game's code (one version folder) |
 | `extracted/` | RomFS, shared fonts |
 | `shaders/<version>/` | the Vulkan shader seed |
-| `driver.so` | the Vulkan driver (a Turnip build). It's copied into the app's private folder at each start, because files on shared storage cannot be loaded as code. Without it, the system driver is used. |
+| `driver.so` | the custom Vulkan driver (a Turnip build), picked as an AdrenoTools `.zip` or a 64-bit ARM `.so`. It's copied into the app's private folder at each start, because files on shared storage cannot be loaded as code. Without it, the bundled Turnip driver is used. |
 | `user-data/` | saves to import: on the first start (no private saves yet) they're copied into the app's private storage, where the game keeps its saves from then on. `install_app.sh saves` copies those to the computer. |
 | `totk.env` | options, one `NAME=value` per line (`#` comments), e.g. `TOTK_VK_SHOT=300` or `TOTK_FACE_BUTTONS=position`. Read after the launcher menu's `settings.env` (app-private `files/settings.env`, written by the menu; only the menu's own option keys are accepted there, others are logged and ignored), so a line here overrides the menu. |
 | `totk.log` | the log of the last start (`install_app.sh log`) |

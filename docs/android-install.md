@@ -206,9 +206,13 @@ Saves live in the app's private storage. Uninstalling the app removes them: expo
 ## Drivers
 
 The APK bundles a pinned Mesa Turnip build (MIT; how to rebuild it: `games/totk/android/turnip/README.md`). To try your
-own Turnip build, open the app's *Game data → Graphics driver* (or copy it as `driver.so` into the game folder);
-*Use the bundled driver* goes back to the bundled one. `TOTK_VK_DRIVER=system` in `totk.env` there selects the system
-driver instead; no current Qualcomm system driver passes the game's startup check, so that is for testing only.
+own Turnip build, open the app's *Game data → Graphics driver* and pick its AdrenoTools `.zip` as downloaded, or its
+64-bit ARM `.so` (you can also copy the library as `driver.so` into the game folder). The zip's `meta.json` selects
+`libraryName` and supplies the displayed name; without metadata, a zip must contain exactly one `.so`.
+Only that library is installed, and a refused import leaves your current driver unchanged. Libraries are limited to
+128 MiB, metadata to 64 KiB and archives to 256 entries / 160 MiB. *Use the bundled driver* goes back to the bundled one.
+`TOTK_VK_DRIVER=system` in `totk.env` there selects the system driver instead; no current Qualcomm system driver
+passes the game's startup check, so that is for testing only.
 
 ## Versions
 

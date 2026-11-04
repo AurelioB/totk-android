@@ -23,6 +23,7 @@ A bug-fix release.
 - When the game really is still running in the background, the affected actions say so, and a **Close the game**
   button closes it safely (waiting for an in-progress save) and then carries on with what you chose. This also works
   after Android freezes the background game: a temporary menu binding wakes it without bringing its task forward.
+- Graphics driver: Turnip drivers can be picked as the .zip they're distributed in (AdrenoTools format), not only as a .so.
 
 ### Second screen
 - Fused materials use the game's own names (for example "Armor Shard" instead of "Obj Armor Spike B"), including world

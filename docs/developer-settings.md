@@ -62,7 +62,7 @@ Everything not in the menu is a developer switch. A selection:
 
 | Switch | What it does |
 |---|---|
-| `TOTK_VK_DRIVER=system` | Use the device's own Vulkan driver instead of Turnip. No current Qualcomm system driver passes the game's startup check; for testing only. A custom Turnip build goes in *Game data → Graphics driver* (or as `driver.so` in the game folder). |
+| `TOTK_VK_DRIVER=system` | Use the device's own Vulkan driver instead of Turnip. No current Qualcomm system driver passes the game's startup check; for testing only. Pick a custom Turnip AdrenoTools `.zip` or 64-bit ARM `.so` in *Game data → Graphics driver* (or copy the library as `driver.so` in the game folder). |
 | `TOTK_ASPECT=21:9` (or `4:3`, …) | Shows the game's view at that ratio with black bars instead of stretching it; the HUD and menus keep their proportions. |
 | `TOTK_AUTOLOAD=1` | Loads the newest save again at start. |
 | `TOTK_COMPANION=0` | Disables the second-screen companion at runtime (no controller, display listener or poller is started). |

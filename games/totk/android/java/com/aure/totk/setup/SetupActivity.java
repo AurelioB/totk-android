@@ -1351,24 +1351,17 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         ContentResolver resolver = getContentResolver();
         worker.execute(() -> {
             String name = Inputs.describe(resolver, uri).name, outcome = null;
-            File target = gameFile("driver.so"), temp = gameFile("driver.so.tmp");
+            File target = gameFile("driver.so");
             File direct = FileAccess.directFile(this, uri, -1);   // by its real path with All files access, else the picker's stream
-            try (GameLock.Hold held = GameLock.hold(getFilesDir());
-                 InputStream in = direct != null ? new java.io.FileInputStream(direct) : resolver.openInputStream(uri)) {
+            try (GameLock.Hold held = GameLock.hold(getFilesDir())) {
                 held.requireFree();
+                InputStream in = direct != null ? new java.io.FileInputStream(direct) : resolver.openInputStream(uri);
                 if (in == null) throw new IOException("unreadable");
-                byte[] header = in.readNBytes(64);
-                // ELF, 64-bit, little-endian, e_machine EM_AARCH64 (183)
-                boolean elf = header.length == 64 && header[0] == 0x7f && header[1] == 'E' && header[2] == 'L' && header[3] == 'F'
-                        && header[4] == 2 && header[5] == 1 && (header[18] & 0xff) == 183 && header[19] == 0;
-                if (!elf) outcome = Strings.DRIVER_BAD;
-                else {
-                    try (OutputStream out = new FileOutputStream(temp)) { out.write(header); in.transferTo(out); }
-                    if (!temp.renameTo(target)) throw new IOException("rename failed");
-                    Inputs.prefs(this).edit().putString("driverName", name).apply();
-                }
+                String label = DriverImport.install(in, target, new File(getCacheDir(), "driver-import.zip.tmp"), name);
+                Inputs.prefs(this).edit().putString("driverName", label).apply();
+            } catch (DriverImport.Invalid failed) {
+                outcome = failed.zip ? Strings.DRIVER_ZIP_BAD : Strings.DRIVER_BAD;
             } catch (IOException | SecurityException failed) {
-                temp.delete();
                 outcome = Strings.gameLockError(failed.toString());
             }
             String message = outcome;
