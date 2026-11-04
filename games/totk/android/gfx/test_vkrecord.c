@@ -166,9 +166,11 @@ int main(int argc, char **argv) {
         }
         rmdir(dir); return !ok;
     }
-    if (argc != 1) { rmdir(dir); return 2; }
+    int split_only = argc == 2 && !strcmp(argv[1], "--split-only");
+    if (argc != 1 && !split_only) { rmdir(dir); return 2; }
     const char *threads[] = {"0", "2", "3"}, *modes[] = {"--rec-identity", "--rec-boundaries", "--rec-submit"};
     const uint64_t magic[] = {0x5245434944454e33ull, 0x524543424e445933ull, 0x524543424e445933ull}; int ok = 1;
+    if (!split_only) {
     for (int i = 0; i < 2; i++) {
         char log[PATH_MAX]; snprintf(log, sizeof log, "%s/xlate-%d.log", dir, i);
         ok &= run(binary, "--xlate-stats", log, i ? "2" : "0", 0);
@@ -211,26 +213,31 @@ int main(int argc, char **argv) {
         ok &= identical(output[0][0], output[1][0], magic[mode]);
         for (int widen = 0; widen < 2; widen++) for (int i = 0; i < 3; i++) unlink(output[widen][i]);
     }
-    /* TOTK_VK_SPLIT_PASS_DRAWS: the same bytes with the split off, every 64 draws and every draw, inline and with
-       workers; the fixture itself checks the split/pass arithmetic. The lag arm reuses the chunk/lag submission path. */
-    for (int arm = 0; arm < 4; arm++) {
+    }
+    /* Pin both LRZ arms and the absent/default arm: lavapipe has no LRZ, so the child checks exact decisions as
+       well as near/far color and depth pixels. --split-only runs this matrix in isolation (including under TSan). */
+    const char *split_modes[] = {"--split-pass", "--split-depth", "--split-depth-only", "--split-depth-mask"};
+    for (unsigned mode = 0; mode < 4; mode++) for (int safe = 0; safe < 3; safe++) for (int arm = 0; arm < 4; arm++) {
+        if (safe < 2) setenv("TOTK_VK_SPLIT_LRZ_SAFE", safe ? "1" : "0", 1); else unsetenv("TOTK_VK_SPLIT_LRZ_SAFE");
         const char *split[] = {NULL, "64", "1"}, *workers = arm == 3 ? "2" : threads[arm];
         if (arm == 3) setenv("TOTK_FRAME_LAG", "1", 1);
         char output[3][PATH_MAX];
         for (int s = 0; s < 3; s++) {
-            snprintf(output[s], sizeof output[s], "%s/split-%d-%d.bin", dir, arm, s);
+            snprintf(output[s], sizeof output[s], "%s/split-%u-%d-%d-%d.bin", dir, mode, safe, arm, s);
             if (split[s]) setenv("TOTK_VK_SPLIT_PASS_DRAWS", split[s], 1); else unsetenv("TOTK_VK_SPLIT_PASS_DRAWS");
-            if (!run(binary, "--split-pass", output[s], workers, 0)) {
-                fprintf(stderr, "--split-pass failed with %s workers, split=%s%s\n", workers, split[s] ? split[s] : "off", arm == 3 ? ", lag" : "");
+            if (!run(binary, split_modes[mode], output[s], workers, 0)) {
+                fprintf(stderr, "%s failed with %s workers, split=%s LRZ_SAFE=%d%s\n", split_modes[mode], workers,
+                    split[s] ? split[s] : "off", safe, arm == 3 ? ", lag" : "");
                 ok = 0;
             }
         }
         unsetenv("TOTK_VK_SPLIT_PASS_DRAWS"); unsetenv("TOTK_FRAME_LAG");
         for (int s = 1; s < 3; s++) {
-            printf("--split-pass threads=%s%s off vs every %s draws: ", workers, arm == 3 ? " lag" : "", split[s]);
+            printf("%s threads=%s%s LRZ_SAFE=%d off vs every %s draws: ", split_modes[mode], workers, arm == 3 ? " lag" : "", safe, split[s]);
             ok &= identical(output[0], output[s], 0x53504c4954504153ull);
         }
         for (int s = 0; s < 3; s++) unlink(output[s]);
     }
+    unsetenv("TOTK_VK_SPLIT_LRZ_SAFE");
     rmdir(dir); return !ok;
 }

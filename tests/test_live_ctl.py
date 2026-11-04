@@ -50,6 +50,13 @@ class LiveCtl(unittest.TestCase):
                           'ok set TOTK_VK_SPLIT_PASS_DRAWS 512 -', 'ok mark - 0 ab arm=B block=2 scene=lookout', 'skip',
                           'skip'])
 
+    def test_split_lrz_safe_commands(self):
+        self.assertEqual(self.parse('set TOTK_VK_SPLIT_LRZ_SAFE=0', 'set TOTK_VK_SPLIT_LRZ_SAFE=1',
+                                    'unset TOTK_VK_SPLIT_LRZ_SAFE'),
+                         ['ok set TOTK_VK_SPLIT_LRZ_SAFE 0 -', 'ok set TOTK_VK_SPLIT_LRZ_SAFE 1 -',
+                          'ok unset TOTK_VK_SPLIT_LRZ_SAFE 0 -'])
+        self.assertIn('not a decimal in 0..1', self.parse('set TOTK_VK_SPLIT_LRZ_SAFE=2')[0])
+
     def test_malformed_and_refused(self):
         got = self.parse('set TOTK_VK_DESC_STOCK', 'set TOTK_VK_DESC_STOCK=', 'set TOTK_VK_DESC_STOCK=2',
                          'set TOTK_VK_DESC_STOCK=1x', 'set TOTK_TIMER_SLACK_NS=0', 'set TOTK_PRIO_RENDER=-21',

@@ -1145,7 +1145,46 @@ long vk_frame_chunk_limit(void) {
    (TOTK_VK_CHUNK_DRAWS=0) or outside a game submission, since there would be nothing to submit. */
 static uint32_t g_split_draws = UINT32_MAX;
 static int g_split_submit;   /* the next pass start submits the recorded part (and reopens the split targets) */
-static uint64_t g_split_count, g_split_reopen, g_split_refused;
+static uint64_t g_split_count, g_split_reopen, g_split_refused, g_split_touches, g_split_lrz_refused;
+static int g_split_safe_launch = 1;
+static totk_live_cache g_split_safe_live;
+static int split_lrz_safe(void) { return totk_live_cached(&g_split_safe_live, "TOTK_VK_SPLIT_LRZ_SAFE", g_split_safe_launch); }
+/* Walking-owned depth epochs. A cache collision loses only a touch elision, never safety. Track even in the
+   control arm so a live enable repairs depth written before it. VkImage, not guest texture/view, is the identity. */
+static struct { VkImage image; uint64_t game, seal; } g_split_depth[64];
+static uint64_t g_split_game;
+static int g_split_cut, g_split_unrepairable;
+static int split_depth_touchable(vk_tex *x) {
+    VkFormat f = vk_tex_format(x);
+    return vk_tex_samples(x) == 1 && (f == VK_FORMAT_D16_UNORM || f == VK_FORMAT_D32_SFLOAT ||
+        f == VK_FORMAT_X8_D24_UNORM_PACK32 || f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT);
+}
+static void split_depth_begin(VkCommandBuffer cb, VkAttachmentLoadOp load) {
+    if (!R.dtex || R.dfmt == VK_FORMAT_UNDEFINED) return;
+    VkImage image = vk_tex_image(R.dtex);
+    unsigned i = (unsigned)(((uintptr_t)image >> 4) % 64);
+    uint64_t game = vk_game_submit_serial(), seal = vk_submit_serial();
+    int known = g_split_depth[i].image == image && g_split_depth[i].game == game;
+    int crossed = known ? g_split_depth[i].seal != seal : g_split_cut;
+    int touchable = split_depth_touchable(R.dtex);
+    if (!touchable) g_split_unrepairable = 1;
+    if ((R.split_draws || g_split_cut) && split_lrz_safe() && crossed && load == VK_ATTACHMENT_LOAD_OP_LOAD && touchable) {
+        /* A transfer depth write invalidates LRZ on Turnip and the Qualcomm driver. Preserve the exact texel
+           bits (including D24); no CPU readback, clear, fragment shader, or change to the guest's depth state.
+           This is outside rendering, on the NEW primary, before its LOAD and any secondary draw executes. */
+        VkBuffer buffer; VkDeviceSize offset;
+        (void)vk_transient(4, 4, &buffer, &offset);
+        VkBufferImageCopy copy = {.bufferOffset = offset,
+            .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, R.dlevel, R.dlayer, 1}, .imageExtent = {1, 1, 1}};
+        vk_barrier_all(cb);
+        vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &copy);
+        vk_barrier_all(cb);
+        vkCmdCopyBufferToImage(cb, buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        vk_barrier_all(cb);
+        g_split_touches++;
+    }
+    g_split_depth[i].image = image; g_split_depth[i].game = game; g_split_depth[i].seal = seal;
+}
 static uint32_t split_pass_draws(void) {
     if (g_split_draws == UINT32_MAX) {
         const char *e = getenv("TOTK_VK_SPLIT_PASS_DRAWS"); long n = e && *e ? atol(e) : 0;
@@ -1158,7 +1197,10 @@ static uint32_t split_pass_draws(void) {
 static totk_live_cache g_split_live;
 static uint32_t split_pass_live(void) { return (uint32_t)totk_live_cached(&g_split_live, "TOTK_VK_SPLIT_PASS_DRAWS", (int)split_pass_draws()); }
 #ifdef TOTK_VK_TESTS
-void vk_draw_test_split_counts(uint64_t out[3]) { out[0] = g_split_count; out[1] = g_split_reopen; out[2] = g_split_refused; }
+void vk_draw_test_split_counts(uint64_t out[5]) {
+    out[0] = g_split_count; out[1] = g_split_reopen; out[2] = g_split_refused;
+    out[3] = g_split_touches; out[4] = g_split_lrz_refused;
+}
 #endif
 /* TOTK_VK_FEEDBACK_CUT (see feedback_cut): the launch value, read once in vk_draw_switches_init, and the value in use.
    Live (runtime/live_ctl.h): taken at each descriptor build (record_stage_impl); the freeze memo's key carries the open
@@ -1180,6 +1222,8 @@ static unsigned view_level(const view_t *v, int has) { return has && v->set_leve
 static int begin_rendering_inner(int draw_tail) {
     if (R.open) return 1;
     fg_extract_refresh(1);   /* configuration/late-state lookup at pass boundaries only */
+    uint64_t game = vk_game_submit_serial();
+    if (g_split_game != game) { g_split_game = game; g_split_cut = g_split_unrepairable = 0; }
     /* The default follows resolved lag, including the native-pressure cutover.
        An explicit threshold (including disabled=0) remains authoritative. */
     { long lim = vk_frame_chunk_limit();
@@ -1282,6 +1326,7 @@ static int begin_rendering_inner(int draw_tail) {
     if (sa.imageView && (discard >> 9 & 1)) { sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; g_store_clear_ds++; discarded = 1; }
     g_store_clear_pass += discarded; R.store_discard = discarded; R.split_refused = 0; R.split_draws = split_pass_live();
     VkCommandBuffer cb = vk_cb();
+    split_depth_begin(cb, da.loadOp);
     vk_barrier_all(cb);
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {R.host_w, R.host_h}}, .layerCount = 1, .colorAttachmentCount = nc, .pColorAttachments = ca,
         .pDepthAttachment = da.imageView ? &da : NULL, .pStencilAttachment = sa.imageView ? &sa : NULL};
@@ -3363,6 +3408,9 @@ void vk_draw_switches_init(void) {
          "colour attachments the fragment shader does not output get colorWriteMask 0" :
          "colour write masks follow the game's channel mask only (default)");
     (void)split_pass_draws();
+    e = getenv("TOTK_VK_SPLIT_LRZ_SAFE"); g_split_safe_launch = !e || !*e || atoi(e) != 0;
+    LOGV("TOTK_VK_SPLIT_LRZ_SAFE=%d: %s", g_split_safe_launch, g_split_safe_launch ?
+         "depth epoch transfer touches and conservative split refusals (default)" : "unsafe split control arm");
     e = getenv("TOTK_VK_FEEDBACK_CUT"); g_feedback_cut_launch = e && atoi(e) == 1;
     atomic_store_explicit(&g_feedback_cut, g_feedback_cut_launch, memory_order_relaxed);
     LOGV("TOTK_VK_FEEDBACK_CUT=%d: %s", g_feedback_cut_launch, g_feedback_cut_launch ?
@@ -5326,8 +5374,21 @@ static void split_pass_check(vk_shader *const sh[6], int canvas_transfer) {
         FGX.writer.open || FGX.authority_span.open || PD.active || probe_on() || serial_draws()) {
         R.split_refused = 1; g_split_refused++; return;
     }
+    if (split_lrz_safe()) {
+        if (g_split_unrepairable || (R.dtex && !split_depth_touchable(R.dtex))) {
+            R.split_refused = 1; g_split_refused++; g_split_lrz_refused++; return;
+        }
+        int color_write = 0;
+        uint32_t outputs = sh[1] ? sh[1]->fout_mask | sh[1]->fout_span : 0;
+        for (unsigned i = 0; i < R.ncolor; i++)
+            color_write |= R.ctex[i] && (outputs >> i & 1) && (S.chmask.mask >> (4 * i) & 15);
+        if (S.raster_discard || S.render_disabled || (R.dtex && !color_write)) {
+            /* Defer this candidate, not the whole scene pass: a depth prepass can become a color-writing region. */
+            g_split_refused++; g_split_lrz_refused++; return;
+        }
+    }
     vk_end_rendering_at(VK_PASS_END_SPLIT, n);
-    g_split_submit = 1; g_split_count++;
+    g_split_submit = 1; g_split_cut = 1; g_split_count++;
 }
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     int prim = dw ? dw->prim : di->prim;
@@ -10011,11 +10072,13 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
             memcpy(previous, c, sizeof previous);
         }
         if (split_pass_draws() || split_pass_live()) {
-            static uint64_t previous[3]; uint64_t c[3] = {g_split_count, g_split_reopen, g_split_refused};
-            LOGV("[split-pass] frame %llu: last 300 presents %llu splits, %llu extra passes (reopened parts), %llu refused passes; per frame %.2f/%.2f/%.2f (TOTK_VK_SPLIT_PASS_DRAWS=%u)",
+            static uint64_t previous[5];
+            uint64_t c[5] = {g_split_count, g_split_reopen, g_split_refused, g_split_touches, g_split_lrz_refused};
+            LOGV("[split-pass] frame %llu: last 300 presents %llu splits, %llu extra passes (reopened parts), %llu refused splits, %llu depth touches, %llu LRZ refusals; per frame %.2f/%.2f/%.2f (TOTK_VK_SPLIT_PASS_DRAWS=%u TOTK_VK_SPLIT_LRZ_SAFE=%d)",
                  (unsigned long long)n, (unsigned long long)(c[0] - previous[0]), (unsigned long long)(c[1] - previous[1]),
-                 (unsigned long long)(c[2] - previous[2]), (c[0] - previous[0]) / 300.0, (c[1] - previous[1]) / 300.0,
-                 (c[2] - previous[2]) / 300.0, split_pass_live());
+                 (unsigned long long)(c[2] - previous[2]), (unsigned long long)(c[3] - previous[3]),
+                 (unsigned long long)(c[4] - previous[4]), (c[0] - previous[0]) / 300.0, (c[1] - previous[1]) / 300.0,
+                 (c[2] - previous[2]) / 300.0, split_pass_live(), split_lrz_safe());
             memcpy(previous, c, sizeof previous);
         }
         if (atomic_load_explicit(&g_feedback_cut, memory_order_relaxed) || g_feedback_cut_launch) {

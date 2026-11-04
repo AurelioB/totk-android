@@ -3452,7 +3452,12 @@ int main(int argc, char **argv) {
     /* TOTK_VK_SPLIT_PASS_DRAWS: one 300-draw pass per submission with overlapping textured stripes (draw order decides
        every column) and a partial in-pass clear between the would-be parts. Fresh processes with the split on and off
        must write identical bytes (vkrectest); pass counts are checked here against the exact split arithmetic. */
-    if (argc == 3 && !strcmp(argv[1], "--split-pass")) {
+    if (argc == 3 && (!strcmp(argv[1], "--split-pass") || !strcmp(argv[1], "--split-depth") ||
+            !strcmp(argv[1], "--split-depth-only") || !strcmp(argv[1], "--split-depth-mask"))) {
+        int with_depth = strcmp(argv[1], "--split-pass") != 0, depth_only = !strcmp(argv[1], "--split-depth-only");
+        int masked = !strcmp(argv[1], "--split-depth-mask");
+        const char *safe_env = getenv("TOTK_VK_SPLIT_LRZ_SAFE");
+        int safe = !safe_env || !*safe_env || atoi(safe_env) != 0;
         FILE *out = fopen(argv[2], "wb"); if (!out) { perror(argv[2]); return 1; }
         tex_t tx2 = tx; tx2.serial = 10012; tx2.mem = cpu_pool + 0x20000;
         for (int i = 0; i < 64 * 64; i++) { lin[i * 4] = 255 - lin[i * 4]; lin[i * 4 + 1] = 255 - lin[i * 4 + 1]; }
@@ -3463,19 +3468,44 @@ int main(int argc, char **argv) {
         const char *e = getenv("TOTK_VK_SPLIT_PASS_DRAWS"); long n = e && *e ? atol(e) : 0;
         const int draws = 300, hole_at = 150;
         uint64_t splits = n > 0 ? (uint64_t)(draws - 1) / (uint64_t)n : 0;
+        uint64_t candidates = splits;
+        if (safe && depth_only) splits = 0;
+        if (safe && masked && n > 0) {
+            uint64_t first = n < hole_at ? (uint64_t)hole_at : (uint64_t)n;
+            splits = first < draws ? 1 + ((uint64_t)draws - 1 - first) / (uint64_t)n : 0;
+        }
+        tex_t depth = rt; depth.serial = 10013; depth.d.format = 0x34; depth.mem = gpu_pool + 0xf00000;
+        nvn_tex_layout(&depth.d, &depth.L);
+        p_set_rt target = srt; if (with_depth) target.depth = &depth; if (depth_only) target.n = 0;
+        p_copy_b2t depth_copy = cp; depth_copy.tex = &depth; depth_copy.src = (uint64_t)(uintptr_t)(readback + 0x5000);
+        p_bind_state depth_state = {.kind = 5};
+        ds_st ds = {.dt = with_depth, .dw = with_depth, .df = NVN_DEPTH_FUNC_LESS};
+        memcpy(depth_state.bytes, &ds, sizeof ds);
+        p_clear_ds depth_clear = {1.0f, 1, 0, 0};
         p_scissor all = {0, 0, 64, 64}, hole = {16, 16, 8, 8};
         p_clear_color red = {0, 0xf, {1, 0, 0, 1}};
         for (int round = 0; round < 12; round++) {
             vk_record_test_counts count0, count1; vk_record_test_counts_get(&count0);
-            uint64_t split0[3], split1[3]; vk_draw_test_split_counts(split0);
+            uint64_t split0[5], split1[5]; vk_draw_test_split_counts(split0);
+            float expect_depth[64][64];
+            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) expect_depth[y][x] = 1;
             uint8_t expect[64][64][4];
             for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) { expect[y][x][0] = expect[y][x][1] = 0; expect[y][x][2] = expect[y][x][3] = 255; }
-            rn = 0; op(OP_SCISSOR, &all, sizeof all); op(OP_SET_RT, &srt, sizeof srt); op(OP_CLEAR_COLOR, &cc, sizeof cc);
+            rn = 0; op(OP_SCISSOR, &all, sizeof all);
+            /* Clear color even for the depth-only refusal arm, then switch before its first draw. */
+            if (depth_only) { op(OP_SET_RT, &srt, sizeof srt); op(OP_CLEAR_COLOR, &cc, sizeof cc); }
+            op(OP_SET_RT, &target, sizeof target);
+            if (!depth_only) op(OP_CLEAR_COLOR, &cc, sizeof cc);
+            op(OP_BIND_STATE, &depth_state, sizeof depth_state);
+            p_bind_state mask = {.kind = 2}; memset(mask.bytes, masked ? 0 : 255, sizeof(chmask_st));
+            op(OP_BIND_STATE, &mask, sizeof mask);
+            if (with_depth) op(OP_CLEAR_DS, &depth_clear, sizeof depth_clear);
             op(OP_BIND_PROGRAM, &bp, sizeof bp); op(OP_BIND_VATTR, &va, sizeof va); op(OP_BIND_VSTREAM, &vs, sizeof vs);
             op(OP_BIND_VBUF, &full_vb, sizeof full_vb); op(OP_BIND_UBO, &u0, sizeof u0); op(OP_BIND_UBO, &u1, sizeof u1);
             op(OP_VIEWPORTS, &vp, sizeof vp);
             for (int i = 0; i < draws; i++) {
-                if (i == hole_at) {
+                if (masked && i == hole_at) { memset(mask.bytes, 255, sizeof(chmask_st)); op(OP_BIND_STATE, &mask, sizeof mask); }
+                if (i == hole_at && !depth_only) {
                     op(OP_SCISSOR, &hole, sizeof hole); op(OP_CLEAR_COLOR, &red, sizeof red);
                     for (int y = 16; y < 24; y++) for (int x = 16; x < 24; x++) { expect[y][x][0] = 255; expect[y][x][1] = 0; expect[y][x][2] = 0; }
                 }
@@ -3487,13 +3517,27 @@ int main(int argc, char **argv) {
                 op(OP_SCISSOR, &stripe, sizeof stripe);
                 op(OP_BIND_TEX, &texture, offsetof(p_bind_handles, h) + sizeof texture.h[0]);
                 op(OP_BIND_SAMP, &sampler, offsetof(p_bind_handles, h) + sizeof sampler.h[0]);
+                float z = i & 1 ? 0.9f : 0.75f - (float)i / 600.0f;
+                if (with_depth) { p_depth_range range = {z, z}; op(OP_DEPTH_RANGE, &range, sizeof range); }
+                /* A threshold reached during discard must not end the pass or submit anything. */
+                if (n > 0 && i && i % n == 0) {
+                    p_flag off = {1}, on = {0};
+                    op(OP_RASTER_DISCARD, &off, sizeof off); op(OP_DRAW, &dw, sizeof dw);
+                    op(OP_RASTER_DISCARD, &on, sizeof on);
+                }
                 op(OP_DRAW, &dw, sizeof dw);
                 for (int x = x0; x < x0 + 3 && x < 64; x++) for (int y = 0; y < 64; y++) {
+                    if (with_depth) {
+                        if (z >= expect_depth[y][x]) continue;
+                        expect_depth[y][x] = z;
+                    }
+                    if (depth_only || (masked && i < hole_at)) continue;
                     expect[y][x][0] = (uint8_t)(which ? 255 - 4 * x : 4 * x);
                     expect[y][x][1] = (uint8_t)(which ? (255 - 4 * y) / 2 : 2 * y); expect[y][x][2] = 128;
                 }
             }
             op(OP_SCISSOR, &all, sizeof all); op(OP_COPY_T2B, &cp, sizeof cp);
+            if (with_depth) op(OP_COPY_T2B, &depth_copy, sizeof depth_copy);
             uint64_t fence0 = mtl_last_fence(), fence = run();
             CHECK(mtl_wait(fence, 5000000000ull), "split round %d completes", round);
             CHECK(fence - fence0 == 1 + splits, "split round %d: %llu GPU submissions, expected one per part (%llu)", round,
@@ -3501,25 +3545,38 @@ int main(int argc, char **argv) {
             vk_record_test_counts_get(&count1); vk_draw_test_split_counts(split1);
             CHECK(count1.draws - count0.draws == (uint64_t)draws, "split round %d records every draw (%llu)", round,
                 (unsigned long long)(count1.draws - count0.draws));
-            CHECK(split1[0] - split0[0] == splits && split1[1] - split0[1] == splits && split1[2] == split0[2],
-                "split round %d: %llu splits, %llu reopened parts, %llu refused; expected %llu", round,
+            uint64_t refused = safe && depth_only && candidates ? (uint64_t)(draws - n) : 0;
+            if (safe && masked && n > 0 && n < hole_at) refused = (uint64_t)(hole_at - n);
+            CHECK(split1[0] - split0[0] == splits && split1[1] - split0[1] == splits && split1[2] - split0[2] == refused,
+                "split round %d: %llu splits, %llu reopened parts, %llu refused; expected %llu/%llu", round,
                 (unsigned long long)(split1[0] - split0[0]), (unsigned long long)(split1[1] - split0[1]),
-                (unsigned long long)(split1[2] - split0[2]), (unsigned long long)splits);
-            CHECK(count1.passes - count0.passes == 1 + splits, "split round %d actual passes %llu, expected %llu", round,
-                (unsigned long long)(count1.passes - count0.passes), (unsigned long long)(1 + splits));
+                (unsigned long long)(split1[2] - split0[2]), (unsigned long long)splits, (unsigned long long)refused);
+            CHECK(split1[3] - split0[3] == (safe && with_depth ? splits : 0) &&
+                    split1[4] - split0[4] == refused,
+                "split round %d pins LRZ policy: %llu touches, %llu safety refusals", round,
+                (unsigned long long)(split1[3] - split0[3]), (unsigned long long)(split1[4] - split0[4]));
+            uint64_t passes = 1 + splits + (uint64_t)depth_only;
+            CHECK(count1.passes - count0.passes == passes, "split round %d actual passes %llu, expected %llu", round,
+                (unsigned long long)(count1.passes - count0.passes), (unsigned long long)passes);
             int bad = 0;
             for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
                 const uint8_t *p = readback + 4 * (y * 64 + x);
                 for (int c = 0; c < 4; c++) bad += abs(p[c] - expect[y][x][c]) > 2;
+                if (with_depth) {
+                    float z; memcpy(&z, readback + 0x5000 + 4 * (y * 64 + x), 4);
+                    bad += z != expect_depth[y][x];
+                }
             }
             CHECK(!bad, "split round %d pixels follow draw order across parts and the in-pass clear (%d wrong)", round, bad);
             uint64_t actual = count1.draws - count0.draws;
             CHECK(fwrite(&actual, sizeof actual, 1, out) == 1 && fwrite(readback, 64 * 64 * 4, 1, out) == 1, "write split identity");
+            if (with_depth) CHECK(fwrite(readback + 0x5000, 64 * 64 * 4, 1, out) == 1, "write exact split depth identity");
             int crop[] = {0, 0, 0, 0}; mtl_present(&rt, 1.0 / 60, crop);
         }
         const uint64_t footer[] = {0x53504c4954504153ull, 12};
         CHECK(fwrite(footer, sizeof footer, 1, out) == 1 && !fclose(out), "close split identity output");
-        printf("%s: split pass (TOTK_VK_SPLIT_PASS_DRAWS=%ld) %d checks, %d failed\n", fails ? "FAILED" : "ok", n, checks, fails);
+        printf("%s: %s (TOTK_VK_SPLIT_PASS_DRAWS=%ld LRZ_SAFE=%d) kept %llu/%llu splits per round; %d checks, %d failed\n",
+            fails ? "FAILED" : "ok", argv[1], n, safe, (unsigned long long)splits, (unsigned long long)candidates, checks, fails);
         return fails != 0;
     }
     if (argc == 3 && !strcmp(argv[1], "--rec-identity")) {

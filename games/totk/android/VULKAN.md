@@ -539,8 +539,14 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   same chunk path, and the same targets reopen with `loadOp=LOAD`. Refused (counted) for passes with a `DONT_CARE`
   store, native/canvas UI, framegen extraction or pass diagnostics; nothing splits with chunking off (`CHUNK_DRAWS=0`).
   **Cost:** each split stores and reloads every attachment on a tiler (GMEM), so it stays off. Try `512`, then `256`;
-  `[split-pass]` logs splits, extra passes and refusals per 300 presents. Compare p95/GPU-busy overlap, not just fps.
-  Live (`totk.ctl`, APP.md *Live switches*): each pass (part) takes the value when it opens.
+  `[split-pass]` logs splits, extra passes, refused candidates, depth touches and LRZ refusals per 300 presents.
+  Compare p95/GPU-busy overlap, not just fps. Live (`totk.ctl`, APP.md *Live switches*): each pass (part) takes the
+  draw threshold when it opens. The 60fps preset enables `512` through "Keep the GPU busy".
+- **LRZ-safe splits** (`TOTK_VK_SPLIT_LRZ_SAFE=1`, default **on**, inert when pass splitting is off):
+  live at the next split/depth-pass boundary; `0` restores the unsafe control. Color+depth scene passes keep their cuts,
+  but depth LOAD after a command-buffer epoch change gets an exact one-texel GPU transfer write-back before rendering.
+  Depth-only/masked regions defer cuts; unsupported/MSAA depth refuses further cuts in that game submission.
+  A/B with splitting fixed at `512`: count isolated luminance dips in 600 recorded frames, plus fps/GPU ms and touches.
 - **The uniform-update log** drops entries a newer update covers entirely (the game rewrites the same constant blocks
   many times a frame), and `ub_prune` returns at once unless a submission finished. `ub_overlaps` had been a quarter of
   the render thread.

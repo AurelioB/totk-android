@@ -2695,6 +2695,50 @@ the byte cap, and checks complete synchronous invalidate, partial CPU overwrite,
 and pool death. A separate point-address oracle checks full/chunked swizzling, padding/guards and round trips for
 2D, array, 3D and linear layouts. The 64-tile fixture waits for ordinary budgeted completion, never invalidating.
 
+## Pass-split LRZ safety (device validation required)
+
+The P4 hazard is **depth written/cleared in one primary command-buffer epoch and later loaded for depth testing in
+another epoch of the same game submission, without a full depth clear or a driver-recognized depth write invalidation**.
+The first part consumes the pending clear; reopening uses LOAD. Attachment barriers make the pixels visible, but do
+not themselves request LRZ invalidation. A depthless part can also cut between two users of the same depth image.
+This is a driver-workaround condition, not a Vulkan rule forbidding cross-command-buffer LOAD. Current
+[Turnip hardware notes](https://docs.mesa3d.org/drivers/freedreno/hw/lrz.html) describe GPU direction tracking on
+A650+ and safe reuse when the depth view agrees; pre-A650 cannot reuse LRZ between passes. Do not claim that every
+Turnip version necessarily has the stale-LRZ bug.
+
+`TOTK_VK_SPLIT_LRZ_SAFE` defaults to 1 and is live. Keep the draw threshold fixed when comparing it with 0.
+The safe rule keeps color-writing single-sample scene splits, defers depth-only/no-color-write candidates (it can cut
+later in the same pass), and refuses cuts after an unrepairable/MSAA depth attachment has appeared in that submission.
+Raster-discard/disabled draws return before the split check and never submit. Existing DONT_CARE/UI/framegen/
+diagnostic exclusions remain. The bounded walking-owned cache keys actual VkImage plus game/command-stream epochs,
+not a guest texture pointer or view. Eviction conservatively adds a touch after a cut; it never elides required work.
+Before a cross-epoch depth LOAD, copy one texel's depth aspect to the current slot's transient buffer, barrier, then
+copy its exact bits back and barrier before BeginRendering. Clear loads and known same-epoch loads need no touch.
+Stencil is untouched, no shader/depth state is modified, and no CPU readback or additional queue wait is introduced.
+
+[Turnip CopyBufferToImage](https://github.com/chaotic-cx/mesa-mirror/blob/0ac3efa9f4f99ece07971de98360f339a1dc8803/src/freedreno/vulkan/tu_clear_blit.cc#L3024-L3039)
+explicitly calls `tu_disable_lrz` for a destination with LRZ. The proprietary driver's internals are not available here;
+the transfer-write workaround is empirical, not a guarantee for every blob revision. Feedback-loop extensions are not
+a portable invalidate-LRZ command: they require supported/enabled features, matching image usage/layout and pipeline
+state, and are not a reason to claim a false guest feedback loop or disable LRZ for all draws. Use the ordinary transfer
+path rather than adding that second rendering convention.
+
+Host: `vkrectest --split-only` runs color-only, same-depth near/far, depth-only and masked-depth-to-color streams at
+0/2/3 recording workers, plus protected lag, with safe=0/1/unset and split=off/64/1. It checks byte identity against
+unsplit color/depth and exact split/reopen/touch/refusal counts, including discard draws at the threshold. Lavapipe has
+no LRZ: this pins decisions and pixels, not the Android artifact. The ordinary `vkrectest` includes this matrix.
+The host scene fixture retains 100% of splits: 4/4 at 64 draws and 299/299 at 1 draw, for color-only and same-depth
+near/far scenes. The intentionally half-masked scene retains 3/4 (75%) at 64, resuming cuts when color writes return;
+the depth-only scene retains 0/4 by design. These are synthetic decision shares, not a measurement of the game workload.
+
+
+Device gate (not exercised by host tests): same saved scene, camera path, resolution, driver and split=512; record
+600 steady-state frames per arm in ABBA order with safe=0/1. Count isolated one-frame luminance dips relative to both
+neighbors (exclude fades/cuts), inspect the flagged near-geometry blocks, and retain fps/GPU-ms plus `[split-pass]`
+counts. Expect fewer/zero dips in the safe arm without losing most scene splits; a loss of the measured fps gain or
+remaining spikes blocks promotion. Screenshots alone cannot catch a one-frame failure. This is separate from the
+conditional-clear flicker below, whose earlier fix must remain enabled in both arms.
+
 ## Fixed: black flicker (lit geometry went dark for one frame)
 
 **Cause:** the game clears its shadow / AO mask under conditional rendering (two counter reports compared). Our

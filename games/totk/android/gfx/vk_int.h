@@ -524,7 +524,7 @@ void vk_wb_test_tile(const tex_t *t, uint64_t v[6]); /* last GPU/landed version,
 void vk_wb_test_fresh(uint64_t v[3]); /* landed before base quiet, bytes, relevant copy-fence wait ns */
 uint64_t vk_wb_test_inflight(void); /* exact preflight matches on a synchronous owner's borrowed landing list */
 void vk_res_mem(uint64_t v[8]); /* resource memory summary (also read by the present statistics) */
-void vk_draw_test_split_counts(uint64_t out[3]); /* TOTK_VK_SPLIT_PASS_DRAWS splits, reopened parts, refused passes */
+void vk_draw_test_split_counts(uint64_t out[5]); /* splits, reopened parts, refused passes, depth touches, LRZ refusals */
 void vk_draw_test_clear_counts(uint64_t out[2]); /* ClearTexture calls cleared through the region path: partial, masked */
 void vk_draw_test_feedback_counts(uint64_t out[2]); /* TOTK_VK_FEEDBACK_CUT sampled views cut, left whole */
 #endif
