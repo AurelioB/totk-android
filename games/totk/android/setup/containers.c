@@ -144,20 +144,29 @@ int containers_exefs(SetupCtx *c, SetupContainers *s, const char *out_dir) {
     return rc;
 }
 
-/* hactool writes the merged image into a FIFO in staging that the follow loop drains into a RomfsWriter (one romfs.bin, or
-   parts where a FAT volume cannot hold the 17 GB file): hactool writes its section sequentially (nca_save_section_file),
-   so it never needs to seek in its output, and the writer's digest of exactly the bytes it stored is definitive. */
+/* hactool writes the merged image into an app-private FIFO that the follow loop drains into a RomfsWriter (one
+   romfs.bin, or parts where a FAT volume cannot hold the 17 GB file). Shared storage, including exFAT and some OEM
+   FUSE mounts, cannot create FIFOs. hactool writes sequentially, so the output itself stays on the game volume. */
 int containers_romfs(SetupCtx *c, SetupContainers *s, const char *out_dir, uint64_t part_bytes, char sha_hex[65]) {
     int rc = update_nca(c, s, "romfs");
     if (rc) return rc;
     const NcaRecord *base = &s->base.ncas[s->base.program];
-    char fifo_path[SETUP_PATH], sec_arg[SETUP_PATH + 16], off_env[64], size_env[64];
-    RomfsWriter w; int fifo = -1;
+    char fifo_dir[SETUP_PATH], fifo_path[SETUP_PATH], sec_arg[SETUP_PATH + 16], off_env[64], size_env[64];
+    RomfsWriter w; int fifo = -1, temporary_dir = !c->nobackup[0];
     SetupFollow follow = { .pipe = -1, .sink = &w };
-    if (st_path(fifo_path, sizeof fifo_path, "%s/romfs.fifo", c->staging)) return st_io_fail(c, "create", "romfs.fifo");
-    unlink(fifo_path);
-    if (romfs_writer_open(c, &w, out_dir, c->pins.romfs_size, part_bytes)) return -1;
-    if (mkfifo(fifo_path, 0600) || (fifo = open(fifo_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)) < 0) { romfs_writer_abort(&w); unlink(fifo_path); return st_io_fail(c, "create", "romfs.fifo"); }
+    if (temporary_dir) {
+        if (st_path(fifo_dir, sizeof fifo_dir, "/tmp/totk-romfs-XXXXXX")) return st_io_fail(c, "create", "the FIFO directory");
+        if (!mkdtemp(fifo_dir)) return st_io_fail(c, "create", "the FIFO directory");
+    } else if (st_path(fifo_dir, sizeof fifo_dir, "%s/setup-work", c->nobackup) || st_mkdirs(fifo_dir))
+        return st_io_fail(c, "create", "the FIFO directory");
+    if (st_path(fifo_path, sizeof fifo_path, "%s/romfs-%ld.fifo", fifo_dir, (long)getpid())) {
+        rc = st_io_fail(c, "create", "romfs.fifo"); goto directory_out;
+    }
+    if (unlink(fifo_path) && errno != ENOENT) { rc = st_io_fail(c, "remove", fifo_path); goto directory_out; }
+    if (romfs_writer_open(c, &w, out_dir, c->pins.romfs_size, part_bytes)) { rc = -1; goto directory_out; }
+    if (mkfifo(fifo_path, 0600) || (fifo = open(fifo_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)) < 0) {
+        romfs_writer_abort(&w); unlink(fifo_path); rc = st_io_fail(c, "create", fifo_path); goto directory_out;
+    }
     fcntl(fifo, F_SETPIPE_SZ, 1 << 20);   /* fewer wake-ups per GB; the default 64 KiB also works */
     follow.pipe = fifo;
     if (st_path(sec_arg, sizeof sec_arg, "--section%d=%s", s->update.bktr_section, fifo_path)) { rc = st_io_fail(c, "create", fifo_path); goto out; }
@@ -189,5 +198,7 @@ int containers_romfs(SetupCtx *c, SetupContainers *s, const char *out_dir, uint6
 out:
     close(fifo); unlink(fifo_path);
     if (rc) romfs_writer_abort(&w);
+directory_out:
+    if (temporary_dir) rmdir(fifo_dir);
     return rc;
 }
