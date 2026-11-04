@@ -56,7 +56,7 @@ static const totk_live_switch totk_live_switches[] = {
     {"TOTK_ADPF_GPU", 0, 1},                 /* the next presented frame; that frame is not reported */
     {"TOTK_RATE_HINT_HOLD", 0, 60000},       /* the next guest present (ms; 0 = the configured rate); needs TOTK_FRAME_RATE_HINT=1 */
 };
-enum { TOTK_LIVE_MAX = 16 };
+enum { TOTK_LIVE_MAX = 32 };
 _Static_assert(sizeof totk_live_switches / sizeof *totk_live_switches <= TOTK_LIVE_MAX, "live switch table");
 /* Read once at startup by design: changing them inside a session is refused with this reason. */
 static const char *const totk_live_startup_only[][2] = {
