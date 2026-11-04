@@ -47,7 +47,9 @@ final class DriverImport {
                         try (ZipFile zip = new ZipFile(archive)) {
                             label = extract(zip, temp, fallback);
                         }
-                    } catch (Invalid | ZipException | EOFException badZip) { throw new Invalid(true); }
+                    } catch (Invalid | ZipException | EOFException | RuntimeException | OutOfMemoryError badZip) {
+                        throw new Invalid(true);
+                    }
                 } else {
                     try (OutputStream out = new FileOutputStream(temp)) { driver(in, out, null); }
                 }
@@ -66,16 +68,20 @@ final class DriverImport {
             int size = (int) Math.min(file.length(), 65557);
             byte[] end = new byte[size];
             file.seek(file.length() - size); file.readFully(end);
+            int footer = -1;
             for (int p = size - 22; p >= 0; p--) {
-                if (u32(end, p) != 0x06054b50L || p + 22 + u16(end, p + 20) != size) continue;
-                int count = u16(end, p + 10);
-                if (u16(end, p + 4) != 0 || u16(end, p + 6) != 0 || u16(end, p + 8) != count
-                        || count > MAX_ENTRIES || u32(end, p + 12) > (2 << 20)
-                        || u32(end, p + 16) + u32(end, p + 12) != file.length() - size + p)
-                    throw new Invalid(true);
-                return;
+                if (u32(end, p) != 0x06054b50L) continue;
+                // Android may accept an EOCD whose comment does not reach EOF. Never let ZipFile choose a
+                // different, unchecked directory hidden in the validated record's comment (or elsewhere in the tail).
+                if (footer != -1) throw new Invalid(true);
+                footer = p;
             }
-            throw new Invalid(true);
+            if (footer < 0 || footer + 22 + u16(end, footer + 20) != size) throw new Invalid(true);
+            int count = u16(end, footer + 10);
+            if (u16(end, footer + 4) != 0 || u16(end, footer + 6) != 0 || u16(end, footer + 8) != count
+                    || count > MAX_ENTRIES || u32(end, footer + 12) > (2 << 20)
+                    || u32(end, footer + 16) + u32(end, footer + 12) != file.length() - size + footer)
+                throw new Invalid(true);
         }
     }
     private static int u16(byte[] b, int p) { return (b[p] & 255) | (b[p + 1] & 255) << 8; }

@@ -61,7 +61,7 @@ class DriverTests(unittest.TestCase):
         return self.pick_file(source, failure)
 
     def pick_file(self, source, failure=None):
-        command = [self.java, '-cp', str(self.classes), 'com.aure.totk.setup.DriverProbe', str(source), str(self.target)]
+        command = [self.java, '-Xmx32m', '-cp', str(self.classes), 'com.aure.totk.setup.DriverProbe', str(source), str(self.target)]
         if failure:
             command.append(failure)
         result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
@@ -124,6 +124,28 @@ class DriverTests(unittest.TestCase):
         for data in cases:
             self.assertEqual(self.pick(data), 'invalid zip')
             self.unchanged()
+
+    def test_nested_eocd_is_refused_before_zipfile_allocation(self):
+        valid = bytearray(archive([('meta.json', meta(name='New')), ('driver.so', ELF)]))
+        footer = valid.rindex(b'PK\x05\x06')
+        hidden = bytearray(valid[footer:footer + 22])
+        struct.pack_into('<I', hidden, 12, 0x7ffffff0)  # unchecked platform selection could request a huge CEN
+        struct.pack_into('<H', hidden, 20, 7)  # deliberately does not end at EOF
+        comment = bytes(hidden) + b'padding!'
+        struct.pack_into('<H', valid, footer + 20, len(comment))
+        crafted = bytes(valid) + comment
+        self.assertEqual(self.pick(crafted, failure='directory'), 'invalid zip')
+        self.unchanged()
+        self.assertEqual(self.pick(crafted), 'invalid zip')
+        self.unchanged()
+
+    def test_normal_zip_comment_is_accepted(self):
+        valid = bytearray(archive([('driver.so', ELF)]))
+        footer = valid.rindex(b'PK\x05\x06')
+        comment = b'A normal AdrenoTools archive comment.'
+        struct.pack_into('<H', valid, footer + 20, len(comment))
+        self.assertEqual(self.pick(bytes(valid) + comment), 'ok picked.zip')
+        self.assertEqual(self.target.read_bytes(), ELF)
 
     def test_actual_bare_library_size_is_bounded(self):
         source = self.directory / 'large.so'

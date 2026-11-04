@@ -48,6 +48,8 @@ folder over USB with `install_app.sh data` (install.json goes last). The rest of
 `libraryName` entry (including nested paths); without metadata exactly one `.so` is required. Other entries are
 never extracted. Archives are limited to 160 MiB / 256 entries, libraries to 128 MiB; the library's ELF header,
 uncompressed length and CRC are checked before `driver.so.tmp` replaces `driver.so` under `GameLock`.
+The directory is bounded before `ZipFile` opens it; multiple EOCD signatures in the scanned footer are refused so a
+platform parser cannot select a different, unchecked directory hidden in a zip comment.
 Failed reads leave the previous driver and `driverName` preference intact and remove staging files.
 The row uses metadata `name` plus `driverVersion`, or the picked filename; *Use the bundled driver* removes the override.
 Host coverage: `tests/test_android_drivers.py`.
