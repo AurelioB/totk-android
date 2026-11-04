@@ -115,6 +115,21 @@ static pthread_cond_t rec_work = PTHREAD_COND_INITIALIZER, rec_done = PTHREAD_CO
    in dispatch_building for every batch (~2 % of its time on the Thor). Waiters re-check their condition under
    rec_mu before sleeping, so a skipped signal can never be a lost wakeup. */
 static unsigned rec_work_waiters, rec_done_waiters;
+/* TOTK_VK_REC_WAKE_BATCH (default 0 = off: every enqueue with a parked worker signals one). n >= 1: the walker signals
+   only when no worker is already on its way to the queue (a signalled worker not yet running, or one polling it), and
+   a worker that takes a batch and leaves more queued wakes the next parked worker itself, so a burst of chunks costs
+   the walker one futex wake. n >= 2 also lets a worker that found the queue empty poll it for up to n µs before it
+   parks, so a chunk published meanwhile needs no wake at all. Live (runtime/live_ctl.h): read at each enqueue and each
+   time a worker finds the queue empty. All under rec_mu: rec_wake_pending counts signals whose worker has not yet
+   taken rec_mu again (each wake, spurious or not, takes one off, so it never overstates the workers on their way:
+   a signal under rec_mu with a parked, unsignalled waiter always wakes one), rec_spinning the polling workers. A
+   queued batch therefore always has a worker that will look at the queue before it parks. */
+static unsigned rec_wake_pending, rec_spinning;
+static _Atomic uint32_t rec_queue_seq;   /* enqueues so far: what polling workers watch (written under rec_mu) */
+static uint64_t rec_wakes_walker, rec_wakes_chain, rec_spin_hits, rec_parks;   /* per-300 report, under rec_mu */
+static int rec_wake_launch;
+static totk_live_cache rec_wake_live;
+static int rec_wake_batch(void) { return totk_live_cached(&rec_wake_live, "TOTK_VK_REC_WAKE_BATCH", rec_wake_launch); }
 static rec_job *queue_head, *queue_tail, *pass_head, *pass_tail, *building;
 static rec_pass *pending_head, *pending_tail;
 static rec_job *small_head, *small_tail; static uint32_t small_jobs, small_draws;
@@ -174,6 +189,11 @@ static void descriptor_totals(uint64_t out[8]) {
 }
 #ifdef TOTK_VK_TESTS
 void vk_record_test_descriptors(uint64_t out[8]) { descriptor_totals(out); }
+void vk_record_test_wakes(uint64_t out[4]) {   /* cumulative: walker signals, worker-chained signals, polled hits, parks */
+    pthread_mutex_lock(&rec_mu);
+    out[0] = rec_wakes_walker; out[1] = rec_wakes_chain; out[2] = rec_spin_hits; out[3] = rec_parks;
+    pthread_mutex_unlock(&rec_mu);
+}
 #endif
 static void commands_publish(unsigned worker) {
     rec_commands *s = &command_owner[worker];
@@ -1116,6 +1136,31 @@ static void record_job(rec_job *j, unsigned worker) {
         c->stock_events[k] = 0;
     }
 }
+static inline void rec_relax(void) {
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
+/* TOTK_VK_REC_WAKE_BATCH >= 2: an idle worker watches the queue for up to `us` µs before it parks (rec_mu held on entry
+   and on return; released while polling). The walker sees it in rec_spinning and does not signal. */
+static void rec_poll_queue(unsigned us) {
+    uint32_t seen = atomic_load_explicit(&rec_queue_seq, memory_order_relaxed);
+    rec_spinning++;
+    pthread_mutex_unlock(&rec_mu);
+    uint64_t until = host_now_ns() + (uint64_t)us * 1000;
+    int published = 0;
+    for (;;) {
+        for (int i = 0; i < 32 && !published; i++) {
+            rec_relax(); published = atomic_load_explicit(&rec_queue_seq, memory_order_relaxed) != seen;
+        }
+        if (published || host_now_ns() >= until) break;
+    }
+    pthread_mutex_lock(&rec_mu);
+    rec_spinning--;
+    if (published && queue_head) rec_spin_hits++;
+}
 static void *record_worker(void *arg) {
     unsigned worker = (unsigned)(uintptr_t)arg;
     char name[16]; snprintf(name, sizeof name, "totk-recw%u", worker - 1);
@@ -1123,9 +1168,19 @@ static void *record_worker(void *arg) {
     nvn_dirty_lag_thread_role("recorder");
     for (;;) {
         pthread_mutex_lock(&rec_mu);
-        while (!queue_head) { rec_work_waiters++; pthread_cond_wait(&rec_work, &rec_mu); rec_work_waiters--; }
+        int wake_batch = queue_head ? 0 : rec_wake_batch();
+        if (wake_batch >= 2) rec_poll_queue((unsigned)wake_batch);
+        while (!queue_head) {
+            rec_work_waiters++; rec_parks++;
+            pthread_cond_wait(&rec_work, &rec_mu);
+            rec_work_waiters--; if (rec_wake_pending) rec_wake_pending--;
+        }
         rec_job *batch = queue_head;
         if (batch) { queue_head = batch->queue_next; if (!queue_head) queue_tail = NULL; }
+        /* More work left behind and a parked worker nobody has signalled: wake it from here, not from the walker. */
+        if (queue_head && rec_work_waiters > rec_wake_pending && !rec_spinning && rec_wake_batch()) {
+            rec_wake_pending++; rec_wakes_chain++; pthread_cond_signal(&rec_work);
+        }
         pthread_mutex_unlock(&rec_mu);
         totk_live_slack_tick();   /* a live TOTK_TIMER_SLACK_NS: this thread applies it itself */
         uint64_t recycled = commands_recycle(worker);
@@ -1186,6 +1241,11 @@ int vk_record_enabled(void) {
         e = getenv(diagnostics[i]); if (e && *e && strcmp(e, "0")) { LOGV("recorder: threads disabled by %s", diagnostics[i]); threads = 0; }
     }
     if (!threads) return 0;
+    e = getenv("TOTK_VK_REC_WAKE_BATCH");
+    if (e && *e) { long n = atol(e); rec_wake_launch = n < 0 ? 0 : n > 2000 ? 2000 : (int)n; }
+    LOGV("TOTK_VK_REC_WAKE_BATCH=%d: %s", rec_wake_launch, !rec_wake_launch ? "every queued chunk batch wakes a parked recorder worker (default)" :
+         rec_wake_launch == 1 ? "one walker wake per burst; a worker leaving work queued wakes the next" :
+         "one walker wake per burst; idle workers poll the queue for that many µs before parking");
     e = getenv("TOTK_VK_REC_VMA_NAMES"); vma_names = e && atoi(e) != 0; /* opt-in memory-map diagnostics only */
     e = getenv("TOTK_VK_REC_CHUNK_DRAWS"); if (e && *e) { long n = atol(e); chunk_draws = n < 1 ? 1 : n > 512 ? 512 : (uint32_t)n; }
     e = getenv("TOTK_VK_REC_LEAD_DRAWS"); if (e && *e) { long n = atol(e); lead_draws = n < 0 ? 0 : n > chunk_draws ? chunk_draws : (uint32_t)n; }
@@ -1308,9 +1368,16 @@ vk_record_descriptor *vk_record_descriptors(vk_record_draw *draw, unsigned set, 
 }
 static void enqueue_batch(rec_job *first) {
     first->queue_next = NULL;
+    int batched = rec_wake_batch() != 0;
     pthread_mutex_lock(&rec_mu);
     if (queue_tail) queue_tail->queue_next = first; else queue_head = first;
-    queue_tail = first; if (rec_work_waiters) pthread_cond_signal(&rec_work);
+    queue_tail = first;
+    atomic_store_explicit(&rec_queue_seq, atomic_load_explicit(&rec_queue_seq, memory_order_relaxed) + 1, memory_order_relaxed);
+    /* Batched: a signalled or polling worker takes this batch, and wakes the next parked worker if more are queued. */
+    if (rec_work_waiters && (!batched || (!rec_wake_pending && !rec_spinning))) {
+        if (rec_wake_pending < rec_work_waiters) rec_wake_pending++;
+        rec_wakes_walker++; pthread_cond_signal(&rec_work);
+    }
     pthread_mutex_unlock(&rec_mu);
 }
 static void flush_small(void) {
@@ -1561,6 +1628,11 @@ void vk_record_stats(uint64_t frame) {
     LOGV("recorder submit guards/frame: shards %.1f projected VA ranges %.1f unique units %.1f; prep/merge/service/join/critical %.3f/%.3f/%.3f/%.3f/%.3f ms (prep overlaps recording; service is summed worker time)",
         guard_jobs / 300.0, guard_intents / 300.0, guard_units / 300.0, guard_prep_ns / 3e8,
         guard_merge_ns / 3e8, guard_service_ns / 3e8, guard_wait_ns / 3e8, guard_critical_ns / 3e8);
+    { static uint64_t previous[4]; uint64_t now[4] = {rec_wakes_walker, rec_wakes_chain, rec_spin_hits, rec_parks};
+      LOGV("recorder wakes/frame: walker %.2f worker-chained %.2f, polled hits %.2f, parks %.2f (TOTK_VK_REC_WAKE_BATCH=%d)",
+          (now[0] - previous[0]) / 300.0, (now[1] - previous[1]) / 300.0, (now[2] - previous[2]) / 300.0,
+          (now[3] - previous[3]) / 300.0, rec_wake_batch());
+      memcpy(previous, now, sizeof now); }
     memset(busy_ns, 0, sizeof busy_ns); worker_reset_ns = 0;
     ready_delay_ns = service_ns = max_ready_delay_ns = max_service_ns = jobs_serviced = 0;
     guard_jobs = guard_intents = guard_units = guard_prep_ns = guard_merge_ns = guard_service_ns = guard_wait_ns = guard_critical_ns = 0;

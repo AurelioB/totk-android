@@ -155,6 +155,7 @@ int vk_record_counter_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStag
 #ifdef TOTK_VK_TESTS
 void vk_record_test_descriptor_retained(uint64_t out[4]); /* recorder pools, primary pools, stock sets, bytes per pool */
 void vk_record_test_descriptors(uint64_t out[8]); /* sets, allocate calls, resets, walk ns, list ns/count, template ns/count */
+void vk_record_test_wakes(uint64_t out[4]); /* TOTK_VK_REC_WAKE_BATCH: walker signals, worker-chained signals, polled hits, parks */
 int vk_record_test_descriptor_stock(void); /* isolated real-driver checkout/recycle/batch/pressure fixture */
 int vk_record_test_descriptor_ceiling(void); /* the stock ceiling on one recorder context, set live at its handoffs */
 void vk_test_descriptor_pools_check(unsigned slot); /* nvn_vk.c: slot's pools may be reset/destroyed now (counted) */

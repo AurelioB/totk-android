@@ -50,6 +50,7 @@ static const totk_live_switch totk_live_switches[] = {
     {"TOTK_VK_FEEDBACK_CUT", 0, 1},          /* the next descriptor build */
     {"TOTK_VK_PREPARE_MASK", 0, 1},          /* the next draw's uniform preparation; a change dirties every register */
     {"TOTK_THREAD_SAMPLER", 0, 1},           /* the next presented frame (thread_sampler.h); starts its thread once */
+    {"TOTK_VK_REC_WAKE_BATCH", 0, 2000},     /* the next chunk enqueue and the next time a recorder worker finds no work */
 };
 enum { TOTK_LIVE_MAX = 16 };
 _Static_assert(sizeof totk_live_switches / sizeof *totk_live_switches <= TOTK_LIVE_MAX, "live switch table");

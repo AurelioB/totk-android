@@ -1385,6 +1385,14 @@ is on and native VMA pressure is absent, otherwise 75; an explicit setting inclu
 `TOTK_VK_COMPILE_THREADS` (pipeline compiler workers, unchanged default 2). Worker creation failure reduces the count
 to the workers actually started, with zero retaining the original path.
 
+**Worker wakes** (`TOTK_VK_REC_WAKE_BATCH`, default **0** = off): every queued chunk batch signals a parked worker,
+and the walker pays the futex wake (T7: 0.6 ms/frame Odin, 1.0 Duo; the default also signals workers already woken).
+`1` signals from the walker only when no worker is already on its way to the queue; a worker that takes a batch and
+leaves more queued wakes the next parked worker. `n ≥ 2` also lets an idle worker poll the queue for up to `n` µs
+before it parks, so steady chunk streams need no wake (CPU spent polling; try 50/200 against 0). `recorder
+wakes/frame` (every 300 presents) counts walker and worker signals, polled hits and parks. Live at the next enqueue;
+`vkrectest` compares bytes with 1 and 200 at 2/3 workers, and `--lag-walk-bench` prints wakes per case.
+
 Every 300 presents, `recorder frame ...` reports per-present walking elapsed time excluding GPU and worker waits,
 each of four possible workers' busy elapsed time (unused entries zero), worker wait time, and parallel/inline chunk
 and pass counts. Worker busy includes preemption and Vulkan calls, not thread CPU time. `TOTK_VK_REC_PROFILE`

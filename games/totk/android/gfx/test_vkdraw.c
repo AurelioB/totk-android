@@ -124,7 +124,7 @@ typedef struct {
 typedef struct {
     uint64_t ns[VK_REC_N], cpu, wall, seal, wait, draws, freeze_hits, program_hits;
     int frames;
-    uint64_t descriptors[8], api[3];
+    uint64_t descriptors[8], api[3], wakes[4];
 } walk_measure;
 static uint64_t walk_clock(clockid_t clock) {
     struct timespec t; if (clock_gettime(clock, &t)) DIE("walking benchmark clock_gettime failed");
@@ -1102,7 +1102,8 @@ static int lag_walk_bench(int argc, char **argv) {
         uint64_t previous[VK_REC_N], current[VK_REC_N], delta[VK_REC_N];
         vk_record_test_counts count0, count1; vk_record_test_counts_get(&count0);
         vk_record_test_profile_ns(previous, VK_REC_N);
-        uint64_t desc0[8], desc1[8], api0[3], api1[3]; vk_record_test_descriptors(desc0); walk_api_counts(api0);
+        uint64_t desc0[8], desc1[8], api0[3], api1[3], wake0[4], wake1[4]; vk_record_test_descriptors(desc0); walk_api_counts(api0);
+        vk_record_test_wakes(wake0);
         uint64_t serial = vk_submit_serial(), cpu_ns = 0, wall_ns = 0, seal_ns = 0;
         mtl_sub_begin(); mtl_sub_snapshot_ubos_cap(handles, WALK_CHUNKS, NULL);
         if (pending_service) atomic_store(&service.active, 1);
@@ -1132,7 +1133,7 @@ static int lag_walk_bench(int argc, char **argv) {
         uint64_t wait0 = walk_clock(CLOCK_MONOTONIC);
         CHECK(mtl_wait(fence, 30000000000ull), "walking frame %d real Vulkan execution completes", frame);
         uint64_t wait_ns = walk_clock(CLOCK_MONOTONIC) - wait0, chunks = vk_submit_serial() - serial;
-        vk_record_test_descriptors(desc1); walk_api_counts(api1);
+        vk_record_test_descriptors(desc1); walk_api_counts(api1); vk_record_test_wakes(wake1);
         CHECK(chunks == (stress ? WALK_CHUNKS : 1),
             "walking %s frame %d has %s actual Vulkan submissions (%llu observed)",
             case_names[phase], sample, stress ? "exactly twelve" : "exactly one", (unsigned long long)chunks);
@@ -1184,6 +1185,7 @@ static int lag_walk_bench(int argc, char **argv) {
             for (int k = 0; k < VK_REC_N; k++) m->ns[k] += delta[k];
             for (int k = 0; k < 8; k++) m->descriptors[k] += desc1[k] - desc0[k];
             for (int k = 0; k < 3; k++) m->api[k] += api1[k] - api0[k];
+            for (int k = 0; k < 4; k++) m->wakes[k] += wake1[k] - wake0[k];
         }
     }
     for (int phase = 0; phase < 3; phase++) {
@@ -1197,6 +1199,8 @@ static int lag_walk_bench(int argc, char **argv) {
         printf("lag-walk %s descriptors/frame: sets=%.2f calls=%.2f resets=%.2f walker_ns=%.0f list_ns=%.0f lists=%.2f template_ns=%.0f templates=%.2f\n",
             label, m->descriptors[0] / n, m->descriptors[1] / n, m->descriptors[2] / n, m->descriptors[3] / n,
             m->descriptors[4] / n, m->descriptors[5] / n, m->descriptors[6] / n, m->descriptors[7] / n);
+        printf("lag-walk %s recorder wakes/frame: walker=%.2f worker_chained=%.2f polled_hits=%.2f parks=%.2f\n",
+            label, m->wakes[0] / n, m->wakes[1] / n, m->wakes[2] / n, m->wakes[3] / n);
         if (call_counts_path)
             printf("lag-walk %s api/frame: vkAllocateDescriptorSets=%.2f allocated_descriptor_sets=%.2f vkResetDescriptorPool=%.2f\n",
                 label, m->api[0] / n, m->api[1] / n, m->api[2] / n);
