@@ -226,7 +226,10 @@ char *setup_move_json(const char *request, size_t len, SetupProgressFn progress_
     snprintf(c->staging, sizeof c->staging, "%s", m->stage);
     setup_progress(c, "move", 0, 0, "checking");
 
-    lock = game_lock(priv);
+    /* Android SetupService holds the JVM's shared record-lock lease throughout this call and the folder switch.
+       Do not even open this inode in that case: closing any descriptor here would release its POSIX lock. Standalone
+       callers (including host tests) still own an OFD lock for the entire move. */
+    lock = json_bool(j, "gameLockHeld") ? -2 : game_lock(priv);
     if (lock == -1) {
         if (errno == EAGAIN) setup_fail(c, "busy", "The game is running; close it before moving the game data");
         else st_io_fail(c, "open", "state/game.lock");
