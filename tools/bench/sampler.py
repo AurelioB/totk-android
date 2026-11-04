@@ -3,10 +3,13 @@
 
 Every --interval seconds, through one persistent root shell on the device (nothing is pushed), print the newest
 '计时 至帧 N' frame of totk.log, the max CPU / GPU thermal-zone temperature, the sum of the thermal cooling-device states
-(cpufreq / cpu-cluster / kgsl / gpu), the GPU's thermal_pwrlevel and clock, and each cpufreq policy's
-scaling_max_freq/cpuinfo_max_freq. Lines are host-timestamped (epoch seconds) and appended to <out>/samples-<label>.txt:
+(cpufreq / cpu-cluster / kgsl / gpu), the GPU's thermal_pwrlevel, clock and max_gpuclk (its effective cap), and each
+cpufreq policy's scaling_max_freq/cpuinfo_max_freq. Lines are host-timestamped (epoch seconds) and appended to
+<out>/samples-<label>.txt:
 
-  <epoch> f=<frame> cpu=<mC> gpu=<mC> cool=<sum> tpl=<level> gclk=<Hz> caps= <scaling>/<cpuinfo> ...
+  <epoch> f=<frame> cpu=<mC> gpu=<mC> cool=<sum> tpl=<level> gclk=<Hz> gcap=<Hz> caps= <scaling>/<cpuinfo> ...
+
+A value the device does not expose (no matching thermal zone / cooling device, no kgsl) is left empty and becomes null.
 
 Runs until --duration elapses, or SIGINT / SIGTERM; then the device loop and its sleep are killed, so no process is left
 on the device. As a safety net the device loop also ends by itself after --max-seconds (default 3 h, or --duration + 60).
@@ -16,17 +19,18 @@ import argparse, os, signal, subprocess, sys, threading, time
 LOOP = r'''
 echo "pid=$$"
 END=$(( $(date +%s) + @MAX@ ))
-cd /sys/class/thermal
+cd /sys/class/thermal 2>/dev/null
 CZ=""; GZ=""; CD=""
-for z in thermal_zone*; do t=$(cat $z/type); case $t in cpu*) CZ="$CZ $z/temp";; gpuss*) GZ="$GZ $z/temp";; esac; done
-for c in cooling_device*; do t=$(cat $c/type); case $t in cpufreq-*|cpu-cluster*|thermal-cluster*|kgsl|gpu|devfreq-*kgsl*) CD="$CD $c/cur_state";; esac; done
+for z in thermal_zone*; do t=$(cat $z/type 2>/dev/null); case $t in cpu*) CZ="$CZ $z/temp";; gpuss*) GZ="$GZ $z/temp";; esac; done
+for c in cooling_device*; do t=$(cat $c/type 2>/dev/null); case $t in cpufreq-*|cpu-cluster*|thermal-cluster*|kgsl|gpu|devfreq-*kgsl*) CD="$CD $c/cur_state";; esac; done
 L=@LOG@
 while true; do
   f=$(tail -c 30000 $L 2>/dev/null | grep -ao '至帧 [0-9]*' | tail -n1 | grep -o '[0-9]*')
-  ct=$(cat $CZ 2>/dev/null | sort -n | tail -n1); gt=$(cat $GZ 2>/dev/null | sort -n | tail -n1)
-  cs=0; for s in $(cat $CD 2>/dev/null); do cs=$((cs+s)); done
-  caps=""; for p in /sys/devices/system/cpu/cpufreq/policy*; do caps="$caps $(cat $p/scaling_max_freq)/$(cat $p/cpuinfo_max_freq)"; done
-  echo "f=${f:-0} cpu=$ct gpu=$gt cool=$cs tpl=$(cat /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel 2>/dev/null) gclk=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null) caps=$caps"
+  # </dev/null: with an empty zone list `cat` would otherwise read this script's stdin and block.
+  ct=$(cat $CZ 2>/dev/null </dev/null | sort -n | tail -n1); gt=$(cat $GZ 2>/dev/null </dev/null | sort -n | tail -n1)
+  cs=""; [ -z "$CD" ] || { cs=0; for s in $(cat $CD 2>/dev/null </dev/null); do cs=$((cs+s)); done; }
+  caps=""; for p in /sys/devices/system/cpu/cpufreq/policy*; do caps="$caps $(cat $p/scaling_max_freq 2>/dev/null)/$(cat $p/cpuinfo_max_freq 2>/dev/null)"; done
+  echo "f=${f:-0} cpu=$ct gpu=$gt cool=$cs tpl=$(cat /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel 2>/dev/null) gclk=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null) gcap=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null) caps=$caps"
   [ $(date +%s) -lt $END ] || exit 0
   sleep @INTERVAL@
 done

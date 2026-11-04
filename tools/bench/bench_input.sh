@@ -7,12 +7,37 @@
 #   shot <file>           screenshot of the main display, written to <file> on the host
 #   log                   print the game's totk.log
 #   detect                print the detected "event=<node> display=<id>" and exit
+#   freqs                 print the frequency limits as one line of tokens: per cpufreq policy N
+#                         cpuN=<related cpus>:<scaling_min>:<scaling_max>:<cpuinfo_max> (kHz; scaling_max = effective cap,
+#                         cpuinfo_max = hardware max), GPU gpu_maxclk (kgsl max_gpuclk, Hz), gpu_freqs (available, Hz),
+#                         gpu_devfreq_max, gpu_min_pwrlevel / gpu_max_pwrlevel / gpu_thermal_pwrlevel (absent ones omitted)
 # The controller node is the input device whose `getevent -p` lists ABS_Z and ABS_RZ (0002 / 0005) and BTN_SOUTH (0130);
 # the display is the first (internal) one of `dumpsys SurfaceFlinger --display-id`.
 set -u
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die() { echo "bench_input: $*" >&2; exit 1; }
+
+# Device-side script of `freqs` (fed to a root shell on stdin; prints one line).
+FREQS_SH=$(cat <<'EOF'
+for p in /sys/devices/system/cpu/cpufreq/policy*; do
+  [ -d "$p" ] || continue
+  r=$(echo $(cat $p/related_cpus 2>/dev/null) | tr ' ' ,)
+  printf 'cpu%s=%s:%s:%s:%s ' "${p##*policy}" "$r" "$(cat $p/scaling_min_freq 2>/dev/null)" \
+    "$(cat $p/scaling_max_freq 2>/dev/null)" "$(cat $p/cpuinfo_max_freq 2>/dev/null)"
+done
+K=/sys/class/kgsl/kgsl-3d0
+D=""; for d in /sys/class/devfreq/*; do case ${d##*/} in *kgsl*|*gpu*|*mali*) D=$d; break;; esac; done
+v=$(cat $K/max_gpuclk 2>/dev/null); [ -n "$v" ] && printf 'gpu_maxclk=%s ' "$v"
+f=$(cat $K/gpu_available_frequencies 2>/dev/null); [ -n "$f" ] || [ -z "$D" ] || f=$(cat $D/available_frequencies 2>/dev/null)
+[ -n "$f" ] && printf 'gpu_freqs=%s ' "$(echo $f | tr ' ' ,)"
+[ -n "$D" ] && v=$(cat $D/max_freq 2>/dev/null) && [ -n "$v" ] && printf 'gpu_devfreq_max=%s ' "$v"
+for k in min_pwrlevel max_pwrlevel thermal_pwrlevel; do
+  v=$(cat $K/$k 2>/dev/null); [ -n "$v" ] && printf 'gpu_%s=%s ' $k "$v"
+done
+echo
+EOF
+)
 
 SER=""; EV=""; DISP=""; PKG=com.aure.totk; GAME=""
 while [ $# -gt 0 ]; do
@@ -83,5 +108,8 @@ case $ACT in
   log)
     out=$(root "cat $GAME/totk.log" 2>&1) || die "cannot read $GAME/totk.log: $out"
     printf '%s\n' "$out" ;;
+  freqs)
+    out=$(printf '%s\n' "$FREQS_SH" | adbs shell 'su -c sh' | tr -d '\r')
+    case $out in *cpu[0-9]*=*) printf '%s\n' "$out" ;; *) die "no cpufreq limits read (root / sysfs): '$out'" ;; esac ;;
   *) die "unknown action $ACT" ;;
 esac

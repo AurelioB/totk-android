@@ -1,96 +1,167 @@
 ---
 name: totk-benchmark
-description: Use when measuring TotK Native performance on Android devices, checking a change for performance regressions against the recorded baseline, or recording/reproducing a benchmark ledger entry.
+description: Use when measuring TotK Native performance on Android devices, checking a change for performance regressions against the recorded baselines, or recording/reproducing a benchmark ledger entry.
 ---
 
 # TotK Native benchmark
 
-Measure the game on rooted Android handhelds with the same scenes and method as the recorded baseline, then compare.
+Measure the game on rooted Android handhelds with the same scenes and method as the recorded baselines, then compare.
 All scripts are in `tools/bench/` (paths below are relative to the repository root; quick reference in
 `tools/bench/README.md`).
 
-## Baselines are immutable
+## Scope: rooted Android devices over adb
 
-- The current baseline is **`docs/benchmarks/baseline-1.0.0.md`** + **`docs/benchmarks/baseline-1.0.0.json`**
-  (named in `docs/benchmarks/CURRENT_BASELINE`).
-- **Never edit, overwrite or regenerate a baseline file.** A new baseline is recorded only when the user explicitly
-  asks for one, as a NEW file (`docs/benchmarks/baseline-<version-or-date>.{md,json}`): write the JSON with
-  `analyze.py ... --json docs/benchmarks/baseline-<name>.json --new-baseline`, pin both files with
-  `python3 tools/bench/check_baselines.py --pin <file>`, then point `docs/benchmarks/CURRENT_BASELINE` at the new JSON and
-  update the name in this skill.
-- `analyze.py` / `compare.py` refuse to write `docs/benchmarks/baseline-*` without `--new-baseline` and never overwrite
-  one. `python3 tools/bench/check_baselines.py` (also in `tests/test_bench_tools.py`) fails when a baseline changed.
-- Every measurement round adds its own files: `docs/benchmarks/<name>.md` + `docs/benchmarks/<name>.json` (a short
-  write-up in the style of the baseline document plus the `analyze.py` JSON), and a ledger entry (below).
+- **Supported**: Android devices reachable with `adb` (USB or wireless) **with root through `su`** (Magisk, KernelSU),
+  the app `com.aure.totk` installed and set up. Root is required by every measuring step:
+  - **`sendevent`**: the scene is panned by writing stick events to the built-in controller's `/dev/input/event*` node
+    (and menus are navigated with button events); those nodes are root-only. `getevent -p` (controller detection) too.
+  - **The app's private files**: the frame timings come from the game's own log, `totk.log`, and the profile from
+    `settings.env`, both in `/data/user/0/com.aure.totk/files` (readable only by the app or root).
+  - **Kernel log and sysfs**: the dmesg marker and the GPU/SMMU fault check read the kernel log; the sampler and the
+    frequency snapshots read thermal zones, cooling devices, cpufreq policies and `/sys/class/kgsl` (several of them
+    root-only on production builds).
+- **Without root nothing is automatic**: `collect.sh` stops with "no root (su)", `sampler.py` with "the root shell never
+  started", `pan.sh` / `bench_input.sh press|rstick|detect|freqs` fail at `su`. Only `bench_input.sh shot` (screencap)
+  works. There is no non-root source of the frame timings, so such a device cannot be measured with this method or
+  added to the ledger.
+- **Unknown devices** (anything besides the Thor, Odin 3 and Pocket Duo of the baseline) are handled like this:
+  - Controller node: auto-detected as the input device whose `getevent -p` lists ABS_Z, ABS_RZ and BTN_SOUTH (a built-in
+    gamepad; an attached USB/Bluetooth pad matches too). If none or the wrong one is found, give
+    `--event /dev/input/eventN` to `bench_input.sh` and `pan.sh` (list the nodes with `adb shell su -c 'getevent -p'`).
+  - Display: the first display of `dumpsys SurfaceFlinger --display-id` (the internal one on dual-screen devices); give
+    `--display <id>` if `shot` shows the wrong screen.
+  - Temperatures and throttling: CPU / GPU temperatures come from thermal zones whose type starts with `cpu` / `gpuss`
+    (Qualcomm naming); cooling devices of type `cpufreq-*`, `cpu-cluster*`, `thermal-cluster*`, `kgsl`, `gpu`,
+    `devfreq-*kgsl*`; GPU thermal power level / clock / cap from `/sys/class/kgsl` (Adreno). What a device does not have
+    is recorded as empty sampler fields and `null` in the result (`cpu_max_c`, `gpu_max_c`, cooling state, ...; shown
+    as `-`, compared as `n/a`); the frame metrics are unaffected. Look at `samples-<label>.txt` after the first scene.
+  - GPU frequency limits: kgsl first, else the first `/sys/class/devfreq/*` whose name contains `kgsl`, `gpu` or `mali`;
+    without either the GPU cap is unknown (null) and the signature says so.
+  - `collect.sh` records the device facts (model, SoC, GPU, Android, displays, serial hash). The first run of a new
+    device (or of new caps / settings) becomes the baseline of its frequency signature (below).
+
+## Baselines: one per frequency signature, immutable
+
+- A **frequency signature** identifies what a run is comparable with: device model + SoC, the hash of the profile's
+  `settings_env`, the effective CPU cap of each cluster (cpufreq `scaling_max_freq` per policy, kHz) and the effective
+  GPU cap (kgsl `max_gpuclk`, lowered by `max_pwrlevel` / devfreq `max_freq` when those are lower; Hz).
+  Tools like ClusterTune, a vendor "performance mode", game boosters or thermal throttling change these caps; the same
+  build then runs at another speed, so runs with different signatures are **not comparable**.
+- `docs/benchmarks/baselines/index.json` maps each signature to its baseline file, with the caps in readable form.
+  - The 1.0.0 release baseline (`docs/benchmarks/baseline-1.0.0.{md,json}`) is registered for its three devices with
+    the CPU caps from its sampler records (Odin 3 2227200 / 2246400 of 3532800 / 4320000 kHz, Thor and Duo at the
+    hardware maximum) and **GPU cap unknown (null)**. A null GPU cap never matches a known one, so it serves only as a
+    **reference-only** comparison (same model, settings and CPU caps), labelled as such.
+  - **Auto-baselining**: `ledger.py add` with a device whose signature has no baseline yet, and whose runs all have
+    `freq_stable: true`, writes that result as the NEW baseline `docs/benchmarks/baselines/<device-slug>/<short>.json`,
+    pins it in `docs/benchmarks/BASELINES.sha256` and adds it to the index. Later runs with that signature are compared
+    against it. Nothing else creates a baseline.
+- **Never edit, overwrite or regenerate a baseline file or an index entry.** `analyze.py` / `compare.py` refuse to
+  write any baseline path; `python3 tools/bench/check_baselines.py` (also in `tests/test_bench_tools.py`) fails when a
+  pinned file changed, a baseline file is unpinned, or an index entry does not match its file or fields.
+- A run whose caps changed during a pan (`freq_stable: false`: throttling, a tool or the user changed a limit) is
+  recorded in the ledger but never becomes a baseline and is not compared; repeat it.
+- A measurement round may add a write-up: `docs/benchmarks/<name>.md` + `docs/benchmarks/<name>.json` (in the style of
+  the 1.0.0 document plus the `analyze.py` JSON), and always a ledger entry (below).
 
 ## Prerequisites
 
-- Host: `adb`, POSIX sh, Python 3. Device: root through `su` (sendevent, the app's private files, dmesg).
+- Host: `adb`, POSIX sh, Python 3. Device: root (see Scope).
 - The app (`com.aure.totk`) installed and set up, on the device's **default profile**: in the app's Graphics screen the
   preset marked IN USE is the one marked "Recommended for this device" (not Custom), and there is no developer
-  `totk.env` (`collect.sh` warns if there is). Start the game with the app's **Start game** button: it rewrites
+  `totk.env` (`collect.sh` warns if there is). Start the game with the app's **Start game** (or PLUS): it rewrites
   `settings.env` from the profile.
-- The merged save set (kept outside the repository: `merged-saves.zip` and its sha256 list), imported on the device
-  with the app's Saves → Import saves → A zip file → Replace my saves. Scenes:
-  | Scene label | Save slot | Note |
-  |---|---|---|
-  | `hateno` | `slot_00` Hateno Village | outdoors in the village |
-  | `lookout` | `slot_02` Lookout Landing | arrives **inside** the shelter next to Monte (indoor) |
-  | `rotsumamu` | `slot_04` Rotsumamu Shrine | outdoors at the shrine |
+- The merged save set (kept outside the repository: `merged-saves.zip` and its sha256 list `merged-saves.sha256`, 32
+  files), imported on the device with the app's Saves → Import saves → A zip file → Replace my saves. Scenes:
+  | Scene label | Save slot | App's Saves screen | Note |
+  |---|---|---|---|
+  | `hateno` | `slot_00` Hateno Village | Slot 1 | outdoors in the village |
+  | `lookout` | `slot_02` Lookout Landing | Slot 3 | arrives **inside** the shelter next to Monte (indoor) |
+  | `rotsumamu` | `slot_04` Rotsumamu Shrine | Slot 5 | outdoors at the shrine |
+
+  The game's own Load list is ordered by save date, newest first, not by slot: pick the scene by its **name**.
 - Nothing else measuring or loading the device (no other samplers, screen recorders, or test loops in `ps -A`).
+- **Frequency caps as intended**: `tools/bench/bench_input.sh -s <serial> freqs` prints the current limits:
+  `cpuN=<cpus>:<scaling_min>:<scaling_max>:<cpuinfo_max>` per cluster (kHz; `scaling_max` is the effective cap,
+  `cpuinfo_max` the hardware maximum) and `gpu_maxclk` / `gpu_freqs` (Hz; the cap and the available frequencies, the
+  first being the hardware maximum) plus the GPU power levels. A cap below the hardware maximum is usually ClusterTune,
+  a performance-mode tile / setting being off, or a game booster: decide whether that is the state you want to measure
+  (it becomes part of the signature) and keep it for the whole session.
 - Never uninstall the app (it deletes the game data and saves); never change its settings for a benchmark unless the
-  run is deliberately on another profile (then say so in the notes).
+  run is deliberately on another profile (then say so with `--profile` and in the notes).
 
 ## Procedure (per device; devices can run in parallel)
 
 Use one output directory per round, e.g. `OUT=.scratch/bench/<YYYY-MM-DD>-<label>` (gitignored), and a short device
-label (`thor`, `odin`, `duo`, or a new one for another device).
+label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/bench_input.sh -s <serial>"` below.
 
-1. **Check the profile.** Open the app's Graphics screen (`tools/bench/bench_input.sh -s <serial> shot $OUT/shots/<label>-graphics.png`
-   and look at it): IN USE must be the Recommended preset. Start the game with **Start game**.
-2. **Detect input/display** once: `tools/bench/bench_input.sh -s <serial> detect` prints `event=... display=...`
-   (pass them with `--event` / `--display` if detection picks the wrong node).
-3. **Load the scene from the in-game Load list** (PLUS menu → System → Load → the slot; navigate with
-   `bench_input.sh press <button>` and check each step with `bench_input.sh shot`). Do not use the app's autoload.
-4. **Settle 55 s** after the world appears (`shot` the arrival view).
-5. **Mark dmesg** (first scene of the session): `tools/bench/collect.sh -s <serial> --device <label> --out $OUT --mark`.
-6. **Start the sampler** (first scene; it runs for the whole session):
-   `python3 tools/bench/sampler.py -s <serial> --device <label> --out $OUT &`.
-7. **Pan**: `tools/bench/pan.sh -s <serial> --device <label> --scene <hateno|lookout|rotsumamu> --seconds 48 --out $OUT`
-   (right stick at 16000 of 32767, right then left; 48 s gives at least 4 full windows at 30 fps). Look at the mid-pan
-   screenshot in `$OUT/shots/`. Repeat steps 3–4 and 7 for the other scenes.
-8. **Stop the sampler** (`kill %1`, or Ctrl-C; it removes its device loop) and **collect**:
-   `tools/bench/collect.sh -s <serial> --device <label> --out $OUT`. It must report 0 GPU/SMMU fault lines and 0
-   "device lost"; investigate otherwise.
-9. **Analyze** all devices of the round:
-   `python3 tools/bench/analyze.py $OUT --name <name> --commit <sha> --json $OUT/<name>.json`
-   (optionally `--meta <json>` to add curated device names / profile descriptions / extra caveats).
-10. **Compare** with the baseline: `python3 tools/bench/compare.py docs/benchmarks/baseline-1.0.0.json $OUT/<name>.json`.
-11. **Record**: copy the JSON to `docs/benchmarks/<name>.json`, write `docs/benchmarks/<name>.md` (build, devices and
-    profiles, results table printed by `analyze.py`, comparison, caveats), and add the ledger entry (below).
-12. **Restore state**: release the stick (`bench_input.sh -s <serial> rstick 0`), stop the game
-    (`adb -s <serial> shell am force-stop com.aure.totk`), turn off any screen stay-on you set, delete anything you
-    put in the device's Download folder (e.g. save exports), and confirm `ps -A` shows no leftover sampler. If a save
-    could have been overwritten (autosave), export the saves from the app and check them against the merged set's
-    sha256 list; re-import the merged set if they differ.
+1. **Wake the device and keep it awake**: `adb -s <serial> shell input keyevent KEYCODE_WAKEUP` and
+   `adb -s <serial> shell svc power stayon true` (note the previous `settings get global stay_on_while_plugged_in` to
+   restore it). A sleeping device gives black screenshots and ignores input.
+2. **Check the profile.** Open the app (`adb -s <serial> shell monkey -p com.aure.totk -c android.intent.category.LAUNCHER 1`),
+   then Graphics (`$B press DOWN`, `$B press A`) and `$B shot $OUT/shots/<label>-graphics.png`; look at it: IN USE must
+   be the Recommended preset. The main menu remembers its focus: check with `shot` before pressing A.
+3. **Detect input/display** once: `$B detect` prints `event=... display=...` (pass them with `--event` / `--display` if
+   detection picks the wrong node). **Check the caps**: `$B freqs` (see Prerequisites).
+4. **Start the game** with `$B press PLUS` (Start game) and wait for the title screen (~45 s, `shot`).
+5. **Load the scene from the game's Load list**: on the title screen `$B press A` opens "Select save data to load"; in
+   the world it is PLUS menu → System → Load. Move to the scene by name with `$B press DOWN`, check with `shot`, then
+   `$B press A` twice (select, then **Load**). Do not use the app's autoload ("Open the game directly").
+6. **Settle 55 s** after the world appears (`shot` the arrival view).
+7. **Mark dmesg** (first scene of the session): `tools/bench/collect.sh -s <serial> --device <label> --out $OUT --mark`.
+8. **Start the sampler** (first scene; it runs for the whole session):
+   `python3 tools/bench/sampler.py -s <serial> --device <label> --out $OUT &` (note its PID if you run the next steps
+   from another shell).
+9. **Pan**: `tools/bench/pan.sh -s <serial> --device <label> --scene <hateno|lookout|rotsumamu> --seconds 48 --out $OUT`
+   (right stick at 16000 of 32767, right then left; 48 s gives at least 4 full windows at 30 fps). It also records the
+   frequency limits just before and after the pan in `$OUT/freqs.txt`. Look at the mid-pan screenshot in
+   `$OUT/shots/`. Repeat steps 5–6 and 9 for the other scenes.
+10. **Stop the sampler** (`kill %1` in the same shell, else `kill <pid>`, or Ctrl-C; it removes its device loop) and
+    **collect**: `tools/bench/collect.sh -s <serial> --device <label> --out $OUT`. It must report 0 GPU/SMMU fault
+    lines and 0 "device lost"; investigate otherwise.
+11. **Analyze** all devices of the round:
+    `python3 tools/bench/analyze.py $OUT --name <name> --commit <full sha> --json $OUT/<name>.json`
+    (optionally `--meta <json>` to add curated device names / profile descriptions / extra caveats). Check the
+    `frequency caps: ..., stable` line of each scene and the printed frequency signature; a `CHANGED` run is not usable.
+12. **Compare** with the baseline of the run's signature: `ledger.py add` (below) does it and creates the baseline when
+    the signature is new. To look before recording: `python3 tools/bench/compare.py <baseline file> $OUT/<name>.json`
+    with the file named for that signature in `docs/benchmarks/baselines/index.json` (or `baseline-1.0.0.json`, which
+    gives a reference-only comparison at best).
+13. **Record**: the ledger entry (below); for a full round also `docs/benchmarks/<name>.{md,json}` (build, devices and
+    profiles, caps, results table printed by `analyze.py`, comparison, caveats).
+14. **Restore state**: release the stick (`$B rstick 0`), stop the game (`adb -s <serial> shell am force-stop com.aure.totk`),
+    `adb -s <serial> shell svc power stayon false` (or the previous value), delete anything you put in the device's
+    Download folder, and confirm `ps -A` shows no leftover sampler. **Saves**: loading a scene can autosave over a slot,
+    so restore and verify the merged set:
+    1. `adb -s <serial> push merged-saves.zip /sdcard/Download/`; in the app: Saves → Import saves → A zip file; in the
+       file picker tap the search icon, `adb shell input text merged-saves`, tap the file; then **Replace my saves**
+       (the dialog's focus starts on "Keep my saves": `$B press UP`, `$B press A`).
+    2. Saves → Export saves → SAVE (the picker proposes `TotK Native saves <date> <time>.zip` in Download).
+    3. `adb pull "/sdcard/Download/TotK Native saves <date> <time>.zip"`, unzip it on the host and, inside its
+       `TotK Native saves/` folder, `sha256sum -c merged-saves.sha256` must print 32 `OK` lines.
+    4. Delete both zips from `/sdcard/Download` and stop the app.
 
 ## Reading the results
 
 - Windows are the runtime's own 300-frame windows that started after the stick was pushed and ended before it was
   released. `fps`, `p50`/`p95`/`max` frame time, `GPU ms` per frame, `>50 ms` frames (stutter line) and long frames
   (`[长帧]`) come from `totk.log`; temperatures, cooling states, GPU `thermal_pwrlevel` and cpufreq limits from the
-  sampler over each pan.
+  sampler over each pan; the frequency limits (per cluster `related_cpus`, `scaling_min/max`, `cpuinfo_max`; GPU cap,
+  hardware maximum and power levels) from `freqs.txt` (`freq_limits` per pan, `freq_stable` per run).
 - `compare.py` verdicts: per metric `better` / `worse` / `same` within documented tolerances (`compare.py --help`); a
-  scene is worse if fps mean, p50, p95, GPU ms or >50 ms frames (per window) got worse. Exit status 1 when any scene
-  is worse.
-- **Not comparable** warnings: a different `settings_env` (another profile or menu change) or different cpufreq caps.
-  Do not draw conclusions from those pairs.
+  scene is worse if fps mean, p50, p95, GPU ms or >50 ms frames (per window) got worse. Each device pair is labelled by
+  frequency signature: **match** (a regression check; exit status 1 when such a scene is worse), **reference only**
+  (the reference has no GPU cap: indicative) or **NOT COMPARABLE** (signatures differ or are unknown: loud warning,
+  never decides the exit status).
+- Other **not comparable** warnings: a different `settings_env`, different cpufreq caps, or `freq_stable: false`.
+- Temperatures depend on how long the device has been running the game: a one-scene session ends cooler than the
+  1.0.0 round, which measured three scenes back to back. They are reported, not part of the scene verdict.
 
 Known caveats:
 
-- **Odin 3 CPU cap**: in the baseline its CPU clocks were capped at 2.23 / 2.25 GHz (hardware 3.53 / 4.32 GHz) by a
+- **Odin 3 CPU cap**: in the 1.0.0 baseline its CPU clocks were capped at 2.23 / 2.25 GHz (hardware 3.53 / 4.32 GHz) by a
   non-thermal limit (performance mode off, a ClusterTune "Performance" tile present); its Hateno and Lookout Landing
-  numbers are CPU-limited. The sampler records the caps; compare only runs with the same caps.
+  numbers are CPU-limited. That cap is part of its 1.0.0 signature; an uncapped Odin 3 run is another signature.
 - **Long-frame counts are lower bounds**: a long frame is logged only when over 20 ms and 40 % above the recent
   16-frame average, so 45–46.7 ms frames at 30 fps and sustained slowdowns are missed. For 30 fps devices the
   `>50 ms` count is the reliable one.
@@ -100,36 +171,53 @@ Known caveats:
 
 ## Capture a new benchmark (any device)
 
-1. **Build the experiment APK from a clean commit** (no uncommitted changes: the APK's `assets/build.txt` must not say
-   `-dirty`, or the ledger refuses it):
+1. **Build the experiment APK from a clean checkout of the commit** (the APK's `assets/build.txt` must say
+   `commit <sha12>` without `-dirty`, or the ledger refuses it). A separate worktree keeps your working tree out of it:
    ```sh
-   git status --short            # must be empty
-   python3 games/totk/android/build_release.py --ndk <Android NDK r28> --turnip <Turnip driver.so> \
-     --key <signing key .p12> --key-pass-env <VAR> -o .scratch/bench/<sha12>.apk
+   git worktree add --detach .scratch/wt-<sha12> <commit>     # or a fresh clone; `git status --short` must be empty
+   cd .scratch/wt-<sha12>
+   python3 games/totk/android/build_release.py --ndk <Android NDK r28> --turnip <pinned Turnip driver.so> \
+     --key <signing key .p12> --key-pass-env <VAR> [--translator <prebuilt android-arm64 totk_xlate>] \
+     -o .scratch/bench/<sha12>.apk
+   unzip -p .scratch/bench/<sha12>.apk assets/build.txt         # commit <sha12>
    ```
+   The build needs the prerequisites of `games/totk/android/README.md`: Python 3.12+ **with `cryptography`**
+   (`pip install cryptography==50.0.2`, e.g. in a venv whose `python` runs the command), git, make, cmake, javac 17+,
+   the Android SDK and NDK r28, and the .NET 10 SDK unless `--translator` gives a prebuilt translator. The key password
+   goes in an environment variable named by `--key-pass-env` (never on the command line).
 2. **Install** with `adb -s <serial> install -r .scratch/bench/<sha12>.apk`. If it fails with a signature mismatch,
    stop and ask the user (never uninstall: that deletes the game data and saves).
-3. **Profile**: the device's default (Recommended) profile, or a deliberate profile written in the ledger note.
-4. **Run the procedure above.** Unknown devices are fine: `collect.sh` records their facts (model, SoC, GPU, Android,
-   displays, serial hash). They are compared only against earlier ledger entries for the same device model and
-   `settings_env`, or against the baseline only if the device is in it.
+3. **Profile**: the device's default (Recommended) profile, or a deliberate profile written in `--profile` and the note.
+4. **Run the procedure above.** Unknown devices are fine (see Scope).
 5. **Add to the ledger**, tied to that commit and APK (the commit must exist; the APK's `assets/build.txt` must match
    it; its sha256 must equal the installed APK's that `collect.sh` recorded):
    ```sh
-   python3 tools/bench/ledger.py add $OUT/<name>.json --commit <full sha> --apk .scratch/bench/<sha12>.apk \
-     [--run-id <YYYY-MM-DD>-<label>] [--profile "<profile>"] --note "<what changed / why>"
+   python3 tools/bench/ledger.py add $OUT/<name>.json --commit <full sha> --apk <path to the APK> \
+     --profile "<IN USE preset> (default: Recommended for this device)" [--run-id <YYYY-MM-DD>-<label>] \
+     --note "<what changed / why>"
    ```
-   This writes `docs/benchmarks/runs/<run-id>/<device>.json`, appends to `docs/benchmarks/ledger.jsonl`, prints the
-   verdicts against the current baseline and the previous comparable entry, and re-renders
+   `--profile` names the preset as the Graphics screen shows it (or describes a deliberate other profile). This writes
+   `docs/benchmarks/runs/<run-id>/<device>.json`, appends to `docs/benchmarks/ledger.jsonl`, prints the frequency
+   signature and caps, and either the verdicts against that signature's baseline or **NEW BASELINE** (a signature seen
+   for the first time: the baseline file, pin and index entry are written), plus a reference-only comparison with
+   1.0.0 when model, settings and CPU caps match and the previous entry of the signature; then re-renders
    `docs/benchmarks/LEDGER.md` (`python3 tools/bench/ledger.py render` does it alone). The ledger is append-only.
-6. **Commit** the ledger, LEDGER.md and the run JSON (plus `docs/benchmarks/<name>.{md,json}` for a full round).
+6. **Commit** the ledger, LEDGER.md and the run JSON, plus any new `docs/benchmarks/baselines/` file, the index and
+   `BASELINES.sha256` (and `docs/benchmarks/<name>.{md,json}` for a full round); run `python3 tools/bench/check_baselines.py`.
 
 ## Reproduce a ledger entry
 
-1. `python3 tools/bench/ledger.py show <run-id>`: commit, APK sha256, device, profile, settings and scenes.
-2. `git checkout <commit>` (in a clean tree or a worktree), rebuild with the command above, and check the APK's
-   sha256 / `assets/build.txt`. (Release builds are not byte-reproducible across keys; the commit is what must match.)
-3. Install with `adb install -r`, set the same profile (its `settings_env` must equal the entry's), and run the same
-   scenes with the procedure above.
-4. Add it as a new ledger entry (new run id) and compare:
-   `python3 tools/bench/ledger.py compare <old-run-id> <new-run-id>` (or `compare.py` on the two result JSONs).
+1. `python3 tools/bench/ledger.py show <run-id>` prints everything needed: the commit, app version and APK sha256, the
+   game version and Turnip driver sha256, the device facts, the profile and its `settings_env`, the frequency caps
+   (per cluster and GPU) and signature, the method (`totk-android-benchmark/1` schema and the method summary: Load list,
+   ~55 s settle, half-deflection stick pan) and per scene its name, save slot and pan length / stick value.
+2. Check out that commit cleanly (step 1 of "Capture": a worktree), rebuild, and check the APK's `assets/build.txt`.
+   (Release builds are not byte-reproducible across keys, so the APK sha256 differs with another key; the commit is what
+   must match. The Turnip driver is pinned by `build_release.py`.)
+3. Install with `adb install -r`, set the same profile (its `settings_env` must equal the entry's: `collect.sh` writes
+   `settings-<label>.env`) and the same frequency caps (`bench_input.sh freqs` must show the entry's caps), import the
+   merged save set (same sha256 list), and run the same scenes with the procedure above and the current `tools/bench`
+   (check that `analyze.py` still writes the same schema and method summary).
+4. Add it as a new ledger entry (new run id): with the same signature it is compared against that signature's baseline
+   automatically; `python3 tools/bench/ledger.py compare <old-run-id> <new-run-id>` (or `compare.py` on the two result
+   JSONs) compares the two runs directly.

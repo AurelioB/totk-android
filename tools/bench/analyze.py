@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""analyze.py <out-dir> [--json FILE] [--name NAME] [--date YYYY-MM-DD] [--commit SHA] [--meta FILE] [--new-baseline]
+"""analyze.py <out-dir> [--json FILE] [--name NAME] [--date YYYY-MM-DD] [--commit SHA] [--meta FILE]
 
 Per device x scene, the runtime's own 300-frame windows recorded while panning: from <out>/pans.txt, the windows whose
 end frame is in [F0+600, F1] (started after the stick was pushed, finished before it was released), read from
 <out>/logs/<device>.log, plus the max CPU / GPU zone temperature, cooling / GPU throttle state and cpufreq caps from
-<out>/samples-<device>.txt over [T0, T1]. Prints the windows and a results table; --json writes the result in the
-totk-android-benchmark/1 schema (the shape of docs/benchmarks/baseline-1.0.0.json).
+<out>/samples-<device>.txt over [T0, T1], and the frequency limits at the start and end of each pan from
+<out>/freqs.txt. Prints the windows and a results table; --json writes the result in the totk-android-benchmark/1
+schema (the shape of docs/benchmarks/baseline-1.0.0.json, plus the frequency fields below).
+
+Frequency limits: each pan gets freq_limits {start, end} (per cpufreq policy related_cpus, scaling_min/scaling_max/
+cpuinfo_max kHz; GPU max_gpuclk, available frequencies, devfreq max, power levels, effective cap_hz and hw_max_hz).
+A run is freq_stable false when any effective cap (CPU scaling_max per cluster, GPU cap) differs between those
+snapshots, between the sampler's records over the pans, or from the device's first scene: such a run is not usable
+for comparison and never becomes a baseline. Each device gets freq_limits (its first pan's start) and freq_signature
+(benchlib.device_signature: model + SoC, settings_env hash, CPU caps, GPU cap).
 
 Inputs per device label (as written by collect.sh / sampler.py / pan.sh): logs/<d>.log, logs/<d>-dmesg.txt,
-samples-<d>.txt, settings-<d>.env, facts-<d>.txt, totk-env-<d>.txt (only when a developer totk.env exists).
+samples-<d>.txt, settings-<d>.env, facts-<d>.txt, totk-env-<d>.txt (only when a developer totk.env exists), freqs.txt.
 pans.txt lines with the same device and scene (a trailing repeat number is ignored: hateno2 = hateno) form one run.
 --meta: a JSON object deep-merged over the generated document (curated device names / profiles, build fields);
-its "caveats" are appended to the generated ones.
-Never writes docs/benchmarks/baseline-* unless --new-baseline (then only to a file that does not exist yet)."""
+its "caveats" are appended to the generated ones. Never writes a baseline file (benchlib.guard_output)."""
 import argparse, collections, datetime, json, os, re, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchlib import SCHEMA, guard_output  # noqa: E402
+from benchlib import SCHEMA, caps_of_limits, device_signature, guard_output, parse_freq_tokens, sig_caps_text  # noqa: E402
 
 METHOD_SUMMARY = ('Default profile per device (no totk.env). Save loaded from the in-game Load list, ~55 s settle, then the '
                   'right stick held at {stick} (right, then left) via sendevent on the controller node. Only the runtime\'s own '
@@ -28,6 +35,8 @@ METHOD_SOURCES = {
     'long_frames': '[长帧] lines (logged only when >20 ms and 40% above the recent 16-frame average: lower bound)',
     'over33_over50': '[nvn-vk] stutter line counts per window',
     'thermal': 'thermal zones, cooling devices, GPU thermal_pwrlevel and cpufreq limits sampled every 3 s',
+    'freq_limits': 'cpufreq policies and the kgsl/devfreq GPU limits read at the start and end of each pan, plus the '
+                   'sampler\'s scaling_max_freq / max_gpuclk records',
 }
 KNOWN_SCENES = {
     'hateno': {'name': 'Hateno Village', 'save_slot': 'slot_00', 'note': 'outdoors in the village'},
@@ -75,15 +84,59 @@ def parse_samples(path, t0, t1):
                 continue
         except ValueError:
             continue
-        d = dict(x.split('=', 1) for x in p[1:7] if '=' in x)
+        d = dict(x.split('=', 1) for x in line.split('caps=', 1)[0].split()[1:] if '=' in x)
         num = lambda k: int(d[k]) if d.get(k, '').lstrip('-').isdigit() else None
         caps = []
         for c in line.split('caps=', 1)[1].split():
             s, _, m = c.partition('/')
             if s.isdigit() and m.isdigit():
                 caps.append((int(s), int(m)))
-        rows.append({'cpu': num('cpu'), 'gpu': num('gpu'), 'cool': num('cool'), 'tpl': num('tpl'), 'caps': caps})
+        rows.append({'cpu': num('cpu'), 'gpu': num('gpu'), 'cool': num('cool'), 'tpl': num('tpl'), 'gcap': num('gcap'),
+                     'caps': caps})
     return rows
+
+
+def parse_freqs(path):
+    """{(device, T0): {'start': freq_limits, 'end': freq_limits}} from pan.sh's freqs.txt (empty snapshots skipped)."""
+    out = collections.defaultdict(dict)
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        for line in fh:
+            p = line.split()
+            if len(p) < 4 or not p[2].startswith('T0=') or p[3] not in ('start', 'end'):
+                continue
+            fl = parse_freq_tokens(p[4:])
+            if fl['cpu']:
+                out[(p[0], int(p[2][3:]))][p[3]] = fl
+    return out
+
+
+def fmt_caps(caps):
+    cpu, gpu = caps
+    return f'CPU {"/".join(map(str, cpu))} kHz, GPU {gpu if gpu is not None else "?"} Hz'
+
+
+def freq_stability(snapshots, rows, reference=None):
+    """Whether the effective frequency caps stayed put over a run: snapshots = the freq_limits read at the start / end
+    of its pans, rows = the sampler's records over the pans, reference = the device's first-scene caps (or None).
+    Returns (True | False | None when nothing was recorded, [descriptions of the changes])."""
+    changes = []
+    caps = list(dict.fromkeys(caps_of_limits(s) for s in snapshots if s))
+    if reference is not None and caps and caps[0] != reference:
+        changes.append(f'caps differ from the device\'s first scene ({fmt_caps(reference)} -> {fmt_caps(caps[0])})')
+    if len(caps) > 1:
+        changes.append('caps changed between the pan start / end readings: ' + ' -> '.join(map(fmt_caps, caps)))
+    cpu_seen = list(dict.fromkeys([c[0] for c in caps] + [tuple(s for s, _ in r['caps']) for r in rows if r['caps']]))
+    if len(cpu_seen) > 1:
+        changes.append('CPU scaling_max_freq changed during the pans: ' + ' -> '.join('/'.join(map(str, c)) for c in cpu_seen))
+    gpu_seen = list(dict.fromkeys([s['gpu']['max_gpuclk_hz'] for s in snapshots if s and s['gpu']['max_gpuclk_hz']]
+                                  + [r['gcap'] for r in rows if r.get('gcap')]))
+    if len(gpu_seen) > 1:
+        changes.append('GPU max_gpuclk changed during the pans: ' + ' -> '.join(map(str, gpu_seen)) + ' Hz')
+    if not caps and not changes:
+        return None, changes
+    return not changes, changes
 
 
 def read_kv(path, comments=True):
@@ -126,10 +179,9 @@ def main():
     ap.add_argument('--date', help='measurement date (default: UTC date of the first pan)')
     ap.add_argument('--commit', help='source commit of the measured APK (its assets/build.txt)')
     ap.add_argument('--meta', help='JSON object deep-merged over the result (device names, profiles, extra caveats)')
-    ap.add_argument('--new-baseline', action='store_true', help='allow writing a NEW docs/benchmarks/baseline-*.json')
     a = ap.parse_args()
     if a.json:
-        guard_output(a.json, a.new_baseline)
+        guard_output(a.json)
     out = a.out
     meta = json.load(open(a.meta, encoding='utf-8')) if a.meta else {}
 
@@ -190,6 +242,7 @@ def main():
              'turnip_driver_sha256': one('turnip_driver_sha256')}
 
     runs, table = [], []
+    freqs = parse_freqs(os.path.join(out, 'freqs.txt'))
     for dev in order:
         timing, gpu, fps, stut, longf, info = logs[dev]
         for scene in scenes:
@@ -198,7 +251,7 @@ def main():
                 continue
             print(f'\n## {dev} / {scene}')
             print('window          fps    p50    p95    max   GPU ms  long>=25  long>=45  over33/over50(stutter line)')
-            windows, thermal = [], []
+            windows, thermal, all_rows = [], [], []
             for kv in plist:
                 f0, f1 = kv['F0'], kv['F1']
                 for f in sorted(x for x in timing if f0 + 600 <= x <= f1):
@@ -214,6 +267,7 @@ def main():
                           f'{w["long_ge45"]:>6}    {st[0] if st else "-"}/{st[2] if st else "-"} '
                           f'(>{st[1] if st else "-"}/>{st[3] if st else "-"})')
                 rows = parse_samples(os.path.join(out, f'samples-{dev}.txt'), kv['T0'], kv['T1'])
+                all_rows += rows
                 if rows:
                     capped = sorted({c for r in rows for c in r['caps'] if c[0] != c[1]})
                     t = {'cpu_max_c': mx(r['cpu'] for r in rows), 'gpu_max_c': mx(r['gpu'] for r in rows),
@@ -242,9 +296,20 @@ def main():
                 'over50_total': sum(vals('over50')),
                 'cpu_max_c': mx(t['cpu_max_c'] for t in thermal), 'gpu_max_c': mx(t['gpu_max_c'] for t in thermal),
             }
+            snaps = [freqs.get((dev, kv['T0']), {}) for kv in plist]
+            first = next((s.get('start') or s.get('end') for s in snaps if s), None)
+            if first and not devices[dev].get('freq_limits'):
+                devices[dev]['freq_limits'] = first
+            ref = caps_of_limits(devices[dev].get('freq_limits'))
+            stable, changes = freq_stability([s.get(k) for s in snaps for k in ('start', 'end')], all_rows, ref)
+            print('  frequency caps: ' + (fmt_caps(caps_of_limits(first)) if first else 'not recorded (no freqs.txt)')
+                  + {True: ', stable', False: ', CHANGED: ' + '; '.join(changes), None: ''}[stable])
             runs.append({'device': dev, 'scene': scene,
                          'pans': [{'start_frame': kv['F0'], 'end_frame': kv['F1'], 'start_utc': utc(kv['T0']),
-                                   'end_utc': utc(kv['T1']), 'stick_value': kv['V']} for kv in plist],
+                                   'end_utc': utc(kv['T1']), 'stick_value': kv['V'],
+                                   'freq_limits': {'start': s.get('start'), 'end': s.get('end')}}
+                                  for kv, s in zip(plist, snaps)],
+                         'freq_stable': stable, 'freq_changes': changes,
                          'summary': summary, 'windows': windows, 'thermal': thermal})
             table.append((dev, scene, summary, windows))
 
@@ -258,6 +323,13 @@ def main():
                if (t['cooling_state_max'] or 0) > 0 or (t['gpu_thermal_pwrlevel_max'] or 0) > 0]
         if hot:
             caveats.append(f'{dev}: thermal throttling engaged during {", ".join(dict.fromkeys(hot))}.')
+        unstable = [f'{r["scene"]} ({"; ".join(r["freq_changes"])})' for r in runs if r['device'] == dev
+                    and r['freq_stable'] is False]
+        if unstable:
+            caveats.append(f'{dev}: frequency limits changed during {", ".join(unstable)}: freq_stable false, not usable '
+                           'for comparison.')
+        if not devices[dev].get('freq_limits'):
+            caveats.append(f'{dev}: no frequency limits recorded (pan.sh freqs.txt): no frequency signature.')
     faults = {}
     for dev in order:
         dm = os.path.join(out, 'logs', f'{dev}-dmesg.txt')
@@ -288,6 +360,12 @@ def main():
         'caveats': caveats,
     }
     deep_merge(doc, meta)
+    for dev in order:
+        sig = device_signature(doc, dev)
+        if sig:
+            doc['devices'][dev]['freq_signature'] = {'sha256': sig['sha256'], 'short': sig['short'],
+                                                     'caps': sig_caps_text(sig)}
+            print(f'\n{dev}: frequency signature {sig["short"]}: {sig_caps_text(sig)}')
 
     print('\n| Device | Scene | Windows | fps | p50 ms | p95 ms | Worst ms | GPU ms | ≥45 ms | >50 ms | Max CPU / GPU °C |')
     print('|---|---|---|---|---|---|---|---|---|---|---|')
@@ -300,7 +378,7 @@ def main():
     print('\nCaveats:\n' + '\n'.join(f'- {c}' for c in doc['caveats']))
     if a.json:
         os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
-        with open(a.json, 'x' if a.new_baseline else 'w', encoding='utf-8') as fh:
+        with open(a.json, 'w', encoding='utf-8') as fh:
             json.dump(doc, fh, ensure_ascii=False, indent=2)
             fh.write('\n')
         print(f'\nwrote {a.json}')

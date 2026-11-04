@@ -5,11 +5,13 @@
 # Steady horizontal camera pan: the right stick held at --value (of 32767) to the right for the first half of the time,
 # then to the left for the second half, then released. Appends one line to <out>/pans.txt:
 #   <device> <scene> F0=<last finished frame window before> F1=<after> T0=<epoch s> T1=<epoch s> V=<value>
+# and two lines to <out>/freqs.txt, the frequency limits (`bench_input.sh freqs`) just before and just after the pan:
+#   <device> <scene> T0=<epoch s> start|end <cpuN=... gpu_...>
 # and takes a mid-pan screenshot into <out>/shots/<device>-<scene>-pan-<T0>.png. The game must be running.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die() { echo "pan: $*" >&2; exit 1; }
 
 SER=""; DEV=""; SCENE=""; SECS=""; V=16000; OUT=""; EV=""; DISP=""; PKG=com.aure.totk; GAME=""
@@ -48,6 +50,7 @@ F0=$(lastf) || die "no '至帧 N' timing line in $LOG yet (has the game rendered
 mkdir -p "$OUT/shots"
 trap 'input rstick 0' EXIT
 trap 'exit 130' INT TERM
+FS=$(input freqs) || die "cannot read the frequency limits"
 T0=$(date +%s)
 input rstick "$V"
 sleep "$(awk "BEGIN { print $SECS / 4 }")"
@@ -57,6 +60,8 @@ input rstick "-$V"
 sleep "$(awk "BEGIN { print $SECS / 2 }")"
 F1=$(lastf)
 T1=$(date +%s)
+FE=$(input freqs) || echo "pan: cannot read the frequency limits after the pan" >&2
 input rstick 0
 trap - EXIT
+printf '%s\n' "$DEV $SCENE T0=$T0 start $FS" "$DEV $SCENE T0=$T0 end $FE" >> "$OUT/freqs.txt"
 echo "$DEV $SCENE F0=$F0 F1=$F1 T0=$T0 T1=$T1 V=$V" | tee -a "$OUT/pans.txt"
