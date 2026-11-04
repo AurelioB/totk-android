@@ -135,6 +135,8 @@ static struct {
     uint32_t merge_pending, merge_armed, merge_storage, merge_continued;
     int store_discard, split_refused;           /* a storeOp DONT_CARE was chosen at begin; the split was refused once */
     uint32_t split_draws;                       /* TOTK_VK_SPLIT_PASS_DRAWS taken when this pass (part) opened */
+    uint32_t feedback_pending, feedback_written, feedback_sampled, feedback_continued;
+    int feedback_on, feedback_unknown, feedback_armed, feedback_restore;
 } R;
 static VkPipeline g_bound_pipe; static int g_dyn_dirty = 1;
 static vk_record_draw *g_record_draw;  /* walking-only packet under construction, NULL on original path */
@@ -965,6 +967,76 @@ static int pass_merge_draw_hazard(vk_shader *const sh[6]) {
     }
     return 0;
 }
+/* Texture-only invalidations can move to the existing full barrier at pass end
+   only while all intervening reads refer to unchanged images. In particular,
+   a loaded, read-only attachment is not an attachment write. Storage, unknown
+   descriptors and memory aliases retain the original boundary. */
+static int g_feedback_narrow_launch;
+static totk_live_cache g_feedback_narrow_live;
+static uint64_t g_feedback_deferred, g_feedback_avoided, g_feedback_hazards;
+typedef struct { uint32_t read, written; int unknown; } feedback_usage;
+static int feedback_overlap(const tex_t *a, const tex_t *b) {
+    uint64_t lo=(uintptr_t)a->mem, hi=lo+a->L.size, blo=(uintptr_t)b->mem, bhi=blo+b->L.size;
+    return !lo || !blo || !a->L.size || !b->L.size || hi<lo || bhi<blo || (lo<bhi && blo<hi);
+}
+static feedback_usage feedback_draw_usage(vk_shader *const sh[6]) {
+    feedback_usage use = {0};
+    if (!S.has_rt) { use.unknown=1; return use; }
+    for (unsigned i=0;i<9;i++) {
+        const tex_t *a=i<8 ? (i<(unsigned)S.rt.n ? S.rt.color[i] : NULL) : S.rt.depth;
+        if (!a) continue;
+        for (unsigned j=0;j<i;j++) {
+            const tex_t *b=j<8 ? (j<(unsigned)S.rt.n ? S.rt.color[j] : NULL) : S.rt.depth;
+            if (b && feedback_overlap(a,b)) use.unknown=1;
+        }
+        if (i<8 && sh[1] && ((S.chmask.mask>>(4*i))&15) &&
+            ((sh[1]->fout_mask|sh[1]->fout_span)==0 || ((sh[1]->fout_mask|sh[1]->fout_span)>>i&1)))
+            use.written |= 1u<<i;
+    }
+    if (S.rt.depth) {
+        if (S.ds.dt && S.ds.dw) use.written |= 1u<<8;
+        if (S.ds.st && (S.st_wmask[0] || S.st_wmask[1])) use.written |= 1u<<9;
+    }
+    for (unsigned st=0;st<2;st++)
+        if (sh[st] && (sh[st]->has_storage_writes || sh[st]->has_storage_reads)) use.unknown=1;
+    for (unsigned st=0;st<2;st++) for (int i=0;sh[st] && i<sh[st]->nb;i++) {
+        const vk_bind *b=&sh[st]->b[i];
+        if (b->dtype==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+            if (b->kind!=RB_SUPPORT && b->kind!=RB_CBUF && b->kind!=RB_C1 && b->kind!=RB_DRV0 && b->kind!=RB_DRV2)
+                use.unknown=1;
+            continue;
+        }
+        if (b->dtype==VK_DESCRIPTOR_TYPE_SAMPLER) continue;
+        if ((b->dtype!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->dtype!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
+            (b->kind!=RB_TEX && b->kind!=RB_TEXSAMP) || b->count!=1 || b->reg<0 || b->reg>=128) {
+            use.unknown=1; continue;
+        }
+        uint64_t handle=S.tex[st][b->reg]; if (!handle) continue;
+        vk_treg t;
+        if (!vk_treg_get((int)(handle&0xfffff),&t) || !t.t.mem || !t.t.L.size) { use.unknown=1; continue; }
+        for (unsigned a=0;a<9;a++) {
+            const tex_t *att=a<8 ? (a<(unsigned)S.rt.n ? S.rt.color[a] : NULL) : S.rt.depth;
+            if (!att) continue;
+            if (att->serial==t.t.serial && att->mem==t.t.mem && att->L.size==t.t.L.size)
+                use.read |= a<8 ? 1u<<a : 3u<<8; /* all levels/aspects: no view/LOD guesses */
+            else if (feedback_overlap(att,&t.t)) use.unknown=1;
+        }
+    }
+    return use;
+}
+static int feedback_narrow_barrier(uint32_t bits) {
+    const uint32_t allowed=NVN_BARRIER_INVALIDATE_TEXTURE_BIT|NVN_BARRIER_ORDER_PRIMITIVES_BIT;
+    if (!R.feedback_on || R.feedback_unknown || !(bits&NVN_BARRIER_INVALIDATE_TEXTURE_BIT) ||
+        (bits&~allowed) || R.native || R.canvas || vk_fg_extract_active || PD.active || PP.active ||
+        probe_on() || serial_draws() || store_clear_on() || pass_merge_on()) return 0;
+    R.feedback_pending |= bits; R.feedback_armed=1; g_feedback_deferred++;
+    return 1;
+}
+#ifdef TOTK_VK_TESTS
+void vk_draw_test_feedback_narrow_counts(uint64_t out[3]) {
+    out[0]=g_feedback_deferred; out[1]=g_feedback_avoided; out[2]=g_feedback_hazards;
+}
+#endif
 static int pass_merge_barrier(uint32_t bits) {
     const uint32_t allowed = NVN_BARRIER_ORDER_PRIMITIVES_BIT | NVN_BARRIER_ORDER_FRAGMENTS_BIT |
         NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT | NVN_BARRIER_INVALIDATE_TEXTURE_BIT |
@@ -987,6 +1059,7 @@ static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
             !R.merge_armed && R.merge_continued != 0;
         g_merge_avoided += R.merge_continued - (uint32_t)restored;
     }
+    g_feedback_avoided += R.feedback_continued - (uint32_t)R.feedback_restore;
     VkCommandBuffer cb = vk_cb();
     if (R.secondary) {
         if (VK_REC_VALUE(VK_REC_O_ASSEMBLE, vk_record_pass_end(cb))) cb = vk_record_next_primary();
@@ -996,6 +1069,9 @@ static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
         vkCmdEndRendering(cb);
     }
     vk_barrier_all(cb);
+    /* This full barrier also issues every deferred texture invalidation before
+       the next pass's reads. No deferred dependency survives an ownership end. */
+    R.feedback_pending=0;
     if (vk_gpuprof_on) vk_gpuprof_end(cb, reason, detail);
     if (PP.open >= 0) { PP.rec[PP.open].draws = (uint32_t)(g_stat_draws - PP.draws0); pp_end(cb, PP.open); PP.open = -1; }
     pso_life_pass_write(0);
@@ -1490,6 +1566,12 @@ static int begin_rendering_inner(int draw_tail) {
         !(vk_fg_extract_active && fg_extract_inline());
     if (R.secondary) { ri.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT; vk_record_pass_begin(nc, R.cfmt, R.dfmt, R.sfmt, R.samples); }
     R.merge_pending = R.merge_armed = R.merge_storage = R.merge_continued = 0;
+    R.feedback_on=totk_live_cached(&g_feedback_narrow_live,"TOTK_VK_FEEDBACK_NARROW",g_feedback_narrow_launch);
+    R.feedback_pending=R.feedback_sampled=R.feedback_continued=0;
+    R.feedback_unknown=R.feedback_armed=R.feedback_restore=0;
+    R.feedback_written=R.cleared&255u;
+    if (da.imageView && da.loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR) R.feedback_written|=1u<<8;
+    if (sa.imageView && sa.loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR) R.feedback_written|=1u<<9;
     if (pso_life_active()) {
         memset(PL.color_draws, 0, sizeof PL.color_draws); PL.depth_draws = PL.stencil_draws = 0;
         for (unsigned i = 0; i < 8; i++) PL.color_view[i] = i < nc ? ca[i].imageView : VK_NULL_HANDLE;
@@ -3546,6 +3628,8 @@ void vk_draw_switches_init(void) {
          "depth epoch transfer touches and conservative split refusals (default)" : "unsafe split control arm");
     e = getenv("TOTK_VK_LOAD_ELIDE"); g_load_elide_launch = e && atoi(e) == 1;
     LOGV("[nvn-vk] TOTK_VK_LOAD_ELIDE=%d: conservative first-draw coverage proof, next pass open", g_load_elide_launch);
+    e=getenv("TOTK_VK_FEEDBACK_NARROW"); g_feedback_narrow_launch=e && atoi(e)==1;
+    LOGV("[nvn-vk] TOTK_VK_FEEDBACK_NARROW=%d: texture-only feedback boundaries, next pass open",g_feedback_narrow_launch);
     e = getenv("TOTK_VK_FEEDBACK_CUT"); g_feedback_cut_launch = e && atoi(e) == 1;
     atomic_store_explicit(&g_feedback_cut, g_feedback_cut_launch, memory_order_relaxed);
     LOGV("TOTK_VK_FEEDBACK_CUT=%d: %s", g_feedback_cut_launch, g_feedback_cut_launch ?
@@ -5555,12 +5639,23 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         uint32_t pending = R.merge_pending; g_merge_hazards++;
         vk_end_rendering_at(VK_PASS_END_MERGE_HAZARD, pending);
     }
+    feedback_usage feedback={0}; int feedback_known=0;
+    if (R.open && R.feedback_on) {
+        feedback=feedback_draw_usage(sh); feedback_known=1;
+        if (R.feedback_pending && (feedback.unknown ||
+            (feedback.read&(R.feedback_written|feedback.written)) || (feedback.written&R.feedback_sampled))) {
+            R.feedback_restore=!R.feedback_armed && R.feedback_continued!=0;
+            g_feedback_hazards++;
+            vk_end_rendering_at(VK_PASS_END_TEXTURE_BARRIER,R.feedback_pending);
+        }
+    }
     split_pass_check(sh, canvas_transfer);
     VK_REC_DO(VK_REC_S_TOUCH, draw_touch(sh, dw, di));
     g_load_draw = dw; g_load_indexed = di; g_load_sh = sh; g_load_pipeline = VK_NULL_HANDLE;
     int opened = begin_rendering(1);
     g_load_sh = NULL; g_load_draw = NULL; g_load_indexed = NULL;
     if (!opened) { g_stat_skips[5]++; return; }
+    if (R.feedback_on && !feedback_known) feedback=feedback_draw_usage(sh);
     p_draw certified;
     if (g_load_override) {
         certified = (p_draw){prim,0,(int32_t)count,dw ? dw->base_instance : di->base_instance,
@@ -5711,6 +5806,11 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (pass_merge_on()) {
         R.merge_storage |= (uint32_t)merge_hazard;
         if (R.merge_armed) { R.merge_continued++; R.merge_armed = 0; }
+    }
+    if (R.feedback_on) {
+        R.feedback_written |= feedback.written; R.feedback_sampled |= feedback.read;
+        R.feedback_unknown |= feedback.unknown;
+        if (R.feedback_armed) { R.feedback_continued++; R.feedback_armed=0; }
     }
     if (vk_gpuprof_on) vk_gpuprof_draw(sh, 0);
     g_samples_cum += (uint64_t)count * inst;
@@ -6155,6 +6255,7 @@ static void clear_tex(const p_clear_tex *c) {   /* clear a texture region with a
 
 void vk_draw_exec(uint32_t op, const void *a) {
     state_init();
+    if (R.open && (op==OP_CLEAR_COLOR || op==OP_CLEAR_DS)) R.feedback_written|=0x3ffu;
     if (R.open && R.merge_pending && (op == OP_REPORT_COUNTER || op == OP_RESET_COUNTER || op == OP_RENDER_COND))
         vk_end_rendering_at(VK_PASS_END_QUERY, op);
     if (vk_fg_extract_active && R.open) switch (op) {
@@ -6192,6 +6293,7 @@ void vk_draw_exec(uint32_t op, const void *a) {
             int bits; memcpy(&bits, a, 4);
             if (!R.open) { VK_REC_DO(VK_REC_O, vk_barrier_all(vk_cb())); }
             else if ((bits & ~NVN_BARRIER_ORDER_PRIMITIVES_BIT) && pass_barrier_on()) {
+                if (feedback_narrow_barrier((uint32_t)bits)) break;
                 if (pass_merge_barrier((uint32_t)bits)) break;
                 vk_end_rendering_at(bits & NVN_BARRIER_INVALIDATE_TEXTURE_BIT ? VK_PASS_END_TEXTURE_BARRIER : VK_PASS_END_NVN_BARRIER, (uint32_t)bits);
                 g_stat_inpass_barriers++;
@@ -10214,6 +10316,10 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         LOGV("[load-elide] frame %llu: last 300 presents %llu proven, %llu elided passes",
              (unsigned long long)n, (unsigned long long)g_load_proven, (unsigned long long)g_load_elided);
         g_load_proven = g_load_elided = 0;
+        LOGV("[feedback-narrow] frame %llu: last 300 presents %llu deferred, %llu avoided pass ends, %llu retained late hazards",
+             (unsigned long long)n,(unsigned long long)g_feedback_deferred,
+             (unsigned long long)g_feedback_avoided,(unsigned long long)g_feedback_hazards);
+        g_feedback_deferred=g_feedback_avoided=g_feedback_hazards=0;
 #ifdef TOTK_ANDROID_APP
         if (g_guest_extent_diag && vk_overlay_mode()) {
             static vk_overlay_counters previous;

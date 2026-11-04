@@ -551,6 +551,10 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   SPIR-V `vec4(position.xy,0,1)` and an unconditional fragment output, then prove full-area triangle/quad coverage
   from ordered vertex bytes. Blending, masks, depth/stencil tests, feedback, unknown shaders or GPU-only vertices retain
   `LOAD`. `[load-elide]` counts proven/elided passes per 300 presents; compare GPU ms on identical scenes and pixels.
+- **Narrow feedback splits** (`TOTK_VK_FEEDBACK_NARROW=1`, default **0**, live at the next pass open): defer only
+  texture-only invalidations while sampled attachments remain unwritten. Earlier writes, current writes, later writes
+  to previously sampled attachments, storage, aliases and unknown descriptors retain the split; the full end-of-pass
+  barrier drains deferred invalidations before dependent reads. `[feedback-narrow]` counts net avoided ends per 300 presents.
 - **The uniform-update log** drops entries a newer update covers entirely (the game rewrites the same constant blocks
   many times a frame), and `ub_prune` returns at once unless a submission finished. `ub_overlaps` had been a quarter of
   the render thread.

@@ -2728,6 +2728,68 @@ int main(int argc, char **argv) {
         CHECK(!fclose(output),"coverage fixture output closes");
         return fails != 0;
     }
+    if (argc == 3 && !strcmp(argv[1], "--feedback-narrow")) {
+        CHECK(mtl_wait(run(),5000000000ull),"feedback fixture setup completes");
+        shader_binary(0,37,vctl,vcode,&vlen); memcpy(vc,vcode,vlen); pg.serial=99107;
+        const float full[]={-1,-1,3,-1,-1,3}; memcpy(vtx,full,sizeof full);
+        fub[0]=fub[1]=fub[2]=fub[3]=1;
+        uint8_t actl[0x880], acode[0x230]; uint32_t alen;
+        shader_binary(1,46,actl,acode,&alen); memcpy(cpu_pool+0x102000,acode,alen);
+        prog_t array=pg; array.serial=99108; array.sd[1].control=actl;
+        array.sd[1].data=(uint64_t)(uintptr_t)(cpu_pool+0x102000);
+        p_bind_program ab={&array,3};
+        tex_t auxiliary=rt; auxiliary.mem=gpu_pool+0x10000; auxiliary.serial=99109;
+        tex_t alias=tx; alias.serial=99110;
+        mtl_reg_tex(2,&auxiliary,NULL); mtl_reg_tex(3,&alias,NULL);
+        p_set_rt two=srt; two.n=2; two.color[1]=&auxiliary;
+        p_scissor all={0,0,64,64};
+        FILE *output=fopen(argv[2],"wb"); if (!output) { perror(argv[2]); return 1; }
+        const char *setting=getenv("TOTK_VK_FEEDBACK_NARROW"); int enabled=setting && atoi(setting)==1;
+        extern void vk_draw_test_feedback_narrow_counts(uint64_t out[3]);
+        for (int fixture=0;fixture<7;fixture++) {
+            rn=0; op(OP_SET_RT,&two,sizeof two); op(OP_SCISSOR,&all,sizeof all);
+            op(OP_CLEAR_COLOR,&cc,sizeof cc);
+            p_clear_color red={1,15,{1,0,0,1}}; op(OP_CLEAR_COLOR,&red,sizeof red); op(OP_END,NULL,0);
+            CHECK(mtl_wait(run(),5000000000ull),"feedback fixture %d initializes attachments",fixture);
+            p_set_rt targets=(fixture==0 || fixture==5) ? srt : two;
+            if (fixture==1 || fixture==4) targets.color[1]=&tx;
+            p_bind_handles sample=th; sample.h[0]=(fixture==2 || fixture==3 || fixture==6 ? 2 : fixture==4 ? 3 : 1)|(1u<<20);
+            chmask_st mask={fixture==2 ? 255u : 15u};
+            p_bind_state channels={.kind=2}; memcpy(channels.bytes,&mask,sizeof mask);
+            uint64_t before[3], after[3]; vk_draw_test_feedback_narrow_counts(before);
+            vk_record_test_counts start,end; vk_record_test_counts_get(&start);
+            rn=0; op(OP_SET_RT,&targets,sizeof targets); op(OP_BIND_PROGRAM,fixture==2 ? &ab : &bp,sizeof bp);
+            op(OP_BIND_STATE,&channels,sizeof channels); op(OP_BIND_VATTR,&va,sizeof va);
+            op(OP_BIND_VSTREAM,&vs,sizeof vs); op(OP_BIND_VBUF,&vb,sizeof vb);
+            /* The first draw never simultaneously samples an image it writes. */
+            p_bind_handles initial=sample; if (fixture==2) initial.h[0]=1|(1u<<20);
+            op(OP_BIND_TEX,&initial,sizeof initial); op(OP_DRAW,&dw,sizeof dw);
+            int bits=NVN_BARRIER_INVALIDATE_TEXTURE_BIT;
+            if (fixture==5) bits|=NVN_BARRIER_INVALIDATE_ZCULL_BIT;
+            op(OP_BARRIER,&bits,sizeof bits);
+            mask.mask=fixture==3 ? 255u : 15u; memcpy(channels.bytes,&mask,sizeof mask);
+            op(OP_BIND_STATE,&channels,sizeof channels);
+            op(OP_BIND_PROGRAM,fixture==3 ? &ab : &bp,sizeof bp); op(OP_BIND_TEX,&sample,sizeof sample);
+            op(OP_DRAW,&dw,sizeof dw);
+            if (fixture==6) {
+                mask.mask=255; memcpy(channels.bytes,&mask,sizeof mask);
+                op(OP_BIND_STATE,&channels,sizeof channels); op(OP_BIND_PROGRAM,&ab,sizeof ab);
+                op(OP_DRAW,&dw,sizeof dw); /* late write restores the deferred boundary */
+            }
+            op(OP_COPY_T2B,&cp,sizeof cp); op(OP_END,NULL,0);
+            CHECK(mtl_wait(run(),5000000000ull),"feedback fixture %d completes",fixture);
+            vk_record_test_counts_get(&end); vk_draw_test_feedback_narrow_counts(after);
+            unsigned avoided=enabled && fixture<2;
+            CHECK(end.passes-start.passes==2-avoided,"feedback fixture %d retains required pass boundaries (%llu passes)",fixture,
+                (unsigned long long)(end.passes-start.passes));
+            CHECK(after[1]-before[1]==avoided,"feedback fixture %d reports net avoided ends %u",fixture,avoided);
+            CHECK(fwrite(readback,64*64*4,1,output)==1,"feedback fixture %d writes all pixels",fixture);
+            printf("feedback-narrow fixture=%d deferred=%llu avoided=%llu hazards=%llu passes=%llu\n",fixture,
+                (unsigned long long)(after[0]-before[0]),(unsigned long long)(after[1]-before[1]),
+                (unsigned long long)(after[2]-before[2]),(unsigned long long)(end.passes-start.passes));
+        }
+        CHECK(!fclose(output),"feedback output closes"); return fails!=0;
+    }
     if (overlay_scene_mode) {
         CHECK(mtl_wait(run(), 5000000000ull), "overlay scene fixture warms a real draw");
         const size_t bytes = 64u << 20;

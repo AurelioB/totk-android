@@ -134,7 +134,7 @@ static int identical(const char *a, const char *b, uint64_t magic) {
         if (nl != nr || memcmp(l, r, nl)) { fprintf(stderr, "identity differs at byte block %zu\n", total); ok = 0; break; }
         total += nl;
         if (!nl) {
-            if (!magic) { ok = !ferror(left) && !ferror(right) && total == 9 * 64 * 64 * 4; break; }
+            if (magic < (1u<<20)) { ok = !ferror(left) && !ferror(right) && total == magic; break; } /* raw pixel fixture size */
             uint64_t footer[2];
             ok = !ferror(left) && !ferror(right) && total > sizeof footer && !fseek(left, -(long)sizeof footer, SEEK_END)
                 && fread(footer, sizeof footer, 1, left) == 1 && footer[0] == magic && footer[1] == 12;
@@ -150,15 +150,16 @@ int main(int argc, char **argv) {
     if (len < 0) { perror("/proc/self/exe"); return 1; } binary[len] = 0;
     char *base = strrchr(binary, '/'); if (!base) return 1; strcpy(base + 1, "vkdrawtest");
     char dir[] = "./vkrecord-XXXXXX"; if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
-    if (argc == 2 && !strcmp(argv[1], "--load-elide")) {
+    if (argc == 2 && (!strcmp(argv[1],"--load-elide") || !strcmp(argv[1],"--feedback-narrow"))) {
+        int feedback=!strcmp(argv[1],"--feedback-narrow");
         char reference[PATH_MAX]; snprintf(reference,sizeof reference,"%s/reference.bin",dir);
         int ok = 1;
         for (int enabled = 0; enabled < 2; enabled++) for (int worker = 0; worker < 2; worker++) {
-            char path[PATH_MAX]; snprintf(path,sizeof path,"%s/load-%d-%d.bin",dir,enabled,worker);
-            setenv("TOTK_VK_LOAD_ELIDE",enabled ? "1" : "0",1);
-            ok &= run(binary,"--load-elide",path,worker ? "2" : "0",0);
+            char path[PATH_MAX]; snprintf(path,sizeof path,"%s/pixels-%d-%d.bin",dir,enabled,worker);
+            setenv(feedback ? "TOTK_VK_FEEDBACK_NARROW" : "TOTK_VK_LOAD_ELIDE",enabled ? "1" : "0",1);
+            ok &= run(binary,argv[1],path,worker ? "2" : "0",0);
             if (!enabled && !worker) { if (rename(path,reference)) ok = 0; }
-            else { ok &= identical(reference,path,0); unlink(path); }
+            else { ok &= identical(reference,path,(feedback ? 7 : 9)*64*64*4); unlink(path); }
         }
         unlink(reference); rmdir(dir); return !ok;
     }
