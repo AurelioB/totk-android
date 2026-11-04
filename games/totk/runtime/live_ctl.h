@@ -63,6 +63,7 @@ static const totk_live_switch totk_live_switches[] = {
     {"TOTK_ADPF_CPU_SPLIT", 0, 1},           /* the next presented frame; only subsequent frames have complete queue-wait history */
     {"TOTK_ADPF_TARGET_PCT", 50, 100},       /* the next presented frame; update target before its duration report */
     {"TOTK_RATE_HINT_HOLD", 0, 60000},       /* the next guest present (ms; 0 = the configured rate); needs TOTK_FRAME_RATE_HINT=1 */
+    {"TOTK_THERMAL_STEP", 0, 1},            /* next guest present; release/publish the game's controller floor */
 };
 enum { TOTK_LIVE_MAX = 32 };
 _Static_assert(sizeof totk_live_switches / sizeof *totk_live_switches <= TOTK_LIVE_MAX, "live switch table");

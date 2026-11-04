@@ -1,6 +1,7 @@
 /* Android performance hints. dlsym discovery follows nx2android perf_android.c
  * (MIT); no affinity, governor, frequency-cap or thermal policy writes. */
 #include "android_perf.h"
+#include "android_thermal.h"
 #ifdef __ANDROID__
 #include "adpf_policy.h"
 #include "live_ctl.h"
@@ -333,6 +334,7 @@ static void rate_frame(int guest_interval, int64_t target) {
 }
 void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_interval) {
     pthread_once(&config_once, configure);
+    runtime_thermal_frame(guest_interval > 0 ? (unsigned)guest_interval : 1u);
     int64_t target = totk_adpf_target(period, fps60, framegen);
     if (rate_on) rate_frame(guest_interval, target);
     if (!mode) return;

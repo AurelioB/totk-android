@@ -1965,6 +1965,7 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_ADPF_CPU_SPLIT` | 0–1 | the next presented frame | queue waits are measured for subsequent frames; total span/GPU unchanged; needs `TOTK_ADPF_GPU=1` and API 35 |
 | `TOTK_ADPF_TARGET_PCT` | 50…100 | the next presented frame | default 90 (unchanged); updates the session target before reporting; needs `TOTK_ADPF_GPU=1` |
 | `TOTK_RATE_HINT_HOLD` | 0…60000 | the next guest present | ms; a change clears the held rates; no effect without `TOTK_FRAME_RATE_HINT=1` |
+| `TOTK_THERMAL_STEP` | 0–1 | the next guest present | default off; v143 FPS60 controller floor; 1 Hz thermal sampling, 30 s cool recovery; see “Thermal frame step” |
 
 `TOTK_IDEAL_CORE_FIX` is startup-only and refused. Another launch-time switch becomes live by adding it, with its
 range, to `totk_live_switches` in `runtime/live_ctl.h`, reading it through `totk_live_cached` at a point where a change
@@ -3963,6 +3964,29 @@ Over-budget work, a freeze/explicit policy change, or a listener veto can theref
 Stored `min/max=2/3` with FPS60 enabled is **expected**: the patch changes comparison/select
 instructions, not those configuration words. Native emulation explicitly checks that interval 1 is
 selected while the stored words remain 2/3; seeing 2/3 is not evidence that the patch is absent.
+
+**Thermal frame step (Android, opt-in):** `TOTK_THERMAL_STEP=1` (default `0`, live at guest present)
+raises the v143 FPS60 controller's minimum result to two 60-Hz ticks when the running interval is one
+and thermal status reaches SEVERE (3), or the 10-second headroom forecast reaches 1.0.
+A nice-10 sampler calls the optional NDK status/headroom APIs via `dlsym` at most once per second,
+including with the policy off for matched-arm diagnostics. API30 status-only devices can cap;
+unavailable/NaN headroom cannot prove recovery. No platform thermal settings are written.
+Recovery releases our floor only after 30 continuous seconds of samples below MODERATE (2) and
+headroom below 0.8; missing/stale samples restart that evidence. Disabling releases the floor immediately.
+The existing game controller still owns cooldown, vetoes, simulation step, and window interval:
+no present delay, forced-60 recovery, or shortening of game-requested slower intervals is introduced.
+The three FPS60 select veneers are installed once at launch, with an aligned live floor word; shipping
+30 (`TOTK_FPS60=0`) and other game versions have no thermal guest-floor hook.
+
+Host-side device check (when devices are free): keep the 60fps preset and one loaded scene, collect
+a sustained five-minute off/on run with the existing bench sampler (its thermal-zone temperatures),
+and join `totk.log`'s `[totk-thermal] last300 status=... headroom=... floor=... guest_interval=...
+transitions=...` lines to the `[fps-policy]` game/window decisions. Status uses NDK values (-1 unavailable,
+0 none, 1 light, 2 moderate, 3 severe, 4 critical, 5 emergency, 6 shutdown); headroom is the forecast,
+not a temperature. Expect a 60→30 game interval at the hot threshold, no extra presenter hold, and
+no release before 30 seconds of qualifying cool readings. Count transition chatter and compare
+temperature slope, p95, >50ms frames and sustained cadence; lower peak fps is intentional, not a win
+in mean fps. Do not infer thermal status from thermal-zone temperatures alone.
 
 **Fade increments and cutscene pacing:** whenever FPS60 is enabled, four guarded fade-increment
 hooks keep a positive fractional increment from truncating to zero. They are default-on in FPS60 mode,

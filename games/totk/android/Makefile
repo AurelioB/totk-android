@@ -91,7 +91,7 @@ RUNTIME_C := runtime/loader.c runtime/game_data.c $(PATCHES) runtime/world_surve
   runtime/motion_fusion.c runtime/autoload.c runtime/gfx_probe.c runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c \
   runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c \
   runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c \
-  runtime/host_tp.c runtime/host_os.c runtime/pgo_dump.c runtime/android_perf.c \
+  runtime/host_tp.c runtime/host_os.c runtime/pgo_dump.c runtime/android_perf.c runtime/android_thermal.c \
   $(if $(filter 1,$(APP)),runtime/frontend_android.c runtime/feedback_android.c runtime/companion_snapshot.c runtime/companion_actions.c runtime/companion_jni.c,runtime/frontend_headless.c)
 RUNTIME_S := runtime/gate.S runtime/hle_stack.S runtime/thread_enter.S
 # The NVN layer (portable C), without the Mac's text overlay (CoreGraphics) and system-load reader (sysctl).
