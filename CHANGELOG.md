@@ -34,8 +34,8 @@ Fixes for the first reports, plus a few improvements.
   a .so.
 
 ### Second screen
-- Controller input no longer stays on the second display after touching the companion or a non-focusable overlay
-  such as AYN's performance panel. Home and recent-apps still pause the game.
+- The controller keeps working after you touch the companion or an overlay on the second screen (such as AYN's
+  performance overlay): Android sends the buttons to the last-touched screen, so the game now takes them back.
 - Fused materials use the game's own names (for example "Armor Shard" instead of "Obj Armor Spike B"), including world
   objects that are not pouch items and the Russian names. Existing second-screen art updates automatically on the next
   start; unknown objects fall back to readable text.

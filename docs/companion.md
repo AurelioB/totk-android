@@ -58,6 +58,12 @@ game's), and only while the game is in front: Home dismisses it and returning sh
 *Graphics → Screen → Second screen* turns it off for play. Developers can also disable it with `TOTK_COMPANION=0` in
 `totk.env` ([developer settings](developer-settings.md)).
 
+Android sends controller buttons to the screen that was touched last. When you touch the companion, or an overlay
+shown on the second screen (such as AYN's performance overlay), the game takes the controller back: right after a
+companion touch, and about 0.3 s after anything else took it. If a window on the second screen keeps taking it (for
+example the keyboard of another app shown there), the game stops after three quick tries until you touch the
+companion again. Apps cannot see other apps' windows, so such a window can lose the controller up to three times first.
+
 ## Preparing the pictures
 
 Setup builds the optional second-screen art alongside shaders only on devices with a built-in second screen.
