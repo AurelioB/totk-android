@@ -109,7 +109,7 @@ public final class SetupActivity extends BaseActivity {
     Screen screen = Screen.HOME;
     final File files;
     int renders, statuses, syncs, checks, notices;
-    SetupActivity(File files) { this.files = files; }
+    SetupActivity(File files) throws IOException { this.files = files; Files.createDirectories(new File(files, "state").toPath()); }
     File getFilesDir() { return files; }
     boolean isDestroyed() { return false; }
     void render() { renders++; }
