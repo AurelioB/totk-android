@@ -67,8 +67,12 @@ class Application {
 }
 class Handler {
     final List<Runnable> pending = new ArrayList<>();
+    final List<Runnable> delayed = new ArrayList<>();
     int posts;
     void post(Runnable value) { pending.add(value); posts++; }
+    void postDelayed(Runnable value, long ms) { if (ms != 300) throw new AssertionError("unexpected debounce"); delayed.add(value); }
+    void removeCallbacks(Runnable value) { pending.removeIf(x -> x == value); delayed.removeIf(x -> x == value); }
+    void drainDelayed() { SystemClock.now += 300; List<Runnable> copy = new ArrayList<>(delayed); delayed.clear(); for (Runnable value : copy) value.run(); }
     void drain() { while (!pending.isEmpty()) pending.remove(0).run(); }
 }
 class MotionEvent {
@@ -179,6 +183,38 @@ TESTS = r'''
                 require(p.task.moves == 4, "failed claim permanently blocked the next touch");
                 break;
             }
+            case "automatic": {
+                p.ownerTopResumed(false);
+                require(p.task.moves == 0 && p.main.delayed.size() == 1, "overlay loss was not debounced");
+                p.main.drainDelayed();
+                require(p.task.moves == 1, "overlay loss did not return controller focus");
+                for (int i = 0; i < 3; i++) {
+                    p.ownerTopResumed(true);
+                    SystemClock.now += 100;
+                    p.ownerTopResumed(false);
+                    p.main.drainDelayed();
+                }
+                require(p.task.moves == 3 && p.autoReturnBlocked, "competing window was fought indefinitely");
+                SystemClock.now += 2000;
+                p.ownerTopResumed(false); p.main.drainDelayed();
+                require(p.task.moves == 3, "circuit breaker reset without player intent");
+                p.tap(); p.main.drain();
+                require(p.task.moves == 4 && !p.autoReturnBlocked, "companion touch did not reset recovery");
+                CompanionFocusProbe paused = new CompanionFocusProbe();
+                paused.ownerTopResumed(false);
+                paused.lifecycle.onActivityPaused(paused.owner);
+                paused.main.drainDelayed();
+                require(paused.task.moves == 0, "automatic recovery undid a lifecycle pause");
+                paused.lifecycle.onActivityResumed(paused.owner);
+                paused.ownerTopResumed(false);
+                paused.event(MotionEvent.ACTION_DOWN);
+                paused.main.drainDelayed();
+                require(paused.task.moves == 0, "automatic recovery interrupted a companion drag");
+                paused.event(MotionEvent.ACTION_CANCEL);
+                paused.main.drain();
+                require(paused.task.moves == 0, "cancelled drag requested recovery");
+                break;
+            }
             default: throw new AssertionError("unknown scenario");
         }
         System.out.println("passed " + args[0]);
@@ -199,7 +235,7 @@ class CompanionFocusTests(unittest.TestCase):
         source = SOURCE.read_text()
         fields = section(source, '    private boolean closed,', '    public PresentationController(')
         top = section(source, '    public void ownerTopResumed(', '    /** Coalesced')
-        reclaim = section(source, '    private void returnInputToOwner()', '    private void dismiss()')
+        reclaim = section(source, '    private boolean returnInputToOwner()', '    private void dismiss()')
         touch = section(source, '            private boolean touching;', '            @Override protected void onCreate(')
         probe = cls.work / 'CompanionFocusProbe.java'
         probe.write_text(PRELUDE + fields + top + reclaim + '\n    final class TouchPresentation extends Presentation {\n'
@@ -228,6 +264,9 @@ class CompanionFocusTests(unittest.TestCase):
 
     def test_claims_coalesce_and_failed_or_noop_claims_can_retry_on_touch(self):
         self.probe('retry')
+
+    def test_overlay_focus_loss_is_debounced_and_competing_windows_stop_recovery(self):
+        self.probe('automatic')
 
 
 class NativeInputFocusTests(unittest.TestCase):

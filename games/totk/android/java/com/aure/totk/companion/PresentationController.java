@@ -36,14 +36,26 @@ public final class PresentationController implements DisplayManager.DisplayListe
     private boolean closed, stopped, resumed, topResumed, returnQueued, returnRequested, reported, reportQueued;
     private ActivityManager.AppTask inputTask;
     private long returnRequestedAt;
+    private int rapidAutoReturns;
+    private long autoReturnedAt = -1000;
+    private boolean autoReturnBlocked, touchInProgress;
+    private final Runnable autoReturnInput = () -> {
+        if (!autoReturnBlocked && !touchInProgress && shown != null && shown.isShowing() && returnInputToOwner())
+            autoReturnedAt = SystemClock.uptimeMillis();
+    };
     private final Runnable returnInput = () -> { returnQueued = false; returnInputToOwner(); };
     private final Application.ActivityLifecycleCallbacks lifecycle = new Application.ActivityLifecycleCallbacks() {
         @Override public void onActivityStarted(Activity activity) { if (activity == owner && stopped) { stopped = false; refresh(); } }
         @Override public void onActivityStopped(Activity activity) { if (activity == owner) { stopped = true; dismiss(); } }
         @Override public void onActivityCreated(Activity activity, Bundle state) {}
-        @Override public void onActivityResumed(Activity activity) { if (activity == owner) resumed = true; }
+        @Override public void onActivityResumed(Activity activity) {
+            if (activity == owner) { resumed = true; resetAutoReturn(); }
+        }
         @Override public void onActivityPaused(Activity activity) {
-            if (activity == owner) { resumed = false; returnRequested = false; }
+            if (activity == owner) {
+                resumed = false; returnRequested = false;
+                main.removeCallbacks(autoReturnInput);
+            }
         }
         @Override public void onActivitySaveInstanceState(Activity activity, Bundle state) {}
         @Override public void onActivityDestroyed(Activity activity) {}
@@ -63,7 +75,18 @@ public final class PresentationController implements DisplayManager.DisplayListe
     /** Owners forward Activity.onTopResumedActivityChanged: window focus alone is per-display on multi-resume devices. */
     public void ownerTopResumed(boolean top) {
         topResumed = top;
+        main.removeCallbacks(autoReturnInput);
         if (top) returnRequested = false;
+        else {
+            if (SystemClock.uptimeMillis() - autoReturnedAt < 1000) rapidAutoReturns++;
+            else rapidAutoReturns = 0;
+            if (rapidAutoReturns >= 3) autoReturnBlocked = true;
+            if (!autoReturnBlocked && !touchInProgress) main.postDelayed(autoReturnInput, 300);
+        }
+    }
+    private void resetAutoReturn() {
+        main.removeCallbacks(autoReturnInput);
+        rapidAutoReturns = 0; autoReturnedAt = -1000; autoReturnBlocked = false;
     }
     /** Coalesced on the main thread: a display change dismisses and recreates the Presentation in one pass, which must
      * not flash the companion onto the owner's display. Stop/start is not reported: the owner's own display is not
@@ -92,33 +115,36 @@ public final class PresentationController implements DisplayManager.DisplayListe
                 | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
     }
-    /** A non-focusable Presentation can still make its display top-focused on Android. The game retains its window
-     * focus on the other display, but controllers go to the app underneath this Presentation. Return only our own
-     * resumed, focused task after our touch finishes; never compete with another app or an overlay on the game screen. */
-    private void returnInputToOwner() {
+    /** A non-focusable window on the companion display can still make it top-focused. Return our own task only while
+     * its activity remains resumed and window-focused. Repeated competing focus requests stop automatic recovery. */
+    private boolean returnInputToOwner() {
         if (closed || stopped || !resumed || topResumed
                 || (returnRequested && SystemClock.uptimeMillis() - returnRequestedAt < 250)
-                || !owner.hasWindowFocus() || owner.isFinishing() || owner.isDestroyed()) return;
+                || !owner.hasWindowFocus() || owner.isFinishing() || owner.isDestroyed()) return false;
         try {
             if (inputTask == null) {
                 ActivityManager manager = owner.getSystemService(ActivityManager.class);
-                if (manager == null) return;
+                if (manager == null) return false;
                 for (ActivityManager.AppTask task : manager.getAppTasks()) {
                     if (task.getTaskInfo().taskId == owner.getTaskId()) { inputTask = task; break; }
                 }
             }
-            if (inputTask == null || !owner.getComponentName().equals(inputTask.getTaskInfo().topActivity)) return;
+            if (inputTask == null || !owner.getComponentName().equals(inputTask.getTaskInfo().topActivity)) return false;
             returnRequested = true;
             returnRequestedAt = SystemClock.uptimeMillis();
             inputTask.moveToFront();
+            return true;
         } catch (IllegalArgumentException | SecurityException unavailable) {
             returnRequested = false;
             Log.w("TotkCompanion", "Could not return controller focus to the owner task", unavailable);
+            return false;
         }
     }
     private void dismiss() {
         Presentation previous = shown;
         shown = null; displayId = -1;
+        touchInProgress = false;
+        main.removeCallbacks(autoReturnInput);
         if (previous != null) { previous.setOnDismissListener(null); previous.dismiss(); }
         report();
     }
@@ -162,11 +188,11 @@ public final class PresentationController implements DisplayManager.DisplayListe
             private boolean touching;
             @Override public boolean dispatchTouchEvent(MotionEvent event) {
                 int action = event.getActionMasked();
-                if (action == MotionEvent.ACTION_DOWN) touching = true;
+                if (action == MotionEvent.ACTION_DOWN) { touching = true; touchInProgress = true; resetAutoReturn(); }
                 boolean handled = super.dispatchTouchEvent(event);
-                if (action == MotionEvent.ACTION_CANCEL) touching = false; // an interruption is not a request to refocus
+                if (action == MotionEvent.ACTION_CANCEL) { touching = false; touchInProgress = false; }
                 if (touching && action == MotionEvent.ACTION_UP) {
-                    touching = false;
+                    touching = false; touchInProgress = false;
                     // Let Android deliver the top-resumed change caused by DOWN before checking it.
                     if (shown == this && isShowing() && !returnQueued) {
                         returnQueued = true;

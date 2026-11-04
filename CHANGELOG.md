@@ -34,8 +34,8 @@ Fixes for the first reports, plus a few improvements.
   a .so.
 
 ### Second screen
-- Touching the second-screen companion no longer leaves controller input on the app behind it; the game gets
-  controller focus back when the companion gesture ends.
+- Controller input no longer stays on the second display after touching the companion or a non-focusable overlay
+  such as AYN's performance panel. Home and recent-apps still pause the game.
 - Fused materials use the game's own names (for example "Armor Shard" instead of "Obj Armor Spike B"), including world
   objects that are not pouch items and the Russian names. Existing second-screen art updates automatically on the next
   start; unknown objects fall back to readable text.
