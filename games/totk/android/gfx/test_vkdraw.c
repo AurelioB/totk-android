@@ -2680,7 +2680,10 @@ int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1],"--alpha-test")) {
         CHECK(mtl_wait(run(),5000000000ull),"alpha fixture initial draw completes");
         const float full[]={-1,-1,3,-1,-1,3}; memcpy(vtx,full,sizeof full);
-        for (int y=0;y<64;y++) for (int x=0;x<64;x++) lin[4*(y*64+x)+3]=((x+y)&1)?192:64;
+        /* Exact binary alphas keep EQUAL independent of the sampler's UNORM
+         * conversion precision (which differs between valid host drivers). */
+        fub[3]=.5f;
+        for (int y=0;y<64;y++) for (int x=0;x<64;x++) lin[4*(y*64+x)+3]=((x+y)&1)?255:0;
         CHECK(!nvn_swizzle(&tx.d,0,0,lin,256,tx.mem),"alpha checkerboard is swizzled");
         mtl_pool_invalidate(&P_cpu,(uint64_t)((uint8_t *)tx.mem-cpu_pool),tx.L.size);
         extern void vk_draw_test_correctness_counts(uint64_t out[2]);
@@ -2695,7 +2698,7 @@ int main(int argc, char **argv) {
                 p_scissor all={0,0,64,64};
                 op(OP_SET_RT,&srt,sizeof srt); op(OP_SCISSOR,&all,sizeof all); op(OP_CLEAR_COLOR,&cc,sizeof cc);
                 op(OP_BIND_STATE,&state,sizeof state); op(OP_BIND_VBUF,&vb,sizeof vb);
-                const float references[]={.5f,64.0f/255,192.0f/255,.5f};
+                const float references[]={.25f,0,.5f,.25f};
                 for (unsigned stripe=0;stripe<4;stripe++) {
                     p_scissor area={(int)stripe*16,0,16,64};
                     p_alpha_ref ref={references[stripe]};
@@ -2705,7 +2708,7 @@ int main(int argc, char **argv) {
                 CHECK(mtl_wait(run(),5000000000ull),"alpha func %u enabled %u completes",func,enabled);
                 int bad=0;
                 for (int y=0;y<64;y++) for (int x=0;x<64;x++) {
-                    float a=(((x+y)&1)?192.0f:64.0f)/255, ref=references[x/16];
+                    float a=((x+y)&1)?.5f:0, ref=references[x/16];
                     int pass=!enabled || func==NVN_ALPHA_FUNC_ALWAYS ||
                         (func==NVN_ALPHA_FUNC_LESS && a<ref) || (func==NVN_ALPHA_FUNC_EQUAL && a==ref) ||
                         (func==NVN_ALPHA_FUNC_LEQUAL && a<=ref) || (func==NVN_ALPHA_FUNC_GREATER && a>ref) ||
