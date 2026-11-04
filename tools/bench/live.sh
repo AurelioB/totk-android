@@ -50,10 +50,12 @@ adb -s "$SER" shell pidof "$PKG" >/dev/null 2>&1 || die "$PKG is not running on 
 N0=$(adb -s "$SER" shell "su -c 'grep -ac \"\\[totk-ctl\\]\" $LOG'" 2>/dev/null | tr -d '\r')
 case $N0 in ""|*[!0-9]*) N0=0 ;; esac
 # Build the batch in a root-only temp file, give the control file the game folder's owner / mode / context (create it
-# if needed), then append the whole batch with one cat (one write).
+# if needed), then append the whole batch with one cat (one write). The command substitution drops the batch's final
+# newline, so the remote printf puts it back: the game stages complete lines only, and an unterminated last line would
+# wait for (and run into) the next write.
 Q=$(printf '%s' "$LINES" | sed "s/'/'\\\\''/g")
 TMP=/data/local/tmp/totk-ctl.$$
-REMOTE="umask 077; printf '%s' '$Q' > $TMP || exit 1
+REMOTE="umask 077; printf '%s\n' '$Q' > $TMP || exit 1
 [ -e $CTL ] || : > $CTL || exit 1
 chown \$(stat -c %u:%g $GAME) $CTL && chmod 0600 $CTL || exit 1
 chcon --reference=$GAME $CTL 2>/dev/null || chcon \$(ls -Zd $GAME | cut -d' ' -f1) $CTL || exit 1

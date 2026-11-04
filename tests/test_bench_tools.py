@@ -3,6 +3,7 @@ limits and signatures, automatic per-signature baselines, the comparison verdict
 stays consistent with its stored results; no device needed."""
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -385,6 +386,43 @@ class InSessionAB(unittest.TestCase):
         self.assertIn('value must be a decimal', r.stderr)
         r = subprocess.run(['sh', str(BENCH / 'live.sh'), '-s', 'x', 'mark', 'a"b'], capture_output=True, text=True)
         self.assertIn('mark text', r.stderr)
+
+    FAKE_ADB = r'''#!/bin/sh
+# adb -s <serial> shell <command> with this host as the rooted device; after a control-file write the "game" answers
+# with $FAKE_ANSWER in totk.log
+shift 3
+case $1 in
+  pidof\ *) exit 0 ;;
+  'su -c sh') sed "s#/data/local/tmp/#$FAKE_TMP/#g" | sh; r=$?; printf '%b' "$FAKE_ANSWER" >> "$FAKE_LOG"; exit $r ;;
+  su\ -c\ *) eval "sh -c ${1#su -c }" ;;
+esac
+'''
+
+    def test_live_write(self):
+        """live.sh ends its batch with a newline: the game stages complete lines only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'bin').mkdir(); (d / 'tmp').mkdir(); (d / 'game').mkdir()
+            (d / 'bin/adb').write_text(self.FAKE_ADB); (d / 'bin/adb').chmod(0o755)
+            (d / 'bin/chcon').write_text('#!/bin/sh\nexit 0\n'); (d / 'bin/chcon').chmod(0o755)
+            log, ctl = d / 'game/totk.log', d / 'game/totk.ctl'
+            log.write_text('[totk-ctl] following\n')
+
+            def live(answer, *lines):
+                env = dict(os.environ, PATH=f"{d / 'bin'}:{os.environ['PATH']}", FAKE_TMP=str(d / 'tmp'),
+                           FAKE_LOG=str(log), FAKE_ANSWER=answer)
+                return subprocess.run(['sh', str(BENCH / 'live.sh'), '-s', 'x', '--game-dir', str(d / 'game'),
+                                       '--wait', '1', *lines], capture_output=True, text=True, env=env)
+
+            r = live('', 'set', 'TOTK_VK_PIPE_BOOST=1', 'mark', 'a', 'b')
+            self.assertEqual(r.returncode, 3, r.stderr)   # no acknowledgement
+            self.assertEqual(ctl.read_text(), 'set TOTK_VK_PIPE_BOOST=1\nmark a b\n')
+            r = live('[totk-ctl] gen=1 frame=9 mark ok\n', 'unset TOTK_VK_PIPE_BOOST', 'mark ok')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('gen=1 frame=9 mark ok', r.stdout)
+            self.assertEqual(ctl.read_text(), 'set TOTK_VK_PIPE_BOOST=1\nmark a b\nunset TOTK_VK_PIPE_BOOST\nmark ok\n')
+            self.assertEqual(oct(ctl.stat().st_mode & 0o777), '0o600')
+            self.assertEqual(list((d / 'tmp').iterdir()), [])   # the batch's temp file is removed
 
 
 class MemorySampling(unittest.TestCase):
