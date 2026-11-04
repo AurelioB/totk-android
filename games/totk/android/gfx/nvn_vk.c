@@ -2241,6 +2241,7 @@ static void slot_descriptors_recycle(slot_t *s) {
     if (s->dstock_on && !want) {
         vk_desc_stock_free(&s->dstock);
         for (int i = 0; i < s->ndpool; i++) vkDestroyDescriptorPool(V.dev, s->dpools[i], NULL);
+        vk_record_primary_pools(-(int64_t)s->ndpool);
         s->ndpool = s->curdpool = s->curdsets = 0; s->dstock_on = 0;
         return;
     }
@@ -2408,7 +2409,7 @@ static uint32_t slot_alloc_sets(void *owner, VkDescriptorSetLayout layout, uint3
         if (s->ndpool == s->capdpool) { s->capdpool = s->capdpool ? 2 * s->capdpool : 4; s->dpools = VK_REALLOC(s->dpools, (size_t)s->capdpool * sizeof *s->dpools); }
         if (fresh) break;   /* a set that does not fit an empty pool */
         VKCHECK(vkCreateDescriptorPool(V.dev, &pci, NULL, &s->dpools[s->ndpool++]));
-        HK_ADD(dpools, 1);
+        HK_ADD(dpools, 1); vk_record_primary_pools(1);
         s->curdpool = s->ndpool - 1; s->curdsets = 0; fresh = 1;
     }
     DIE("descriptor set allocation failed in a fresh pool");

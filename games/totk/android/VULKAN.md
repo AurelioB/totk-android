@@ -1399,6 +1399,12 @@ per job) and the primary slot owner (immediate graphics, compute, post, presenta
 elapsed time and stay 0 unless `TOTK_VK_REC_PROFILE=1` or frame tracing enables timing; `walker-ns` includes the list
 and template times. `vkdrawtest --lag-walk-bench` prints the same counts per measured frame, and the driver-level
 `vkAllocateDescriptorSets`/`vkResetDescriptorPool` counts when `TOTK_VK_TEST_CALL_COUNTS=<file>` is set.
+The same line ends with what is retained, in both arms of `TOTK_VK_DESC_STOCK`:
+`retained: pools N (recorder R, primary P) ~M MiB, stock sets S`. N counts the descriptor pools that exist (a pool is
+never destroyed by the default policy, only reset, so N is each owner's peak); M is N times one pool's approximate
+driver memory, with every declared descriptor at 64 bytes, a combined image sampler at 128 and a sampler at 16 (about
+7.4 MiB a pool; a driver that reserves a pool's descriptors when it creates it keeps them until the pool is destroyed);
+S is the sets held in the stocks. Compare M with the kgsl / `memory` sampler figure of the same window.
 
 Every recorder context (1,024 sets) and primary slot (4,096 sets) makes its descriptor pools from one shape
 (`vk_desc_pool_sizes`): combined image samplers and uniform buffers 32,768, sampled images and storage buffers 8,192,

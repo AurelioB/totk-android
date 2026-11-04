@@ -1201,6 +1201,12 @@ static int lag_walk_bench(int argc, char **argv) {
             printf("lag-walk %s api/frame: vkAllocateDescriptorSets=%.2f allocated_descriptor_sets=%.2f vkResetDescriptorPool=%.2f\n",
                 label, m->api[0] / n, m->api[1] / n, m->api[2] / n);
     }
+    {   /* What the measured phases left retained (TOTK_VK_DESC_STOCK arms compare this, not only the call counts). */
+        uint64_t kept[4]; vk_record_test_descriptor_retained(kept);
+        printf("lag-walk descriptor retention: pools %llu (recorder %llu, primary %llu) ~%.1f MiB at the reported per-pool estimate, stock sets %llu\n",
+            (unsigned long long)(kept[0] + kept[1]), (unsigned long long)kept[0], (unsigned long long)kept[1],
+            (kept[0] + kept[1]) * kept[3] / 1048576.0, (unsigned long long)kept[2]);
+    }
     if (pending_service) {
         atomic_store(&service.stop, 1); pthread_join(service_thread, NULL);
         printf("lag-walk owner-service pending requests: %llu completed across %d primary/stress frames (callbacks do no rendering work)\n",

@@ -132,6 +132,12 @@ static uint64_t guard_jobs, guard_intents, guard_units, guard_prep_ns, guard_mer
 static int pass_parallel;
 /* Requested retained capacity, not RSS/driver bytes. Rare growth updates only; reports never inspect live jobs. */
 static _Atomic uint64_t memory_draws, memory_info, memory_cbs, memory_dpools;
+/* Retained descriptor pools of the primary slots (nvn_vk.c) beside memory_dpools (recorder contexts), and the sets held
+   in every owner's TOTK_VK_DESC_STOCK stock: the descriptors line reports both arms' retained descriptor memory. */
+static _Atomic uint64_t memory_primary_dpools, stock_sets_retained;
+void vk_record_primary_pools(int64_t delta) {
+    atomic_fetch_add_explicit(&memory_primary_dpools, (uint64_t)delta, memory_order_relaxed);
+}
 static uint64_t storage_limit = UINT64_C(64) << 20;
 static _Atomic uint64_t storage_reclaims, storage_reclaimed, cb_reclaimed;
 static uint64_t storage_trim_ns, storage_referenced;
@@ -515,6 +521,23 @@ int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t c
     }
     return 1;
 }
+/* Approximate driver memory of one pool, for the descriptors line: every declared descriptor at 64 bytes, a combined
+   image sampler at 128 and a sampler at 16 (Adreno descriptor sizes; a driver that reserves a pool's descriptors at
+   creation keeps them while the pool exists, used or reset). ~7.4 MiB. */
+static uint64_t desc_pool_bytes(void) {
+    uint64_t bytes = 0;
+    for (unsigned t = 0; t < VK_DESC_POOL_TYPES; t++)
+        bytes += (uint64_t)vk_desc_pool_sizes[t].descriptorCount *
+            (vk_desc_pool_sizes[t].type == VK_DESCRIPTOR_TYPE_SAMPLER ? 16 :
+             vk_desc_pool_sizes[t].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? 128 : 64);
+    return bytes;
+}
+#ifdef TOTK_VK_TESTS
+void vk_record_test_descriptor_retained(uint64_t out[4]) {
+    out[0] = atomic_load(&memory_dpools); out[1] = atomic_load(&memory_primary_dpools);
+    out[2] = atomic_load(&stock_sets_retained); out[3] = desc_pool_bytes();
+}
+#endif
 /* Allocates count (1..VK_DESC_STOCK_BATCH) sets, fewer near the end of a pool; never fewer than one. */
 static uint32_t alloc_sets(void *owner, VkDescriptorSetLayout layout, uint32_t count, VkDescriptorSet *out) {
     rec_context *c = owner;
@@ -569,6 +592,7 @@ int vk_desc_stock_want(void) {
 }
 void vk_desc_stock_free(vk_desc_stock **stock) {
     vk_desc_stock *st = *stock; if (!st) return;
+    atomic_fetch_sub_explicit(&stock_sets_retained, st->sets, memory_order_relaxed);
     while (st->list) { desc_layout_stock *s = st->list; st->list = s->next; free(s->set); free(s); }
     free(st->layouts.keys); free(st->layouts.vals); free(st); *stock = NULL;
 }
@@ -591,7 +615,7 @@ VkDescriptorSet vk_desc_stock_take(vk_desc_stock **stock, VkDescriptorSetLayout 
             s->set = VK_REALLOC(s->set, (size_t)s->capacity * sizeof *s->set);
         }
         uint32_t n = alloc(owner, layout, batch, s->set + s->count);
-        s->count += n; st->sets += n;
+        s->count += n; st->sets += n; atomic_fetch_add_explicit(&stock_sets_retained, n, memory_order_relaxed);
     }
     st->used++;
     return s->set[s->used++];
@@ -607,7 +631,7 @@ int vk_desc_stock_retire(vk_desc_stock *st) {
     else st->pressure = 0;
     for (desc_layout_stock *s = st->list; s; s = s->next) { s->used = 0; if (rebuild) s->count = 0; }
     st->used = 0;
-    if (rebuild) st->sets = st->pressure = 0;
+    if (rebuild) { atomic_fetch_sub_explicit(&stock_sets_retained, st->sets, memory_order_relaxed); st->sets = st->pressure = 0; }
     return rebuild;
 }
 static VkDescriptorSet alloc_set(rec_context *c, VkDescriptorSetLayout layout) {
@@ -1346,10 +1370,16 @@ void vk_record_stats(uint64_t frame) {
     if (!(frame % 300)) {
         static uint64_t previous[8]; uint64_t now[8];
         descriptor_totals(now);
-        LOGV("descriptors frame %llu, per-frame: sets %.2f allocate-calls %.2f pool-resets %.2f walker-ns %.0f list-ns %.0f lists %.2f template-ns %.0f templates %.2f",
+        uint64_t recorder_pools = atomic_load_explicit(&memory_dpools, memory_order_relaxed);
+        uint64_t primary_pools = atomic_load_explicit(&memory_primary_dpools, memory_order_relaxed);
+        LOGV("descriptors frame %llu, per-frame: sets %.2f allocate-calls %.2f pool-resets %.2f walker-ns %.0f list-ns %.0f lists %.2f template-ns %.0f templates %.2f; "
+             "retained: pools %llu (recorder %llu, primary %llu) ~%.1f MiB, stock sets %llu",
             (unsigned long long)frame, (now[0] - previous[0]) / 300.0, (now[1] - previous[1]) / 300.0,
             (now[2] - previous[2]) / 300.0, (now[3] - previous[3]) / 300.0, (now[4] - previous[4]) / 300.0,
-            (now[5] - previous[5]) / 300.0, (now[6] - previous[6]) / 300.0, (now[7] - previous[7]) / 300.0);
+            (now[5] - previous[5]) / 300.0, (now[6] - previous[6]) / 300.0, (now[7] - previous[7]) / 300.0,
+            (unsigned long long)(recorder_pools + primary_pools), (unsigned long long)recorder_pools,
+            (unsigned long long)primary_pools, (recorder_pools + primary_pools) * desc_pool_bytes() / 1048576.0,
+            (unsigned long long)atomic_load_explicit(&stock_sets_retained, memory_order_relaxed));
         memcpy(previous, now, sizeof previous);
     }
     if (threads <= 0 || frame % 300) return;

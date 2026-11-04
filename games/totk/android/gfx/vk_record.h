@@ -123,6 +123,7 @@ void vk_record_walk_time(uint64_t ns);  /* submission elapsed, excluding GPU wai
 void vk_record_stats(uint64_t frame);
 void vk_record_descriptor_walk(uint64_t ns); /* walking owner: complete bind/selection time, not just driver calls */
 void vk_record_descriptor_primary(uint64_t sets, uint64_t calls, uint64_t resets); /* serialized primary owner */
+void vk_record_primary_pools(int64_t delta); /* primary slots' retained descriptor pools, for the descriptors line */
 /* The one descriptor-pool shape of every recorder context and primary slot (vk_record.c). It declares every type a
    backend layout uses: the reflected shader types (vk_reflect.py) and those of the post / presentation / frame-generation
    layouts. A type a pool does not declare has zero capacity, so a layout using it would fail in a fresh pool (DIE);
@@ -144,6 +145,7 @@ int vk_desc_stock_retire(vk_desc_stock *stock);
 void vk_desc_stock_free(vk_desc_stock **stock);   /* the owner switched the stock off: its bookkeeping, not its pools */
 int vk_record_counter_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2 stage);
 #ifdef TOTK_VK_TESTS
+void vk_record_test_descriptor_retained(uint64_t out[4]); /* recorder pools, primary pools, stock sets, bytes per pool */
 void vk_record_test_descriptors(uint64_t out[8]); /* sets, allocate calls, resets, walk ns, list ns/count, template ns/count */
 int vk_record_test_descriptor_stock(void); /* isolated real-driver checkout/recycle/batch/pressure fixture */
 void vk_record_test_storage(uint64_t values[4]); /* retention budget, reclaimed slots/bytes/secondary CBs */
