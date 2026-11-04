@@ -265,6 +265,13 @@ $(OUT)/vksubgrouptest: $(TOTK)/android/gfx/test_vk_subgroup.c $(TOTK)/android/gf
 	@mkdir -p $(dir $@)
 	$(CC) -std=c11 -O1 -g $(WARN) -o $@ $< -lvulkan
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest vkrectest vkcanvastest): $(TOTK)/android/gfx/vk_subgroup.h
+vktest: $(OUT)/vkpositiontest
+.PHONY: vkpositiontest
+vkpositiontest: $(OUT)/vkpositiontest
+$(OUT)/vkpositiontest: $(TOTK)/android/gfx/test_vk_position.c $(TOTK)/android/gfx/vk_position.h $(TOTK)/android/gfx/vk_seed_pack.h
+	@mkdir -p $(dir $@)
+	$(CC) -std=c11 -D_GNU_SOURCE -O1 -g $(WARN) -o $@ $<
+$(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest vkrectest vkcanvastest): $(TOTK)/android/gfx/vk_position.h
 vktest: $(OUT)/vkreplaypintest
 $(OUT)/vkreplaypintest: $(TOTK)/android/gfx/test_vkreplaypin.c $(VKTEST_SRC) $(TOTK)/android/gfx/vk_int.h $(TOTK)/android/gfx/vk_framegen.h
 	@mkdir -p $(dir $@)

@@ -24,6 +24,7 @@
 #include "vk_seed_io.h"
 #include "vk_load_proof.h"
 #include "vk_subgroup.h"
+#include "vk_position.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <sys/stat.h>
@@ -32,6 +33,14 @@
 
 #include "host_os.h"
 int totk_depth_near_minus_w(void) __attribute__((weak));
+
+static pthread_once_t g_position_once = PTHREAD_ONCE_INIT;
+static unsigned g_position_policy;
+static void position_init(void) {
+    g_position_policy = vk_position_policy(getenv("TOTK_VK_POS_INVARIANT"), getenv("TOTK_VK_POS_NOCONTRACT"));
+    LOGV("[nvn-vk] TOTK_VK_POS_INVARIANT=%u (startup-only): vertex Position Invariant", g_position_policy & 1);
+    LOGV("[nvn-vk] TOTK_VK_POS_NOCONTRACT=%u (startup-only): position-feeding float arithmetic NoContraction", g_position_policy >> 1);
+}
 
 /* Folder selection is process-lifetime. Preserve legacy cache paths for the
    canonical game seed; only alternate folders use a folder/content namespace. */
@@ -74,12 +83,14 @@ static void seed_init(void) {
     for (int i = 0; i < 32; i++) snprintf(g_seed_tag + 2 * i, 3, "%02x", digest[i]);
 }
 static const char *seed_dir(void) { pthread_once(&g_seed_once, seed_init); return g_seed_dir; }
-/* Alternate seeds namespace explicit cache/import paths too. The canonical
-   seed retains every legacy path, including explicit overrides. Caller owns out. */
+/* Alternate seeds and position precision arms namespace explicit cache/import
+   paths too. Off/off with the canonical seed retains legacy paths. Caller owns out. */
 const char *vk_shader_cache_path(const char *base, char *out, size_t size) {
     pthread_once(&g_seed_once, seed_init);
+    pthread_once(&g_position_once, position_init);
     if (!base || !strcmp(base, "0")) return NULL;
-    int n = g_seed_default ? snprintf(out, size, "%s", base) : snprintf(out, size, "%s.%s", base, g_seed_tag);
+    const char *suffix = vk_position_cache_suffix(g_position_policy);
+    int n = g_seed_default ? snprintf(out, size, "%s%s", base, suffix) : snprintf(out, size, "%s.%s%s", base, g_seed_tag, suffix);
     return n >= 0 && (size_t)n < size ? out : NULL;
 }
 static void seed_io_start(void) {
@@ -118,6 +129,7 @@ int vk_shaders_ready(void) {
 /* Frontend calls before renderer startup: relative selection must not depend on
    a later process-wide chdir by the guest/runtime. Keep this base process-owned. */
 void vk_shader_seed_startup(const char *game_dir) {
+    pthread_once(&g_position_once, position_init);
     if (!g_seed_dir && !realpath(game_dir, g_seed_base))
         snprintf(g_seed_base, sizeof g_seed_base, "%s", game_dir);
     if (vk_seed_io_enabled()) seed_io_start(); /* index/warming overlaps remaining boot work */
@@ -204,7 +216,7 @@ static int deps_match(const char *deps, const answers_t *a) {
 }
 
 /* ---------- shaders ---------- */
-typedef struct { char variant[80]; uint32_t early_tests; } shader_key;
+typedef struct { char variant[80]; uint32_t early_tests, position_policy; } shader_key;
 static nvn_hmap g_shaders = {.klen = sizeof(shader_key)};
 static int earlyz_on(void) { static int v = -1; if (v < 0) v = vk_earlyz_enabled(getenv("TOTK_VK_EARLYZ")); return v; }
 static inline uint32_t ctl_key_len(const uint8_t *control) { uint32_t n; memcpy(&n, control + 0x20, 4); return n >= 0x7cc && n < 0x880 ? n : 0x880; }
@@ -364,7 +376,9 @@ static int spirv_image_features_ok(const uint32_t *w, size_t nw, int can_read, i
 }
 static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
 static vk_shader *shader_load(const char *variant, int early_tests) {
-    shader_key key = {0}; snprintf(key.variant, sizeof key.variant, "%s", variant); key.early_tests = (uint32_t)early_tests;
+    pthread_once(&g_position_once, position_init);
+    shader_key key = {0}; snprintf(key.variant, sizeof key.variant, "%s", variant);
+    key.early_tests = (uint32_t)early_tests; key.position_policy = g_position_policy;
     vk_shader *sh = nvn_hm_get(&g_shaders, &key);
     if (sh) return sh;
     char path[1024]; size_t spv_len = 0, vk_len = 0;
@@ -429,6 +443,14 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
             b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
         if (b->kind == RB_IMG) { if (b->reg >= 0 && b->reg < 32) sh->native_img_mask |= 1u << b->reg; }
         else if (b->reg >= 0 && b->reg < 128) sh->native_tex_mask[b->reg/64] |= 1ull << (b->reg&63);
+    }
+    if (sh->stage == 0 && g_position_policy) {
+        size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
+        if (vk_spirv_position(&words, &nw, g_position_policy) < 0) {
+            RED(16, "shader %s: cannot preserve requested vertex position precision; refused", variant);
+            free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
+        }
+        spv = (char *)words; spv_len = nw * 4;
     }
     if (sh->stage == 1) {
         size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;

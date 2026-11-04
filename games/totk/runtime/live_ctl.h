@@ -70,6 +70,8 @@ _Static_assert(sizeof totk_live_switches / sizeof *totk_live_switches <= TOTK_LI
 static const char *const totk_live_startup_only[][2] = {
     {"TOTK_IDEAL_CORE_FIX", "core bookkeeping of every guest thread is chosen when it is created"},
     {"TOTK_CORE_WAIT_EVENT", "virtual-core wait and host-return handoff invariants are chosen at startup"},
+    {"TOTK_VK_POS_INVARIANT", "shader modules and cache identity are fixed at startup"},
+    {"TOTK_VK_POS_NOCONTRACT", "shader modules and cache identity are fixed at startup"},
     {"TOTK_VK_SUBGROUP_FIX", "device subgroup features and immutable shader modules/pipelines are chosen at startup"},
     {"TOTK_THERMAL_STEP", "guest controller veneers and thermal sampling are installed only at startup"},
 };

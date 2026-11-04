@@ -2571,6 +2571,12 @@ On Standard mode the GPU stays at 401 MHz and the game's CPU thread waits about 
   Metal; `[occl]` logs queries per frame and the share reporting 0. Lookout Landing: 76 queries a frame, 25 % report
   0, draws −1.6 %, recording +1.4 ms (the queries), so no gain there; it stays opt-in.
 
+**Vertex position precision:** `TOTK_VK_POS_INVARIANT=1` and `TOTK_VK_POS_NOCONTRACT=1` are independent, startup-only, default **0**.
+The first adds `Invariant` to vertex Position outputs (including block members); existing seed decorations are preserved in every arm.
+The second adds `NoContraction` only to core float arithmetic feeding Position through SSA, calls and conservative memory aliases; explicit fused Fma remains fused. Invariant/NoContraction guarantees require identical position computations and inputs: they do **not** make arbitrary shaders, or depth across unrelated shaders, identical.
+Each opt-in arm isolates shader/pipeline/prewarm cache identity. Compare identical fresh-process camera sweeps for flicker, GPU ms and compile/warm-up cost; no speedup is claimed.
+Host checks: `python3 -m unittest discover -s tests -p test_vk_position.py -v`; with `spirv-val`, set `TOTK_TEST_POSITION_SEED` to a loose seed directory or `seed.vkpack` for real vertex samples in all four arms.
+
 ### Original NVN early fragment tests (guest semantics)
 
 Original shader **declared** early depth/stencil tests are honored **by default**. `TOTK_VK_EARLYZ=0` is an explicit,
