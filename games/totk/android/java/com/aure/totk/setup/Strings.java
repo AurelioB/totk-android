@@ -104,7 +104,7 @@ final class Strings {
             case "light": return "30 fps · 960 × 540";
             case "balanced": return "30 fps · game size";
             case "smooth": return "30 → 60 generated";
-            case "60fps": return "60 fps · game size";
+            case "60fps": return "60 fps · GPU busy";
             default: return "your own mix";
         }
     }
@@ -115,7 +115,8 @@ final class Strings {
             case "balanced": return "The game as it was made: 30 fps at the game's own resolution with full shadows.";
             case "smooth": return "The game runs at 30 fps and frame generation adds an in-between picture, so the screen shows 60. "
                     + "The 3D scene is drawn at 1152 × 648 to leave room for it.";
-            case "60fps": return "The game itself runs at 60 fps at its own resolution. Needs a fast GPU; busy areas can dip below 60.";
+            case "60fps": return "The game itself runs at 60 fps at its own resolution, with Keep the GPU busy on. "
+                    + "Needs a fast GPU; busy areas can dip below 60.";
             default: return "Your own combination of the options below. Pick a preset to start from one of the tested mixes.";
         }
     }
@@ -126,6 +127,7 @@ final class Strings {
             case "frame_gen": return "Frame generation";
             case "render_res": return "Render resolution";
             case "latency": return "Latency";
+            case "gpu_feed": return "Keep the GPU busy";
             case "upscaler": return "Upscaler";
             case "sharpness_fsr": case "sharpness_sgsr": return "Sharpness";
             case "aa": return "Anti-aliasing";
@@ -149,6 +151,7 @@ final class Strings {
             case "frame_gen": return "Shows an extra picture between two real ones";
             case "render_res": return "Size of the 3D scene before upscaling";
             case "latency": return "Responsive · Balanced · Smoothest";
+            case "gpu_feed": return "Feeds work earlier · more power and heat";
             case "upscaler": return "Off · FSR 1 · Snapdragon GSR";
             case "sharpness_fsr": case "sharpness_sgsr": return "Applies to the upscaler";
             case "aa": return "Smooths jagged edges";
@@ -176,6 +179,9 @@ final class Strings {
                     + "and softer. Game default lets the game choose, as on the console.";
             case "latency": return "How many finished pictures may wait for the screen. Responsive shows each one as soon as possible; "
                     + "Smoothest keeps one more in reserve to hide uneven frames, at up to one more frame of input delay.";
+            case "gpu_feed": return "Sends smaller batches of work to the GPU earlier and asks Android for clocks that keep up. "
+                    + "Helps 60 fps devices whose GPU idles between batches. A little more GPU and CPU clock means more power "
+                    + "and heat. On in the 60 fps preset; has no effect with frame generation.";
             case "upscaler": return "How the picture is enlarged to the screen. FSR 1 is AMD's edge-aware upscaler; Snapdragon GSR is "
                     + "Qualcomm's, made for Adreno GPUs. Off uses plain filtering.";
             case "sharpness_fsr": case "sharpness_sgsr": return "How much detail the upscaler restores after enlarging the picture. Too high "
@@ -210,6 +216,7 @@ final class Strings {
         switch (key) {
             case "frame_rate": return value + " fps";
             case "frame_gen": return value.equals("on") ? "Interpolation" : "Off";
+            case "gpu_feed": return value.equals("on") ? "On" : "Off";
             case "render_res": return value.equals("game") ? "Game default" : value.replace("x", " × ");
             case "upscaler": return upscalerName(value);
             case "aa": return value.equals("fxaa") ? "Game (FXAA)" : value.equals("smaa") ? "SMAA" : "Off";

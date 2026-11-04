@@ -3,6 +3,15 @@
 All notable changes to TotK Native for Android (`com.aure.totk`). The app follows [semantic versioning](https://semver.org);
 the game version it runs is shown separately. versionCode = major × 10000 + minor × 100 + patch.
 
+## Unreleased
+
+### Menu
+- **Keep the GPU busy** in Graphics → Performance feeds smaller batches earlier and requests clocks that keep up.
+  On in the 60 fps preset only; it uses a little more GPU and CPU clock, power and heat. On the Odin 3 it raised
+  Hateno from 43.3 to 56.9 fps and Lookout from 53.3 to 56.8 fps (16/16 block pairs each).
+  Existing matching presets adopt the new value on upgrade; custom mixes stay off. Other presets' settings.env
+  text is unchanged, and frame generation leaves the option inactive.
+
 ## 1.0.1 (versionCode 10001), game 1.4.3
 
 Fixes for the first reports, plus a few improvements.

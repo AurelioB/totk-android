@@ -37,6 +37,7 @@ final class Settings {
         new Option("frame_gen", PERFORMANCE, "off", "off", "on"),
         new Option("render_res", PERFORMANCE, "game", "game", "1280x720", "1152x648", "960x540"),
         new Option("latency", PERFORMANCE, "balanced", "responsive", "balanced", "smoothest"),
+        new Option("gpu_feed", PERFORMANCE, "off", "off", "on"),
         new Option("upscaler", PICTURE, "off", "off", "fsr", "sgsr"),
         new Option("sharpness_fsr", PICTURE, "20"),
         new Option("sharpness_sgsr", PICTURE, "50"),
@@ -54,14 +55,14 @@ final class Settings {
         new Option("game_language", CONTROLS, "auto", LANGUAGES),
     };
 
-    private static final String[] PRESET_KEYS = {"frame_rate", "frame_gen", "render_res", "latency", "upscaler", "aa", "shadows"};
+    private static final String[] PRESET_KEYS = {"frame_rate", "frame_gen", "render_res", "latency", "upscaler", "aa", "shadows", "gpu_feed"};
     /** Rows follow PRESETS, columns PRESET_KEYS; null = not part of that preset (Smooth: latency is set by frame generation).
      * Light is exactly the Retroid Pocket Duo's device-approved profile (540p scene, full shadows). */
     private static final String[][] PRESET_VALUES = {
-        {"30", "off", "960x540", "balanced", "off", "fxaa", "high"},
-        {"30", "off", "game", "balanced", "off", "fxaa", "high"},
-        {"30", "on", "1152x648", null, "off", "fxaa", "high"},
-        {"60", "off", "game", "balanced", "off", "fxaa", "high"},
+        {"30", "off", "960x540", "balanced", "off", "fxaa", "high", "off"},
+        {"30", "off", "game", "balanced", "off", "fxaa", "high", "off"},
+        {"30", "on", "1152x648", null, "off", "fxaa", "high", "off"},
+        {"60", "off", "game", "balanced", "off", "fxaa", "high", "on"},
     };
     /** The qualified locked frame-generation profile (android/APP.md). DM_DETCLOCK / TOTK_MFX are dead on Android. */
     private static final String[] FRAMEGEN_BLOCK = {
@@ -81,6 +82,14 @@ final class Settings {
         }
         // A hand-edited store must not hold a combination the menu cannot produce.
         if ("on".equals(get("frame_gen"))) values.put("frame_rate", "30");
+        // 1.0.0 had no gpu_feed key. Preserve its preset identity, adopting the new value only when all the old
+        // preset values match; a custom mix stays off. An explicit choice (even an invalid stored value) never migrates.
+        if (stored != null && !stored.containsKey("gpu_feed")) {
+            for (int p = 0; p < PRESETS.length; p++) if (matches(p, true)) {
+                values.put("gpu_feed", presetValue(PRESETS[p], "gpu_feed"));
+                break;
+            }
+        }
     }
     /** The first launch: shipping defaults with the profile for this chip (profile(soc)). */
     static Settings firstRun(String soc) {
@@ -126,11 +135,12 @@ final class Settings {
 
     /** The preset whose values all match, else CUSTOM. */
     String preset() {
-        for (int p = 0; p < PRESETS.length; p++) if (matches(p)) return PRESETS[p];
+        for (int p = 0; p < PRESETS.length; p++) if (matches(p, false)) return PRESETS[p];
         return CUSTOM;
     }
-    private boolean matches(int preset) {
+    private boolean matches(int preset, boolean legacy) {
         for (int k = 0; k < PRESET_KEYS.length; k++) {
+            if (legacy && PRESET_KEYS[k].equals("gpu_feed")) continue;
             String want = PRESET_VALUES[preset][k];
             if (want != null && !want.equals(values.get(PRESET_KEYS[k]))) return false;
         }
@@ -205,6 +215,11 @@ final class Settings {
             line(out, "TOTK_FPS60=" + (sixty ? "1" : "0"));
             // The device-tested 60 fps profile reports hardware GPU time (the FPS60 default, latency, overstates it).
             if (sixty) line(out, "TOTK_GPU_TIME=hardware");
+            // Extraction cannot split passes. Leave both hints out with frame generation, retaining its timing block.
+            if ("on".equals(get("gpu_feed"))) {
+                line(out, "TOTK_VK_SPLIT_PASS_DRAWS=512");
+                line(out, "TOTK_ADPF_GPU=1");
+            }
         }
         if (!get("render_res").equals("game")) line(out, "TOTK_RENDER_RES=" + get("render_res"));
         if (!framegen) line(out, "TOTK_ACQUIRE_SLACK=" + Arrays.asList("responsive", "balanced", "smoothest").indexOf(get("latency")));

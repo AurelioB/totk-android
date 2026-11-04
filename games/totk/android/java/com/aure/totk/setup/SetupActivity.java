@@ -1261,7 +1261,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         Widgets.Panel list = panel(80, listTop, 1040, 906 - listTop, false, 28, 28);
         List<String> keys = new ArrayList<>();
         switch (tab) {
-            case Settings.PERFORMANCE: keys.addAll(Arrays.asList("frame_rate", "frame_gen", "render_res", "latency")); break;
+            case Settings.PERFORMANCE: keys.addAll(Arrays.asList("frame_rate", "frame_gen", "render_res", "latency", "gpu_feed")); break;
             case Settings.PICTURE: keys.addAll(Arrays.asList("upscaler", "sharpness", "aa", "shadows")); break;
             default:
                 keys.addAll(Arrays.asList("console_mode", "native_hud", "overlay", "overlay_pos"));
@@ -1294,7 +1294,9 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     /** One option row: a ‹ value › selector, or the sharpness slider bound to the current upscaler's value. */
     private void settingRow(LinearLayout parent, String key) {
         String labelKey = key.equals("sharpness") ? "sharpness_fsr" : key;
-        Widgets.Row row = listRow(parent, "opt:" + key, Strings.optionLabel(labelKey), Strings.optionHint(labelKey), 92, 18);
+        // Five Performance rows share the space below the preset cards; keep the last selector inside the panel.
+        float gap = Settings.option(labelKey).tab.equals(Settings.PERFORMANCE) ? 6 : 18;
+        Widgets.Row row = listRow(parent, "opt:" + key, Strings.optionLabel(labelKey), Strings.optionHint(labelKey), 92, gap);
         row.setFocusableInTouchMode(true);   // a tap selects the row (and shows its detail); the arrows change it
         if (key.equals("sharpness")) {
             Widgets.Slider slider = new Widgets.Slider(this, row, value -> {
@@ -1385,6 +1387,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         switch (key) {
             case "frame_rate": return value.equals("60") ? 4 : 2;
             case "frame_gen": return value.equals("on") ? 3 : 0;
+            case "gpu_feed": return value.equals("on") ? 1 : 0;
             case "render_res": return value.equals("960x540") ? 1 : value.equals("1152x648") ? 2 : 3;
             case "upscaler": return value.equals("off") ? 0 : 1;
             case "sharpness_fsr": case "sharpness_sgsr": return 1;
@@ -1408,7 +1411,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             detailText.setText(Strings.presetText(preset));
             detailDiagram.setVisibility(View.GONE);
             if (!preset.equals(Settings.CUSTOM))
-                for (String key : new String[]{"frame_rate", "frame_gen", "render_res", "latency", "upscaler", "aa", "shadows"}) {
+                for (String key : new String[]{"frame_rate", "frame_gen", "render_res", "latency", "gpu_feed", "upscaler", "aa", "shadows"}) {
                     String v = Settings.presetValue(preset, key);
                     fact(Strings.optionLabel(key), v == null ? Strings.LOCKED_FRAMEGEN : Strings.valueName(key, v));
                 }
@@ -1431,6 +1434,10 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 case "frame_gen":
                     fact(Strings.ADDED_LATENCY, Strings.addedLatency(key, value));
                     fact(Strings.WORKS_WITH, "30 fps only");
+                    break;
+                case "gpu_feed":
+                    fact(Strings.WORKS_WITH, "Frame generation off");
+                    if (settings.latencyLocked()) constraint = Strings.LOCKED_FRAMEGEN;
                     break;
                 case "latency":
                     fact(Strings.ADDED_LATENCY, settings.latencyLocked() ? Strings.LOCKED_FRAMEGEN : Strings.addedLatency(key, value));

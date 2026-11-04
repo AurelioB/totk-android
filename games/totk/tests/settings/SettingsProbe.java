@@ -16,6 +16,7 @@ import java.util.Map;
  *    profile soc                   Settings.profile, profileKnown and socClass ('-' = null SOC_MODEL), space-separated
  *    first soc                     Settings.firstRun values
  *    env locale k=v...             Settings.env(locale) with newlines as '|' ('-' = no locale)
+ *    envpreset name locale k=v...  apply a preset, then Settings.env(locale)
  *    envdir locale dir k=v...      Settings.env(locale, dir) ('-' = primary folder, no TOTK_DATA_DIR)
  *    write dir name text           Settings.writeAtomic(dir, name, text): "ok" or "error <exception message>" */
 public final class SettingsProbe {
@@ -55,6 +56,11 @@ public final class SettingsProbe {
                 case "first": answer = dump(Settings.firstRun(w.length > 1 ? w[1] : null)); break;
                 case "defaults": { Settings s = new Settings(pairs(w, 3)); s.defaults(w[1], w[2]); answer = dump(s); break; }
                 case "env": answer = new Settings(pairs(w, 2)).env(w[1].equals("-") ? null : w[1]).replace('\n', '|'); break;
+                case "envpreset": {
+                    Settings s = new Settings(pairs(w, 3));
+                    s.applyPreset(w[1]);
+                    answer = s.env(w[2].equals("-") ? null : w[2]).replace('\n', '|'); break;
+                }
                 case "envdir": answer = new Settings(pairs(w, 3)).env(w[1].equals("-") ? null : w[1], w[2].equals("-") ? null : w[2]).replace('\n', '|'); break;
                 case "write":
                     try { Settings.writeAtomic(new java.io.File(w[1]), w[2], w[3]); answer = "ok"; }

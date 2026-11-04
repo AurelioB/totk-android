@@ -3844,6 +3844,18 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 | `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
 | `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
 
+**Keep the GPU busy** (Graphics → Performance) turns on `TOTK_VK_SPLIT_PASS_DRAWS=512` and `TOTK_ADPF_GPU=1`
+together. It feeds smaller batches earlier and requests clocks that keep up; a little more GPU and CPU clock costs
+power and heat. On only in the **60 fps** preset; off writes neither line, keeping other presets' settings.env bytes
+unchanged. With frame generation both lines are omitted because extraction cannot split passes.
+
+A 1.0.0 store without this option adopts its matching preset's value (60 fps: on; Light / Balanced / Smooth: off).
+Custom mixes stay off, and an explicit stored choice is never replaced. This keeps existing preset identities on upgrade.
+On the Odin 3 (Snapdragon 8 Elite class), the pair raised Hateno 43.3 → 56.9 fps and Lookout 53.3 → 56.8 fps
+(16/16 block pairs each), moving the GPU off its 660 MHz floor. Splits alone were neutral on Thor / Duo at their
+30 fps caps; ADPF_GPU was not tested there. Compare off/on on the same warmed route after restarting: fps, GPU-clock
+residency, power and temperature; retain `[split-pass]` and `[totk-perf] ADPF span` logs.
+
 ### Android performance hints (experimental full mode)
 
 The shipped render-only ADPF session remains the default, including its historical
