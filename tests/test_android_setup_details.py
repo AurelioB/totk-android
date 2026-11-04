@@ -1,4 +1,4 @@
-"""The production plain-text setup report on a host JVM: bounded reads/output and allowlisted diagnostics only."""
+"""The production plain-text setup report on a host JVM: bounded output and allowlisted, record-safe diagnostics."""
 from pathlib import Path
 import re
 import shutil
@@ -119,6 +119,65 @@ class SetupDetailsTests(unittest.TestCase):
         self.assertIn('END', report)
         self.assertNotIn('1234', report)
         self.assertIn('bytes omitted', report)
+
+    def test_private_values_crossing_both_byte_cuts_leave_no_fragments(self):
+        intro = self.report().split('\n--- .import/', 1)[0]
+        budget = (64 * 1024 - len(intro.encode()) - 512) // 2
+        keep = (budget - 128) // 3
+        size = 60000
+        cuts = [keep // 2, size - (keep - keep // 2)]
+        secrets = [
+            ('SensitivePickedName-PrefixHiddenSuffix.nsp', True),
+            ('/data/user/0/SecretAccountDirectory/PrivateLeafLocation', False),
+            ('content://SecretDocumentsAuthority/ConfidentialDocumentSegment', False),
+        ]
+        for secret, exclude in secrets:
+            with self.subTest(secret=secret):
+                data = bytearray(b'!' * size)
+                beginning, ending = b'HEAD-CONTEXT\n', b'\nTAIL-CONTEXT'
+                data[:len(beginning)] = beginning
+                data[-len(ending):] = ending
+                encoded = secret.encode()
+                for cut in cuts:
+                    start = cut - len(encoded) // 2
+                    data[start - 1] = ord('\n')
+                    data[start:start + len(encoded)] = encoded
+                    data[start + len(encoded)] = ord('\n')
+                (self.logs / 'hactool-romfs.log').write_bytes(data)
+                report = self.report(excluded=[secret] if exclude else [])
+                self.assertIn('HEAD-CONTEXT', report)
+                self.assertIn('TAIL-CONTEXT', report)
+                self.assertIn('bytes omitted', report)
+                for start in range(len(secret) - 7):
+                    self.assertNotIn(secret[start:start + 8], report, 'a cut leaked part of a private value')
+
+    def test_oversized_edge_lines_are_scrubbed_before_truncation(self):
+        intro = self.report().split('\n--- .import/', 1)[0]
+        budget = (64 * 1024 - len(intro.encode()) - 512) // 2
+        keep = (budget - 128) // 3
+        secrets = [
+            'SensitivePickedName-PrefixHiddenSuffix.nsp',
+            '/data/user/0/SecretAccountDirectory/PrivateLeafLocation',
+            'content://SecretDocumentsAuthority/ConfidentialDocumentSegment',
+        ]
+        line = bytearray(b'!' * 60000)
+        line[:len(b'LINE-BEGIN')] = b'LINE-BEGIN'
+        line[-len(b'LINE-END'):] = b'LINE-END'
+        # Put complete private values across both former raw cuts, with no newline to drop at either edge.
+        for cut in [keep // 2, len(line) - (keep - keep // 2)]:
+            text = (' ' + ' '.join(secrets) + ' ').encode()
+            start = cut - len(text) // 2
+            line[start:start + len(text)] = text
+        for data in [bytes(line), bytes(line) + b'\nTAIL-CONTEXT\n', b'HEAD-CONTEXT\n' + bytes(line)]:
+            with self.subTest(first_bytes=data[:20]):
+                (self.logs / 'hactool-romfs.log').write_bytes(data)
+                report = self.report(excluded=[secrets[0]])
+                self.assertIn('LINE-BEGIN', report)
+                self.assertIn('LINE-END', report)
+                self.assertIn('bytes omitted', report)
+                for secret in secrets:
+                    for start in range(len(secret) - 7):
+                        self.assertNotIn(secret[start:start + 8], report, 'an oversized line leaked a private value')
 
     def test_symlinks_and_nonregular_files_are_not_opened(self):
         secret = self.game / 'prod.keys'

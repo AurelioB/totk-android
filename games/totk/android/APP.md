@@ -65,8 +65,10 @@ Failure cleanup keeps the top-level logs, even for private Internal storage that
 `SetupDetails.java` is the pure, host-tested builder (`tests/test_android_setup_details.py`). Its only file reads
 are `.import/hactool-romfs.log`, `.import/hactool-exefs.log`, and, for a shader failure, `.import/shaders.log`.
 Missing/unreadable files are marked; symlinks and non-regular files are excluded. The UTF-8 report is capped at
-64 KiB, retaining each oversized log's beginning and end with a byte-omission marker. Hex runs of 32 or more
-characters are redacted again across the whole report; input names, URIs and absolute paths are scrubbed.
+64 KiB, retaining each oversized log's beginning and end with a byte-omission marker. Partial records at byte cuts
+are dropped; an oversized edge line is scrubbed whole before it is truncated, so filename/URI/path fragments cannot
+escape redaction. Hex runs of 32 or more characters are redacted again across the whole report; input names,
+URIs and absolute paths are scrubbed.
 Metadata includes the result JSON, app version/code/commit, device/Android/SoC, route, destination kind and free
 bytes, plus each input's direct-path/provider-authority access, extension and size only.
 

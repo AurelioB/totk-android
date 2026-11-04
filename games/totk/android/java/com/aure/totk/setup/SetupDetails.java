@@ -1,5 +1,6 @@
 package com.aure.totk.setup;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -13,7 +14,7 @@ import java.util.Locale;
 import java.util.regex.Pattern;
 
 /** Plain-text setup diagnostics. No directory walk: these are the only diagnostic files setup writes.
- * Reads are bounded too, including for a damaged or unexpectedly large log. No Android dependencies (host-tested). */
+ * Normal reads use bounded windows; an oversized edge line is scrubbed whole before truncation. Host-tested. */
 final class SetupDetails {
     static final int MAX_BYTES = 64 * 1024;
     static final String PRIVACY = "No game files or keys are included; nothing is sent until you choose an app.";
@@ -62,17 +63,57 @@ final class SetupDetails {
             byte[] head = read(channel, keep / 2);
             channel.position(size - (keep - head.length));
             byte[] tail = read(channel, keep - head.length);
+            // Never scrub a fragment: an input name, URI or path may straddle either byte cut.
             int h = head.length, t = 0;
-            // A cut inside a long hex value must not leak its short, otherwise unredacted edge.
-            while (h > 0 && hex(head[h - 1])) h--;
-            while (t < tail.length && hex(tail[t])) t++;
-            String text = decode(java.util.Arrays.copyOf(head, h))
-                    + omitted(size - h - (tail.length - t))
-                    + decode(java.util.Arrays.copyOfRange(tail, t, tail.length));
-            return bounded(scrub(text, excluded), budget);
+            while (h > 0 && head[h - 1] != '\n') h--;
+            while (t < tail.length && tail[t] != '\n') t++;
+            if (t < tail.length) t++;
+            long headBytes = h, tailBytes = tail.length - t;
+            String beginning, ending;
+            if (h == 0) {
+                channel.position(0);
+                byte[] line = readLine(channel);
+                if (line.length == size) return bounded(scrub(decode(line), excluded), budget);
+                headBytes = line.length;
+                beginning = bounded(scrub(decode(line), excluded), (budget - 128) / 2);
+            } else beginning = scrub(new String(head, 0, h, StandardCharsets.UTF_8), excluded);
+            if (t == tail.length) {
+                channel.position(lastLineStart(channel, size));
+                byte[] line = readLine(channel);
+                tailBytes = line.length;
+                ending = bounded(scrub(decode(line), excluded), (budget - 128) / 2);
+            } else ending = scrub(new String(tail, t, tail.length - t, StandardCharsets.UTF_8), excluded);
+            long skipped = size - headBytes - tailBytes;
+            return bounded(beginning + (skipped > 0 ? omitted(skipped) : "") + ending, budget);
         } catch (IOException | SecurityException unavailable) {
             return "[unavailable: could not read log]";
         }
+    }
+
+    /** Only needed when an edge record is larger than its window. Never truncate its raw text before scrubbing. */
+    private static byte[] readLine(SeekableByteChannel channel) throws IOException {
+        ByteArrayOutputStream line = new ByteArrayOutputStream();
+        ByteBuffer block = ByteBuffer.allocate(4096);
+        for (int n; (n = channel.read(block)) != -1; block.clear()) {
+            int end = 0;
+            while (end < n && block.array()[end] != '\n') end++;
+            line.write(block.array(), 0, end < n ? end + 1 : end);
+            if (end < n) break;
+        }
+        return line.toByteArray();
+    }
+
+    private static long lastLineStart(SeekableByteChannel channel, long size) throws IOException {
+        for (long end = size; end > 0;) {
+            int count = (int) Math.min(4096, end);
+            long start = end - count;
+            channel.position(start);
+            byte[] block = read(channel, count);
+            for (int i = block.length - 1; i >= 0; i--)
+                if (block[i] == '\n' && start + i < size - 1) return start + i + 1;
+            end = start;
+        }
+        return 0;
     }
 
     private static byte[] read(SeekableByteChannel channel, int count) throws IOException {
