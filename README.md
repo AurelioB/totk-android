@@ -80,7 +80,8 @@ Tested devices:
 
 ## Install and first setup
 
-1. Download `totk-native.apk` from the Releases page and install it (allow installs from your browser or file manager).
+1. Download `TotK-Native-1.0.0.apk` from the Releases page and install it (allow installs from your browser or file
+   manager).
 2. Copy your dump to the device or an SD card.
 3. Open **TotK Native** and press **Begin setup**. Then:
    1. **Storage**: where the game data goes. Internal storage is recommended (fastest); the SD card or a folder you
@@ -88,8 +89,9 @@ Tested devices:
    2. **What you have**: pick your route.
    3. **Choose your files** with the file picker. Each file is checked as soon as you pick it; when everything is
       there, press **+** or *Install*.
-   4. **Prepare**: the game is built on the device. On an AYN Thor with a decrypted dump on internal storage this took
-      about 5 minutes; the container route merges the base game and update for about 12 minutes more. The
+   4. **Prepare**: the game is built on the device. On an AYN Thor with a decrypted dump on internal storage this takes
+      about 1 minute 45 seconds (about 1.5–3 minutes on the Odin 3 and the Duo); the container route merges the base
+      game and update for about 12 minutes more. The
       second-screen art is optional: you can start playing before it is done.
    5. **Choose graphics** opens with your device's preset selected. Press **+** to play.
 4. Nothing is uploaded: your files stay on the device.
