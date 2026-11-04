@@ -53,6 +53,7 @@ static int g_ui_aspect_on;
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <unistd.h>
@@ -3153,6 +3154,7 @@ typedef struct pipe_ent {
     uint64_t wait_sub, retry_at; unsigned skipped, seen_failure;   /* walking thread only */
     uint64_t frame;                    /* originating request; immutable while queued/building */
     int predicted, capture; uint32_t list_index, collected; struct pipe_ent *next;
+    vk_lend lend;                      /* g_pq_mu: the worker building it and any nice a waiter lent it */
 } pipe_ent;
 #define PIPE_FAILED ((VkPipeline)(uintptr_t)1)
 static nvn_hmap g_pipes = {.klen = sizeof(pipe_key)};
@@ -3222,6 +3224,66 @@ static void pipe_predict_maybe(const uint8_t *next);
 static pthread_mutex_t g_pq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pq_cv = PTHREAD_COND_INITIALIZER;
 static pipe_ent *g_pq_head, *g_pq_tail;
 static _Atomic uint64_t g_win_async, g_win_async_ns;   /* compiled on worker threads, per stutter window */
+/* Priority lending (TOTK_VK_PIPE_BOOST=1, default off). Workers run at VK_WORKER_NICE so background builds yield to the
+   game. Once a recording thread joins a worker's in-flight build, that build is on the frame's critical path: the
+   waiter lends the worker its own nice until the build is published, then the worker returns to VK_WORKER_NICE.
+   Joins and their wall time are counted with the switch off too, so both arms report the same line. */
+static int g_pipe_boost;
+static _Atomic uint64_t g_boost_joins, g_boost_join_ns, g_boost_raised, g_boost_refused;
+static _Atomic int g_boost_refusal_logged;
+#ifdef TOTK_VK_TESTS
+static int (*g_boost_test_nice)(void), (*g_boost_test_set)(int tid, int nice);
+void vk_pipe_boost_test_hooks(int (*self_nice)(void), int (*set)(int tid, int nice)) {
+    g_boost_test_nice = self_nice; g_boost_test_set = set;
+}
+void vk_pipe_boost_test_stats(uint64_t out[4]) {
+    out[0] = atomic_load(&g_boost_joins); out[1] = atomic_load(&g_boost_join_ns);
+    out[2] = atomic_load(&g_boost_raised); out[3] = atomic_load(&g_boost_refused);
+}
+#endif
+static int boost_self_nice(void) {
+#ifdef TOTK_VK_TESTS
+    if (g_boost_test_nice) return g_boost_test_nice();
+#endif
+    int saved = errno; errno = 0;
+    int nice = getpriority(PRIO_PROCESS, 0);   /* Linux nice is per thread */
+    if (nice == -1 && errno) nice = VK_WORKER_NICE;
+    errno = saved; return nice;
+}
+static int boost_set(int tid, int nice) {   /* 0 or the errno; tid 0 is the calling thread */
+#ifdef TOTK_VK_TESTS
+    if (g_boost_test_set) return g_boost_test_set(tid, nice);
+#endif
+    int saved = errno, error = setpriority(PRIO_PROCESS, (id_t)tid, nice) ? errno : 0;
+    errno = saved; return error;
+}
+int vk_thread_tid(void) { return (int)syscall(SYS_gettid); }
+int vk_pipe_boost_lend(vk_lend *l) {
+    if (!g_pipe_boost || !l->tid) return 0;
+    int nice = boost_self_nice();
+    if (nice >= (l->lent ? l->nice : VK_WORKER_NICE)) return 0;
+    int error = boost_set(l->tid, nice);
+    if (error) {
+        atomic_fetch_add_explicit(&g_boost_refused, 1, memory_order_relaxed);
+        if (!atomic_exchange_explicit(&g_boost_refusal_logged, 1, memory_order_relaxed))
+            LOGV("pipe boost: raising worker %d to nice %d refused (%s); joins keep the worker's nice", l->tid, nice, strerror(error));
+        return -1;
+    }
+    l->lent = 1; l->nice = nice;
+    atomic_fetch_add_explicit(&g_boost_raised, 1, memory_order_relaxed);
+    return 1;
+}
+void vk_pipe_boost_restore(const vk_lend *l) { if (l->lent) boost_set(0, VK_WORKER_NICE); }
+void vk_pipe_boost_waited(uint64_t ns) {
+    atomic_fetch_add_explicit(&g_boost_joins, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_boost_join_ns, ns, memory_order_relaxed);
+}
+void vk_draw_switches_init(void) {
+    const char *e = getenv("TOTK_VK_PIPE_BOOST"); g_pipe_boost = e && atoi(e) == 1;
+    LOGV("TOTK_VK_PIPE_BOOST=%d: %s", g_pipe_boost, g_pipe_boost ?
+         "a join on a compile worker's build lends the worker the waiter's nice until it publishes" :
+         "compile workers keep nice 10 while joined (default)");
+}
 #include "vk_pso_runtime.inc"
 static void pipe_enqueue(pipe_ent *e) {
     pthread_mutex_lock(&g_pq_mu);
@@ -3492,8 +3554,9 @@ static VkPipeline pipe_ready_get(pipe_ent *e) {
     }
     return e->p;
 }
-/* Exactly one builder owns an entry. Publication and prewarm accounting are shared by workers and bounded takeover. */
-static void pipe_publish(pipe_ent *e, VkResult r, VkPipeline p, uint64_t dt) {
+/* Exactly one builder owns an entry. Publication and prewarm accounting are shared by workers and bounded takeover.
+   Returns the nice a waiter lent the building worker; once published no waiter can lend it again. */
+static vk_lend pipe_publish(pipe_ent *e, VkResult r, VkPipeline p, uint64_t dt) {
     pthread_mutex_lock(&g_pq_mu);
     if (r) {
         HK_ADD(pipes_fail, 1);
@@ -3507,8 +3570,10 @@ static void pipe_publish(pipe_ent *e, VkResult r, VkPipeline p, uint64_t dt) {
     e->optimized_ns = dt;
     e->p = p;
     atomic_store_explicit(&e->state, r ? PE_FAILED : PE_READY, memory_order_release);
+    vk_lend lend = e->lend; e->lend = (vk_lend){0};
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
+    return lend;
 }
 static int pipe_pending(int state) { return state == PE_QUEUED || state == PE_BUILDING; }
 /* Remove a queued entry to build it on the walk. An in-flight build is joined, never duplicated or overwritten. */
@@ -3527,13 +3592,17 @@ static int pipe_build_now(pipe_ent *e) {
     }
     if (build) atomic_store_explicit(&e->state, PE_BUILDING, memory_order_release);
     else if (pipe_pending(state)) {
-        int diag = dm_wait_stats_enabled();
-        uint64_t started = diag ? host_now_ns() : 0;
+        int diag = dm_wait_stats_enabled(), refused = 0;
+        uint64_t started = host_now_ns();
         while (pipe_pending(state)) {
+            /* A queued entry gets its worker when one takes it; lend again after any wake while unlent. */
+            if (!refused && vk_pipe_boost_lend(&e->lend) < 0) refused = 1;
             pthread_cond_wait(&g_pq_cv, &g_pq_mu);
             state = atomic_load_explicit(&e->state, memory_order_acquire);
         }
-        if (diag) pipe_diag_add(&g_pp_wait_ns, host_now_ns() - started);
+        uint64_t waited = host_now_ns() - started;
+        vk_pipe_boost_waited(waited);
+        if (diag) pipe_diag_add(&g_pp_wait_ns, waited);
     }
     pthread_mutex_unlock(&g_pq_mu);
     if (build) {
@@ -3555,7 +3624,8 @@ static int pipe_build_now(pipe_ent *e) {
 static void *pipe_worker(void *arg) {
     char name[16]; snprintf(name, sizeof name, "totk-pipe%u", (unsigned)(uintptr_t)arg);
     totk_thread_start(name, NULL);
-    setpriority(PRIO_PROCESS, 0, 10);   /* this thread: below the game's threads */
+    setpriority(PRIO_PROCESS, 0, VK_WORKER_NICE);   /* this thread: below the game's threads */
+    int self = vk_thread_tid();
     for (;;) {
         pthread_mutex_lock(&g_pq_mu);
         int background = 0;
@@ -3582,7 +3652,7 @@ static void *pipe_worker(void *arg) {
         } else { e = g_pq_head; g_pq_head = e->next; if (!g_pq_head) g_pq_tail = NULL; }
         int demand_active = !background && atomic_load_explicit(&g_pso_warming, memory_order_relaxed);
         g_pq_active += demand_active;
-        e->next = NULL; atomic_store_explicit(&e->state, PE_BUILDING, memory_order_release);
+        e->next = NULL; e->lend = (vk_lend){.tid = self}; atomic_store_explicit(&e->state, PE_BUILDING, memory_order_release);
         pthread_mutex_unlock(&g_pq_mu);
         uint64_t t0 = host_now_ns(); VkPipeline p;
         /* Library parts only enable fast links for later draws; a part failure never fails the entry itself. */
@@ -3594,7 +3664,8 @@ static void *pipe_worker(void *arg) {
         if (build_started) pso_trace_log(&e->k, "build", e->list_index ? "prewarm-worker" : "async-worker",
                                         e->frame, r, host_now_ns() - build_started, 0, -1);
         uint64_t dt = host_now_ns() - t0; g_win_async++; g_win_async_ns += dt;
-        pipe_publish(e, r, p, dt);
+        vk_lend lent = pipe_publish(e, r, p, dt);
+        vk_pipe_boost_restore(&lent);
         if (background || demand_active) {
             pthread_mutex_lock(&g_pq_mu);
             if (background) { g_pw_active = 0; g_pw_pause_until = host_now_ns()+10000000; }
@@ -9643,6 +9714,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
              (unsigned long long)n, g_win_frame_max_ns / 1e6, (unsigned long long)g_win_over33, (unsigned long long)g_win_over50,
              (unsigned long long)g_win_pipes, g_win_pipe_ns / 1e6, g_win_pipe_max_ns / 1e6, (unsigned long long)atomic_exchange(&g_win_async, 0), atomic_exchange(&g_win_async_ns, 0) / 1e6,
              (unsigned long long)g_win_sync, g_win_sync_ns / 1e6, (unsigned long long)g_win_prewarm_wait, g_win_prewarm_wait_ns / 1e6);
+        LOGV("frame %llu, pipeline joins: %llu waits on worker builds (graphics and compute) in %.1f ms; boosts %llu, refused %llu (TOTK_VK_PIPE_BOOST=%d)",
+             (unsigned long long)n, (unsigned long long)atomic_exchange(&g_boost_joins, 0), atomic_exchange(&g_boost_join_ns, 0) / 1e6,
+             (unsigned long long)atomic_exchange(&g_boost_raised, 0), (unsigned long long)atomic_exchange(&g_boost_refused, 0), g_pipe_boost);
         if (V.has_pipeline_library) {
             static uint64_t previous[7], previous_parts[PL_COUNT], previous_ns[PL_COUNT];
             uint64_t current[7] = {atomic_load(&g_library_stats.fast_links), atomic_load(&g_library_stats.fast_link_ns),

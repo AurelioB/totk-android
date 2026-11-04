@@ -6,7 +6,10 @@
    without --gpl runs the original failure/backoff/compute/takeover suite with the backend enabled.
    --screen-classify covers aligned scene misses and a persistent 64x64 color/depth capture.
    --screen-classify-pure (or TOTK_SCREEN_CLASSIFY_ONLY) runs just the dependency-free helper cases.
-   --target-life checks current-frame and retained 480x268 color/depth contents through real sampled draws. */
+   --target-life checks current-frame and retained 480x268 color/depth contents through real sampled draws.
+   TOTK_VK_PIPE_BOOST=1 checks that the bounded graphics join and the compute dispatch join lend their waiter's nice
+   to the building worker exactly for that build (through a priority hook: hosts may not lower nice); unset checks
+   that joins never touch worker priority. */
 #include "vk_screen_classify.h"
 #include <stdio.h>
 
@@ -110,6 +113,7 @@ static void screen_classify_cases(void) {
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include "dm_wait_stats.h"
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -122,6 +126,28 @@ extern void vk_compute_test_counts(uint64_t out[4]);
 static unsigned failure_mask = 7;
 static PFN_vkCreateGraphicsPipelines real_graphics;
 static PFN_vkCreateComputePipelines real_compute;
+/* Priority hook: every lend (worker tid, waiter nice) and restore (0 = the worker itself, VK_WORKER_NICE) in order. */
+extern void vk_pipe_boost_test_hooks(int (*self_nice)(void), int (*set)(int tid, int nice));
+extern void vk_pipe_boost_test_stats(uint64_t out[4]);
+enum { WAITER_NICE = -8 };
+static struct { int tid, nice, caller; } boost_calls[16];
+static unsigned nboost, held_tid, compute_tid;
+static int waiter_nice(void) { return WAITER_NICE; }
+static int boost_hook(int tid, int nice) {
+    pthread_mutex_lock(&mu);
+    if (nboost < 16) boost_calls[nboost] = (typeof(boost_calls[0])){tid, nice, (int)syscall(SYS_gettid)};
+    nboost++; pthread_cond_broadcast(&cv); pthread_mutex_unlock(&mu);
+    return 0;
+}
+/* The loan to worker `tid` and that worker's own restore, both recorded after `from`. */
+static int boost_loan_seen(unsigned from, unsigned tid) {
+    pthread_mutex_lock(&mu); int lent = -1, restored = 0;
+    for (unsigned i = from; i < nboost && i < 16; i++) {
+        if (lent < 0 && boost_calls[i].tid == (int)tid && boost_calls[i].nice == WAITER_NICE) lent = (int)i;
+        else if (lent >= 0 && !boost_calls[i].tid && boost_calls[i].nice == VK_WORKER_NICE && boost_calls[i].caller == (int)tid) restored = 1;
+    }
+    pthread_mutex_unlock(&mu); return tid && lent >= 0 && restored;
+}
 static unsigned graphics_count(const unsigned *counter) {
     pthread_mutex_lock(&mu); unsigned n = *counter; pthread_mutex_unlock(&mu); return n;
 }
@@ -157,7 +183,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL graphics(VkDevice dev, VkPipelineCache cac
     attempts[mask]++;
     main_builds[mask] += pthread_equal(pthread_self(), walk) != 0;
     if (mask == held_mask && !pthread_equal(pthread_self(), walk)) {
-        entered = 1; pthread_cond_broadcast(&cv);
+        entered = 1; held_tid = (unsigned)syscall(SYS_gettid); pthread_cond_broadcast(&cv);
         while (!release_build) pthread_cond_wait(&cv, &mu);
     }
     int fail = mask == failure_mask && failures_left;
@@ -173,6 +199,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compute(VkDevice dev, VkPipelineCache cach
         const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *alloc, VkPipeline *out) {
     pthread_mutex_lock(&mu);
     compute_calls++; compute_recording += pthread_equal(pthread_self(), walk) != 0;
+    if (!pthread_equal(pthread_self(), walk)) compute_tid = (unsigned)syscall(SYS_gettid);
     compute_entered = 1; pthread_cond_broadcast(&cv);
     while (compute_hold) pthread_cond_wait(&cv, &mu);
     pthread_mutex_unlock(&mu);
@@ -749,6 +776,8 @@ int main(int argc, char **argv) {
         CHECK(vk_compute_pipe_cum_ns() == before && !graphics_count(&compute_calls), "learned key incurs zero recording creation/blocking");
         return finish_tests();
     }
+    const char *boost_env = getenv("TOTK_VK_PIPE_BOOST"); int boost_on = boost_env && atoi(boost_env) == 1;
+    vk_pipe_boost_test_hooks(waiter_nice, boost_hook);
     draw(15, 1);
     pthread_mutex_lock(&mu); while (!entered) pthread_cond_wait(&cv, &mu); pthread_mutex_unlock(&mu);
     CHECK(pixel[0] == 0 && pixel[2] == 255, "cold miss skipped the draw (clear remains)");
@@ -762,6 +791,11 @@ int main(int argc, char **argv) {
     draw_current(1); pthread_join(helper, NULL);
     CHECK(pixel[0] == 255 && pixel[1] == 255, "bounded in-flight build joined; later draw has real pixels");
     CHECK(graphics_count(&attempts[15]) == 1 && atomic_load(&g_hk.pipe_bounds) == 1, "bound never duplicates or overwrites a worker build");
+    uint64_t boost[4]; vk_pipe_boost_test_stats(boost);
+    CHECK(boost[0] >= 1 && boost[1] > 0, "the bounded join is counted with its wall time");
+    if (boost_on) CHECK(wait_graphics(&nboost, 2) && boost_loan_seen(0, held_tid) && !boost[3],
+                        "the join lent the waiter's nice to the held worker, which restored nice %d after publishing", VK_WORKER_NICE);
+    else CHECK(!graphics_count(&nboost) && !boost[2], "switch off: a join never changes worker priority");
     if (V.has_pipeline_library) CHECK(graphics_count(&attempts[7]) == 1, "bounded unavailable-part key is built exactly once");
     vk_pipeline_test_stats credit;
     vk_pipeline_test_stats_get(&credit);
@@ -789,6 +823,7 @@ int main(int argc, char **argv) {
     vk_shader *resolved[6]; CHECK(!vk_prog_resolve(&cs_prog, resolved) && resolved[5], "compute seed resolved");
     uint32_t *result = (uint32_t *)(mem + 0x60000); memset(result, 0, 256);
     p_bind_buf output = {5, 0, (uintptr_t)result, 256}; p_dispatch dispatch = {1, 1, 1};
+    unsigned boost_before = graphics_count(&nboost);
     pthread_create(&helper, NULL, release_compute_waiter, NULL);
     op(OP_BIND_UBO, &output, sizeof output); op(OP_DISPATCH, &dispatch, sizeof dispatch);
     CHECK(mtl_wait(submit(), 5000000000ull), "dispatch waits for held compute creation and completes");
@@ -798,6 +833,9 @@ int main(int argc, char **argv) {
     for (uint32_t i = 0; i < 64; i++) if (result[i] != (i ^ 0x12345678u)) correct = 0;
     CHECK(correct, "joined dispatch writes every expected output word");
     CHECK(graphics_count(&compute_calls) == 1, "bind/resolve/dispatch share exactly one in-flight compute creation");
+    if (boost_on) CHECK(wait_graphics(&nboost, boost_before + 2) && boost_loan_seen(boost_before, compute_tid),
+                        "the dispatch join lent the waiter's nice to the compute worker until its build published");
+    else CHECK(!graphics_count(&nboost), "switch off: the dispatch join never changes compute worker priority");
     pthread_mutex_lock(&mu); int graphics_still_held = !release_build; release_build = 1; pthread_cond_broadcast(&cv); pthread_mutex_unlock(&mu);
     CHECK(graphics_still_held, "compute dispatch completes while graphics compilation is still held");
     CHECK(wait_graphics(&completed[3], 1), "released graphics driver call drains before reusing the hold gate");

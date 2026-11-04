@@ -601,6 +601,16 @@ void vk_compute_start(void);
 void vk_compute_prepare(vk_shader *cs); /* startup/replay only; immutable module/layout handed to worker */
 void vk_compute_stop(void);
 void vk_compute_report(void);
+/* Priority lending for joins on background compiles (TOTK_VK_PIPE_BOOST=1, vk_draw.c). Graphics and compute workers
+   run at VK_WORKER_NICE. A thread that must wait for a worker's in-flight build lends that worker its own nice until
+   the build is published; the worker then restores itself. Lend under the queue mutex that publishes the build. */
+#define VK_WORKER_NICE 10
+typedef struct { int tid, lent, nice; } vk_lend;   /* tid: the worker building; lent: a waiter raised it to nice */
+int vk_thread_tid(void);
+int vk_pipe_boost_lend(vk_lend *l);             /* 1 raised, 0 not needed or switch off, -1 refused by the kernel */
+void vk_pipe_boost_restore(const vk_lend *l);   /* the worker itself, after publishing: back to VK_WORKER_NICE */
+void vk_pipe_boost_waited(uint64_t ns);         /* one join on a worker build, counted with the switch off too */
+void vk_draw_switches_init(void);               /* launch-time vk_draw.c switches, read once before any worker */
 int vk_shaders_ready(void);
 void vk_shader_seed_startup(const char *game_dir); /* freeze game-relative selection and diagnose seed before replay */
 const char *vk_shader_cache_path(const char *base, char *out, size_t size); /* folder/content-isolated disk state */

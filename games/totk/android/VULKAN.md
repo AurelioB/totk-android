@@ -894,6 +894,12 @@ an existing handle. The bound trades one possible hitch for prolonged missing ge
 Use **2** as the aggressive area-load/loading-map diagnostic, versus 90 and disabled, before selecting a lower default.
 Offscreen color captures still build/wait immediately, even if their key was first queued by a screen pass.
 
+`TOTK_VK_PIPE_BOOST=1` (default unset = off) lends priority to a joined build: when a recording thread waits in
+such a join (or a dispatch joins the compute worker), the worker building that entry runs at the waiter's nice
+until it publishes, then returns to +10. Every 300 presents `pipeline joins: N waits on worker builds ... in X ms;
+boosts B, refused R` reports both arms; compare the join ms and the frames over 50 ms. `refused` counts kernel
+refusals (no `RLIMIT_NICE` headroom), logged once as `pipe boost: ... refused`.
+
 Build errors are no longer permanent silent skips. Each failed key logs its identity, shader variants and Vulkan
 result once, then retries synchronously after a failure is observed: one subsequent game submission for the first
 failure, then 30, 60, 120, 240 and at most 300 submissions between observations/retries. Repeated draws cannot cause
