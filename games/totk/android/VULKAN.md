@@ -1359,6 +1359,15 @@ and pass counts. Worker busy includes preemption and Vulkan calls, not thread CP
 remains exclusive walking-thread accounting: moved work is reported by the recorder busy fields, not its P buckets;
 its original Amdahl estimate is meaningful only with recording threads disabled.
 
+Every 300 presents, with or without recorder workers, the backend also logs
+`descriptors frame <n>, per-frame: sets … allocate-calls … pool-resets … walker-ns … list-ns … lists … template-ns … templates …`.
+`sets` are successful driver set allocations, `allocate-calls` every `vkAllocateDescriptorSets` attempt (pool-full
+retries included) and `pool-resets` actual `vkResetDescriptorPool` calls, summed over recorder workers (published once
+per job) and the primary slot owner (immediate graphics, compute, post, presentation). The three `-ns` columns are
+elapsed time and stay 0 unless `TOTK_VK_REC_PROFILE=1` or frame tracing enables timing; `walker-ns` includes the list
+and template times. `vkdrawtest --lag-walk-bench` prints the same counts per measured frame, and the driver-level
+`vkAllocateDescriptorSets`/`vkResetDescriptorPool` counts when `TOTK_VK_TEST_CALL_COUNTS=<file>` is set.
+
 `recorder overhead ...` additionally separates synchronous secondary recording, batched ExecuteCommands, walking
 and worker pool-reset time, and job setup. Reset is a subset of inline/worker busy time, not another additive cost.
 Worker pool resets are lazy on their owner; only generation/version bookkeeping remains in walking slot reset.

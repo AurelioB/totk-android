@@ -72,6 +72,7 @@ typedef struct rec_context {
     uint32_t lease_head, lease_tail, ncb;
     struct rec_context *retired_next; int retired; /* rec_mu: return-list publication */
     VkDescriptorPool *dp; uint32_t ndp, capdp, curdp, sets;
+    uint64_t descriptor_sets, descriptor_calls, descriptor_resets;
     struct {
         uint64_t hash[2]; VkDescriptorSetLayout layout; uint32_t count; VkDescriptorSet set;
         uint64_t guard_ticket; const vk_record_spans *guard_spans;
@@ -132,6 +133,28 @@ static _Atomic uint64_t memory_draws, memory_info, memory_cbs, memory_dpools;
 static uint64_t storage_limit = UINT64_C(64) << 20;
 static _Atomic uint64_t storage_reclaims, storage_reclaimed, cb_reclaimed;
 static uint64_t storage_trim_ns, storage_referenced;
+/* Descriptor accounting is cumulative; publish owner-local driver counts once per job, not per set. */
+static struct { _Atomic uint64_t sets, calls, resets; } descriptor_stats[REC_WORKERS + 1];
+/* Elapsed timers run only with TOTK_VK_REC_PROFILE=1 or frame tracing (vk_rec_timing_on); the counts are always on. */
+static uint64_t descriptor_walk_ns, descriptor_list_ns, descriptor_lists, descriptor_template_ns, descriptor_templates;
+static uint64_t descriptor_primary[3]; /* serialized primary/walking owner, also presentation/compute */
+void vk_record_descriptor_primary(uint64_t sets, uint64_t calls, uint64_t resets) {
+    descriptor_primary[0] += sets; descriptor_primary[1] += calls; descriptor_primary[2] += resets;
+}
+void vk_record_descriptor_walk(uint64_t ns) { descriptor_walk_ns += ns; }
+static void descriptor_totals(uint64_t out[8]) {
+    memcpy(out, descriptor_primary, sizeof descriptor_primary);
+    for (unsigned w = 0; w <= REC_WORKERS; w++) {
+        out[0] += atomic_load_explicit(&descriptor_stats[w].sets, memory_order_relaxed);
+        out[1] += atomic_load_explicit(&descriptor_stats[w].calls, memory_order_relaxed);
+        out[2] += atomic_load_explicit(&descriptor_stats[w].resets, memory_order_relaxed);
+    }
+    out[3] = descriptor_walk_ns; out[4] = descriptor_list_ns; out[5] = descriptor_lists;
+    out[6] = descriptor_template_ns; out[7] = descriptor_templates;
+}
+#ifdef TOTK_VK_TESTS
+void vk_record_test_descriptors(uint64_t out[8]) { descriptor_totals(out); }
+#endif
 static void commands_publish(unsigned worker) {
     rec_commands *s = &command_owner[worker];
     atomic_store_explicit(&command_stats[worker].in_use, s->in_use, memory_order_relaxed);
@@ -468,8 +491,9 @@ static VkDescriptorSet alloc_set(rec_context *c, VkDescriptorSetLayout layout, u
         if (c->curdp < c->ndp && c->sets < REC_POOL_SETS) {
             VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                 .descriptorPool = c->dp[c->curdp], .descriptorSetCount = 1, .pSetLayouts = &layout};
+            c->descriptor_calls++;
             VkDescriptorSet set; VkResult r = vkAllocateDescriptorSets(V.dev, &ai, &set);
-            if (!r) { c->sets++; (*creates)++; return set; }
+            if (!r) { c->sets++; c->descriptor_sets++; (*creates)++; return set; }
             if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) DIE("recorder descriptor allocation: %d", r);
         }
         if (c->curdp + 1 < c->ndp) { c->curdp++; c->sets = 0; continue; }
@@ -548,8 +572,10 @@ static void project_guards(rec_job *j) {
 }
 /* Shader layouts have immutable binding order and process lifetime. Only the walking owner touches this map. */
 VkDescriptorUpdateTemplate vk_record_template(VkDescriptorSetLayout layout, const vk_record_descriptor *input, uint32_t count) {
+    uint64_t start = __builtin_expect(vk_rec_timing_on, 0) ? host_now_ns() : 0; descriptor_templates++;
     static nvn_hmap templates = {.klen = sizeof layout};
-    VkDescriptorUpdateTemplate *found = nvn_hm_get(&templates, &layout); if (found) return *found;
+    VkDescriptorUpdateTemplate *found = nvn_hm_get(&templates, &layout);
+    if (found) { if (start) descriptor_template_ns += host_now_ns() - start; return *found; }
     static VkDescriptorUpdateTemplateEntry *entries; static uint32_t capacity;
     if (count > capacity) { capacity = count + 16; entries = VK_REALLOC(entries, capacity * sizeof *entries); }
     uint32_t n = 0;
@@ -567,7 +593,9 @@ VkDescriptorUpdateTemplate vk_record_template(VkDescriptorSetLayout layout, cons
         .descriptorUpdateEntryCount = n, .pDescriptorUpdateEntries = entries,
         .templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET, .descriptorSetLayout = layout};
     found = VK_MALLOC(sizeof *found); VKCHECK(vkCreateDescriptorUpdateTemplate(V.dev, &ci, NULL, found));
-    nvn_hm_put(&templates, &layout, found); return *found;
+    nvn_hm_put(&templates, &layout, found);
+    if (start) descriptor_template_ns += host_now_ns() - start;
+    return *found;
 }
 static VkDescriptorSet descriptor_set(rec_context *c, rec_job *j, VkDescriptorSetLayout layout, VkDescriptorUpdateTemplate update, const vk_record_descriptor *input, uint32_t count, uint64_t ticket, uint64_t *creates) {
     if (count > c->capinfo) { c->capinfo = count + 16; c->info = VK_REALLOC(c->info, c->capinfo * sizeof *c->info); }
@@ -665,7 +693,7 @@ static void record_job(rec_job *j, unsigned worker) {
         uint64_t t0 = host_now_ns();
         (void)commands_recycle(worker);
         if (c->ncb) DIE("recorder slot reused before its secondary leases retired");
-        for (uint32_t i = 0; i < c->ndp; i++) VKCHECK(vkResetDescriptorPool(V.dev, c->dp[i], 0));
+        for (uint32_t i = 0; i < c->ndp; i++) { VKCHECK(vkResetDescriptorPool(V.dev, c->dp[i], 0)); c->descriptor_resets++; }
         c->curdp = c->sets = 0; memset(c->cache, 0, sizeof c->cache); c->generation = j->generation; c->spans = NULL;
         #ifdef TOTK_VK_TESTS
         atomic_fetch_add(&test_resets, 1);
@@ -766,6 +794,10 @@ static void record_job(rec_job *j, unsigned worker) {
         }
     }
     if (!worker) commands_publish(0);
+    atomic_fetch_add_explicit(&descriptor_stats[worker].sets, c->descriptor_sets, memory_order_relaxed);
+    atomic_fetch_add_explicit(&descriptor_stats[worker].calls, c->descriptor_calls, memory_order_relaxed);
+    atomic_fetch_add_explicit(&descriptor_stats[worker].resets, c->descriptor_resets, memory_order_relaxed);
+    c->descriptor_sets = c->descriptor_calls = c->descriptor_resets = 0;
 }
 static void *record_worker(void *arg) {
     unsigned worker = (unsigned)(uintptr_t)arg;
@@ -930,6 +962,7 @@ vk_record_draw *vk_record_draw_begin(VkPipeline pipeline, VkPipelineLayout layou
 }
 uint64_t vk_record_chunk_id(void) { return building ? building->id : 0; }
 vk_record_descriptor *vk_record_descriptors(vk_record_draw *draw, unsigned set, VkDescriptorSetLayout layout, uint32_t count) {
+    uint64_t start = __builtin_expect(vk_rec_timing_on, 0) ? host_now_ns() : 0; descriptor_lists++;
     rec_job *j = building; uint32_t first = j->ninfo;
     if (count > UINT32_MAX - first) DIE("recorder descriptor count overflow");
     j->ninfo += count;
@@ -941,7 +974,9 @@ vk_record_descriptor *vk_record_descriptors(vk_record_draw *draw, unsigned set, 
         j->capinfo = storage_capacity(info, sizeof *info);
     }
     draw->sets[set].layout = layout; draw->sets[set].first = first; draw->sets[set].count = count;
-    memset(j->info + first, 0, count * sizeof *j->info); return j->info + first;
+    memset(j->info + first, 0, count * sizeof *j->info);
+    if (start) descriptor_list_ns += host_now_ns() - start;
+    return j->info + first;
 }
 static void enqueue_batch(rec_job *first) {
     first->queue_next = NULL;
@@ -1131,6 +1166,15 @@ void vk_record_walk_time(uint64_t ns) {
 }
 void vk_record_stats(uint64_t frame) {
     vk_slot_stats(frame);
+    if (!(frame % 300)) {
+        static uint64_t previous[8]; uint64_t now[8];
+        descriptor_totals(now);
+        LOGV("descriptors frame %llu, per-frame: sets %.2f allocate-calls %.2f pool-resets %.2f walker-ns %.0f list-ns %.0f lists %.2f template-ns %.0f templates %.2f",
+            (unsigned long long)frame, (now[0] - previous[0]) / 300.0, (now[1] - previous[1]) / 300.0,
+            (now[2] - previous[2]) / 300.0, (now[3] - previous[3]) / 300.0, (now[4] - previous[4]) / 300.0,
+            (now[5] - previous[5]) / 300.0, (now[6] - previous[6]) / 300.0, (now[7] - previous[7]) / 300.0);
+        memcpy(previous, now, sizeof previous);
+    }
     if (threads <= 0 || frame % 300) return;
     pthread_mutex_lock(&rec_mu);
     LOGV("recorder frame %llu, ms/frame: walking %.3f workers %.3f %.3f %.3f %.3f wait %.3f; chunks parallel/inline %.2f/%.2f passes parallel/inline %.2f/%.2f",

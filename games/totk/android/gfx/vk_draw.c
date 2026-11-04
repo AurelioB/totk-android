@@ -4342,7 +4342,7 @@ static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh
     return R.open;
 }
 /* Fill and bind one stage's descriptor set; stage: NVN stage. Returns 0 when a binding cannot be satisfied. */
-static inline __attribute__((always_inline)) int bind_stage_impl(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set_index, vk_shader *sh, int stage, const uint32_t grid[3], int stats) {
+static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set_index, vk_shader *sh, int stage, const uint32_t grid[3], int stats) {
     if (!sh->nb) return 1;
     if (__builtin_expect(PL.enabled, 0)) pso_life_reads(sh, (unsigned)stage);
     if (g_record_draw) return R.open ? record_stage_impl(sh, stage, set_index, stats) : 0;
@@ -4496,6 +4496,14 @@ static inline __attribute__((always_inline)) int bind_stage_impl(VkCommandBuffer
     if (set_index < 6) { g_bound_set[bi][set_index].sub = sub; g_bound_set[bi][set_index].set = set; g_bound_set[bi][set_index].layout = layout; }
     for (uint32_t j = set_index + 1; j < 6; j++) g_bound_set[bi][j].sub = 0;   /* a later set may have been disturbed */
     return 1;
+}
+/* Descriptor counters' walker-ns: complete nonempty stage selection/binding, only while timing is enabled. */
+static inline __attribute__((always_inline)) int bind_stage_impl(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set_index, vk_shader *sh, int stage, const uint32_t grid[3], int stats) {
+    int timed = __builtin_expect(vk_rec_timing_on, 0) && sh->nb;
+    uint64_t start = timed ? host_now_ns() : 0;
+    int ok = bind_stage_body(cb, bp, layout, set_index, sh, stage, grid, stats);
+    if (timed) vk_record_descriptor_walk(host_now_ns() - start);
+    return ok;
 }
 static int bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set_index, vk_shader *sh, int stage, const uint32_t grid[3]) {
     return bind_stage_impl(cb, bp, layout, set_index, sh, stage, grid, 0);

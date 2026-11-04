@@ -2251,6 +2251,7 @@ static void slot_open(slot_t *s) {
     }
     arena_reset(&s->ar, 4);
     for (int i = 0; i < s->ndpool; i++) VKCHECK(vkResetDescriptorPool(V.dev, s->dpools[i], 0));
+    vk_record_descriptor_primary(0, 0, (uint64_t)s->ndpool);
     );
     s->oq_cur = NULL;
     s->tsq_first = s->tsq_count = 0;
@@ -2370,6 +2371,7 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
         } else if (s->curdpool < s->ndpool) {
             VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = s->dpools[s->curdpool], .descriptorSetCount = 1, .pSetLayouts = &layout};
             VkDescriptorSet set; VkResult r = vkAllocateDescriptorSets(V.dev, &ai, &set);
+            vk_record_descriptor_primary(!r, 1, 0);
             if (!r) { s->curdsets++; totk_ft_count(FT_COUNT_DESC_CREATES, 1); return set; }
             if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) DIE("vkAllocateDescriptorSets: %d", r);
             if (s->curdpool + 1 < s->ndpool) { s->curdpool++; s->curdsets = 0; continue; }

@@ -121,8 +121,11 @@ void vk_record_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2
 void vk_record_dynamic_emit(VkCommandBuffer cb, const vk_record_dynamic *state, vk_record_dynamic *last, int all);
 void vk_record_walk_time(uint64_t ns);  /* submission elapsed, excluding GPU waits */
 void vk_record_stats(uint64_t frame);
+void vk_record_descriptor_walk(uint64_t ns); /* walking owner: complete bind/selection time, not just driver calls */
+void vk_record_descriptor_primary(uint64_t sets, uint64_t calls, uint64_t resets); /* serialized primary owner */
 int vk_record_counter_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2 stage);
 #ifdef TOTK_VK_TESTS
+void vk_record_test_descriptors(uint64_t out[8]); /* sets, allocate calls, resets, walk ns, list ns/count, template ns/count */
 void vk_record_test_storage(uint64_t values[4]); /* retention budget, reclaimed slots/bytes/secondary CBs */
 void vk_record_test_primary_memory(uint64_t values[2]); /* retained primary CBs, reclaimed primary CBs */
 void vk_record_test_leases(uint64_t values[4]); /* published active leases, summed worker peak, returned leases, cold resets */
