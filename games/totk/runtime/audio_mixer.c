@@ -268,6 +268,13 @@ static void output_background(Mixer *m) {
         m->background = 1;
     }
     aaudio_stream_state_t state = AAudioStream_getState(m->unit);
+    /* Legacy callback streams need waitForStateChange to service their state
+       machine after the callback thread stops; getState alone can stay PAUSING
+       forever. This bounded wait is on the device worker, never the UI/renderer. */
+    if (state == AAUDIO_STREAM_STATE_PAUSING || state == AAUDIO_STREAM_STATE_FLUSHING) {
+        aaudio_result_t result = AAudioStream_waitForStateChange(m->unit, state, &state, 20000000);
+        if (result != AAUDIO_OK && result != AAUDIO_ERROR_TIMEOUT) { atomic_store(&m->lost, 1); return; }
+    }
     if (m->background == 1 && state == AAUDIO_STREAM_STATE_PAUSED) {
         if (AAudioStream_requestFlush(m->unit) != AAUDIO_OK) { atomic_store(&m->lost, 1); return; }
         m->background = 2;
