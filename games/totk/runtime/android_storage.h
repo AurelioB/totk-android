@@ -136,6 +136,13 @@ static int android_game_lock(const char *path, int wait_ms, char *why, size_t n)
     }
 }
 
+/* Complete both successful and refused launch handshakes. Never unlink game.lock itself (its inode is the protocol). */
+__attribute__((unused)) static int android_game_start_finished(const char *private_files) {
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof path, "%s/state/game-starting", private_files) >= (int)sizeof path) { errno = ENAMETOOLONG; return -1; }
+    return unlink(path) && errno != ENOENT ? -1 : 0;
+}
+
 /* A refused start (no data folder, the lock held, nothing installed) finishes the activity, but Android keeps the
    process: the next "Start game" would then reuse it, where start_game has already run once and the game never
    starts (a black window), and the launcher would see a game process and refuse save changes and moves. So the process

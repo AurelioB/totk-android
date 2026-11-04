@@ -113,6 +113,43 @@ int main(void) {
 }
 '''
 
+SAVE_CLOSE_MAIN = SAVE_MAIN[:SAVE_MAIN.index('int main(void)')] + r'''
+static _Atomic int save_attempted, save_finished;
+static void *late_save(void *unused) {
+    (void)unused;
+    atomic_store(&save_attempted, 1);
+    create_file("save:/after-close.sav", 8);
+    atomic_store(&save_finished, 1);
+    return NULL;
+}
+int main(void) {
+    uint64_t uid[2], h; runtime_account_uid(uid);
+    if (mount_save("save", uid) || create_file("save:/before-close.sav", 8)
+            || open_file(&h, "save:/before-close.sav", OPEN_WRITE)) return 3;
+    if (runtime_fs_begin_close()) return 4;  /* save first: no close, no loss */
+    commit("save");
+    if (runtime_fs_begin_close()) return 5;  /* an open writer still forbids close */
+    close_file(h);
+    if (runtime_fs_begin_close()) return 6;  /* between files, before Commit */
+    commit("save");
+    const char *busy = getenv("TOTK_SAVE_BUSY");
+    int fd = open(busy, O_WRONLY | O_CREAT, 0600); if (fd < 0) return 7; close(fd);
+    if (runtime_fs_begin_close()) return 8;  /* physical save-busy alone also forbids close */
+    unlink(busy);
+    if (!runtime_fs_begin_close()) return 9;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, late_save, NULL)) return 10;
+    while (!atomic_load(&save_attempted)) usleep(1000);
+    usleep(100000);
+    char path[1100];
+    if (host_path("save:/after-close.sav", path, sizeof path)) return 11;
+    if (atomic_load(&save_finished) || !access(path, F_OK) || !access(busy, F_OK)) return 12;
+    puts("save-first refused; close-first save blocked before any change");
+    fflush(stdout);
+    _exit(0);   /* the blocked save is held only until the owning process exits */
+}
+'''
+
 
 def compiler():
     return shutil.which(os.environ.get('CC', 'cc'))
@@ -133,6 +170,10 @@ class Storage(unittest.TestCase):
         (save / 'main.c').write_text(SAVE_MAIN)
         cls.save_probe = cls.work / 'save_probe'
         subprocess.run([compiler(), '-std=gnu11', '-O1', '-w', '-I', str(save), '-I', str(RUNTIME), str(save / 'main.c'), '-pthread', '-o', str(cls.save_probe)], check=True)
+        (save / 'close.c').write_text(SAVE_CLOSE_MAIN)
+        cls.close_probe = cls.work / 'close_probe'
+        subprocess.run([compiler(), '-std=gnu11', '-O1', '-w', '-I', str(save), '-I', str(RUNTIME), str(save / 'close.c'),
+                        '-pthread', '-o', str(cls.close_probe)], check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -323,6 +364,13 @@ class Storage(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(gen.exists())
         self.assertNotIn('save committed', r.stderr)
+
+    def test_save_close_admission_both_orders(self):
+        state = self.dir / 'state'; state.mkdir()
+        env = dict(os.environ, TOTK_PROFILE_DIR=str(self.dir / 'profile'), TOTK_SAVE_BUSY=str(state / 'save-busy'))
+        result = subprocess.run([self.close_probe], capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('save-first refused; close-first save blocked before any change', result.stdout)
 
 
 if __name__ == '__main__':

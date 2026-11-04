@@ -1450,6 +1450,9 @@ static int start_game(const ANativeActivity *a) {
     fprintf(stderr, "[totk-app] build %s %s %s; game folder %s (%s; Android SDK %d)\n", TOTK_BUILD_KIND, __DATE__, __TIME__, g_data, why, a->sdkVersion);
     snprintf(p, sizeof p, "%s/game.lock", state);
     if ((g_game_lock = android_game_lock(p, 4000, why, sizeof why)) < 0) { fprintf(stderr, "[totk-app] 【红】%s; not starting\n", why); return -1; }
+    int marker_rc = android_game_start_finished(a->internalDataPath);
+    __android_log_print(marker_rc ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "TotkSetup",
+            "game start: pid=%d lock=OFD-acquired marker=%s errno=%d", getpid(), marker_rc ? "remove-error" : "removed", marker_rc ? errno : 0);
     if (chdir(g_data)) fprintf(stderr, "[totk-app] chdir %s: %s\n", g_data, strerror(errno));
     if (!install_playable(g_data)) return start_refused();   /* the caller finishes the activity */
     /* The launcher menu's choices first, then the developer's totk.env, which overrides them (both replace). */
@@ -1665,7 +1668,23 @@ void runtime_gamepad_read(RuntimeGamepadState *out) {
     out->connected = g_pad_seen;
     pthread_mutex_unlock(&g_pad_mu);
 }
-void runtime_front_request_close(void) { fprintf(stderr, "[totk] close requested: flushing pipeline cache and exiting\n"); vk_pcache_shutdown(); _exit(0); }
+void runtime_front_request_close(void) {
+    if (!runtime_fs_begin_close()) {
+        __android_log_print(ANDROID_LOG_INFO, "TotkSetup", "close game: pid=%d save=busy; native exit refused", getpid());
+        return;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "TotkSetup", "close game: pid=%d save=idle; native pipeline-cache flush and exit", getpid());
+    fprintf(stderr, "[totk] close requested: flushing pipeline cache and exiting\n"); vk_pcache_shutdown(); _exit(0);
+}
+/* The menu has already waited for save-busy. Check in the game too, closing the cross-process observation gap. */
+jboolean runtime_android_request_close(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    const char *busy = getenv("TOTK_SAVE_BUSY");
+    struct stat st;
+    if (runtime_fs_save_busy() || (busy && (!stat(busy, &st) || errno != ENOENT))) return JNI_FALSE;
+    runtime_front_request_close();
+    return JNI_FALSE;   /* only reached when a save won native close admission; the activity retries */
+}
 
 /* ---------- text entry (nn::swkbd, runtime/swkbd_host.c) ----------
    The guest thread that asks waits here (its virtual core given up by swkbd_host.c). A byte on g_text_wake wakes the UI
@@ -2159,6 +2178,14 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     immersive(a);
     text_wake_start();
     /* Not set up (or not finished): nothing to show, so return to the launcher, whose setup screen explains. */
-    if (!started) { started = 1; if (start_game(a) < 0) { ANativeActivity_finish(a); android_refused_exit(1500); } }
+    if (!started) {
+        started = 1;
+        if (start_game(a) < 0) {
+            int rc = android_game_start_finished(a->internalDataPath);
+            __android_log_print(ANDROID_LOG_INFO, "TotkSetup", "game start refused: pid=%d marker=%s errno=%d", getpid(), rc ? "remove-error" : "removed", rc ? errno : 0);
+            ANativeActivity_finish(a);
+            android_refused_exit(1500);
+        }
+    }
 }
 #endif

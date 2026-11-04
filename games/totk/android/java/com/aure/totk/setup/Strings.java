@@ -645,6 +645,14 @@ final class Strings {
     static final String CHANGE_FILES_HINT = "Pick other files or the other route";
     static final String DETAILS = "Details: ";
 
+    static final String CLOSE_GAME = "Close the game";
+    static final String WAITING_SAVE = "Waiting for the game to finish saving…";
+    static final String CLOSING_GAME = "Closing the game…";
+    static final String SAVE_WAIT_TIMEOUT = "The game is still saving after 30 seconds. It was not closed. Let it finish saving, then try again.";
+    static final String CLOSE_GAME_TIMEOUT = "The game did not finish closing. Return to the game and close it, then try again.";
+    static String gameRunning(String action) { return "TotK Native's game is still running in the background. " + action + " needs it closed."; }
+    static String gameLockError(String reason) { return "Could not check or close the game: " + reason; }
+
     static String error(String code) {
         switch (code == null ? "" : code) {
             case "hash_mismatch": return "A file does not match Tears of the Kingdom 1.4.3. Make sure the dump is complete "
@@ -661,7 +669,8 @@ final class Strings {
             case "permission": return "This app can no longer open some of your chosen files (access was removed, or "
                     + "they were moved, renamed or are on a removed card). Choose them again below.";
             case "library": return NO_LIBRARY;
-            case "game_running": return "The game is running. Close it first, then try again.";
+            case "game_running": return gameRunning("Installing");
+            case "game_lock": return "Could not check the game's lock. The error details below explain why; nothing was changed.";
             case "not_available": return "Not available on this device.";
             default: return "Something unexpected went wrong. Resume to retry; if it keeps failing, report it with the details below.";
         }

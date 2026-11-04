@@ -124,14 +124,24 @@ final class InstallState {
         return total;
     }
 
-    /** The game runs in the app's default process (TotkActivity); setup lives in ":setup". The game also holds
-     * <private>/state/game.lock from start_game until it exits, which covers a process that is still starting. */
-    static boolean gameRunning(Context context) {
+    /** Only an acquired game lock or a live start handshake proves the game is running, not a cached default process. */
+    static GameLock.Result gameState(Context context) {
+        GameLock.logger = message -> android.util.Log.i("TotkSetup", message);
         ActivityManager manager = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
-        if (manager != null && manager.getRunningAppProcesses() != null)
-            for (ActivityManager.RunningAppProcessInfo process : manager.getRunningAppProcesses())
-                if (context.getPackageName().equals(process.processName)) return true;
-        return SaveManager.gameLocked(context.getFilesDir());
+        boolean alive = false;
+        StringBuilder processes = new StringBuilder();
+        java.util.List<ActivityManager.RunningAppProcessInfo> running = manager == null ? null : manager.getRunningAppProcesses();
+        if (running != null) for (ActivityManager.RunningAppProcessInfo process : running)
+            if (context.getPackageName().equals(process.processName)) {
+                alive = true;
+                processes.append(" pid=").append(process.pid).append(" process=").append(process.processName)
+                        .append(" importance=").append(process.importance);
+            }
+        GameLock.Result result = GameLock.check(context.getFilesDir(), alive);
+        if (result.state != GameLock.State.FREE)
+            android.util.Log.i("TotkSetup", "game decision=" + result.state + " checkerPid=" + android.os.Process.myPid()
+                    + (alive ? processes : " defaultProcess=absent") + " " + result.reason);
+        return result;
     }
 
     /** Whether libtotk_setup.so can be loaded (a preview build may lack it). */

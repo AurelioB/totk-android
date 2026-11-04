@@ -63,6 +63,10 @@ typedef struct {
 } ANativeActivity;
 typedef FILE AAsset; /* Host fixture reads the test APK asset from an ordinary, bounded file. */
 enum { AASSET_MODE_STREAMING = 2 };
+enum { ANDROID_LOG_INFO = 4, ANDROID_LOG_WARN = 5 };
+static int __android_log_print(int level, const char *tag, const char *format, ...) {
+    (void)level; (void)tag; (void)format; return 0;
+}
 static AAsset *AAssetManager_open(const char *root, const char *name, int mode) {
     (void)mode; char path[4096]; snprintf(path, sizeof path, "%s/assets/%s", root, name); return fopen(path, "rb");
 }

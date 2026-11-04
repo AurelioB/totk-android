@@ -1813,8 +1813,26 @@ needs `su`). The folder holds what the adb-shell folder holds:
 - **Backup.** `allowBackup=false` (no cloud backup, unchanged) plus `dataExtractionRules`/`fullBackupContent`
   (`build_apk.backup_rules`, res/xml) excluding `file:game`, `file:state` and `external:.` from cloud backup and
   device-to-device transfer; the rest of the private files (saves, settings) keep Android's D2D behaviour.
-- **Game lock.** The game holds an OFD write lock on `<private>/state/game.lock` for its lifetime; the move holds it
-  too. Java's `FileChannel.tryLock` (POSIX lock) conflicts with it, so `SaveManager.holdGame` = "game not running".
+- **Game lock.** The game holds an OFD write lock on `<private>/state/game.lock` for its lifetime (up to four seconds'
+  wait for a setup operation). `GameLock` owns the setup JVM's single POSIX-lock descriptor behind a mutex/refcount:
+  concurrent menu probes, save swaps, sync and service work share that owner instead of conflicting with themselves.
+  Results are `FREE`, `GAME` (external contention) or `ERROR` with the exception/cause; open/lock errors never mean free
+  or game-running. SetupService holds a lease across setup/move; `gameLockHeld=true` makes native move skip opening
+  **or closing** that inode (any same-process descriptor close would release a POSIX lock). Standalone moves still
+  acquire their own OFD lock. The file itself is never unlinked.
+  Before `startActivity`, the menu writes `state/game-starting` with wall-clock time and setup pid under the same
+  mutex. The game removes it immediately after acquiring the lock, and on refused start. A live default process plus
+  marker counts as `GAME`; a cached process alone does not. A local launch bridges the pre-process gap for up to four
+  seconds; abandoned markers without a default process are removed. `TotkSetup` logs the decision branch, process
+  pid/name/importance, lock outcome/exception/cause and marker state.
+- **Close the game.** Installing, moving/deleting game data, changing the driver and replacing saves are disabled
+  while `GAME` (errors display their reason instead). The menu re-checks every second and on resume, so controls clear
+  without a restart. *Close the game* waits up to 30 seconds for `state/save-busy` to disappear, then sends an internal
+  intent to non-exported `TotkActivity`; `onNewIntent` waits/checks again and calls the native window-close path.
+  `runtime_fs_begin_close` refuses an active/uncommitted save and atomically gates any later save before its first
+  change until process exit. The accepted close flushes the Vulkan pipeline cache and exits, never kills the process.
+  The menu waits for the game lock/start marker to clear (bounded), then retries the selected operation. A timeout
+  explains why the game was left running.
 - **Save signals.** `fs_host.c` creates `<private>/state/save-busy` on the first change to save data and, on the
   `Commit` that completes it with every fsync successful, removes it and rewrites `state/save-generation` (counter,
   tmp+rename). The game-process `SaveMirror.Watcher` polls it (1 s), waits 3 s and for `save-busy` to be gone, then
