@@ -1898,10 +1898,11 @@ needs `su`). The folder holds what the adb-shell folder holds:
   without inotify), so an idle log costs no wakeup (`tests/test_log_mirror.py` measures it). The log's
   `[totk-logcat] on: ... wake=inotify nice=10` or `[totk-logcat] off` line shows the arm; `adb logcat -s totk` reads it.
 - **Crash reports** (always on). The runtime's SIGSEGV/SIGBUS/SIGILL/SIGTRAP/SIGABRT report (`[totk] signal=` …, `[totk]
-  host abort`) is written by the first crashing thread only (others wait), then the signal goes to the handler that was
-  there before (`runtime/crash_chain.h`): Android's debuggerd writes a tombstone and a logcat backtrace
-  (`adb logcat -b crash`, `/data/tombstones`). A real fault returns and faults again into it with its own siginfo;
-  aborts and sent signals are raised again. The process no longer ends with `_exit(128+signal)` but by the signal.
+  host abort`) is written by the first crashing thread only; another crashing thread waits for it at most 5 s, then
+  ends the process with `_exit(128+signal)`. After the report the handler that was there before is called once,
+  directly, with the original siginfo (`runtime/crash_chain.h`): Android's debuggerd writes a tombstone and a logcat
+  backtrace (`adb logcat -b crash`, `/data/tombstones`). Then the signal's default action ends the process (tgkill
+  to the crashing thread, `_exit(128+signal)` as the last fallback), whatever that handler did.
 - **`TOTK_WATCHDOG`** (default on; `0` turns it off) and **`TOTK_WATCH_STALL=<seconds>`** (default unset). From the first
   presented frame a thread polls every 250 ms; after >= 1 s without a new frame it logs `[totk-watch] no presented frame
   for … s at stage "…" (frame …): thread dump n/3` and the `TOTK_DUMP_AFTER` thread dump (one per stall, at most 3,
