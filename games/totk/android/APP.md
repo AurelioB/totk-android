@@ -1889,6 +1889,15 @@ needs `su`). The folder holds what the adb-shell folder holds:
 | `totk.env` | options, one `NAME=value` per line (`#` comments), e.g. `TOTK_VK_SHOT=300` or `TOTK_FACE_BUTTONS=position`. Read after the launcher menu's `settings.env` (app-private `files/settings.env`, written by the menu; only the menu's own option keys are accepted there, others are logged and ignored), so a line here overrides the menu. |
 | `totk.log` | the log of the last start (`install_app.sh log`) |
 
+### Diagnostics: logcat copy
+
+- **`TOTK_LOGCAT`** (default on; `0` turns it off). `totk.log` stays the primary log (written directly, so a sudden end
+  loses nothing); a thread at nice 10 (on the slower CPUs when sysfs shows them) copies its complete lines to logcat with
+  tag `totk`: FATAL, CRASH or "device lost" as errors, red messages (`【红】`, `[RED]`) as warnings, the rest as info;
+  lines over 1000 bytes are cut and marked ` [...]`. It sleeps on an inotify watch of the file (20 ms polling only
+  without inotify), so an idle log costs no wakeup (`tests/test_log_mirror.py` measures it). The log's
+  `[totk-logcat] on: ... wake=inotify nice=10` or `[totk-logcat] off` line shows the arm; `adb logcat -s totk` reads it.
+
 ### Game data location, game lock and save signals (release app)
 
 - **Location.** Three kinds (`StoragePaths.Kind`, pure Java, host-tested in `tests/test_android_direct_access.py`):

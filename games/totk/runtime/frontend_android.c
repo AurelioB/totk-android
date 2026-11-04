@@ -7,7 +7,8 @@
      line, like the variables run.sh takes in front). Without install.json saying "playable" the game does not start;
    - the Vulkan driver: the player's driver.so (copied into private storage), else the Turnip the APK bundles
      (libtotk_turnip.so beside this library, used in place), else the system's;
-   - the log: stdout and stderr go to totk.log in that folder and to logcat (tag "totk");
+   - the log: stdout and stderr go to totk.log in that folder, which a low-priority thread copies to logcat (tag "totk",
+     log_mirror.h; TOTK_LOGCAT=0 turns the copy off);
    - the window: handed to the Vulkan backend's AHB presenter or automatic copy fallback (vk_draw.c);
    - input: the built-in controller (the AYN Thor's) or any gamepad, mapped to the Switch's buttons by position;
    - a full-screen landscape window kept on while the game runs.
@@ -32,6 +33,7 @@
 #include <stdatomic.h>
 #include "present_clock.h"
 #include "thread_place.h"
+#include "log_mirror.h"
 #include "build_kind.h"
 #include <android/api-level.h>
 #include <android/choreographer.h>
@@ -1109,25 +1111,63 @@ static int android_display_vsync_start(void) {
     return display_pace_on;
 }
 
-/* ---------- log: stdout / stderr -> totk.log ----------
+/* ---------- log: stdout / stderr -> totk.log, mirrored to logcat ----------
    Straight into the file, not through a pipe and a reader thread: a failure that ends the process with _exit (or a
    signal) would lose whatever the thread had not yet copied, which is exactly the message that says why. */
 static int g_log_fd = -1;
+static char g_log_path[1100];
 static void log_start(void) {
-    char path[1100]; snprintf(path, sizeof path, "%s/totk.log", g_data);
-    g_log_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644);
-    if (g_log_fd < 0) { __android_log_print(ANDROID_LOG_ERROR, "totk", "cannot open %s: %s", path, strerror(errno)); return; }
+    snprintf(g_log_path, sizeof g_log_path, "%s/totk.log", g_data);
+    g_log_fd = open(g_log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644);
+    if (g_log_fd < 0) { __android_log_print(ANDROID_LOG_ERROR, "totk", "cannot open %s: %s", g_log_path, strerror(errno)); return; }
     dup2(g_log_fd, 1); dup2(g_log_fd, 2);
     setvbuf(stdout, NULL, _IOLBF, 0); setvbuf(stderr, NULL, _IONBF, 0);
-    __android_log_print(ANDROID_LOG_INFO, "totk", "log: %s", path);
+    __android_log_print(ANDROID_LOG_INFO, "totk", "log: %s", g_log_path);
+}
+/* The logcat copy (log_mirror.h): a thread that sleeps until totk.log grows, then copies its new complete lines with
+   tag "totk" (FATAL / CRASH / device lost as errors, red messages as warnings). It runs at nice 10, on the slower CPUs
+   when the device has them, and reads the file from its start, so lines written before it started are copied too.
+   TOTK_LOGCAT=0 (totk.env) turns it off; started after the environment files, or at a refusal before them. */
+static log_mirror_tail g_log_tail;
+static void log_mirror_logcat(void *context, int level, const char *line) {
+    (void)context;
+    __android_log_write(level == LOG_MIRROR_ERROR ? ANDROID_LOG_ERROR : level == LOG_MIRROR_WARN ? ANDROID_LOG_WARN : ANDROID_LOG_INFO,
+                        "totk", line);
+}
+static void *log_mirror_thread(void *arg) {
+    (void)arg; totk_thread_start("totk-logcat", NULL);
+    errno = 0; int nice_error = setpriority(PRIO_PROCESS, 0, 10) ? errno : 0;
+    cpu_set_t allowed, slow; unsigned capacity[CPU_SETSIZE]; const char *source, *decision = "unchanged";
+    if (!sched_getaffinity(0, sizeof allowed, &allowed)) {
+        totk_thread_background_select("/sys/devices/system/cpu", &allowed, &slow, capacity, &source, &decision);
+        if (!CPU_EQUAL(&slow, &allowed) && sched_setaffinity(0, sizeof slow, &slow)) decision = "unchanged (setaffinity failed)";
+    }
+    fprintf(stderr, "[totk-logcat] on: totk.log -> logcat tag totk, wake=%s nice=%d%s cpus=%s (TOTK_LOGCAT=0 turns it off)\n",
+            g_log_tail.watch >= 0 ? "inotify" : "poll 20 ms", getpriority(PRIO_PROCESS, 0), nice_error ? " (setpriority failed)" : "", decision);
+    log_mirror_run(&g_log_tail);
+    return NULL;
+}
+static void log_mirror_start(void) {
+    static int started;
+    if (started || g_log_fd < 0) return;
+    started = 1;
+    const char *value = getenv("TOTK_LOGCAT");
+    if (value && !strcmp(value, "0")) { fprintf(stderr, "[totk-logcat] off (TOTK_LOGCAT=0): totk.log only\n"); return; }
+    g_log_tail.path = g_log_path; g_log_tail.emit = log_mirror_logcat;
+    int error = log_mirror_open(&g_log_tail);
+    pthread_t thread;
+    if (!error) error = pthread_create(&thread, NULL, log_mirror_thread, NULL);
+    if (error) { fprintf(stderr, "[totk-logcat] off: %s\n", strerror(error)); return; }
+    pthread_detach(thread);
 }
 
 /* ---------- options ---------- */
 #include "android_storage.h"   /* TOTK_DATA_DIR validation and the game lock */
 /* The game lock (android_storage.h), taken by start_game and held until the process ends; given back when the start is
-   refused, since the process outlives a finished activity and the launcher would otherwise see a game running. */
+   refused, since the process outlives a finished activity and the launcher would otherwise see a game running. A refusal
+   also starts the logcat copy (the environment files are not read yet), so the reason reaches logcat before the exit. */
 static int g_game_lock = -1;
-static int start_refused(void) { if (g_game_lock >= 0) { close(g_game_lock); g_game_lock = -1; } return -1; }
+static int start_refused(void) { if (g_game_lock >= 0) { close(g_game_lock); g_game_lock = -1; } log_mirror_start(); return -1; }
 /* What the launcher menu may write into <private>/settings.env: the option mapping and the frame-generation timing
    block of the settings contract, and the game data folder when it is not on the primary storage (TOTK_DATA_DIR, which
    start_game reads before anything else), plus TOTK_AUTOLOAD for a session that writes settings.env and starts the game
@@ -1452,7 +1492,7 @@ static int start_game(const ANativeActivity *a) {
             snprintf(g_data, sizeof g_data, "%s", state);
             log_start();
             fprintf(stderr, "[totk-app] 【红】game folder %s %s; not starting. Insert the card, or open TotK Native and set the game up on another storage\n", chosen, why);
-            return -1;
+            return start_refused();
         }
         snprintf(g_data, sizeof g_data, "%s", chosen);
         snprintf(why, sizeof why, "%s", kind == ANDROID_DATA_PRIVATE ? "private storage" : kind == ANDROID_DATA_APP ? "app folder" : "folder with All files access");
@@ -1466,7 +1506,7 @@ static int start_game(const ANativeActivity *a) {
     log_start();
     fprintf(stderr, "[totk-app] build %s %s %s; game folder %s (%s; Android SDK %d)\n", TOTK_BUILD_KIND, __DATE__, __TIME__, g_data, why, a->sdkVersion);
     snprintf(p, sizeof p, "%s/game.lock", state);
-    if ((g_game_lock = android_game_lock(p, 4000, why, sizeof why)) < 0) { fprintf(stderr, "[totk-app] 【红】%s; not starting\n", why); return -1; }
+    if ((g_game_lock = android_game_lock(p, 4000, why, sizeof why)) < 0) { fprintf(stderr, "[totk-app] 【红】%s; not starting\n", why); return start_refused(); }
     int marker_rc = android_game_start_finished(a->internalDataPath);
     __android_log_print(marker_rc ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "TotkSetup",
             "game start: pid=%d lock=OFD-acquired marker=%s errno=%d", getpid(), marker_rc ? "remove-error" : "removed", marker_rc ? errno : 0);
@@ -1476,6 +1516,7 @@ static int start_game(const ANativeActivity *a) {
     snprintf(p, sizeof p, "%s/settings.env", a->internalDataPath); settings_file(p);
     snprintf(p, sizeof p, "%s/totk.env", g_data); env_file(p);
     android_driver_env_policy(); /* freeze driver options before any app worker or driver call */
+    log_mirror_start();   /* TOTK_LOGCAT is final now */
     totk_thread_game_startup();   /* snapshot the allowed CPUs before any guest narrows its affinity */
     setenv("TOTK_INPUT_FILE_NEW", "1", 0);   /* the command file outlives runs: read newly appended commands only */
     char version[256];
