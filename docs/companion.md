@@ -48,6 +48,10 @@ The optional minus / plus shortcuts only press the game's map / menu buttons.
 
 ## Which display is used
 
+On dual-screen devices the game always opens on the main (top) screen, even when you start it from the second
+screen's launcher or menu. With **Second screen** on and its art prepared, the companion appears on the second
+(bottom) screen. Turning the companion off does not move the game to that screen. Single-screen devices are unchanged.
+
 The companion uses a display that is built into the device, found among the displays present, never guessed from the
 chip: a display counts as built in when Android reports it as built in, or as an unknown connection with the same panel
 maker's id as the main screen. External monitors (HDMI, DisplayPort, USB-C), cast and screen-recording displays and

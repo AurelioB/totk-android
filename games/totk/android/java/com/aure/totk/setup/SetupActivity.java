@@ -42,7 +42,7 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import com.aure.totk.TotkActivity;
+import com.aure.totk.GameLaunch;
 import com.aure.totk.GameControlService;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -533,7 +533,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
      * made again on its own when Home opens, once per launch: the companion stage is optional, so Play now on the install
      * screen stops it and starts the game with the current art, and a failed update stays on Game data's Update row. */
     private void updateOutdatedArt(InstallState install) {
-        if (artUpdateStarted || !install.playable() || !ArtPolicy.updateAutomatically(SettingsStore.secondaryDisplay(this, getDisplay()), install.artState())
+        if (artUpdateStarted || !install.playable() || !ArtPolicy.updateAutomatically(SettingsStore.secondaryDisplay(this), install.artState())
                 || !install.errorCode(InstallState.OPTIONAL).isEmpty()
                 || !InstallState.libraryAvailable() || SetupService.status.running || SetupService.jobActive(this)
                 || !StorageLocation.available(this) || StorageLocation.migrationPending(this, true) || !InstallState.gameState(this).free()) return;
@@ -554,7 +554,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             replace(Screen.HOME);
             return;
         }
-        if (ArtPolicy.offerBeforePlay(SettingsStore.secondaryDisplay(this, getDisplay()), InstallState.read(this).artState(),
+        if (ArtPolicy.offerBeforePlay(SettingsStore.secondaryDisplay(this), InstallState.read(this).artState(),
                 Inputs.prefs(this).getBoolean(ArtPolicy.DECLINED, false))) {
             if (!ui) showUi();
             openChoice("data", Strings.COMPANION_ROW, Strings.ART_OFFER_TITLE, Strings.ART_OFFER_BODY,
@@ -578,7 +578,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         }
         gameError = null;
         try { GameLock.start(getFilesDir(), System.currentTimeMillis(), android.os.Process.myPid(),
-                () -> startActivity(new Intent(this, TotkActivity.class))); }
+                () -> GameLaunch.start(this)); }
         catch (IOException | RuntimeException failedStart) {
             if (!ui) showUi();
             showNote(Strings.gameLockError(failedStart.toString()));
@@ -874,7 +874,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             chips.add(new Widgets.Chip(this).set(Widgets.Chip.OK, Strings.INSTALLED_CHIP));
             chips.add(!noSeed ? new Widgets.Chip(this).set(Widgets.Chip.OK, Strings.shadersReady(install.shaderVariants()))
                     : new Widgets.Chip(this).set(Widgets.Chip.WARN, Strings.SHADERS_NONE));
-            if (install.done("companion") && SettingsStore.secondaryDisplay(this, getDisplay()))
+            if (install.done("companion") && SettingsStore.secondaryDisplay(this))
                 chips.add(new Widgets.Chip(this).set(Widgets.Chip.OK, Strings.SECOND_READY));
         }
         if (pulledChip) chips.add(new Widgets.Chip(this).set(Widgets.Chip.OK, Strings.SAVES_UPDATED));
@@ -931,7 +931,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         homeItem(menu, "home:saves", "save", Strings.SAVES, Strings.savesSummary(liveSlots == null ? 0 : liveSlots.size(),
                 liveSlots == null ? 0 : SaveManager.newest(liveSlots), folderSummary()), v -> go(Screen.SAVES), 88, 8);
         homeItem(menu, "home:data", "data", Strings.GAME_DATA, missing ? StorageLocation.label(this) + " · " + Strings.NOT_AVAILABLE
-                : Strings.dataSummary(Strings.size(dataBytes()), SettingsStore.secondaryDisplay(this, getDisplay()),
+                : Strings.dataSummary(Strings.size(dataBytes()), SettingsStore.secondaryDisplay(this),
                         install.done("companion"), install.artOutdated(), install.done("shaders")), v -> go(Screen.DATA), 88, 8);
         homeItem(menu, "home:about", "about", Strings.ABOUT, Strings.ABOUT_HINT, v -> go(Screen.ABOUT), 88, 0);
         primary = start;
@@ -970,10 +970,10 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     /** "Snapdragon 8 Gen 2 class (QCS8550) · dual screen": the profile family and the second screen, both detected. */
     private String detected() {
         String soc = SettingsStore.soc();
-        return Strings.detected(Settings.socClass(soc), soc, SettingsStore.secondScreen(this, getDisplay()));
+        return Strings.detected(Settings.socClass(soc), soc, SettingsStore.secondScreen(this));
     }
     private String screenChip() {
-        int second = SettingsStore.secondScreen(this, getDisplay());
+        int second = SettingsStore.secondScreen(this);
         return second == com.aure.totk.companion.DisplayClass.BUILT_IN ? Strings.SECOND_DETECTED
                 : second == com.aure.totk.companion.DisplayClass.EXTERNAL ? Strings.EXTERNAL_ONLY : Strings.ONE_SCREEN;
     }
@@ -1023,7 +1023,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             case Settings.PICTURE: keys.addAll(Arrays.asList("upscaler", "sharpness", "aa", "shadows")); break;
             default:
                 keys.addAll(Arrays.asList("console_mode", "native_hud", "overlay", "overlay_pos"));
-                if (SettingsStore.secondaryDisplay(this, getDisplay())) keys.add("second_screen");
+                if (SettingsStore.secondaryDisplay(this)) keys.add("second_screen");
         }
         for (String key : keys) settingRow(list, key);
         detailPanel();
@@ -1180,7 +1180,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             detailTitle.setText(Strings.optionLabel(key));
             detailText.setText(Strings.optionText(key));
             detailDiagram.setVisibility(View.VISIBLE);
-            detailDiagram.show(key, settings, SettingsStore.secondaryDisplay(this, getDisplay()));
+            detailDiagram.show(key, settings, SettingsStore.secondaryDisplay(this));
             if (!Settings.option(key).tab.equals(Settings.CONTROLS)) fact(Strings.GPU_COST, new Widgets.Meter(this).set(cost(key, value)));
             switch (key) {
                 case "frame_rate":
@@ -1277,7 +1277,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                     if (!missing && install.anyDone() && !installed) { showNote(Strings.MOVE_PARTIAL); return; }
                     go(Screen.STORAGE);
                 });
-        boolean secondScreen = SettingsStore.secondaryDisplay(this, getDisplay());
+        boolean secondScreen = SettingsStore.secondaryDisplay(this);
         boolean companion = install.done("companion"), shaders = install.done("shaders") && !seedRefused;
         Widgets.Row companionRow = dataRow(list, "companion", Strings.COMPANION_ROW, secondScreen ? Strings.COMPANION_HINT : Strings.ART_NOT_NEEDED_HINT,
                 !secondScreen ? Strings.ART_NOT_NEEDED + " · " + (companion || install.artOutdated() ? Strings.REBUILD : Strings.BUILD)
@@ -1345,7 +1345,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 break;
             }
             case "access": detailText.setText(Strings.ACCESS_TEXT); break;
-            case "companion": detailText.setText((SettingsStore.secondaryDisplay(this, getDisplay()) ? "" : Strings.ART_NOT_NEEDED + ". ") + Strings.COMPANION_TEXT); break;
+            case "companion": detailText.setText((SettingsStore.secondaryDisplay(this) ? "" : Strings.ART_NOT_NEEDED + ". ") + Strings.COMPANION_TEXT); break;
             case "shaders": detailText.setText(Strings.SHADERS_TEXT); break;
             case "driver": case "driver-reset": detailText.setText(Strings.DRIVER_TEXT); break;
             case "rerun": detailText.setText(Strings.RERUN_TEXT); break;

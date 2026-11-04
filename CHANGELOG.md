@@ -34,6 +34,7 @@ Fixes for the first reports, plus a few improvements.
   a .so.
 
 ### Second screen
+- On dual-screen devices the game always opens on the main screen, with the companion on the second one, even when started from the second screen.
 - The controller keeps working after you touch the companion or an overlay on the second screen (such as AYN's
   performance overlay): Android sends the buttons to the last-touched screen, so the game now takes them back.
 - Fused materials use the game's own names (for example "Armor Shard" instead of "Obj Armor Spike B"), including world

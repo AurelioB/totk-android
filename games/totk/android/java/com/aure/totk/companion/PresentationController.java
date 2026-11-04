@@ -171,6 +171,12 @@ public final class PresentationController implements DisplayManager.DisplayListe
         if (displays == null) return DisplayClass.NONE;
         return DisplayClass.classify(screens(displays.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION), own), mainPnp(displays));
     }
+    /** Device capability, independent of the menu/game's current display. A menu on the second panel must still
+     * offer its art/settings and route play to the main panel. Presentation selection remains owner-relative. */
+    public static int deviceSecondScreen(Context context) {
+        DisplayManager displays = context.getSystemService(DisplayManager.class);
+        return displays == null ? DisplayClass.NONE : secondScreen(context, displays.getDisplay(Display.DEFAULT_DISPLAY));
+    }
     /** The built-in second panel the companion presents on, or null. */
     private static Display builtInDisplay(DisplayManager displays, Display own) {
         Display[] all = displays.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION);

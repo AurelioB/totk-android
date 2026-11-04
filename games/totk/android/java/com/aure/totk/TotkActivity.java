@@ -2,6 +2,7 @@ package com.aure.totk;
 
 import android.app.NativeActivity;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
@@ -24,6 +25,7 @@ public final class TotkActivity extends NativeActivity {
     private AttachedSurfaceControl presentRoot;
     private AttachedSurfaceControl.OnBufferTransformHintChangedListener presentHintListener;
     private long presentEpoch;
+    private boolean displayMoveRequested;
     private static native void nativePresentTransformHint(long epoch, int hint);
     private static native void nativeTextInputDone(long serial, byte[] utf8);
     private static native void nativeGameFocus(boolean focused, boolean singleDisplay);
@@ -106,9 +108,32 @@ public final class TotkActivity extends NativeActivity {
         int given = nativeFeedbackEnabled();   // what start_game gave the game (TOTK_RUMBLE / TOTK_GYRO and the hardware)
         if (given != 0 && !isFinishing()) feedback = new GameFeedback(this, given);
     }
+    /** Reuse/reparent the singleTask game, never finish it: NativeActivity.onDestroy exits the game process. */
+    private void ensureMainDisplay() {
+        if (GameLaunch.onMainScreen(this)) { displayMoveRequested = false; return; }
+        if (displayMoveRequested) return;
+        displayMoveRequested = true;
+        try { GameLaunch.start(this); }
+        catch (RuntimeException failed) {
+            displayMoveRequested = false;
+            Log.w("TotkGame", "Could not return the game task to the main display", failed);
+        }
+    }
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        ensureMainDisplay();
+    }
+    @Override public void onConfigurationChanged(Configuration config) {
+        super.onConfigurationChanged(config);
+        // Moving a task with the menu on top must not bring its background game back over the menu.
+        if (resumed) ensureMainDisplay();
+        if (companion != null && getDisplay() != null) companion.onDisplayChanged(getDisplay().getDisplayId());
+    }
     @Override protected void onResume() {
         super.onResume();
         resumed = true;
+        ensureMainDisplay();
         GameFeedback f = feedback;
         if (f != null) f.resume();
     }

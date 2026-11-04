@@ -161,8 +161,7 @@ public final class SetupService extends Service {
         Inputs inputs = Inputs.load(context);
         try (Inputs.Opened opened = inputs.open(context, true, stages)) {
             android.util.Log.i("TotkSetup", "inputs: " + opened.byPath + " by path (All files access " + (FileAccess.granted() ? "on" : "off") + ")");
-            opened.request.put("skipCompanion", ArtPolicy.skipSetup(SettingsStore.secondaryDisplay(context,
-                    context.getSystemService(android.hardware.display.DisplayManager.class).getDisplay(android.view.Display.DEFAULT_DISPLAY)), stages != null));
+            opened.request.put("skipCompanion", ArtPolicy.skipSetup(SettingsStore.secondaryDisplay(context), stages != null));
             String result = NativeSetup.run(opened.request.toString(), (stage, done, total, detail) ->
                     main.post(() -> progress(context, stage, done, total, detail)));
             JSONObject parsed = new JSONObject(result == null ? "{}" : result);

@@ -33,6 +33,22 @@ the styled *Prepare second-screen art* / *Play without it* choice. Preparing run
 after success with usable art; cancellation/failure returns Home. `artDeclined` persists a skip across launches for this
 install; a Game data build or deleting imported data clears it. `startAfterArt` preserves the requested build-then-play
 through activity/process recreation. Pure-Java decisions are covered by `tests/test_android_art_policy.py`.
+
+All play paths converge on `SetupActivity.launchGame`: Start game/Play now, the launcher's direct-game preference,
+the Settings `ACTION_VIEW` shortcut followed by Start game, and success after Prepare second-screen art.
+`GameLaunch.start` uses the same `DisplayClass` built-in-panel classification as the companion, relative to
+`Display.DEFAULT_DISPLAY`, not the menu's current panel. This also keeps art preparation and the Second screen
+setting available when the menu is on the bottom screen. Only devices with a built-in second panel get
+`FLAG_ACTIVITY_NEW_TASK` and `ActivityOptions.setLaunchDisplayId(DEFAULT_DISPLAY)`; single-screen devices and
+external/cast/overlay-only configurations keep Android's ordinary launch behavior. The companion's enabled setting
+does not change where the game runs.
+The game remains `singleTask`, with the same affinity as the menu and no manifest/launcher/recents changes.
+`TotkActivity` also checks resume, new-intent and configuration callbacks: a launcher can move an existing task
+without opening the menu again. If it is on the second panel, the activity relaunches its own singleTask on the main
+display, without finishing/restarting the native game; a pending-move guard prevents recursive launches. A display
+move refreshes companion selection, which still excludes the game's current display. Host decision/callback
+coverage: `tests/test_android_game_display.py`; Android task-manager behavior is checked separately on devices.
+
 The menu keeps its options in SharedPreferences and writes them, on every
 change and again right before the game starts, to `<private>/settings.env` (`Settings.java` is the option → variable
 mapping; `tests/test_android_settings.py`). The native side refuses to start without a playable install too and

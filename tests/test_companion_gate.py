@@ -50,6 +50,12 @@ public class Intent {
     public Intent setClassName(Context context, String name) { return this; }
     public Intent putExtra(String name, String value) { return this; }
 }''',
+    'android/content/res/Configuration.java': 'package android.content.res; public final class Configuration {}',
+    'com/aure/totk/GameLaunch.java': '''package com.aure.totk;
+public final class GameLaunch {
+    static boolean onMainScreen(Object activity) { return true; }
+    static void start(Object activity) {}
+}''',
     'com/aure/totk/setup/SetupActivity.java': '''package com.aure.totk.setup;
 public final class SetupActivity {
     public static final String EXTRA_GAME_ERROR = "com.aure.totk.setup.GAME_ERROR";
@@ -70,7 +76,7 @@ public interface AttachedSurfaceControl {
     void addOnBufferTransformHintChangedListener(OnBufferTransformHintChangedListener listener);
     void removeOnBufferTransformHintChangedListener(OnBufferTransformHintChangedListener listener);
 }''',
-    'android/view/Display.java': 'package android.view; public final class Display {}',
+    'android/view/Display.java': 'package android.view; public final class Display { public int getDisplayId() { return 0; } }',
     'android/view/View.java': '''package android.view;
 public class View {
     public boolean isAttachedToWindow() { return false; }
@@ -88,6 +94,9 @@ public class NativeActivity extends Context {
     public static Runnable initialize, destroy;
     public static boolean initialized;
     protected void onCreate(Bundle state) { initialize.run(); initialized = true; }
+    protected void onNewIntent(android.content.Intent intent) {}
+    public void setIntent(android.content.Intent intent) {}
+    public void onConfigurationChanged(android.content.res.Configuration config) {}
     protected void onResume() {}
     protected void onPause() {}
     protected void onStop() {}
@@ -139,6 +148,7 @@ public final class PresentationController {
         created++;
     }
     public void ownerTopResumed(boolean top) {}
+    public void onDisplayChanged(int id) {}
     public void close() { closed++; }
 }''',
     'com/aure/totk/companion/Snapshot.java': '''package com.aure.totk.companion;
