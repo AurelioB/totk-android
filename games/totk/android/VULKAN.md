@@ -2564,6 +2564,15 @@ A region or colour channel mask now opens a temporary pass per layer/slice on th
 writes nothing. Whole unmasked clears keep the image clears; views that cannot be render targets keep the old path and
 its log line. `vkdrawtest` checks level-0/level-1 region, green-only and red+alpha clears texel by texel.
 
+### Same-pass mip feedback (`TOTK_VK_FEEDBACK_CUT`, default off)
+
+A pass that renders one level of an image while sampling that image (mip chains generated level by level) has a
+feedback loop when the sampled view includes the attached level; Vulkan leaves it undefined and Adreno shows NaN
+blotches. `TOTK_VK_FEEDBACK_CUT=1` gives such views only the levels below the attached one (`[base, attached)`, keeping
+LOD numbering); a view based at the attached level is left whole. Startup logs `TOTK_VK_FEEDBACK_CUT=…`;
+`[feedback-cut]` logs cut and left-whole views per 300 presents. Compare screenshots (`TOTK_VK_SHOT`) of scenes with
+blotches. `vkdrawtest` renders a mip step with the switch off and on and checks identical texels and the counters.
+
 ## Upstream Android integration (2026-10-22, device measurement pending)
 
 `origin/android-port` through `d2eb744` is merged with the measured dev work above; [UPSTREAM_MERGE.md](UPSTREAM_MERGE.md)

@@ -1718,6 +1718,35 @@ int vk_tex_view_identity(vk_tex *x, VkImageView view, vk_canvas_image *image, Vk
     pthread_mutex_unlock(&g_tex_mu);
     return found;
 }
+/* TOTK_VK_FEEDBACK_CUT: the same cached view (format, type, aspect, swizzle, layers, base level) with only its first
+   `levels` levels, cached beside it. The original view when it is unknown or already that short. */
+VkImageView vk_tex_view_levels(vk_tex *x, VkImageView view, uint32_t levels) {
+    VkImageView result = view;
+    pthread_mutex_lock(&g_tex_mu);
+    vk_img *im = x ? x->im : NULL;
+    for (int i = 0; im && levels && i < im->nviews; i++) if (im->views[i].v == view) {
+        uint64_t k0 = im->views[i].k0, k1 = im->views[i].k1;
+        uint32_t l0 = (uint32_t)(k1 & 255), nl = (uint32_t)((k1 >> 8) & 255);
+        if (levels >= nl) break;
+        uint64_t cut = (k1 & ~(255ull << 8)) | (uint64_t)levels << 8;
+        for (int j = 0; j < im->nviews; j++) if (im->views[j].k0 == k0 && im->views[j].k1 == cut) { result = im->views[j].v; goto done; }
+        VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+            .usage = (k0 >> 48 & 3) == 2 ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
+        VkComponentMapping sw = {(VkComponentSwizzle)(k1 >> 40 & 7), (VkComponentSwizzle)(k1 >> 43 & 7),
+            (VkComponentSwizzle)(k1 >> 46 & 7), (VkComponentSwizzle)(k1 >> 49 & 7)};
+        VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, .image = im->img,
+            .viewType = (VkImageViewType)(k0 >> 32 & 0xff), .format = (VkFormat)(uint32_t)k0, .components = sw,
+            .subresourceRange = {(VkImageAspectFlags)(k0 >> 40 & 0xff), l0, levels, (uint32_t)(k1 >> 16 & 4095), (uint32_t)(k1 >> 28 & 4095)}};
+        VkImageView v;
+        if (vkCreateImageView(V.dev, &ci, NULL, &v)) { RED(16, "feedback-cut view failed (ser %llu)", (unsigned long long)x->serial); break; }
+        if (im->nviews == im->capviews) { im->capviews = im->capviews ? 2 * im->capviews : 4; im->views = realloc(im->views, (size_t)im->capviews * sizeof *im->views); }
+        im->views[im->nviews++] = (view_ent){k0, cut, v};
+        result = v; break;
+    }
+done:
+    pthread_mutex_unlock(&g_tex_mu);
+    return result;
+}
 int vk_xlate_texture_view_type(vk_tex *x, VkImageView view) {
     int type = -1;
     pthread_mutex_lock(&g_tex_mu);

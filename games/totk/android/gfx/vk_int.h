@@ -475,6 +475,7 @@ int vk_tex_native_window(vk_tex *x);
 int vk_tex_canvas_window(vk_tex *x);
 vk_canvas_image vk_tex_canvas_identity(vk_tex *x, unsigned level, unsigned layer);
 int vk_tex_view_identity(vk_tex *x, VkImageView view, vk_canvas_image *image, VkImageSubresourceRange *range);
+VkImageView vk_tex_view_levels(vk_tex *x, VkImageView view, uint32_t levels); /* the view's first `levels` levels only */
 void vk_pso_life_external_write(vk_tex *x, unsigned mip, unsigned layer, unsigned layers, const char *source);
 void vk_pso_life_external_read(uint32_t width, uint32_t height, const char *source);
 VkImage vk_tex_native_image(vk_tex *x); /* identity only; does not realize or synchronize */
@@ -518,6 +519,7 @@ uint64_t vk_wb_test_inflight(void); /* exact preflight matches on a synchronous 
 void vk_res_mem(uint64_t v[8]); /* resource memory summary (also read by the present statistics) */
 void vk_draw_test_split_counts(uint64_t out[3]); /* TOTK_VK_SPLIT_PASS_DRAWS splits, reopened parts, refused passes */
 void vk_draw_test_clear_counts(uint64_t out[2]); /* ClearTexture calls cleared through the region path: partial, masked */
+void vk_draw_test_feedback_counts(uint64_t out[2]); /* TOTK_VK_FEEDBACK_CUT sampled views cut, left whole */
 #endif
 void vk_res_stats(void);   /* rendered / copied / cleared by the GPU: never re-uploaded from guest memory */
 void vk_upload_threads_init(void);         /* launch-time TOTK_VK_UPLOAD_THREADS, before any upload */

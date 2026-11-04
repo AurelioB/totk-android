@@ -1140,6 +1140,11 @@ static uint32_t split_pass_draws(void) {
 #ifdef TOTK_VK_TESTS
 void vk_draw_test_split_counts(uint64_t out[3]) { out[0] = g_split_count; out[1] = g_split_reopen; out[2] = g_split_refused; }
 #endif
+static int g_feedback_cut;   /* TOTK_VK_FEEDBACK_CUT (see feedback_cut), read once in vk_draw_switches_init */
+static uint64_t g_feedback_cuts, g_feedback_uncut;   /* sampled views cut below an attached level; left whole (base attached) */
+#ifdef TOTK_VK_TESTS
+void vk_draw_test_feedback_counts(uint64_t out[2]) { out[0] = g_feedback_cuts; out[1] = g_feedback_uncut; }
+#endif
 static unsigned view_level(const view_t *v, int has) { return has && v->set_levels ? v->base_level : 0; }
 /* Open the pass for the current targets with the pending clears as load operations. 0 when nothing can be attached. */
 static int begin_rendering_inner(int draw_tail) {
@@ -3320,6 +3325,10 @@ void vk_draw_switches_init(void) {
          "colour attachments the fragment shader does not output get colorWriteMask 0" :
          "colour write masks follow the game's channel mask only (default)");
     (void)split_pass_draws();
+    e = getenv("TOTK_VK_FEEDBACK_CUT"); g_feedback_cut = e && atoi(e) == 1;
+    LOGV("TOTK_VK_FEEDBACK_CUT=%d: %s", g_feedback_cut, g_feedback_cut ?
+         "sampled views of an image the pass renders to stop below the attached level" :
+         "sampled views may include the attached level (default)");
 }
 static uint32_t pipe_write_mask(const pipe_key *k) {   /* the key's channel mask minus attachments without an output */
     if (!g_unwritten_mask) return k->chmask;
@@ -4254,6 +4263,35 @@ static int record_uniforms_unchanged(vk_shader *sh, int stage, uint64_t revision
     }
     return 1;
 }
+/* TOTK_VK_FEEDBACK_CUT=1: a pass that samples the image it renders to (a mip chain generated level by level) gets a
+   sampled view without the attached level. Feedback through a view that includes the attachment's level is undefined
+   in Vulkan even if the shader only reads other levels; Adreno shows it as NaN blotches. Only views whose base level
+   is below the attached level are cut, to [base, attached), keeping LOD numbering; a view based at the attached level
+   is left alone (counted). Sampled views only; storage images are the game's own explicit read/write. */
+static VkImageView feedback_cut(vk_tex *x, VkImageView view) {
+    VkImage image = vk_tex_image(x); int attached = 0;
+    for (unsigned a = 0; a < 9 && !attached; a++) {
+        vk_tex *t = a < 8 ? (a < R.ncolor ? R.ctex[a] : NULL) : R.dtex;
+        attached = t && vk_tex_image(t) == image;
+    }
+    if (!attached) return view;
+    vk_canvas_image identity; VkImageSubresourceRange range;
+    if (!vk_tex_view_identity(x, view, &identity, &range)) return view;
+    uint32_t keep = range.levelCount; int is3d = vk_tex_is3d(x);
+    for (unsigned a = 0; a < 9; a++) {
+        vk_tex *t = a < 8 ? (a < R.ncolor ? R.ctex[a] : NULL) : R.dtex;
+        if (!t || vk_tex_image(t) != image) continue;
+        uint32_t level = a < 8 ? R.clevel[a] : R.dlevel, layer = a < 8 ? R.clayer[a] : R.dlayer;
+        if (level < range.baseMipLevel || level >= range.baseMipLevel + range.levelCount) continue;
+        if (!is3d && (layer < range.baseArrayLayer || layer >= range.baseArrayLayer + range.layerCount)) continue;
+        if (level - range.baseMipLevel < keep) keep = level - range.baseMipLevel;
+    }
+    if (keep == range.levelCount) return view;
+    if (!keep) { g_feedback_uncut++; return view; }
+    VkImageView cut = vk_tex_view_levels(x, view, keep);
+    if (cut != view) g_feedback_cuts++; else g_feedback_uncut++;
+    return cut;
+}
 /* Freeze only stream-position decisions. Descriptor construction, range resolution and zero bindings are worker work. */
 static VkImageView native_texture_by_id(int tid, int *want, vk_tex **object) {
     VkImageView view = vk_tex_by_id(tid, want, object);
@@ -4261,9 +4299,10 @@ static VkImageView native_texture_by_id(int tid, int *want, vk_tex **object) {
         vk_treg reg;
         if (vk_treg_get(tid, &reg)) {
             VkImageView native = vk_tex_native_view(*object, reg.has_v ? &reg.v : NULL, 0);
-            if (native) view = native;
+            if (native) return native;
         }
     }
+    if (__builtin_expect(g_feedback_cut, 0) && R.open && view && object && *object && *want != -2) view = feedback_cut(*object, view);
     return view;
 }
 /* Enumerate descriptor MAY-reads before freeze-memo reuse. The actual view cache supplies exact ranges,
@@ -4329,6 +4368,7 @@ static void pso_life_reads(const vk_shader *sh, unsigned stage) {
 struct freeze_key {
     uint64_t chunk, submission, uniforms, bindings, resources, samplers, cpu_dirty, dirty_epoch;
     const vk_record_spans *spans; vk_shader *shader; uint32_t width, height, stage; vk_tex *native_sample;
+    uint64_t feedback_pass;   /* TOTK_VK_FEEDBACK_CUT: views depend on the open pass's attachments */
     VkImage native_image;
 };
 static struct { struct freeze_key key; __typeof__(g_record_draw->sets[0]) set; record_binding *bindings; int cap, valid; } g_freeze_memo[128];
@@ -4344,7 +4384,7 @@ static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh
        the core again; a dirty-unit birth is only lifetime identity, never a content revision. */
     if (vk_lag_capture_on()) { key.cpu_dirty = nvn_dirty_now(); key.dirty_epoch = nvn_dirty_lag_epoch(); }
     key.spans = g_record_draw->spans; key.shader = sh; key.width = R.w; key.height = R.h; key.stage = (uint32_t)stage;
-    key.native_sample = g_native_sample;
+    key.native_sample = g_native_sample; if (g_feedback_cut) key.feedback_pass = g_stat_passes;
     if (g_native_sample) key.native_image = vk_tex_native_image(g_native_sample);
     __typeof__(g_freeze_memo[0]) *last = &g_freeze_memo[((uintptr_t)sh >> 4) % 128];
     unsigned causes = 0;
@@ -9888,6 +9928,12 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
                  (unsigned long long)n, (unsigned long long)(c[0] - previous[0]), (unsigned long long)(c[1] - previous[1]),
                  (unsigned long long)(c[2] - previous[2]), (c[0] - previous[0]) / 300.0, (c[1] - previous[1]) / 300.0,
                  (c[2] - previous[2]) / 300.0, split_pass_draws());
+            memcpy(previous, c, sizeof previous);
+        }
+        if (g_feedback_cut) {
+            static uint64_t previous[2]; uint64_t c[2] = {g_feedback_cuts, g_feedback_uncut};
+            LOGV("[feedback-cut] frame %llu: last 300 presents %llu sampled views cut below an attached level, %llu left whole (based at it)",
+                 (unsigned long long)n, (unsigned long long)(c[0] - previous[0]), (unsigned long long)(c[1] - previous[1]));
             memcpy(previous, c, sizeof previous);
         }
         vk_rec_unlock();

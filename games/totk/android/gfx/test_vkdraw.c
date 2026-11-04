@@ -4535,6 +4535,51 @@ int main(int argc, char **argv) {
         CHECK(!bad0, "level-0 region and green-only clears keep every other texel and channel (%d wrong)", bad0);
         CHECK(!bad1, "level-1 red+alpha region clear keeps level 0, other texels and green/blue (%d wrong)", bad1);
     }
+    /* TOTK_VK_FEEDBACK_CUT: a pass rendering level 1 of a texture while sampling the same texture (one mip-generation
+       step) gets a sampled view of level 0 only; a pass rendering level 0 leaves the view whole. The rendered level-1
+       texels (LOD 0 reads) are identical with the switch on and off; only the counters differ. */
+    {
+        const char *cut_env = getenv("TOTK_VK_FEEDBACK_CUT"); int cut_on = cut_env && atoi(cut_env) == 1;
+        tex_t mt = rt; mt.d.levels = 2; nvn_tex_layout(&mt.d, &mt.L); mt.mem = gpu_pool + 0xb00000; mt.serial = 30102;
+        mtl_reg_tex(3, &mt, NULL);
+        uint8_t *back = cpu_pool + 0x780000; memset(back, 0xcd, 32 * 32 * 4);
+        view_t level0 = {.set_levels = 1, .base_level = 0, .nlevels = 1}, level1 = {.set_levels = 1, .base_level = 1, .nlevels = 1};
+        p_clear_tex fill0 = {.tex = &mt, .view = level0, .has_view = 1, .r = {0, 0, 0, 64, 64, 1}, .mask = 0xf, .c = {.f = {0.25f, 0.5f, 0.75f, 1}}};
+        p_clear_tex fill1 = {.tex = &mt, .view = level1, .has_view = 1, .r = {0, 0, 0, 32, 32, 1}, .mask = 0xf, .c = {.f = {0, 0, 0, 0}}};
+        const float full[] = {-1, -1, 3, -1, -1, 3}; memcpy(cpu_pool + 0x202000, full, sizeof full);
+        p_bind_vbuf full_vb = vb; full_vb.r[0].address = (uint64_t)(uintptr_t)(cpu_pool + 0x202000);
+        fub[0] = 1; fub[1] = 0.5f; fub[2] = 1; fub[3] = 1;
+        p_set_rt mip1 = {.n = 1, .color = {&mt}, .cview = {level1}, .has_cview = {1}}, mip0 = {.n = 1, .color = {&mt}, .cview = {level0}, .has_cview = {1}};
+        p_bind_handles sampled = th; sampled.h[0] = 3 | (1u << 20);
+        p_viewports half = vp; half.v[0][2] = 32; half.v[0][3] = 32;
+        p_scissor all = {0, 0, 64, 64}, corner = {0, 0, 4, 4};
+        p_copy_b2t c1 = {.src = (uint64_t)(uintptr_t)back, .tex = &mt, .view = level1, .has_view = 1, .r = {0, 0, 0, 32, 32, 1}};
+        uint64_t fb0[2], fb1[2], fb2[2]; vk_draw_test_feedback_counts(fb0);
+        op(OP_CLEAR_TEX, &fill0, sizeof fill0); op(OP_CLEAR_TEX, &fill1, sizeof fill1);
+        op(OP_SCISSOR, &all, sizeof all); op(OP_SET_RT, &mip1, sizeof mip1);
+        op(OP_BIND_PROGRAM, &bp, sizeof bp); op(OP_BIND_VATTR, &va, sizeof va); op(OP_BIND_VSTREAM, &vs, sizeof vs);
+        op(OP_BIND_VBUF, &full_vb, sizeof full_vb); op(OP_BIND_UBO, &u0, sizeof u0); op(OP_BIND_UBO, &u1, sizeof u1);
+        op(OP_BIND_TEX, &sampled, sizeof sampled); op(OP_VIEWPORTS, &half, sizeof half); op(OP_DRAW, &dw, sizeof dw);
+        op(OP_COPY_T2B, &c1, sizeof c1);
+        CHECK(mtl_wait(run(), 5000000000ull), "mip-generation step with same-texture sampling completes");
+        vk_draw_test_feedback_counts(fb1);
+        int bad = 0;
+        for (int i = 0; i < 32 * 32; i++) {
+            const uint8_t *p = back + 4 * i;
+            bad += abs(p[0] - 64) > 2 || abs(p[1] - 64) > 2 || abs(p[2] - 191) > 2 || p[3] != 255;
+        }
+        CHECK(!bad, "level 1 renders level 0's texels, switch %s (%d wrong)", cut_on ? "on" : "off", bad);
+        CHECK(cut_on ? fb1[0] > fb0[0] && fb1[1] == fb0[1] : fb1[0] == fb0[0] && fb1[1] == fb0[1],
+            "feedback cut %s: %llu views cut, %llu left whole", cut_on ? "on" : "off",
+            (unsigned long long)(fb1[0] - fb0[0]), (unsigned long long)(fb1[1] - fb0[1]));
+        op(OP_SCISSOR, &corner, sizeof corner); op(OP_SET_RT, &mip0, sizeof mip0);
+        op(OP_VIEWPORTS, &vp, sizeof vp); op(OP_DRAW, &dw, sizeof dw);
+        CHECK(mtl_wait(run(), 5000000000ull), "level-0 draw sampling its own base level completes");
+        vk_draw_test_feedback_counts(fb2);
+        CHECK(fb2[0] == fb1[0] && (cut_on ? fb2[1] > fb1[1] : fb2[1] == fb1[1]),
+            "a view based at the attached level is never cut (%llu cut, %llu left whole)",
+            (unsigned long long)(fb2[0] - fb1[0]), (unsigned long long)(fb2[1] - fb1[1]));
+    }
     { void vk_mem_report(void); vk_mem_report(); }   /* the memory line runs */
 #ifdef TOTK_FRAME_TIMELINE_TEST
     if (totk_ft_on()) {
