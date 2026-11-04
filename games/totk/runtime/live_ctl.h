@@ -46,6 +46,7 @@ static const totk_live_switch totk_live_switches[] = {
     {"TOTK_VK_DESC_STOCK_MAX_SETS", 0, 1048576}, /* the same handoff; 0 = no ceiling */
     {"TOTK_VK_UNWRITTEN_MASK", 0, 1},        /* pipelines built afterwards; built ones keep their masks */
     {"TOTK_VK_SPLIT_PASS_DRAWS", 0, 1000000},/* the next render pass opened */
+    {"TOTK_VK_STAGING_RETAIN_MB", 8, 4096},  /* each slot at its next open, after its fence */
     {"TOTK_VK_FEEDBACK_CUT", 0, 1},          /* the next descriptor build */
     {"TOTK_VK_PREPARE_MASK", 0, 1},          /* the next draw's uniform preparation; a change dirties every register */
     {"TOTK_THREAD_SAMPLER", 0, 1},           /* the next presented frame (thread_sampler.h); starts its thread once */

@@ -1453,6 +1453,15 @@ submission while pinned slots are skipped. Both pass at 0/2/3 recorder workers, 
 under ThreadSanitizer (`LP_NUM_THREADS=0`, no suppressions) with zero violations; no Khronos validation layer is
 installed on the host.
 
+`TOTK_VK_STAGING_RETAIN_MB=N` (default unset = no cap; logs `staging retention: N MiB per slot` or `staging retention:
+no cap`) caps what each of the 8 slot arenas keeps after its reset. Texture-upload staging comes from the slot arena,
+and a reset keeps what the submission needed (compacted into one high-water chunk), so an upload burst stays allocated
+in that slot for the session; with N (8…4096) a slot keeps whole chunks up to N MiB and clips the high-water hint to N,
+and a later submission that needs more allocates it again. Live (`totk.ctl`) at each slot open, after its fence. The
+per-300 `memory staging retention: cap N MiB per slot, trims T, M MiB not retained` line counts it; compare
+`memory recording: slot/... arenas retained`. Host `vktest --staging-retain` (a 45 MiB burst, then 16 quiet
+submissions): the slot arenas keep 101 MiB uncapped, 72 MiB with N=16 (the burst slot 45 → 16 MiB).
+
 `recorder overhead ...` additionally separates synchronous secondary recording, batched ExecuteCommands, walking
 and worker pool-reset time, and job setup. Reset is a subset of inline/worker busy time, not another additive cost.
 Worker pool resets are lazy on their owner; only generation/version bookkeeping remains in walking slot reset.

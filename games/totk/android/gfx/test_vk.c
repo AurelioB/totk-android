@@ -1153,6 +1153,29 @@ static void arena_check_copy(VkBuffer source, VkDeviceSize offset, VkBuffer dest
     VkBufferCopy copy = {.srcOffset = offset, .dstOffset = (VkDeviceSize)index * 256, .size = 256};
     vkCmdCopyBuffer(vk_cb(), source, destination, 1, &copy);
 }
+uint64_t vk_test_slot_arena_bytes(void);
+/* TOTK_VK_STAGING_RETAIN_MB: a 45 MiB burst of staging in one slot (five 9 MiB uploads' worth), then 16 quiet
+   submissions through every slot. Retained slot-arena bytes before/after; with a cap, the burst slot keeps at most it. */
+static int staging_retain_checks(void) {
+    mtl_init();
+    const char *e = getenv("TOTK_VK_STAGING_RETAIN_MB"); long cap = e && *e ? atol(e) : -1;
+    uint64_t base = vk_test_slot_arena_bytes();
+    mtl_sub_begin();
+    for (int i = 0; i < 5; i++) { VkBuffer b; VkDeviceSize o; memset(vk_transient(9u << 20, 256, &b, &o), 0x30 + i, 256); }
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "staging burst completes");
+    uint64_t burst = vk_test_slot_arena_bytes();
+    for (int i = 0; i < 16; i++) {
+        mtl_sub_begin(); VkBuffer b; VkDeviceSize o; memset(vk_transient(1u << 20, 256, &b, &o), 0x71, 256);
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "quiet submission %d completes", i);
+    }
+    uint64_t settled = vk_test_slot_arena_bytes();
+    printf("staging-retain cap=%ld MiB/slot: slot arenas %.1f MiB before, %.1f MiB after the burst, %.1f MiB after 16 quiet submissions\n",
+        cap, base / 1048576.0, burst / 1048576.0, settled / 1048576.0);
+    if (cap < 0) CHECK(settled >= (45u << 20), "without a cap the burst slot keeps its high-water (%.1f MiB)", settled / 1048576.0);
+    else CHECK(settled <= (uint64_t)8 * ((uint64_t)(cap < 8 ? 8 : cap) << 20), "each slot keeps at most the cap (%.1f MiB)", settled / 1048576.0);
+    printf("%s: staging retain %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
 static int arena_bo_checks(void) {
     setenv("TOTK_FRAME_LAG", "1", 1); setenv("TOTK_VK_LAG_MODE", "copy", 1);
     mtl_init();
@@ -1693,6 +1716,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--lag-vma-policy")) return lag_vma_policy_checks();
     if (argc == 2 && !strcmp(argv[1], "--lag-vma-async")) return lag_vma_async_checks();
     if (argc == 2 && !strcmp(argv[1], "--arena-bo")) return arena_bo_checks();
+    if (argc == 2 && !strcmp(argv[1], "--staging-retain")) return staging_retain_checks();
     const size_t G = 64u << 20;   /* guest memory: shared anonymous, like runtime/services.c */
     uint8_t *g = mmap(NULL, G, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     for (size_t i = 0; i < 16u << 20; i += 4) *(uint32_t *)(g + i) = (uint32_t)i ^ 0x9e3779b9u;

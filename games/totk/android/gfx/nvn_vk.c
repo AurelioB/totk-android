@@ -1445,14 +1445,14 @@ typedef struct {
     occl_page *oq, *oq_cur;   /* reset/reused only after this slot's fence and occl_complete */
     vk_gpuprof_slot *gpuprof;   /* query pool and records, reused only after the slot fence */
 } slot_t;
+static void chunk_release(chunk_t *c, vk_memory_purpose purpose) {
+    vk_res_buffer_released(c->buf);
+    vkUnmapMemory(V.dev, c->mem);
+    vkDestroyBuffer(V.dev, c->buf, NULL);
+    vk_memory_release(c->mem, purpose);
+}
 static void arena_release(arena_t *a) {
-    for (int i = 0; i < a->nchunk; i++) {
-        chunk_t *c = &a->chunks[i];
-        vk_res_buffer_released(c->buf);
-        vkUnmapMemory(V.dev, c->mem);
-        vkDestroyBuffer(V.dev, c->buf, NULL);
-        vk_memory_release(c->mem, a->min ? VK_MEMORY_SNAPSHOT : VK_MEMORY_SLOT);
-    }
+    for (int i = 0; i < a->nchunk; i++) chunk_release(&a->chunks[i], a->min ? VK_MEMORY_SNAPSHOT : VK_MEMORY_SLOT);
     a->nchunk = 0; a->reserve = 0;
 }
 /* Only called after the arena's last GPU fence AND CPU recording ownership
@@ -1469,7 +1469,52 @@ static void arena_reset(arena_t *a, int max_bos) {
         arena_compacts[kind]++; arena_compact_ns[kind] += host_now_ns() - start;
     } else for (int i = 0; i < a->nchunk; i++) a->chunks[i].used = 0;
 }
+/* TOTK_VK_STAGING_RETAIN_MB (default unset: no cap). A slot's transient arena holds the staging of its texture uploads
+   (vk_res.c), and arena_reset keeps whatever a submission needed, compacted into one high-water chunk: a burst of
+   uploads at an area transition stays allocated in that slot for the session. With N, each slot keeps at most N MiB
+   after its reset (whole chunks, oldest first, and a high-water hint clipped to N); a later submission that needs more
+   allocates it again. Live (totk.ctl) at each slot open, after the slot's fence. */
+static int g_staging_retain_launch = -1;   /* MiB, -1: no cap; parsed once (pthread_once) */
+static _Atomic uint64_t g_staging_trims, g_staging_trimmed;
+static pthread_once_t g_staging_once = PTHREAD_ONCE_INIT;
+static void staging_retain_parse(void) {
+    const char *e = getenv("TOTK_VK_STAGING_RETAIN_MB");
+    if (e && *e) { long n = atol(e); g_staging_retain_launch = n < 8 ? 8 : n > 4096 ? 4096 : (int)n; }
+    if (g_staging_retain_launch < 0) LOGV("staging retention: no cap (TOTK_VK_STAGING_RETAIN_MB unset: each slot keeps its upload high-water)");
+    else LOGV("staging retention: %d MiB per slot (TOTK_VK_STAGING_RETAIN_MB; %d slots)", g_staging_retain_launch, RING);
+}
+static int staging_retain_mb(void) {
+    static totk_live_cache live; static _Atomic int reported = -2;
+    pthread_once(&g_staging_once, staging_retain_parse);
+    int mb = totk_live_cached(&live, "TOTK_VK_STAGING_RETAIN_MB", g_staging_retain_launch);
+    if (atomic_load_explicit(&reported, memory_order_relaxed) != mb &&
+        atomic_exchange_explicit(&reported, mb, memory_order_relaxed) != mb && totk_live_generation())
+        LOGV("staging retention: %d MiB per slot (live; -1 = no cap; each slot applies it at its next open)", mb);
+    return mb;
+}
+static void arena_retain_cap(arena_t *a) {   /* a slot arena just reset: no chunk is in use */
+    int mb = staging_retain_mb(); if (mb < 0) return;
+    VkDeviceSize cap = (VkDeviceSize)mb << 20, kept = 0, trimmed = 0;
+    if (a->reserve > cap) { trimmed += a->reserve - cap; a->reserve = cap; }
+    int n = 0;
+    for (int i = 0; i < a->nchunk; i++) {
+        if (kept + a->chunks[i].size <= cap) { kept += a->chunks[i].size; a->chunks[n++] = a->chunks[i]; continue; }
+        trimmed += a->chunks[i].size; chunk_release(&a->chunks[i], VK_MEMORY_SLOT);
+    }
+    a->nchunk = n;
+    if (trimmed) {
+        atomic_fetch_add_explicit(&g_staging_trims, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_staging_trimmed, trimmed, memory_order_relaxed);
+    }
+}
 static slot_t g_ring[RING]; static int g_ring_next;
+#ifdef TOTK_VK_TESTS
+uint64_t vk_test_slot_arena_bytes(void) {   /* walking owner: every slot arena's chunk bytes */
+    uint64_t bytes = 0;
+    for (int i = 0; i < RING; i++) for (int c = 0; c < g_ring[i].ar.nchunk; c++) bytes += g_ring[i].ar.chunks[c].size;
+    return bytes;
+}
+#endif
 /* Separate from the ordinary slot layout and never consulted before an
  * external engine has passed its runtime admission checks. */
 static struct { VkSemaphore signal, wait; uint64_t until; } g_external[RING];
@@ -2324,7 +2369,7 @@ static void slot_open(slot_t *s) {
         }
         s->primary_trim_uses = s->recent_primary_peak = 0;
     }
-    arena_reset(&s->ar, 4);
+    arena_reset(&s->ar, 4); arena_retain_cap(&s->ar);
     slot_descriptors_recycle(s);
     );
     s->oq_cur = NULL;
@@ -5835,6 +5880,9 @@ void vk_mem_report(void) {
     LOGV("memory recording: slot/snapshot arenas retained %.1f/%.1f MiB; draw packet slabs %.1f MiB, descriptor input slabs %.1f MiB; worker secondary buffers %llu, descriptor pools %llu (driver bytes not counted)",
         slot_chunks / 1048576.0, (chunk - slot_chunks) / 1048576.0, recorder[0] / 1048576.0, recorder[1] / 1048576.0,
         (unsigned long long)recorder[2], (unsigned long long)recorder[3]);
+    LOGV("memory staging retention: cap %d MiB per slot (-1: none), trims %llu, %.1f MiB not retained (TOTK_VK_STAGING_RETAIN_MB)",
+        staging_retain_mb(), (unsigned long long)atomic_load_explicit(&g_staging_trims, memory_order_relaxed),
+        atomic_load_explicit(&g_staging_trimmed, memory_order_relaxed) / 1048576.0);
     uint64_t primary[2]; primary_memory(primary);
     LOGV("memory primary command buffers: retained %llu, reclaimed %llu; retired-only trim after32 uses, warm floor256/slot (driver-private BO bytes not observable)",
         (unsigned long long)primary[0], (unsigned long long)primary[1]);
