@@ -1218,6 +1218,119 @@ static uint64_t g_feedback_cuts, g_feedback_uncut;   /* sampled views cut below 
 void vk_draw_test_feedback_counts(uint64_t out[2]) { out[0] = g_feedback_cuts; out[1] = g_feedback_uncut; }
 #endif
 static unsigned view_level(const view_t *v, int has) { return has && v->set_levels ? v->base_level : 0; }
+/* Opt-in, next-pass-open coverage proof. A certificate describes actual SPIR-V,
+   not a shader key. Geometry is read through ordered CPU/snapshot authority;
+   GPU-only producers, unknown layouts and all destination dependencies retain LOAD. */
+static int g_load_elide_launch;
+static totk_live_cache g_load_elide_live;
+static uint64_t g_load_proven, g_load_elided;
+static const p_draw *g_load_draw;
+static const p_draw_idx *g_load_indexed;
+static vk_shader *const *g_load_sh;
+static VkPipeline g_load_pipeline;
+static VkPipelineLayout g_load_layout;
+static uint8_t g_load_vertices[48];
+static unsigned g_load_vertex_bytes;
+static VkDescriptorBufferInfo g_load_geometry;
+static unsigned g_load_stream;
+static int g_load_override;
+static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLayout layout);
+static uint32_t load_coverage_mask(void) {
+    vk_shader *vs = g_load_sh ? g_load_sh[0] : NULL, *fs = g_load_sh ? g_load_sh[1] : NULL;
+    if (!vs || !fs || !vs->load_position_attr || !fs->load_full_outputs ||
+        vs->has_storage_writes || fs->has_storage_writes || S.ds.dt || S.ds.st ||
+        S.color.blend_en || S.color.logic_op != NVN_LOGIC_OP_COPY || (S.ms.a2c & 1) ||
+        S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS || S.poly.mode != NVN_POLYGON_MODE_FILL ||
+        S.poly.cull != NVN_FACE_NONE || R.native || R.canvas || vk_fg_extract_active ||
+        PD.active || PP.active || probe_on() || R.samples != VK_SAMPLE_COUNT_1_BIT ||
+        !S.has_vp || S.vp[0][0] != 0 || S.vp[0][1] != 0 ||
+        S.vp[0][2] != R.w || S.vp[0][3] != R.h ||
+        (S.has_sc && (S.sc.x > 0 || S.sc.y > 0 || (int64_t)S.sc.x + S.sc.w < R.w ||
+                     (int64_t)S.sc.y + S.sc.h < R.h))) return 0;
+    unsigned attr = vs->load_position_attr - 1;
+    if (vs->vin_mask != (1u << attr) || attr >= (unsigned)S.nattr || S.attr[attr].offset) return 0;
+    VkFormat format = vk_vertex_fmt(S.attr[attr].fmt);
+    if (format != VK_FORMAT_R32G32_SFLOAT && format != VK_FORMAT_R16G16_SFLOAT) return 0;
+    unsigned vertex_bytes = format == VK_FORMAT_R32G32_SFLOAT ? 8 : 4;
+    unsigned stream = S.attr[attr].stream;
+    if (stream >= 16 || S.stream[stream].divisor) return 0;
+    int prim = g_load_draw ? g_load_draw->prim : g_load_indexed->prim;
+    unsigned count = g_load_draw ? g_load_draw->count : g_load_indexed->count;
+    if (prim != 4 || (count != 3 && count != 6)) return 0; /* triangle list only */
+    if (g_load_indexed && (g_load_indexed->itype < 0 || g_load_indexed->itype > 2)) return 0;
+    float xy[6][2];
+    for (unsigned i = 0; i < count; i++) {
+        int64_t vertex = g_load_draw ? (int64_t)g_load_draw->first + i : 0;
+        if (g_load_indexed) {
+            unsigned bytes = 1u << g_load_indexed->itype; uint32_t index = 0;
+            uint64_t address = g_load_indexed->ibuf + (uint64_t)i * bytes;
+            VkDescriptorBufferInfo frozen;
+            if (address < g_load_indexed->ibuf || !vk_ub_replay_read(address, bytes, 16, &frozen)) return 0;
+            vk_ub_read(address, &index, bytes); vertex = (int64_t)index + g_load_indexed->base_vertex;
+        }
+        if (vertex < 0 || (S.stream[stream].stride && (uint64_t)vertex > UINT64_MAX / S.stream[stream].stride)) return 0;
+        uint64_t offset = (uint64_t)vertex * S.stream[stream].stride + S.attr[attr].offset;
+        const NVNbufferRange *b = &S.vbuf[stream]; VkDescriptorBufferInfo frozen;
+        if (offset > b->size || b->size - offset < vertex_bytes ||
+            b->address + offset < b->address || !vk_ub_replay_read(b->address + offset, vertex_bytes, 16, &frozen)) return 0;
+        uint8_t *raw = g_load_vertices + i * vertex_bytes;
+        vk_ub_read(b->address + offset, raw, vertex_bytes);
+        if (vertex_bytes == 8) memcpy(xy[i], raw, 8);
+        else for (unsigned k = 0; k < 2; k++) {
+            uint16_t h; memcpy(&h, raw + 2*k, 2);
+            unsigned exponent = h >> 10 & 31, mantissa = h & 1023;
+            if (exponent == 31) return 0;
+            xy[i][k] = ldexpf((float)(exponent ? mantissa + 1024 : mantissa), exponent ? (int)exponent - 25 : -24);
+            if (h & 0x8000) xy[i][k] = -xy[i][k];
+        }
+        for (unsigned k = 0; k < 2; k++)
+            if (!isfinite(xy[i][k]) || fabsf(xy[i][k]) > 16 || xy[i][k] != truncf(xy[i][k])) return 0;
+    }
+    if (count == 3) {
+        double area = ((double)xy[1][0] - xy[0][0]) * ((double)xy[2][1] - xy[0][1]) -
+                      ((double)xy[1][1] - xy[0][1]) * ((double)xy[2][0] - xy[0][0]);
+        if (!area) return 0;
+        for (unsigned corner = 0; corner < 4; corner++) for (unsigned edge = 0; edge < 3; edge++) {
+            unsigned j = (edge + 1) % 3;
+            double cross = ((double)xy[j][0] - xy[edge][0]) * ((corner & 2 ? 1.0 : -1.0) - xy[edge][1]) -
+                           ((double)xy[j][1] - xy[edge][1]) * ((corner & 1 ? 1.0 : -1.0) - xy[edge][0]);
+            if (area > 0 ? cross < 0 : cross > 0) return 0;
+        }
+    } else {
+        unsigned corners[2] = {0}, shared;
+        for (unsigned i = 0; i < 6; i++) {
+            if ((xy[i][0] != -1 && xy[i][0] != 1) || (xy[i][1] != -1 && xy[i][1] != 1)) return 0;
+            unsigned bit = 1u << ((xy[i][0] == 1) | ((xy[i][1] == 1) << 1));
+            if (corners[i / 3] & bit) return 0;
+            corners[i / 3] |= bit;
+        }
+        shared = corners[0] & corners[1];
+        if ((corners[0] | corners[1]) != 15 || (shared != 6 && shared != 9)) return 0;
+    }
+    uint32_t mask = fs->load_full_outputs & 255u;
+    for (unsigned i = 0; i < 8; i++) if ((S.chmask.mask >> (4 * i) & 15) != 15) mask &= ~(1u << i);
+    /* Aliases and every bound sampled/storage view are MAY-reads. */
+    for (unsigned st = 0; st < 2; st++) for (unsigned slot = 0; slot < 160; slot++) {
+        uint64_t handle = slot < 128 ? S.tex[st][slot] : S.img[st][slot - 128];
+        if (!handle) continue;
+        vk_treg t; if (!vk_treg_get((int)(handle & 0xfffff), &t)) return 0;
+        for (unsigned i = 0; i < 8; i++) {
+            const tex_t *a = S.rt.color[i];
+            if (a && (a->serial == t.t.serial || !a->L.size || !t.t.L.size ||
+                ((uintptr_t)a->mem < (uintptr_t)t.t.mem + t.t.L.size &&
+                 (uintptr_t)t.t.mem < (uintptr_t)a->mem + a->L.size))) mask &= ~(1u << i);
+        }
+    }
+    for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 9; j++) {
+        const tex_t *a = S.rt.color[i], *b = j < 8 ? S.rt.color[j] : S.rt.depth;
+        if (i != j && a && b && (a->serial == b->serial || a->mem == b->mem)) mask &= ~(1u << i);
+    }
+    if (mask) { g_load_vertex_bytes = vertex_bytes; g_load_stream = stream; }
+    return mask;
+}
+#ifdef TOTK_VK_TESTS
+void vk_draw_test_load_counts(uint64_t out[2]) { out[0] = g_load_proven; out[1] = g_load_elided; }
+#endif
 /* Open the pass for the current targets with the pending clears as load operations. 0 when nothing can be attached. */
 static int begin_rendering_inner(int draw_tail) {
     if (R.open) return 1;
@@ -1325,6 +1438,26 @@ static int begin_rendering_inner(int draw_tail) {
     if (da.imageView && (discard >> 8 & 1)) { da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; g_store_clear_ds++; discarded = 1; }
     if (sa.imageView && (discard >> 9 & 1)) { sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; g_store_clear_ds++; discarded = 1; }
     g_store_clear_pass += discarded; R.store_discard = discarded; R.split_refused = 0; R.split_draws = split_pass_live();
+    if (draw_tail && totk_live_cached(&g_load_elide_live, "TOTK_VK_LOAD_ELIDE", g_load_elide_launch)) {
+        uint32_t mask = load_coverage_mask();
+        for (unsigned i = 0; i < nc; i++) if (!ca[i].imageView || ca[i].loadOp != VK_ATTACHMENT_LOAD_OP_LOAD) mask &= ~(1u << i);
+        if (mask) {
+            g_load_proven++;
+            /* A skipped asynchronous/failed pipeline must never discard old pixels. */
+            g_load_layout = vk_layout_of(g_load_sh[0], g_load_sh[1]);
+            g_load_pipeline = pipe_get(g_load_sh[0], g_load_sh[1], g_load_draw ? g_load_draw->prim : g_load_indexed->prim, g_load_layout);
+            if (g_load_pipeline && g_load_pipeline != (VkPipeline)(uintptr_t)1) {
+                unsigned count = g_load_draw ? g_load_draw->count : g_load_indexed->count;
+                VkDeviceSize offset;
+                void *vertices = vk_transient(count * g_load_vertex_bytes, 16, &g_load_geometry.buffer, &offset);
+                memcpy(vertices, g_load_vertices, count * g_load_vertex_bytes);
+                g_load_geometry.offset = offset; g_load_geometry.range = count * g_load_vertex_bytes;
+                g_load_override = 1; /* the submitted geometry is exactly the certified immutable bytes */
+                for (unsigned i = 0; i < nc; i++) if (mask >> i & 1) ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                g_load_elided++;
+            }
+        }
+    }
     VkCommandBuffer cb = vk_cb();
     split_depth_begin(cb, da.loadOp);
     vk_barrier_all(cb);
@@ -3411,6 +3544,8 @@ void vk_draw_switches_init(void) {
     e = getenv("TOTK_VK_SPLIT_LRZ_SAFE"); g_split_safe_launch = !e || !*e || atoi(e) != 0;
     LOGV("TOTK_VK_SPLIT_LRZ_SAFE=%d: %s", g_split_safe_launch, g_split_safe_launch ?
          "depth epoch transfer touches and conservative split refusals (default)" : "unsafe split control arm");
+    e = getenv("TOTK_VK_LOAD_ELIDE"); g_load_elide_launch = e && atoi(e) == 1;
+    LOGV("[nvn-vk] TOTK_VK_LOAD_ELIDE=%d: conservative first-draw coverage proof, next pass open", g_load_elide_launch);
     e = getenv("TOTK_VK_FEEDBACK_CUT"); g_feedback_cut_launch = e && atoi(e) == 1;
     atomic_store_explicit(&g_feedback_cut, g_feedback_cut_launch, memory_order_relaxed);
     LOGV("TOTK_VK_FEEDBACK_CUT=%d: %s", g_feedback_cut_launch, g_feedback_cut_launch ?
@@ -5143,6 +5278,11 @@ static int record_buffers(vk_shader *sh, const p_draw *dw, const p_draw_idx *di,
         /* Packets survive slot reuse: a previous hot/copy draw may have overridden this stream.
            Clear that version before choosing between today's live range and a new immutable copy. */
         d->vertex[s].buffer = VK_NULL_HANDLE; d->vertex[s].offset = 0; d->vertex[s].lag_reason = 0;
+        if (g_load_override && s == g_load_stream) {
+            d->vertex[s].address = 0; d->vertex[s].buffer = g_load_geometry.buffer;
+            d->vertex[s].offset = g_load_geometry.offset; d->vertex[s].size = g_load_geometry.range;
+            d->vertex[s].stride = g_load_vertex_bytes; continue;
+        }
         if (vk_lag_capture_on() && d->vertex[s].address) {
             VkBuffer buffer; uint64_t offset, available;
             if (record_buffer_resolve(d->spans, d->vertex[s].address, d->vertex[s].size, 0, &buffer, &offset, &available)) {
@@ -5244,6 +5384,10 @@ static inline __attribute__((always_inline)) int draw_buffers(VkCommandBuffer cb
         int lag_frozen=S.vbuf[s].address && vk_lag_read(S.vbuf[s].address, sz, 16, &frozen, VK_LAG_VERTEX);
         if (lag_frozen) { b = frozen.buffer; o = frozen.offset; }
         VkDeviceSize stride = S.stream[s].stride;
+        if (g_load_override && s == g_load_stream) {
+            b = g_load_geometry.buffer; o = g_load_geometry.offset; sz = g_load_geometry.range;
+            stride = g_load_vertex_bytes;
+        }
         vb[0] = b; vo[0] = o; vsz[0] = sz; vst[0] = stride;
         VK_REC_DO(VK_REC_CMD, vkCmdBindVertexBuffers2(cb, s, 1, vb, vo, vsz, vst));
         if (replay) {
@@ -5391,6 +5535,7 @@ static void split_pass_check(vk_shader *const sh[6], int canvas_transfer) {
     g_split_submit = 1; g_split_cut = 1; g_split_count++;
 }
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
+    g_load_override = 0;
     int prim = dw ? dw->prim : di->prim;
     if (!S.prog) { g_stat_skips[0]++; return; }
     if (S.render_disabled || S.raster_discard) { g_stat_skips[1]++; pd_draw_note("      draw skipped: %s", S.render_disabled ? "conditional rendering off" : "rasterizer discard"); return; }
@@ -5412,16 +5557,29 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     }
     split_pass_check(sh, canvas_transfer);
     VK_REC_DO(VK_REC_S_TOUCH, draw_touch(sh, dw, di));
-    if (!begin_rendering(1)) { g_stat_skips[5]++; return; }
+    g_load_draw = dw; g_load_indexed = di; g_load_sh = sh; g_load_pipeline = VK_NULL_HANDLE;
+    int opened = begin_rendering(1);
+    g_load_sh = NULL; g_load_draw = NULL; g_load_indexed = NULL;
+    if (!opened) { g_stat_skips[5]++; return; }
+    p_draw certified;
+    if (g_load_override) {
+        certified = (p_draw){prim,0,(int32_t)count,dw ? dw->base_instance : di->base_instance,
+            dw ? dw->instances : di->instances};
+        dw = &certified; di = NULL; /* certificates exclude VertexIndex/InstanceIndex */
+    }
     if (S.has_sc) { int32_t x1 = MINV((int32_t)R.w, S.sc.x + S.sc.w), y1 = MINV((int32_t)R.h, S.sc.y + S.sc.h); if (x1 <= MAXV(0, S.sc.x) || y1 <= MAXV(0, S.sc.y)) { g_stat_skips[6]++; pd_draw_note("      draw skipped: empty scissor"); return; } }
     VkPipelineLayout layout; VkPipeline p;
     static struct { vk_shader *vs, *fs; VkPipelineLayout layout; } last_layout;
     VK_REC_DO(VK_REC_PIPE,
-        if (!last_layout.layout || last_layout.vs != sh[0] || last_layout.fs != sh[1]) {
-            last_layout.layout = vk_layout_of(sh[0], sh[1]); last_layout.vs = sh[0]; last_layout.fs = sh[1];
-        }
-        layout = last_layout.layout;
-        p = pipe_get(sh[0], sh[1], prim, layout));
+        if (g_load_pipeline) {
+            layout = g_load_layout; p = g_load_pipeline;
+        } else {
+            if (!last_layout.layout || last_layout.vs != sh[0] || last_layout.fs != sh[1]) {
+                last_layout.layout = vk_layout_of(sh[0], sh[1]); last_layout.vs = sh[0]; last_layout.fs = sh[1];
+            }
+            layout = last_layout.layout;
+            p = pipe_get(sh[0], sh[1], prim, layout);
+        });
     if (!p) { g_stat_skips[10]++; pd_draw_note("      draw skipped: pipeline compiling (vs %.16s fs %.16s)", sh[0]->key, sh[1] ? sh[1]->key : "-"); return; }
     if (p == PIPE_FAILED) { g_stat_skips[7]++; pd_draw_note("      draw skipped: no pipeline (vs %.16s fs %.16s)", sh[0]->key, sh[1] ? sh[1]->key : "-"); return; }
     if (vk_fg_extract_active && (FGX.guard.first || FGX.guard.changed ||
@@ -10053,6 +10211,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     totk_pgo_frame(n);
     if (n % 300 == 0) {
         vk_rec_lock(); vk_occlusion_stats(n); gpu_work_stats(n); native_gpu_stats(n);
+        LOGV("[load-elide] frame %llu: last 300 presents %llu proven, %llu elided passes",
+             (unsigned long long)n, (unsigned long long)g_load_proven, (unsigned long long)g_load_elided);
+        g_load_proven = g_load_elided = 0;
 #ifdef TOTK_ANDROID_APP
         if (g_guest_extent_diag && vk_overlay_mode()) {
             static vk_overlay_counters previous;

@@ -547,6 +547,10 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   but depth LOAD after a command-buffer epoch change gets an exact one-texel GPU transfer write-back before rendering.
   Depth-only/masked regions defer cuts; unsupported/MSAA depth refuses further cuts in that game submission.
   A/B with splitting fixed at `512`: count isolated luminance dips in 600 recorded frames, plus fps/GPU ms and touches.
+- **Attachment load elision** (`TOTK_VK_LOAD_ELIDE=1`, default **0**): at the next pass open, certify a straight-line
+  SPIR-V `vec4(position.xy,0,1)` and an unconditional fragment output, then prove full-area triangle/quad coverage
+  from ordered vertex bytes. Blending, masks, depth/stencil tests, feedback, unknown shaders or GPU-only vertices retain
+  `LOAD`. `[load-elide]` counts proven/elided passes per 300 presents; compare GPU ms on identical scenes and pixels.
 - **The uniform-update log** drops entries a newer update covers entirely (the game rewrites the same constant blocks
   many times a frame), and `ub_prune` returns at once unless a submission finished. `ub_overlaps` had been a quarter of
   the render thread.

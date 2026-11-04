@@ -309,6 +309,7 @@ $(OUT)/vktest: $(TOTK)/android/gfx/test_vk.c $(VKTEST_SRC)
 	@mkdir -p $(dir $@)
 	$(CC) $(VKTEST_FLAGS) -o $@ $(filter %.c,$^) $(VKTEST_LIBS)
 	@echo "built $@"
+$(OUT)/vkdrawtest $(OUT)/vktest $(OUT)/vkrecspantest $(OUT)/vkpipetest: $(TOTK)/android/gfx/vk_load_proof.h
 $(OUT)/vkdrawtest: $(TOTK)/android/gfx/test_vkdraw.c $(VKTEST_SRC) $(VKTEST_FRONTEND)
 	@mkdir -p $(dir $@)
 	$(CC) $(VKTEST_FLAGS) -Wl,--gc-sections -o $@ $(filter %.c %.o,$^) $(VKTEST_LIBS)

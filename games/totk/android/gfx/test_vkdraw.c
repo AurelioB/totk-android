@@ -2677,6 +2677,57 @@ int main(int argc, char **argv) {
     p_viewports vp; memset(&vp, 0, sizeof vp); vp.n = 1; vp.v[0][2] = 64; vp.v[0][3] = 64; vp.v[0][5] = 1; op(OP_VIEWPORTS, &vp, sizeof vp);
     p_draw dw = {4, 0, 3, 0, 0}; op(OP_DRAW, &dw, sizeof dw);
     p_copy_b2t cp; memset(&cp, 0, sizeof cp); cp.src = (uint64_t)(uintptr_t)readback; cp.tex = &rt; cp.r = (NVNcopyRegion){0, 0, 0, 64, 64, 1}; op(OP_COPY_T2B, &cp, sizeof cp);
+    if (argc == 3 && !strcmp(argv[1], "--load-elide")) {
+        CHECK(mtl_wait(run(), 5000000000ull), "coverage fixture setup completes");
+        shader_binary(0, 37, vctl, vcode, &vlen); memcpy(vc, vcode, vlen);
+        pg.serial = 99007;
+        const float full[] = {-1,-1,3,-1,-1,3}, quad[] = {-1,-1,1,-1,-1,1,-1,1,1,-1,1,1};
+        FILE *output = fopen(argv[2], "wb"); if (!output) { perror(argv[2]); return 1; }
+        const char *setting = getenv("TOTK_VK_LOAD_ELIDE"); int enabled = setting && atoi(setting) == 1;
+        extern void vk_draw_test_load_counts(uint64_t out[2]);
+        for (int fixture = 0; fixture < 9; fixture++) {
+            memcpy(vtx, fixture == 1 ? quad : full, fixture == 1 ? sizeof quad : sizeof full);
+            p_draw first = dw; if (fixture == 1) first.count = 6;
+            p_bind_vattr position = va; va_st element = {fixture == 7 ? 0x11 : 0x16,0,0};
+            memcpy(position.st,&element,sizeof element);
+            p_bind_vstream stride = vs; if (fixture == 7) stride.st[0].stride = 4;
+            if (fixture == 7) {
+                const uint16_t half[] = {0xbc00,0xbc00,0x4200,0xbc00,0xbc00,0x4200};
+                memcpy(vtx,half,sizeof half);
+            }
+            p_draw_idx indexed = {4,0,3,0,0,1,(uint64_t)(uintptr_t)(cpu_pool+0x202000)};
+            cpu_pool[0x202000]=0; cpu_pool[0x202001]=1; cpu_pool[0x202002]=2;
+            p_scissor scissor = {0,0,fixture == 2 ? 32 : 64,64};
+            color_st color = {fixture == 3 ? 1 : 0,NVN_LOGIC_OP_COPY,NVN_ALPHA_FUNC_ALWAYS};
+            p_bind_state cb = {.kind=1}; memcpy(cb.bytes,&color,sizeof color);
+            chmask_st channels = {.mask=fixture == 4 ? 7u : 15u};
+            p_bind_state cm = {.kind=2}; memcpy(cm.bytes,&channels,sizeof channels);
+            ds_st depth = {.dt=fixture == 5,.df=NVN_DEPTH_FUNC_ALWAYS};
+            p_bind_state db = {.kind=5}; memcpy(db.bytes,&depth,sizeof depth);
+            if (fixture == 6) { /* Geometry is not merely bounded by a full-screen rectangle. */
+                float partial[] = {-1,-1,1,-1,-1,1}; memcpy(vtx,partial,sizeof partial);
+            }
+            uint64_t before[2], after[2]; vk_draw_test_load_counts(before);
+            rn = 0; op(OP_SET_RT,&srt,sizeof srt); op(OP_SCISSOR,&scissor,sizeof scissor);
+            op(OP_CLEAR_COLOR,&cc,sizeof cc); op(OP_END,NULL,0);
+            CHECK(mtl_wait(run(),5000000000ull),"coverage fixture %d initializes prior pixels",fixture);
+            rn = 0; op(OP_BIND_PROGRAM,&bp,sizeof bp); op(OP_BIND_STATE,&cb,sizeof cb);
+            op(OP_BIND_STATE,&cm,sizeof cm); op(OP_BIND_STATE,&db,sizeof db);
+            op(OP_BIND_VATTR,&position,sizeof position); op(OP_BIND_VSTREAM,&stride,sizeof stride);
+            if (fixture == 8) op(OP_DRAW_IDX,&indexed,sizeof indexed); else op(OP_DRAW,&first,sizeof first);
+            op(OP_COPY_T2B,&cp,sizeof cp); op(OP_END,NULL,0);
+            CHECK(mtl_wait(run(),5000000000ull),"coverage fixture %d draws",fixture);
+            vk_draw_test_load_counts(after);
+            CHECK(after[1]-before[1] == (uint64_t)(enabled && (fixture < 2 || fixture >= 7)),
+                "coverage fixture %d elides only full triangle/quad (%llu proven, %llu elided)",fixture,
+                (unsigned long long)(after[0]-before[0]),(unsigned long long)(after[1]-before[1]));
+            CHECK(fwrite(readback,64*64*4,1,output)==1,"coverage fixture %d writes all pixels",fixture);
+            printf("load-elide fixture=%d proven=%llu elided=%llu\n",fixture,
+                (unsigned long long)(after[0]-before[0]),(unsigned long long)(after[1]-before[1]));
+        }
+        CHECK(!fclose(output),"coverage fixture output closes");
+        return fails != 0;
+    }
     if (overlay_scene_mode) {
         CHECK(mtl_wait(run(), 5000000000ull), "overlay scene fixture warms a real draw");
         const size_t bytes = 64u << 20;

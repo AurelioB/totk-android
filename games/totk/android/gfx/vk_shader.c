@@ -21,6 +21,7 @@
 #include "nvn_hmap.h"
 #include "vk_shader_xlate.h"
 #include "vk_seed_io.h"
+#include "vk_load_proof.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <sys/stat.h>
@@ -396,6 +397,8 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
         }
     }
     free(txt);
+    { vk_load_certificate proof = vk_load_certify((const uint32_t *)spv, spv_len / 4, sh->stage == 1);
+      sh->load_position_attr = proof.position_attr; sh->load_full_outputs = proof.full_outputs; }
     { static uint64_t nmark; int m = spirv_mark_stores(sh, (const uint32_t *)spv, spv_len / 4);
       if (m && ++nmark <= 8) LOGV("shader %s writes %d storage binding(s) (from its SPIR-V)", variant, m); }
     if (sh->stage == 1) {   /* kept for a live TOTK_VK_UNWRITTEN_MASK; the launch switch also extends fout_mask, as before */

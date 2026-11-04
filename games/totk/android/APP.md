@@ -1949,6 +1949,7 @@ stages each complete line appended after the start; the lines of one write are s
 | `TOTK_VK_DESC_STOCK_MAX_SETS` | 0…1048576 | each recorder context and primary slot at its next slot generation | 0 = no ceiling; lowered below an owner's stock, that owner resets its pools and destroys those past the limit at once |
 | `TOTK_VK_UNWRITTEN_MASK` | 0–1 | pipelines and output libraries built afterwards | pipelines already built keep their masks (the key does not carry the switch): compare it with a restart, or read the per-300 count of masked new pipelines |
 | `TOTK_VK_SPLIT_PASS_DRAWS` | 0…1000000 | the next render pass opened | |
+| `TOTK_VK_LOAD_ELIDE` | 0–1 | the next render pass opened | default off; only certified full-coverage first draws discard color loads; `[load-elide]` counts proofs and elided passes per 300 presents |
 | `TOTK_VK_STAGING_RETAIN_MB` | 8…4096 | each slot arena at its next open, after its fence | unset returns to the launch value (no cap when unset at launch) |
 | `TOTK_VK_FEEDBACK_CUT` | 0–1 | the next descriptor build | the freeze memo key carries the pass serial while it is on |
 | `TOTK_VK_PREPARE_MASK` | 0–1 | the next draw's uniform preparation | a change marks every register dirty, so that draw prepares in full; `TOTK_VK_OFF=prepare` keeps it off |
