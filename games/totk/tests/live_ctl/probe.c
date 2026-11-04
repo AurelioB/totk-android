@@ -1,8 +1,12 @@
-/* Host probe of the live-switch channel (runtime/live_ctl.h), the production header unchanged:
+/* Host probe of the live-switch channel (runtime/live_ctl.h, through thread_place.h), the production headers unchanged:
  *   parse                     one line per stdin line: "ok <kind> <key> <value> <text>", "skip" or "refused <why>"
  *   core <dir>                staging and application at the frame boundary, generation ordering, the accessor's
  *                             cache, concurrent readers against a writer and a frame thread, and the control thread
  *                             on a real file in <dir> (created late, appended, partial lines, replaced, truncated)
+ *   switches <dir>            every live switch toggled many times by batches applied on a frame thread, while
+ *                             registered render threads (TOTK_PRIO_RENDER by tid, through the nice hook; a walker
+ *                             pinned by TOTK_PRIO_WALK), game threads applying TOTK_TIMER_SLACK_NS before their timed
+ *                             waits, and readers of every other switch run
  * Every check prints FAIL: on failure; the last line is "ok: ..." or "FAIL: ...". Build it plain and with
  * -fsanitize=thread: the concurrent sections are the race check. */
 #include <fcntl.h>
@@ -10,10 +14,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#include "live_ctl.h"
+#include "thread_place.h"   /* includes live_ctl.h */
 
 static int failures;
 #define CHECK(c, ...) do { if (!(c)) { failures++; fprintf(stdout, "FAIL: "); fprintf(stdout, __VA_ARGS__); fputc('\n', stdout); } } while (0)
@@ -182,14 +187,115 @@ static void core(const char *dir) {
     printf("ok: an existing file's earlier lines are skipped\n");
 }
 
+/* ---------- every live switch toggled ---------- */
+enum { RENDER = 4, SLACKERS = 4, TOGGLES = 300 };
+static _Atomic int render_tid[RENDER + 1], render_nice[RENDER + 1], render_started, stop_all;
+static _Atomic uint32_t applied_gen;
+static int hook_nice(int tid, int nice) {   /* totk_live_set_nice: records instead of needing CAP_SYS_NICE */
+    for (int i = 0; i <= RENDER; i++) if (atomic_load(&render_tid[i]) == tid) { atomic_store(&render_nice[i], nice); return 0; }
+    return ESRCH;
+}
+static void *render_thread(void *arg) {
+    int i = (int)(intptr_t)arg; atomic_store(&render_tid[i], (int)syscall(SYS_gettid));
+    if (i == RENDER) totk_thread_walk();   /* the walker: TOTK_PRIO_WALK pins it */
+    else totk_thread_start(i & 1 ? "totk-submit" : "totk-recw0", NULL);
+    atomic_fetch_add(&render_started, 1);
+    while (!atomic_load(&stop_all)) usleep(500);
+    return NULL;
+}
+static void *slack_thread(void *arg) {
+    int *bad = arg; char name[16]; snprintf(name, sizeof name, "g-%d", (int)(intptr_t)bad % 97);
+    totk_thread_start(name, NULL);
+    long base = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);   /* no launch value: the thread's default */
+    while (!atomic_load(&stop_all)) {
+        /* A value is stored just before its slack generation is published: a mismatch counts only if it outlives a
+           few further ticks with the generation unchanged. */
+        int mismatch = 0;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            uint32_t before = atomic_load(&totk_live_slack_gen);
+            totk_live_slack_tick();   /* as before a timed wait */
+            long slack = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+            int want = totk_live_int("TOTK_TIMER_SLACK_NS", 0);
+            mismatch = atomic_load(&totk_live_slack_gen) == before && slack != (want ? want : base);
+            if (!mismatch) break;
+            usleep(1000);
+        }
+        *bad += mismatch;
+        struct timespec ts = {0, 20000}; nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+static void *switch_reader(void *arg) {
+    int *bad = arg; totk_live_cache cache[TOTK_LIVE_MAX] = {0};
+    unsigned n = sizeof totk_live_switches / sizeof *totk_live_switches;
+    while (!atomic_load(&stop_all))
+        for (unsigned k = 0; k < n; k++) {
+            int v = totk_live_cached(&cache[k], totk_live_switches[k].key, -999);
+            if (v != -999 && (v < totk_live_switches[k].lo || v > totk_live_switches[k].hi)) (*bad)++;
+        }
+    return NULL;
+}
+static void *frame_thread(void *arg) {
+    (void)arg; uint64_t frame = 0;
+    while (!atomic_load(&stop_all)) {
+        uint32_t g = totk_live_generation(); totk_live_frame(++frame);
+        if (totk_live_generation() != g) atomic_store(&applied_gen, totk_live_generation());   /* after its side effects */
+        usleep(100);
+    }
+    return NULL;
+}
+static void switches(void) {
+    totk_live_set_nice = hook_nice;
+    setenv("TOTK_PRIO_WALK", "5", 1); unsetenv("TOTK_PRIO_RENDER"); unsetenv("TOTK_TIMER_SLACK_NS");
+    for (int i = 0; i <= RENDER; i++) atomic_store(&render_nice[i], -100);
+    errno = 0; int inherited = getpriority(PRIO_PROCESS, 0);   /* render threads inherit it; unset returns them to it */
+    pthread_t render[RENDER + 1], slackers[SLACKERS], readers[2], frames;
+    int slack_bad[SLACKERS] = {0}, read_bad[2] = {0};
+    for (int i = 0; i <= RENDER; i++) pthread_create(&render[i], NULL, render_thread, (void *)(intptr_t)i);
+    while (atomic_load(&render_started) < RENDER + 1) usleep(1000);   /* registered, the walker pinned */
+    for (int i = 0; i < SLACKERS; i++) pthread_create(&slackers[i], NULL, slack_thread, &slack_bad[i]);
+    for (int i = 0; i < 2; i++) pthread_create(&readers[i], NULL, switch_reader, &read_bad[i]);
+    pthread_create(&frames, NULL, frame_thread, NULL);
+    uint32_t s = 0x9e3779b9u; unsigned n = sizeof totk_live_switches / sizeof *totk_live_switches, prio_bad = 0, pinned_bad = 0;
+    for (int t = 0; t < TOGGLES; t++) {
+        char batch[2048]; int k = 0;
+        for (unsigned i = 0; i < n; i++) {
+            const totk_live_switch *w = &totk_live_switches[i];
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            if (s % 3 == 0) k += snprintf(batch + k, sizeof batch - k, "unset %s\n", w->key);
+            else k += snprintf(batch + k, sizeof batch - k, "set %s=%d\n", w->key, w->lo + (int)(s % (uint32_t)(w->hi - w->lo + 1)));
+        }
+        snprintf(batch + k, sizeof batch - k, "mark toggle %d\n", t);
+        uint32_t target = totk_live_generation() + 1;
+        feed(batch);
+        double start = now_ms();
+        while (atomic_load(&applied_gen) < target && now_ms() - start < 5000) usleep(100);
+        CHECK(atomic_load(&applied_gen) >= target, "toggle %d applied", t);
+        int want = totk_live_int("TOTK_PRIO_RENDER", 1000);
+        for (int i = 0; i < RENDER; i++) prio_bad += atomic_load(&render_nice[i]) != (want == 1000 ? inherited : want);
+        pinned_bad += atomic_load(&render_nice[RENDER]) != -100;
+    }
+    atomic_store(&stop_all, 1);
+    for (int i = 0; i <= RENDER; i++) pthread_join(render[i], NULL);
+    for (int i = 0; i < SLACKERS; i++) { pthread_join(slackers[i], NULL); CHECK(!slack_bad[i], "game thread %d: slack differed from the live value %d times", i, slack_bad[i]); }
+    for (int i = 0; i < 2; i++) { pthread_join(readers[i], NULL); CHECK(!read_bad[i], "reader %d: %d values out of range", i, read_bad[i]); }
+    pthread_join(frames, NULL);
+    CHECK(!prio_bad, "render threads: nice differed from TOTK_PRIO_RENDER (or their inherited nice when unset) %u times", prio_bad);
+    CHECK(!pinned_bad, "the walker pinned by TOTK_PRIO_WALK was changed %u times", pinned_bad);
+    printf("ok: %d batches toggled all %u live switches; %d render threads by tid, the pinned walker, %d game threads' slack, 2 readers\n",
+           TOGGLES, n, RENDER, SLACKERS);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "parse")) return parse_mode();
-    if (argc != 3 || strcmp(argv[1], "core")) { fprintf(stderr, "usage: probe parse | probe core <dir>\n"); return 2; }
+    if (argc != 3 || (strcmp(argv[1], "core") && strcmp(argv[1], "switches"))) {
+        fprintf(stderr, "usage: probe parse | probe core <dir> | probe switches <dir>\n"); return 2;
+    }
     static char stderr_path[1100]; snprintf(stderr_path, sizeof stderr_path, "%s/stderr.txt", argv[2]);
     if (!freopen(stderr_path, "w", stderr)) return 3;
     setvbuf(stderr, NULL, _IONBF, 0); setvbuf(stdout, NULL, _IOLBF, 0);
     log_path = stderr_path;
-    core(argv[2]);
+    if (!strcmp(argv[1], "core")) core(argv[2]); else switches();
     printf("%s: live switch channel\n", failures ? "FAIL" : "ok");
     return failures != 0;
 }

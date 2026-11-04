@@ -2,6 +2,7 @@
 #pragma once
 #include <stdint.h>
 #include "android_perf.h"
+#include "live_ctl.h"   /* live TOTK_PRIO_RENDER / TOTK_TIMER_SLACK_NS (stubs off Linux) */
 #if defined(__linux__)
 #include <ctype.h>
 #include <errno.h>
@@ -274,8 +275,9 @@ static inline void totk_thread_start(const char *name, const char *affinity_key)
         !strcmp(name, "totk-present"))
         totk_perf_thread(name);
     int frame = totk_thread_frame_critical(name);
-    if (frame || !strncmp(name, "g-", 2)) totk_thread_timer_slack();
-    if (frame) totk_thread_nice("TOTK_PRIO_RENDER");
+    if (frame || !strncmp(name, "g-", 2)) { totk_thread_timer_slack(); totk_live_slack_tick(); }   /* a live value wins */
+    /* Render threads register with their inherited nice, so a live TOTK_PRIO_RENDER can reach them by tid. */
+    if (frame && !totk_live_register_render()) totk_thread_nice("TOTK_PRIO_RENDER");
     totk_thread_affinity(affinity_key); errno = saved;
 }
 /* Linux UAPI sched_attr v1. KEEP_POLICY/PARAMS preserve the caller's scheduler and nice value. */
@@ -303,6 +305,7 @@ static inline void totk_thread_walk(void) {
     static _Thread_local int identified; if (identified) return; identified = 1;
     int saved = errno; totk_thread_start("totk-walk", "TOTK_AFFINITY_WALK");
     totk_thread_nice("TOTK_PRIO_WALK");   /* after TOTK_PRIO_RENDER: the walker's own setting wins */
+    if (getenv("TOTK_PRIO_WALK")) totk_live_pin_render();   /* also over a live TOTK_PRIO_RENDER */
     const char *value = getenv("TOTK_UCLAMP_WALK");
     if (value) {
         int minimum, error;

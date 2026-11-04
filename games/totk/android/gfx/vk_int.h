@@ -559,6 +559,7 @@ typedef struct vk_shader {
     uint32_t vin_mask;      /* vertex inputs read (location = NVN attribute) */
     uint8_t vin_class[32];  /* 0 float 1 uint 2 sint */
     uint32_t fout_mask;     /* fragment colour output locations declared (with TOTK_VK_UNWRITTEN_MASK, arrays span theirs) */
+    uint32_t fout_span;     /* the SPIR-V Output locations, arrays spanning theirs: a live TOTK_VK_UNWRITTEN_MASK never masks them */
     int writes_depth;
     int early_tests;        /* original NVN control byte 0x718; honored by default (EARLYZ=0 is a diagnostic override) */
     int depth_spec;         /* fragment depth exports patched: + specialization constant D16_SPEC_ID (the DEPTH16 nudge, vk_draw.c) */

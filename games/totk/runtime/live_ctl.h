@@ -258,21 +258,20 @@ static inline int totk_live_prio_target(const totk_live_thread *t) {
     int v = totk_live_int("TOTK_PRIO_RENDER", totk_live_prio_launch());
     return v == 1000 ? t->inherited : v;
 }
-/* Registers the calling render thread; returns 1 when a live TOTK_PRIO_RENDER was applied to it (the caller then
-   skips its launch-time setting). */
+/* Registers the calling render thread (once: a repeat keeps the first inherited nice); returns 1 when a live
+   TOTK_PRIO_RENDER was applied to it (the caller then skips its launch-time setting). */
 static inline int totk_live_register_render(void) {
     int tid = (int)syscall(SYS_gettid), saved = errno; errno = 0;
     int inherited = getpriority(PRIO_PROCESS, (id_t)tid); if (inherited == -1 && errno) inherited = 0;
     errno = saved;
-    totk_live_threads_t *r = &totk_live_threads; int live = 0;
+    totk_live_threads_t *r = &totk_live_threads; int live = 0; totk_live_thread *t = NULL;
     pthread_mutex_lock(&r->mu);
-    if (r->n < TOTK_LIVE_THREADS) {
-        totk_live_thread *t = &r->t[r->n++]; *t = (totk_live_thread){tid, inherited, 0};
-        if (totk_live_generation() && atomic_load_explicit(&totk_live_state[totk_live_index("TOTK_PRIO_RENDER")], memory_order_acquire)) {
-            int error = totk_live_nice_set(tid, totk_live_prio_target(t));
-            fprintf(stderr, "[totk-ctl] tid=%d TOTK_PRIO_RENDER=%d (live) errno=%d\n", tid, totk_live_prio_target(t), error);
-            live = 1;
-        }
+    for (unsigned i = 0; i < r->n && !t; i++) if (r->t[i].tid == tid) t = &r->t[i];
+    if (!t && r->n < TOTK_LIVE_THREADS) { t = &r->t[r->n++]; *t = (totk_live_thread){tid, inherited, 0}; }
+    if (t && totk_live_generation() && atomic_load_explicit(&totk_live_state[totk_live_index("TOTK_PRIO_RENDER")], memory_order_acquire)) {
+        int nice = totk_live_prio_target(t), error = totk_live_nice_set(tid, nice);
+        fprintf(stderr, "[totk-ctl] tid=%d TOTK_PRIO_RENDER=%d (live) errno=%d\n", tid, nice, error);
+        live = 1;
     }
     pthread_mutex_unlock(&r->mu);
     return live;

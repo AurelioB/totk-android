@@ -551,10 +551,29 @@ static int img_upgrade(vk_tex *x, VkFormat want) { return VK_REC_VALUE(VK_REC_S_
 /* Upload cost per present window, any switch value: count, bytes and wall time of upload_inner on its caller. */
 static _Atomic uint64_t g_win_uploads, g_win_upload_bytes, g_win_upload_ns;
 /* TOTK_VK_UPLOAD_THREADS=<1..3> (default unset/0 = serial): block-linear uploads of at least UPLOAD_POOL_MIN_BYTES
-   deswizzle on that many helper threads plus the caller (vk_upload_pool.c); the copy is recorded after all runs. */
+   deswizzle on that many helper threads plus the caller (vk_upload_pool.c); the copy is recorded after all runs.
+   Live (runtime/live_ctl.h): each upload takes the current value before it starts; helpers are still started by the
+   first parallel upload, and at 0 (or below their index) they sleep without work. */
+static int g_upload_launch;
+static totk_live_cache g_upload_live;
+static _Atomic int g_upload_configured;
+static pthread_mutex_t g_upload_config_mu = PTHREAD_MUTEX_INITIALIZER;
+static void upload_threads_refresh(void) {
+    if (atomic_load_explicit(&g_upload_configured, memory_order_relaxed) ==
+        totk_live_cached(&g_upload_live, "TOTK_VK_UPLOAD_THREADS", g_upload_launch)) return;
+    pthread_mutex_lock(&g_upload_config_mu);   /* re-read under the lock: the latest value is configured last */
+    int n = totk_live_cached(&g_upload_live, "TOTK_VK_UPLOAD_THREADS", g_upload_launch);
+    if (atomic_load_explicit(&g_upload_configured, memory_order_relaxed) != n) {
+        upload_pool_configure(n); atomic_store_explicit(&g_upload_configured, n, memory_order_relaxed);
+        LOGV("TOTK_VK_UPLOAD_THREADS=%d (live): from the next upload, %s", n,
+             n ? "large block-linear uploads deswizzle on helpers too" : "every deswizzle on the calling thread");
+    }
+    pthread_mutex_unlock(&g_upload_config_mu);
+}
 void vk_upload_threads_init(void) {
     const char *e = getenv("TOTK_VK_UPLOAD_THREADS"); int n = e && *e ? atoi(e) : 0;
     n = n < 0 ? 0 : n > UPLOAD_POOL_MAX_HELPERS ? UPLOAD_POOL_MAX_HELPERS : n;
+    g_upload_launch = n; atomic_store_explicit(&g_upload_configured, n, memory_order_relaxed);
     upload_pool_configure(n);
     if (n) LOGV("TOTK_VK_UPLOAD_THREADS=%d: block-linear uploads of %u KiB or more deswizzle on %d helper thread(s) plus the caller",
                 n, UPLOAD_POOL_MIN_BYTES >> 10, n);
@@ -603,6 +622,7 @@ static void upload_inner(vk_tex *x) {
     VkBuffer sb; VkDeviceSize so; uint8_t *stg = vk_transient(total ? total : 16, 16, &sb, &so);
     VkBufferImageCopy *regions = calloc((size_t)im->levels * im->layers, sizeof *regions); int nr = 0;
     /* With helpers, block-linear subresources are only collected here and decoded together below. */
+    if (!linear) upload_threads_refresh();
     int pooled = !linear && upload_pool_helpers();
     upload_sub *subs = pooled ? malloc((size_t)im->levels * im->layers * sizeof *subs) : NULL; unsigned ns = 0;
     if (!subs) pooled = 0;

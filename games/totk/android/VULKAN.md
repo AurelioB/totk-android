@@ -532,6 +532,7 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   store, native/canvas UI, framegen extraction or pass diagnostics; nothing splits with chunking off (`CHUNK_DRAWS=0`).
   **Cost:** each split stores and reloads every attachment on a tiler (GMEM), so it stays off. Try `512`, then `256`;
   `[split-pass]` logs splits, extra passes and refusals per 300 presents. Compare p95/GPU-busy overlap, not just fps.
+  Live (`totk.ctl`, APP.md *Live switches*): each pass (part) takes the value when it opens.
 - **The uniform-update log** drops entries a newer update covers entirely (the game rewrites the same constant blocks
   many times a frame), and `ub_prune` returns at once unless a submission finished. `ub_overlaps` had been a quarter of
   the render thread.
@@ -905,14 +906,17 @@ Offscreen color captures still build/wait immediately, even if their key was fir
 such a join (or a dispatch joins the compute worker), the worker building that entry runs at the waiter's nice
 until it publishes, then returns to +10. Every 300 presents `pipeline joins: N waits on worker builds ... in X ms;
 boosts B, refused R` reports both arms; compare the join ms and the frames over 50 ms. `refused` counts kernel
-refusals (no `RLIMIT_NICE` headroom), logged once as `pipe boost: ... refused`.
+refusals (no `RLIMIT_NICE` headroom), logged once as `pipe boost: ... refused`. Live (`totk.ctl`): the next join reads
+the new value; a loan already made is still restored by the worker.
 
 `TOTK_VK_UNWRITTEN_MASK=1` (default unset = off) builds `colorWriteMask` 0 for every colour attachment whose location
 the fragment shader does not output (`fout` in the seed, array outputs spanning their locations). NVN/Maxwell leaves
 such a bound target untouched; Vulkan leaves it undefined and Adreno writes black, and the write also costs bandwidth.
 The mask follows the key's fragment shader, so pipeline keys and PSO lists are shared by both arms. Every 300 presents
 `unwritten colour attachments: P new pipelines masked A attachments` (switch on); compare GPU ms and look for black or
-stale targets.
+stale targets. Live (`totk.ctl`): only pipelines and output libraries built after the change follow it; pipelines
+already built keep their masks, because the key does not carry the switch (PSO lists stay shared). Every fragment
+shader keeps its SPIR-V output span (`fout_span`) so an array output is never masked when the switch turns on live.
 
 Build errors are no longer permanent silent skips. Each failed key logs its identity, shader variants and Vulkan
 result once, then retries synchronously after a failure is observed: one subsequent game submission for the first
@@ -1393,7 +1397,9 @@ slot's descriptor sets per exact layout (batches 1, 1, 2, 4 … 32) and reissues
 slot's own retirement, where every pool used to be reset; pools reset only after 32 generations under quarter use.
 Measure with `descriptors frame`: warm `allocate-calls`/`pool-resets` drop to about 0. Host `--lag-walk-bench 32`, frames
 16–31, allocate calls/resets per frame: threaded stable 263.88/2 → 0.06/0, churn 906.56/2 → 0.25/0; synchronous 70/1
-and 140/1 → 0/0.
+and 140/1 → 0/0. Live (`totk.ctl`): each recorder context and primary slot switches at its next slot generation,
+where it used to reset its pools; switched off, it frees its stock and destroys its pools, returning the retained sets'
+memory (the off policy grows pools again as needed). `descriptor stock: on/off (live; ...)` logs the change once.
 
 `recorder overhead ...` additionally separates synchronous secondary recording, batched ExecuteCommands, walking
 and worker pool-reset time, and job setup. Reset is a subset of inline/worker busy time, not another additive cost.
@@ -2572,6 +2578,8 @@ blotches. `TOTK_VK_FEEDBACK_CUT=1` gives such views only the levels below the at
 LOD numbering); a view based at the attached level is left whole. Startup logs `TOTK_VK_FEEDBACK_CUT=…`;
 `[feedback-cut]` logs cut and left-whole views per 300 presents. Compare screenshots (`TOTK_VK_SHOT`) of scenes with
 blotches. `vkdrawtest` renders a mip step with the switch off and on and checks identical texels and the counters.
+Live (`totk.ctl`): each descriptor build takes the current value; the freeze memo's key carries the pass serial only
+while the cut is on, so sets built under the other value are never reused.
 
 ## Upstream Android integration (2026-10-22, device measurement pending)
 
@@ -2811,7 +2819,9 @@ policy as ours and measured the same dead ends (DONT_CARE loads, forced GMEM, LR
    least 512 KiB into runs of whole block rows (≥64 KiB) that 1–3 helper threads and the caller decode
    (`vk_upload_pool.c`); the copy is recorded after every run, byte-identical to the serial path (`uploadpooltest`,
    TSan). Helpers inherit the first uploading thread's nice and affinity. Every 300 presents `texture uploads: N (M MiB)
-   in X ms, Y ms/frame; parallel deswizzles J` reports both arms; compare Y and the over-50 ms frame counts.
+   in X ms, Y ms/frame; parallel deswizzles J` reports both arms; compare Y and the over-50 ms frame counts. Live
+   (`totk.ctl`): each upload takes the current count before it starts (`uploadpooltest` decodes byte-identically while
+   another thread reconfigures the helpers); at 0 the started helpers sleep without work.
    **Pipelines and draws.** Hash the NVN state into `VkPipeline`s, with dynamic state where the driver has it.
    Pipelines are created at their first draw; the `VkPipelineCache` is kept between runs in `TOTK_VK_PIPELINE_CACHE`
    (default `state/vk-pipeline-cache.bin`, `0` turns it off), checked against the driver's cache UUID when read and

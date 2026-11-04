@@ -1,13 +1,18 @@
 /* Parallel upload deswizzle (vk_upload_pool.c) against the serial decoder: every staging byte, including row padding
-   and guard bytes, must equal nvn_deswizzle's for 0, 1 and 3 helpers, forced splits and the default threshold.
-   No Vulkan or game files. Run under CC='clang -fsanitize=thread' for the pool's race check.
+   and guard bytes, must equal nvn_deswizzle's for 0, 1 and 3 helpers, forced splits and the default threshold, and
+   while another thread reconfigures the helpers as a live TOTK_VK_UPLOAD_THREADS does. No Vulkan or game files.
+   Run under CC='clang -fsanitize=thread' for the pool's race check.
    --bench: serial vs 1/3 helper wall time for large uploads (host numbers, not a device measurement). */
 #include "vk_upload_pool.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static unsigned checks, failures, cases;
 static uint32_t seed = 0x5a17c0de;
@@ -122,6 +127,33 @@ static int bench(void) {
     }
     return 0;
 }
+/* A live TOTK_VK_UPLOAD_THREADS (vk_res.c upload_threads_refresh) reconfigures the pool between uploads, from any
+   uploading thread. Here another thread toggles 0..3 helpers while uploads run: every decode stays byte-identical. */
+static _Atomic int live_stop;
+static void *live_toggler(void *arg) {
+    (void)arg; uint32_t s = 0x1234567u; unsigned long n = 0;
+    while (!atomic_load(&live_stop)) { s ^= s << 13; s ^= s >> 17; s ^= s << 5; upload_pool_configure((int)(s % 4)); n++; usleep(200); }
+    return (void *)(uintptr_t)n;
+}
+static void live_case(void) {
+    static upload large; upload_init(&large, (nvn_texdesc){.target=1, .format=0x25, .width=1024, .height=1024, .depth=1, .levels=2}, 0);
+    uint8_t *expected = serial(&large, 0x5a);
+    upload_sub subs[256]; upload_pool_stats s; upload_pool_stats_take(&s);
+    pthread_t t; pthread_create(&t, NULL, live_toggler, NULL);
+    for (unsigned i = 0; i < 200; i++) {
+        uint8_t *out = staging(&large, subs, 0x5a);
+        CHECK(!upload_pool_deswizzle(&large.d, large.storage, subs, large.nsubs, UPLOAD_POOL_MIN_BYTES), "live decode %u", i);
+        CHECK(!memcmp(out, expected, large.total + 64), "live toggles: decode %u differs", i);
+        free(out);
+    }
+    atomic_store(&live_stop, 1); void *toggles; pthread_join(t, &toggles);
+    upload_pool_stats_take(&s);
+    CHECK(s.jobs > 0, "some uploads ran on helpers while toggled (%llu jobs)", (unsigned long long)s.jobs);
+    printf("live: 200 uploads byte-identical while the helpers were reconfigured %lu times (%llu parallel)\n",
+           (unsigned long)(uintptr_t)toggles, (unsigned long long)s.jobs);
+    upload_pool_configure(0);
+    free(expected); free(large.storage);
+}
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--bench")) return bench();
     /* One format per (bytes per block, compressed) class: 1/2/4/8/12/16-byte and block-compressed formats. */
@@ -146,6 +178,7 @@ int main(int argc, char **argv) {
     for (unsigned td = 0; td <= 4; td += 2)
         texture_case((nvn_texdesc){.target=2, .format=0x25, .width=200, .height=130, .depth=37, .levels=3, .pkg_block_h=(int)((td << 4) | 2) + 1});
     threshold_case();
+    live_case();
     printf("%s: upload pool %d formats, %u textures, %u checks, %u failed\n", failures ? "FAILED" : "ok", nformats, cases, checks, failures);
     return !!failures;
 }

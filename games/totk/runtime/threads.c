@@ -407,6 +407,7 @@ static void profile_holder(svc_profile_t *p, uint32_t handle, int prio, int core
 }
 static void core_wait(thr_t *t, const struct timespec *relative) {
     int fps_wait = fps_block_begin();
+    if (relative) totk_live_slack_tick();   /* a live TOTK_TIMER_SLACK_NS reaches each thread before its next timed wait */
     svc_profile_t *p = t->profile;
     if (!p) {
         sync_park_count(1);
@@ -1059,6 +1060,7 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     struct timespec dl;
     int det_wait = ns > 0 && dm_detclock_enabled();
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
+    if (ns > 0) totk_live_slack_tick();
     if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
     while (!t->woke) {
@@ -1408,7 +1410,7 @@ int svc_thread(int num, uint64_t *regs) {
         thr_t *self = cur();
         uint64_t profile_start = self->profile ? now_ns() : 0;
         if (self->profile) { pthread_mutex_lock(&G); self->profile_yield = ns <= 0; self->profile_sleep_active = 1; self->profile_sleep_core_ns = 0; pthread_mutex_unlock(&G); }
-        if (ns > 0) { pthread_mutex_lock(&G); core_put(self); pthread_mutex_unlock(&G); }
+        if (ns > 0) { pthread_mutex_lock(&G); core_put(self); pthread_mutex_unlock(&G); totk_live_slack_tick(); }
         if (ns > 0 && dm_detclock_enabled()) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
             while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
@@ -1424,7 +1426,7 @@ int svc_thread(int num, uint64_t *regs) {
             pthread_mutex_unlock(&G);
             uint64_t backoff = !give && me ? yield_backoff_ns(y0 - me->yrun_ns) : 0;
             if (backoff) {   // a long poll: sleep with the core given up, as SleepThread(ns) does
-                pthread_mutex_lock(&G); core_put(me); pthread_mutex_unlock(&G);
+                pthread_mutex_lock(&G); core_put(me); pthread_mutex_unlock(&G); totk_live_slack_tick();
                 struct timespec ts = {0, (long)backoff}; nanosleep(&ts, 0);
                 pthread_mutex_lock(&G); core_take(me); pthread_mutex_unlock(&G);
             } else if (!give) sched_yield();

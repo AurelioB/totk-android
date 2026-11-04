@@ -1,7 +1,8 @@
 """Live switches (games/totk/runtime/live_ctl.h): the control-file parser line by line, and the host probe
-(games/totk/tests/live_ctl/probe.c) that drives the production header: staging and application at the frame boundary,
-generation order, the accessor's cache, a writer / frame thread / readers race, and the control thread on a real file.
-The probe also runs under ThreadSanitizer when the compiler has it.
+(games/totk/tests/live_ctl/probe.c) that drives the production headers: staging and application at the frame boundary,
+generation order, the accessor's cache, a writer / frame thread / readers race, the control thread on a real file, and
+every live switch toggled 300 times while render threads (TOTK_PRIO_RENDER by tid), game threads (TOTK_TIMER_SLACK_NS
+before their timed waits) and readers run. Both also run under ThreadSanitizer when the compiler has it.
 
 CC accepts a shell-quoted compiler command; TMPDIR selects scratch output.
 """
@@ -66,24 +67,33 @@ class LiveCtl(unittest.TestCase):
         self.assertIn('set it in totk.env and restart', got[12])
         self.assertIn('line longer than 239 bytes', got[13])
 
-    def run_core(self, binary, env=None):
+    def run_mode(self, binary, mode, env=None):
         work = Path(tempfile.mkdtemp(dir=self.dir))
-        r = subprocess.run([str(binary), 'core', str(work)], capture_output=True, text=True, timeout=120, env=env)
+        r = subprocess.run([str(binary), mode, str(work)], capture_output=True, text=True, timeout=300, env=env)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr + (work / 'stderr.txt').read_text(errors='replace')[-4000:])
         self.assertIn('ok: live switch channel', r.stdout)
         return r.stdout
 
+    def tsan_probe(self):
+        binary = self.dir / 'live-ctl-tsan'
+        if not binary.exists() and subprocess.run([*compiler(), *FLAGS, '-fsanitize=thread', str(TOTK / 'tests/live_ctl/probe.c'),
+                                                   '-o', str(binary)], capture_output=True).returncode:
+            self.skipTest('the compiler has no -fsanitize=thread')
+        return binary
+
     def test_core(self):
-        out = self.run_core(self.probe)
+        out = self.run_mode(self.probe, 'core')
         self.assertIn('ok: 400 batches applied', out)
         self.assertIn('ok: control thread', out)
 
     def test_core_thread_sanitizer(self):
-        binary = self.dir / 'live-ctl-tsan'
-        if subprocess.run([*compiler(), *FLAGS, '-fsanitize=thread', str(TOTK / 'tests/live_ctl/probe.c'), '-o', str(binary)],
-                          capture_output=True).returncode:
-            self.skipTest('the compiler has no -fsanitize=thread')
-        self.run_core(binary, env=os.environ | {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66'})
+        self.run_mode(self.tsan_probe(), 'core', env=os.environ | {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66'})
+
+    def test_switches(self):
+        self.assertIn('ok: 300 batches toggled all 8 live switches', self.run_mode(self.probe, 'switches'))
+
+    def test_switches_thread_sanitizer(self):
+        self.run_mode(self.tsan_probe(), 'switches', env=os.environ | {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66'})
 
 
 if __name__ == '__main__':

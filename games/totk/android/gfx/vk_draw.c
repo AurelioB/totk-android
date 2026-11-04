@@ -118,6 +118,7 @@ static struct {
     VkSampleCountFlagBits samples;
     uint32_t merge_pending, merge_armed, merge_storage, merge_continued;
     int store_discard, split_refused;           /* a storeOp DONT_CARE was chosen at begin; the split was refused once */
+    uint32_t split_draws;                       /* TOTK_VK_SPLIT_PASS_DRAWS taken when this pass (part) opened */
 } R;
 static VkPipeline g_bound_pipe; static int g_dyn_dirty = 1;
 static vk_record_draw *g_record_draw;  /* walking-only packet under construction, NULL on original path */
@@ -1137,10 +1138,23 @@ static uint32_t split_pass_draws(void) {
     }
     return g_split_draws;
 }
+/* Live (runtime/live_ctl.h): taken when a pass (or a split part) opens, so one part never changes its split point. */
+static totk_live_cache g_split_live;
+static uint32_t split_pass_live(void) { return (uint32_t)totk_live_cached(&g_split_live, "TOTK_VK_SPLIT_PASS_DRAWS", (int)split_pass_draws()); }
 #ifdef TOTK_VK_TESTS
 void vk_draw_test_split_counts(uint64_t out[3]) { out[0] = g_split_count; out[1] = g_split_reopen; out[2] = g_split_refused; }
 #endif
-static int g_feedback_cut;   /* TOTK_VK_FEEDBACK_CUT (see feedback_cut), read once in vk_draw_switches_init */
+/* TOTK_VK_FEEDBACK_CUT (see feedback_cut): the launch value, read once in vk_draw_switches_init, and the value in use.
+   Live (runtime/live_ctl.h): taken at each descriptor build (record_stage_impl); the freeze memo's key carries the open
+   pass's serial only while it is on, so a change never reuses sets built under the other value. */
+static int g_feedback_cut_launch;
+static _Atomic int g_feedback_cut;
+static totk_live_cache g_feedback_cut_live;
+static inline int feedback_cut_refresh(void) {   /* at the start of each descriptor build */
+    int on = totk_live_cached(&g_feedback_cut_live, "TOTK_VK_FEEDBACK_CUT", g_feedback_cut_launch);
+    if (atomic_load_explicit(&g_feedback_cut, memory_order_relaxed) != on) atomic_store_explicit(&g_feedback_cut, on, memory_order_relaxed);
+    return on;
+}
 static uint64_t g_feedback_cuts, g_feedback_uncut;   /* sampled views cut below an attached level; left whole (base attached) */
 #ifdef TOTK_VK_TESTS
 void vk_draw_test_feedback_counts(uint64_t out[2]) { out[0] = g_feedback_cuts; out[1] = g_feedback_uncut; }
@@ -1250,7 +1264,7 @@ static int begin_rendering_inner(int draw_tail) {
     for (uint32_t i = 0; i < nc; i++) if (ca[i].imageView && (discard >> i & 1)) { ca[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; g_store_clear_c++; discarded = 1; }
     if (da.imageView && (discard >> 8 & 1)) { da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; g_store_clear_ds++; discarded = 1; }
     if (sa.imageView && (discard >> 9 & 1)) { sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; g_store_clear_ds++; discarded = 1; }
-    g_store_clear_pass += discarded; R.store_discard = discarded; R.split_refused = 0;
+    g_store_clear_pass += discarded; R.store_discard = discarded; R.split_refused = 0; R.split_draws = split_pass_live();
     VkCommandBuffer cb = vk_cb();
     vk_barrier_all(cb);
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {R.host_w, R.host_h}}, .layerCount = 1, .colorAttachmentCount = nc, .pColorAttachments = ca,
@@ -3257,8 +3271,11 @@ static _Atomic uint64_t g_win_async, g_win_async_ns;   /* compiled on worker thr
 /* Priority lending (TOTK_VK_PIPE_BOOST=1, default off). Workers run at VK_WORKER_NICE so background builds yield to the
    game. Once a recording thread joins a worker's in-flight build, that build is on the frame's critical path: the
    waiter lends the worker its own nice until the build is published, then the worker returns to VK_WORKER_NICE.
-   Joins and their wall time are counted with the switch off too, so both arms report the same line. */
-static int g_pipe_boost;
+   Joins and their wall time are counted with the switch off too, so both arms report the same line.
+   Live (runtime/live_ctl.h): each join reads the current value; a loan already made is still restored. */
+static int g_pipe_boost;   /* the launch value */
+static totk_live_cache g_pipe_boost_live;
+static int pipe_boost_on(void) { return totk_live_cached(&g_pipe_boost_live, "TOTK_VK_PIPE_BOOST", g_pipe_boost); }
 static _Atomic uint64_t g_boost_joins, g_boost_join_ns, g_boost_raised, g_boost_refused;
 static _Atomic int g_boost_refusal_logged;
 #ifdef TOTK_VK_TESTS
@@ -3289,7 +3306,7 @@ static int boost_set(int tid, int nice) {   /* 0 or the errno; tid 0 is the call
 }
 int vk_thread_tid(void) { return (int)syscall(SYS_gettid); }
 int vk_pipe_boost_lend(vk_lend *l) {
-    if (!g_pipe_boost || !l->tid) return 0;
+    if (!l->tid || !pipe_boost_on()) return 0;
     int nice = boost_self_nice();
     if (nice >= (l->lent ? l->nice : VK_WORKER_NICE)) return 0;
     int error = boost_set(l->tid, nice);
@@ -3311,10 +3328,15 @@ void vk_pipe_boost_waited(uint64_t ns) {
 /* TOTK_VK_UNWRITTEN_MASK=1 (default off): colour attachments the fragment shader has no output for keep their contents.
    NVN/Maxwell leaves such a bound target untouched; Vulkan leaves it undefined and Adreno writes black. The write mask
    derives from the key's fragment shader alone, so equal keys still build equal pipelines and the PSO key lists stay
-   valid in both arms; only the output-interface library key carries the effective mask. */
-static int g_unwritten_mask;
+   valid in both arms; only the output-interface library key carries the effective mask.
+   Live (runtime/live_ctl.h): pipelines and output libraries built after a change use the new value; those already
+   built keep their masks (the key does not carry the switch), so a live arm covers the pipelines it builds. The
+   SPIR-V output span (vk_shader.fout_span) is kept for every fragment shader, so array outputs are never masked. */
+static int g_unwritten_mask;   /* the launch value */
+static totk_live_cache g_unwritten_live;
 static _Atomic uint64_t g_unwritten_pipes, g_unwritten_attachments;
 int vk_unwritten_mask_on(void) { return g_unwritten_mask; }
+static int unwritten_mask_live(void) { return totk_live_cached(&g_unwritten_live, "TOTK_VK_UNWRITTEN_MASK", g_unwritten_mask); }
 void vk_draw_switches_init(void) {
     const char *e = getenv("TOTK_VK_PIPE_BOOST"); g_pipe_boost = e && atoi(e) == 1;
     LOGV("TOTK_VK_PIPE_BOOST=%d: %s", g_pipe_boost, g_pipe_boost ?
@@ -3325,14 +3347,16 @@ void vk_draw_switches_init(void) {
          "colour attachments the fragment shader does not output get colorWriteMask 0" :
          "colour write masks follow the game's channel mask only (default)");
     (void)split_pass_draws();
-    e = getenv("TOTK_VK_FEEDBACK_CUT"); g_feedback_cut = e && atoi(e) == 1;
-    LOGV("TOTK_VK_FEEDBACK_CUT=%d: %s", g_feedback_cut, g_feedback_cut ?
+    e = getenv("TOTK_VK_FEEDBACK_CUT"); g_feedback_cut_launch = e && atoi(e) == 1;
+    atomic_store_explicit(&g_feedback_cut, g_feedback_cut_launch, memory_order_relaxed);
+    LOGV("TOTK_VK_FEEDBACK_CUT=%d: %s", g_feedback_cut_launch, g_feedback_cut_launch ?
          "sampled views of an image the pass renders to stop below the attached level" :
          "sampled views may include the attached level (default)");
 }
 static uint32_t pipe_write_mask(const pipe_key *k) {   /* the key's channel mask minus attachments without an output */
-    if (!g_unwritten_mask) return k->chmask;
-    uint32_t outputs = k->fs ? ((const vk_shader *)k->fs)->fout_mask : 0, mask = k->chmask;
+    if (!unwritten_mask_live()) return k->chmask;
+    const vk_shader *fs = k->fs;
+    uint32_t outputs = fs ? fs->fout_mask | fs->fout_span : 0, mask = k->chmask;
     for (unsigned i = 0; i < 8; i++) if (!(outputs >> i & 1)) mask &= ~(0xfu << (4 * i));
     return mask;
 }
@@ -4302,7 +4326,8 @@ static VkImageView native_texture_by_id(int tid, int *want, vk_tex **object) {
             if (native) return native;
         }
     }
-    if (__builtin_expect(g_feedback_cut, 0) && R.open && view && object && *object && *want != -2) view = feedback_cut(*object, view);
+    if (__builtin_expect(atomic_load_explicit(&g_feedback_cut, memory_order_relaxed), 0) && R.open && view && object && *object && *want != -2)
+        view = feedback_cut(*object, view);
     return view;
 }
 /* Enumerate descriptor MAY-reads before freeze-memo reuse. The actual view cache supplies exact ranges,
@@ -4384,7 +4409,7 @@ static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh
        the core again; a dirty-unit birth is only lifetime identity, never a content revision. */
     if (vk_lag_capture_on()) { key.cpu_dirty = nvn_dirty_now(); key.dirty_epoch = nvn_dirty_lag_epoch(); }
     key.spans = g_record_draw->spans; key.shader = sh; key.width = R.w; key.height = R.h; key.stage = (uint32_t)stage;
-    key.native_sample = g_native_sample; if (g_feedback_cut) key.feedback_pass = g_stat_passes;
+    key.native_sample = g_native_sample; if (feedback_cut_refresh()) key.feedback_pass = g_stat_passes;
     if (g_native_sample) key.native_image = vk_tex_native_image(g_native_sample);
     __typeof__(g_freeze_memo[0]) *last = &g_freeze_memo[((uintptr_t)sh >> 4) % 128];
     unsigned causes = 0;
@@ -4504,6 +4529,7 @@ static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh
 /* Fill and bind one stage's descriptor set; stage: NVN stage. Returns 0 when a binding cannot be satisfied. */
 static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set_index, vk_shader *sh, int stage, const uint32_t grid[3], int stats) {
     if (!sh->nb) return 1;
+    (void)feedback_cut_refresh();   /* a live TOTK_VK_FEEDBACK_CUT takes effect at this descriptor build */
     if (__builtin_expect(PL.enabled, 0)) pso_life_reads(sh, (unsigned)stage);
     if (g_record_draw) return R.open ? record_stage_impl(sh, stage, set_index, stats) : 0;
     size_t total = 0; for (int i = 0; i < sh->nb; i++) total += sh->b[i].count;
@@ -5235,7 +5261,7 @@ static void shader_xlate_first_command(vk_shader *sh, const char *kind) {
    (begin_rendering). Only at a draw on the same, still-open targets; never with a DONT_CARE store, UI/canvas passes,
    framegen extraction or pass diagnostics. Deferred merge barriers are emitted at this end like at a hazard split. */
 static void split_pass_check(vk_shader *const sh[6], int canvas_transfer) {
-    uint32_t n = split_pass_draws();
+    uint32_t n = R.split_draws;   /* taken at this pass (part)'s open */
     if (!n || !R.open || R.split_refused || g_stat_draws - R.draws0 < n) return;
     if (vk_frame_chunk_limit() <= 0 || !vk_submit_chunk_possible()) return;   /* nothing would be submitted */
     if (R.store_discard || R.native || R.canvas || canvas_transfer || sh[0]->canvas_ui || vk_fg_extract_active ||
@@ -8496,6 +8522,7 @@ static void *presenter(void *arg) {
 #endif
     for (;;) {
 #ifdef __ANDROID__
+        totk_live_slack_tick();   /* a live TOTK_TIMER_SLACK_NS: the presenter applies it itself, before its deadline waits */
         if (!g_pres_retire.running) {
             /* OFF keeps its original finish-before-pickup policy. Attribute
              * genuine full-context waiting to the still-queued immutable job. */
@@ -9922,15 +9949,15 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
                  (c[2] - previous[2]) / 300.0, (c[3] - previous[3]) / 300.0);
             memcpy(previous, c, sizeof previous);
         }
-        if (split_pass_draws()) {
+        if (split_pass_draws() || split_pass_live()) {
             static uint64_t previous[3]; uint64_t c[3] = {g_split_count, g_split_reopen, g_split_refused};
             LOGV("[split-pass] frame %llu: last 300 presents %llu splits, %llu extra passes (reopened parts), %llu refused passes; per frame %.2f/%.2f/%.2f (TOTK_VK_SPLIT_PASS_DRAWS=%u)",
                  (unsigned long long)n, (unsigned long long)(c[0] - previous[0]), (unsigned long long)(c[1] - previous[1]),
                  (unsigned long long)(c[2] - previous[2]), (c[0] - previous[0]) / 300.0, (c[1] - previous[1]) / 300.0,
-                 (c[2] - previous[2]) / 300.0, split_pass_draws());
+                 (c[2] - previous[2]) / 300.0, split_pass_live());
             memcpy(previous, c, sizeof previous);
         }
-        if (g_feedback_cut) {
+        if (atomic_load_explicit(&g_feedback_cut, memory_order_relaxed) || g_feedback_cut_launch) {
             static uint64_t previous[2]; uint64_t c[2] = {g_feedback_cuts, g_feedback_uncut};
             LOGV("[feedback-cut] frame %llu: last 300 presents %llu sampled views cut below an attached level, %llu left whole (based at it)",
                  (unsigned long long)n, (unsigned long long)(c[0] - previous[0]), (unsigned long long)(c[1] - previous[1]));
@@ -9948,10 +9975,11 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
              (unsigned long long)g_win_sync, g_win_sync_ns / 1e6, (unsigned long long)g_win_prewarm_wait, g_win_prewarm_wait_ns / 1e6);
         LOGV("frame %llu, pipeline joins: %llu waits on worker builds (graphics and compute) in %.1f ms; boosts %llu, refused %llu (TOTK_VK_PIPE_BOOST=%d)",
              (unsigned long long)n, (unsigned long long)atomic_exchange(&g_boost_joins, 0), atomic_exchange(&g_boost_join_ns, 0) / 1e6,
-             (unsigned long long)atomic_exchange(&g_boost_raised, 0), (unsigned long long)atomic_exchange(&g_boost_refused, 0), g_pipe_boost);
-        if (g_unwritten_mask)
-            LOGV("frame %llu, unwritten colour attachments: %llu new pipelines masked %llu attachments their fragment shader does not output (TOTK_VK_UNWRITTEN_MASK=1)",
-                 (unsigned long long)n, (unsigned long long)atomic_exchange(&g_unwritten_pipes, 0), (unsigned long long)atomic_exchange(&g_unwritten_attachments, 0));
+             (unsigned long long)atomic_exchange(&g_boost_raised, 0), (unsigned long long)atomic_exchange(&g_boost_refused, 0), pipe_boost_on());
+        if (g_unwritten_mask || unwritten_mask_live())
+            LOGV("frame %llu, unwritten colour attachments: %llu new pipelines masked %llu attachments their fragment shader does not output (TOTK_VK_UNWRITTEN_MASK=%d)",
+                 (unsigned long long)n, (unsigned long long)atomic_exchange(&g_unwritten_pipes, 0), (unsigned long long)atomic_exchange(&g_unwritten_attachments, 0),
+                 unwritten_mask_live());
         if (V.has_pipeline_library) {
             static uint64_t previous[7], previous_parts[PL_COUNT], previous_ns[PL_COUNT];
             uint64_t current[7] = {atomic_load(&g_library_stats.fast_links), atomic_load(&g_library_stats.fast_link_ns),

@@ -74,6 +74,7 @@ typedef struct rec_context {
     VkDescriptorPool *dp; uint32_t ndp, capdp, curdp, sets;
     uint64_t descriptor_sets, descriptor_calls, descriptor_resets;
     vk_desc_stock *stock; /* TOTK_VK_DESC_STOCK=1 only */
+    int stock_on;         /* this owner's stock policy, switched only at its generation handoff (descriptors_recycle) */
     struct {
         uint64_t hash[2]; VkDescriptorSetLayout layout; uint32_t count; VkDescriptorSet set;
         uint64_t guard_ticket; const vk_record_spans *guard_spans;
@@ -530,6 +531,24 @@ struct vk_desc_stock {
     uint64_t sets, used; uint32_t pressure;
 };
 int vk_desc_stock_enabled(void) { (void)vk_record_enabled(); return descriptor_stock; }
+/* Live (runtime/live_ctl.h): every owner reads this at its slot generation handoff, where its pools used to be reset,
+   and switches there (vk_desc_stock_want). Turned off, the owner frees its stock and destroys its pools, so the
+   retained sets and their pool memory go back to the driver; the off policy then grows pools again as needed. */
+static totk_live_cache stock_live;
+static _Atomic int stock_reported = -1;
+int vk_desc_stock_want(void) {
+    int on = totk_live_cached(&stock_live, "TOTK_VK_DESC_STOCK", vk_desc_stock_enabled()) != 0;
+    if (atomic_load_explicit(&stock_reported, memory_order_relaxed) != on &&
+        atomic_exchange_explicit(&stock_reported, on, memory_order_relaxed) != on && totk_live_generation())
+        LOGV("descriptor stock: %s (live; each recorder context and primary slot switches at its next slot generation%s)",
+             on ? "on" : "off", on ? "" : " and returns its sets and pools");
+    return on;
+}
+void vk_desc_stock_free(vk_desc_stock **stock) {
+    vk_desc_stock *st = *stock; if (!st) return;
+    while (st->list) { desc_layout_stock *s = st->list; st->list = s->next; free(s->set); free(s); }
+    free(st->layouts.keys); free(st->layouts.vals); free(st); *stock = NULL;
+}
 /* MIT mechanism reference: Nycolazs/LASRecomp-Android-Plus @cca791a,
    runtime/nvn/vulkan/record.c:308-436. Recycle storage, NOT descriptor contents: every checkout is rewritten.
    Each context belongs to one recording owner and one submission slot; generation changes follow that slot's
@@ -569,20 +588,29 @@ int vk_desc_stock_retire(vk_desc_stock *st) {
     return rebuild;
 }
 static VkDescriptorSet alloc_set(rec_context *c, VkDescriptorSetLayout layout) {
-    if (descriptor_stock) return vk_desc_stock_take(&c->stock, layout, alloc_sets, c);
+    if (c->stock_on) return vk_desc_stock_take(&c->stock, layout, alloc_sets, c);
     VkDescriptorSet set; (void)alloc_sets(c, layout, 1, &set); return set;
 }
 static void descriptors_recycle(rec_context *c) {
-    if (descriptor_stock && !vk_desc_stock_retire(c->stock)) return;
+    int want = vk_desc_stock_want();
+    if (c->stock_on && !want) {   /* switched off live: give the stock's sets and pools back */
+        vk_desc_stock_free(&c->stock);
+        for (uint32_t i = 0; i < c->ndp; i++) vkDestroyDescriptorPool(V.dev, c->dp[i], NULL);
+        atomic_fetch_sub_explicit(&memory_dpools, c->ndp, memory_order_relaxed);
+        c->ndp = c->curdp = c->sets = 0; c->stock_on = 0;
+        return;
+    }
+    if (c->stock_on && !vk_desc_stock_retire(c->stock)) return;
     /* A stock rebuild resets only pools allocated since the previous one; the default keeps the old policy. */
-    uint32_t dirty = descriptor_stock ? (c->ndp ? c->curdp + 1 : 0) : c->ndp;
+    uint32_t dirty = c->stock_on ? (c->ndp ? c->curdp + 1 : 0) : c->ndp;
     for (uint32_t i = 0; i < dirty; i++) { VKCHECK(vkResetDescriptorPool(V.dev, c->dp[i], 0)); c->descriptor_resets++; }
     c->curdp = c->sets = 0;
+    c->stock_on = want;   /* switched on live: the stock starts empty on reset pools */
 }
 #ifdef TOTK_VK_TESTS
 int vk_record_test_descriptor_stock(void) {
     (void)vk_record_enabled();
-    rec_context *c = VK_CALLOC(1, sizeof *c);
+    rec_context *c = VK_CALLOC(1, sizeof *c); c->stock_on = vk_desc_stock_want();
     VkDescriptorSetLayout layout[2]; VkDescriptorSet first[2][100]; int ok = 1;
     for (unsigned l = 0; l < 2; l++) {
         VkDescriptorSetLayoutBinding binding = {.binding = 0, .descriptorCount = 1,
@@ -626,10 +654,7 @@ int vk_record_test_descriptor_stock(void) {
     }
     for (uint32_t i = 0; i < c->ndp; i++) vkDestroyDescriptorPool(V.dev, c->dp[i], NULL);
     atomic_fetch_sub_explicit(&memory_dpools, c->ndp, memory_order_relaxed);
-    if (c->stock) {
-        while (c->stock->list) { desc_layout_stock *s = c->stock->list; c->stock->list = s->next; free(s->set); free(s); }
-        free(c->stock->layouts.keys); free(c->stock->layouts.vals); free(c->stock);
-    }
+    vk_desc_stock_free(&c->stock);
     free(c->dp); free(c);
     for (unsigned l = 0; l < 2; l++) vkDestroyDescriptorSetLayout(V.dev, layout[l], NULL);
     return ok;
@@ -811,7 +836,7 @@ static void record_job(rec_job *j, unsigned worker) {
         return;
     }
     rec_context *c = contexts[worker][j->slot];
-    if (!c) { c = VK_CALLOC(1, sizeof *c); contexts[worker][j->slot] = c; }
+    if (!c) { c = VK_CALLOC(1, sizeof *c); c->stock_on = vk_desc_stock_want(); contexts[worker][j->slot] = c; }
     j->reset_time = 0;
     if (c->generation != j->generation) {
         uint64_t t0 = host_now_ns();
@@ -935,6 +960,7 @@ static void *record_worker(void *arg) {
         rec_job *batch = queue_head;
         if (batch) { queue_head = batch->queue_next; if (!queue_head) queue_tail = NULL; }
         pthread_mutex_unlock(&rec_mu);
+        totk_live_slack_tick();   /* a live TOTK_TIMER_SLACK_NS: this thread applies it itself */
         uint64_t recycled = commands_recycle(worker);
 #ifdef TOTK_VK_TESTS
         test_worker_gate(batch);

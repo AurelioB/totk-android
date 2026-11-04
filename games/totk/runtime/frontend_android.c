@@ -1041,6 +1041,7 @@ static void display_frame(int64_t frame_ns, void *arg) {
 }
 static void display_vsync(const AChoreographerFrameCallbackData *data, void *arg) {
     AChoreographer *choreographer = arg;
+    totk_live_slack_tick();   /* a live TOTK_TIMER_SLACK_NS: this thread applies it itself */
     display_frame_observe(present_timeline_api.frame_time(data), data);
     present_timeline_api.post_vsync(choreographer, display_vsync, choreographer);
 }

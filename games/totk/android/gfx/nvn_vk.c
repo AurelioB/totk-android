@@ -1440,6 +1440,7 @@ typedef struct {
     arena_t ar;   /* transient memory */
     VkDescriptorPool *dpools; int ndpool, capdpool, curdpool, curdsets;   /* walk every reset pool before allocating another */
     vk_desc_stock *dstock;   /* TOTK_VK_DESC_STOCK=1: per-layout sets kept across this slot's generations */
+    int dstock_on;           /* this slot's stock policy, switched only in slot_descriptors_recycle */
     VkQueryPool ts; int ts_on;   /* GPU timestamps at the start and end of the main command buffer */
     occl_page *oq, *oq_cur;   /* reset/reused only after this slot's fence and occl_complete */
     vk_gpuprof_slot *gpuprof;   /* query pool and records, reused only after the slot fence */
@@ -1968,6 +1969,7 @@ static void *gpu_guard_thread(void *unused) {
         while (g_gpu_head == g_qtail) pthread_cond_wait(&g_cv_work, &g_mu);
         slot_t *s = g_queue_[g_gpu_head % RING];
         pthread_mutex_unlock(&g_mu);
+        totk_live_slack_tick();   /* a live TOTK_TIMER_SLACK_NS: this thread applies it itself */
         gpu_wait_slot(s);
         if (s->ft_frame && totk_ft_on()) s->ft_gpu_done = totk_ft_now();
         nvn_dirty_lag_complete(s->value);
@@ -1991,6 +1993,7 @@ static void *completion_thread(void *arg) {
         slot_t *s = g_queue_[g_qhead % RING];
         while (g_ub_publication == s->value) pthread_cond_wait(&g_cv, &g_mu);
         pthread_mutex_unlock(&g_mu);
+        totk_live_slack_tick();
         if (g_lag_wait != 1) {
             gpu_wait_slot(s);
             if (s->ft_frame && totk_ft_on()) s->ft_gpu_done = totk_ft_now();
@@ -2230,14 +2233,23 @@ static void slot_begin_inner(void) {
 }
 /* Primary-slot descriptors (immediate graphics, compute, post, presentation, frame generation) are rewound here,
    at the same point the pools used to be reset: busy and submit_busy have retired, replay pins have released the
-   slot, or a cancelled optional pre-submit never reached the GPU. Every caller writes the set it gets. */
+   slot, or a cancelled optional pre-submit never reached the GPU. Every caller writes the set it gets.
+   A live TOTK_VK_DESC_STOCK (vk_desc_stock_want) switches the slot here too; switched off, the slot frees its stock and
+   destroys its pools (nothing of the retired generation is in use), and grows pools again as the off policy needs. */
 static void slot_descriptors_recycle(slot_t *s) {
-    int stock = vk_desc_stock_enabled();
-    if (stock && !vk_desc_stock_retire(s->dstock)) return;
-    int dirty = stock ? (s->ndpool ? s->curdpool + 1 : 0) : s->ndpool;   /* a stock rebuild: pools used since the last */
+    int want = vk_desc_stock_want();
+    if (s->dstock_on && !want) {
+        vk_desc_stock_free(&s->dstock);
+        for (int i = 0; i < s->ndpool; i++) vkDestroyDescriptorPool(V.dev, s->dpools[i], NULL);
+        s->ndpool = s->curdpool = s->curdsets = 0; s->dstock_on = 0;
+        return;
+    }
+    if (s->dstock_on && !vk_desc_stock_retire(s->dstock)) return;
+    int dirty = s->dstock_on ? (s->ndpool ? s->curdpool + 1 : 0) : s->ndpool;   /* a stock rebuild: pools used since the last */
     for (int i = 0; i < dirty; i++) VKCHECK(vkResetDescriptorPool(V.dev, s->dpools[i], 0));
     vk_record_descriptor_primary(0, 0, (uint64_t)dirty);
     s->curdpool = 0; s->curdsets = 0;
+    s->dstock_on = want;   /* switched on: the stock starts empty on reset pools */
 }
 static void slot_open(slot_t *s) {
     VK_REC_DO(VK_REC_O_RESET,
@@ -2408,7 +2420,7 @@ static uint32_t slot_alloc_sets(void *owner, VkDescriptorSetLayout layout, uint3
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
     if (!g_cur) slot_begin();
     slot_t *s = g_cur;
-    if (vk_desc_stock_enabled()) return vk_desc_stock_take(&s->dstock, layout, slot_alloc_sets, s);
+    if (s->dstock_on) return vk_desc_stock_take(&s->dstock, layout, slot_alloc_sets, s);
     VkDescriptorSet set; (void)slot_alloc_sets(s, layout, 1, &set); return set;
 }
 /* Submit what is recorded (pre, then main); with posts, the current submission's post ops ride along. */
@@ -2501,6 +2513,7 @@ static void *submit_worker(void *unused) {
         while (g_sealed_head == g_sealed_tail) pthread_cond_wait(&g_sealed_cv, &g_mu);
         slot_t *s = g_sealed[g_sealed_head % RING];
         pthread_mutex_unlock(&g_mu);
+        totk_live_slack_tick();
         unsigned slot = (unsigned)(s - g_ring); uint64_t value = s->value; int join_on_walk = s->join_on_walk;
         vk_record_assemble(slot, 1);
         int failed = s->native_lag ? lag_guard_submit_native(slot, value, 1) : 0;

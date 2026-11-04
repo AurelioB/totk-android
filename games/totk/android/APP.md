@@ -1933,6 +1933,21 @@ stages each complete line appended after the start; the lines of one write are s
   `tests/test_live_ctl.py` covers the parser, the frame-boundary application, generation order, the cache, the control
   thread on a real file and a writer / frame thread / readers race under ThreadSanitizer.
 
+| Live switch | Range | Takes effect | Notes |
+| --- | --- | --- | --- |
+| `TOTK_VK_PIPE_BOOST` | 0–1 | the next join on a worker build | a loan already made is still restored |
+| `TOTK_VK_UPLOAD_THREADS` | 0–3 | the next texture upload | helpers start with the first parallel upload; at 0 they sleep without work |
+| `TOTK_PRIO_RENDER` | −20…19 | at the application, by tid on every registered render thread | unset returns each to the nice it inherited; the walker keeps `TOTK_PRIO_WALK` when that is set; render threads started later take the live value |
+| `TOTK_TIMER_SLACK_NS` | 1…50000 | each game / frame thread before its next timed wait (the presenting thread at once) | unset returns to the launch value, else the thread's default (50 µs) |
+| `TOTK_VK_DESC_STOCK` | 0–1 | each recorder context and primary slot at its next slot generation | switched off, an owner frees its stock and destroys its descriptor pools, so the retained memory goes back |
+| `TOTK_VK_UNWRITTEN_MASK` | 0–1 | pipelines and output libraries built afterwards | pipelines already built keep their masks (the key does not carry the switch): compare it with a restart, or read the per-300 count of masked new pipelines |
+| `TOTK_VK_SPLIT_PASS_DRAWS` | 0…1000000 | the next render pass opened | |
+| `TOTK_VK_FEEDBACK_CUT` | 0–1 | the next descriptor build | the freeze memo key carries the pass serial while it is on |
+
+`TOTK_IDEAL_CORE_FIX` is startup-only and refused. Another launch-time switch becomes live by adding it, with its
+range, to `totk_live_switches` in `runtime/live_ctl.h`, reading it through `totk_live_cached` at a point where a change
+is safe, and adding its row here. Each switch's per-300 report shows the value in use.
+
 ### Game data location, game lock and save signals (release app)
 
 - **Location.** Three kinds (`StoragePaths.Kind`, pure Java, host-tested in `tests/test_android_direct_access.py`):
@@ -4730,9 +4745,9 @@ Set launch overrides in `totk.env` and restart:
 | `TOTK_AFFINITY_RECW` | Affinity of every recorder chunk worker at startup; the same mask applies to each. |
 | `TOTK_AFFINITY_GAME` | Android main/created guest affinity: unset or `auto` selects the capacity policy below; `all` makes no affinity request; a CPU list/mask overrides auto. WALK still overrides it on an actual submission thread. |
 | `TOTK_PRIO_WALK` | Linux per-tid nice value, decimal **−20…19**, on first submission. Unset leaves the inherited/current nice untouched. |
-| `TOTK_PRIO_RENDER` | Linux per-tid nice value, decimal **−20…19**, at the start of each frame-critical host thread: the walker (`totk-walk`, applied before `TOTK_PRIO_WALK`, which wins), `totk-recw*`, `totk-submit`, `totk-gpufence`, `totk-post`, `totk-present`, `totk-vsync`. Never compile/seed/cache/translator workers (they keep +10) or guests (−8). Unset leaves the inherited nice untouched. |
+| `TOTK_PRIO_RENDER` | Linux per-tid nice value, decimal **−20…19**, at the start of each frame-critical host thread: the walker (`totk-walk`, applied before `TOTK_PRIO_WALK`, which wins), `totk-recw*`, `totk-submit`, `totk-gpufence`, `totk-post`, `totk-present`, `totk-vsync`. Never compile/seed/cache/translator workers (they keep +10) or guests (−8). Unset leaves the inherited nice untouched. Live through `totk.ctl` (*Live switches*): set by tid on every registered render thread at once, `[totk-ctl] gen=N TOTK_PRIO_RENDER=…: n render threads set …`. |
 | `TOTK_UCLAMP_WALK` | Linux utilization-clamp minimum, decimal **0…1024**, on first submission. Zero clears that minimum; this is not a frequency in MHz or a percentage. |
-| `TOTK_TIMER_SLACK_NS` | Linux per-thread timer slack, decimal **1…50000** ns, at the start of every guest thread (`g-*`) and frame-critical host thread (`totk-walk`, `totk-recw*`, `totk-submit`, `totk-gpufence`, `totk-post`, `totk-present`, `totk-vsync`). Unset keeps the kernel's inherited 50 µs; `0`/out-of-range log `EINVAL`. Logs the first application once (`TOTK_TIMER_SLACK_NS=1 result=1`). |
+| `TOTK_TIMER_SLACK_NS` | Linux per-thread timer slack, decimal **1…50000** ns, at the start of every guest thread (`g-*`) and frame-critical host thread (`totk-walk`, `totk-recw*`, `totk-submit`, `totk-gpufence`, `totk-post`, `totk-present`, `totk-vsync`). Unset keeps the kernel's inherited 50 µs; `0`/out-of-range log `EINVAL`. Logs the first application once (`TOTK_TIMER_SLACK_NS=1 result=1`). Live through `totk.ctl`: each of those threads applies it itself before its next timed wait (guest sleeps / timed waits / yield back-off, the frame threads' loops), the presenting thread at the application. |
 
 CPU values are lists/ranges such as `7`, `3-6` or `3-6,7`, or explicitly `0x`-prefixed hexadecimal masks:
 `0x80` means CPU 7 and `0x78` means CPUs 3–6. A bare `7` is **CPU 7**, not mask 7; `0` is CPU 0, not disabled.

@@ -130,9 +130,11 @@ void vk_record_descriptor_primary(uint64_t sets, uint64_t calls, uint64_t resets
 enum { VK_DESC_STOCK_BATCH = 32 };
 typedef struct vk_desc_stock vk_desc_stock;
 typedef uint32_t (*vk_desc_stock_alloc)(void *owner, VkDescriptorSetLayout layout, uint32_t count, VkDescriptorSet *out); /* 1..count */
-int vk_desc_stock_enabled(void);
+int vk_desc_stock_enabled(void);   /* the launch value */
+int vk_desc_stock_want(void);      /* the live value an owner takes at its generation handoff (runtime/live_ctl.h) */
 VkDescriptorSet vk_desc_stock_take(vk_desc_stock **stock, VkDescriptorSetLayout layout, vk_desc_stock_alloc alloc, void *owner);
 int vk_desc_stock_retire(vk_desc_stock *stock);
+void vk_desc_stock_free(vk_desc_stock **stock);   /* the owner switched the stock off: its bookkeeping, not its pools */
 int vk_record_counter_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2 stage);
 #ifdef TOTK_VK_TESTS
 void vk_record_test_descriptors(uint64_t out[8]); /* sets, allocate calls, resets, walk ns, list ns/count, template ns/count */

@@ -398,7 +398,10 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
     free(txt);
     { static uint64_t nmark; int m = spirv_mark_stores(sh, (const uint32_t *)spv, spv_len / 4);
       if (m && ++nmark <= 8) LOGV("shader %s writes %d storage binding(s) (from its SPIR-V)", variant, m); }
-    if (sh->stage == 1 && vk_unwritten_mask_on()) sh->fout_mask |= spirv_fout_locations((const uint32_t *)spv, spv_len / 4);
+    if (sh->stage == 1) {   /* kept for a live TOTK_VK_UNWRITTEN_MASK; the launch switch also extends fout_mask, as before */
+        sh->fout_span = spirv_fout_locations((const uint32_t *)spv, spv_len / 4);
+        if (vk_unwritten_mask_on()) sh->fout_mask |= sh->fout_span;
+    }
     for (int i = 0; i < sh->nb; i++) if (sh->b[i].rw &&
         (sh->b[i].dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || sh->b[i].dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
          sh->b[i].dtype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)) { sh->has_storage_writes = 1; break; }
