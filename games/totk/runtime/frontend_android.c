@@ -2174,24 +2174,35 @@ static void on_focus(ANativeActivity *a, int focused) {
         vk_window_resized(g_window, g_window_epoch);
     } else { runtime_gamepad_clear(); runtime_feedback_quiet(); }   /* releases may not arrive while another window has focus; no rumble meanwhile */
 }
-static void android_game_lifecycle_pause(int paused) {
+/* UI-thread facets: focus cannot undo an actual lifecycle pause. A single
+ * display's live recents tile may stay RESUMED; dual-screen focus stays free. */
+static int game_activity_paused, game_focus_paused;
+static void android_game_pause_update(void) {
+    int paused = game_activity_paused || game_focus_paused;
+    if (paused == runtime_android_game_paused()) return;
     android_game_pause_set(&game_pause, paused);
     runtime_audio_output_pause(paused);
     runtime_input_clear();
-    fprintf(stderr, "[totk-app] activity %s: game and audio %s\n",
-            paused ? "paused/stopped" : "resumed", paused ? "paused (pending saves may finish)" : "resumed");
+    present_timeline_lifecycle(-1, paused);
+    vk_pcache_background(paused);
+    fprintf(stderr, "[totk-app] game and audio %s: lifecycle=%d single-display-focus=%d\n",
+            paused ? "paused (pending saves may finish)" : "resumed", game_activity_paused, game_focus_paused);
 }
-static void on_pause(ANativeActivity *a) {
-    (void)a; android_game_lifecycle_pause(1); present_timeline_lifecycle(-1, 1); vk_pcache_background(1);
+void runtime_android_game_focus(JNIEnv *env, jclass cls, jboolean focused, jboolean single_display) {
+    (void)env; (void)cls;
+    game_focus_paused = !focused && single_display;
+    android_game_pause_update();
 }
-static void on_stop(ANativeActivity *a) {
-    (void)a; android_game_lifecycle_pause(1); present_timeline_lifecycle(-1, 1); vk_pcache_background(1);
+static void android_game_lifecycle_pause(int paused) {
+    game_activity_paused = paused;
+    android_game_pause_update();
 }
+static void on_pause(ANativeActivity *a) { (void)a; android_game_lifecycle_pause(1); }
+static void on_stop(ANativeActivity *a) { (void)a; android_game_lifecycle_pause(1); }
 static void on_resume(ANativeActivity *a) {
     (void)a;
     android_game_lifecycle_pause(0);
-    present_timeline_lifecycle(-1, 0);
-    vk_pcache_background(0);
+    /* The focus facet may still hold the gate until the window regains focus. */
     vk_window_resized(g_window, g_window_epoch);
     present_transform_update(a,g_window_epoch);
 }

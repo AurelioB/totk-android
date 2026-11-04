@@ -1880,9 +1880,11 @@ needs `su`). The folder holds what the adb-shell folder holds:
   running.
 - **Background pause (default).** `TotkActivity`'s actual `onPause`/`onStop` pauses gameplay at the next
   `nvnWindowAcquireTexture`, after releasing the guest virtual core and before taking graphics locks. `onResume`
-  wakes it. Focus changes alone do not suspend the game: using the same activity's companion Presentation or another
-  display while Android keeps the game resumed continues playing. NativeActivity callbacks only publish the pause
-  state; they never wait for a frame or an audio stream. Input is cleared on each transition and ignored while paused,
+  wakes it. On a single display, losing window focus also pauses (including live recent-apps tiles which Android can
+  leave `RESUMED`), and regaining focus wakes it without requiring another `onResume`. On multi-display devices,
+  focus changes alone never suspend the game: using the companion Presentation or another display while Android
+  keeps the game resumed continues playing. Callbacks only publish state; they never wait for a frame or an audio
+  stream. Input is cleared on each transition and ignored while paused,
   including synthetic button presses and new companion requests. Rumble and motion retain GameFeedback's lifecycle.
   A pending save is allowed the guest frames it needs through `Commit`, not merely the three-second busy heuristic;
   save I/O, the save-generation watcher and Java's `SaveMirror` stop flush are never gated. The independent close-request
