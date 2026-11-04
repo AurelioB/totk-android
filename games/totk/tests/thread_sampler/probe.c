@@ -164,14 +164,16 @@ static int real(const char *work) {
     CHECK(line && strstr(text, "from schedstat"), "a long frame line from schedstat:\n%s", text);
     if (line) {
         char one[1024]; snprintf(one, sizeof one, "%.*s", (int)strcspn(line, "\n"), line);
-        /* Both spinners ran for most of 400 ms, so they lead; the napper and this thread hardly ran. */
+        /* Both spinners were runnable for the whole 400 ms, so they lead and each one's run plus run-queue wait covers
+           most of the window; on a loaded host one may spend most of it waiting, so run alone is not asserted. */
         const char *colon = strstr(one, ": ");
-        double a = 0, b = 0; char n1[64] = "", n2[64] = "";
-        CHECK(colon && sscanf(colon + 2, "%63[^(](%*d) run %lf wait %*s %63[^(](%*d) run %lf", n1, &a, n2, &b) == 4,
+        double a = 0, b = 0, wa = 0, wb = 0; char n1[64] = "", n2[64] = "";
+        CHECK(colon && sscanf(colon + 2, "%63[^(](%*d) run %lf wait %lf, %63[^(](%*d) run %lf wait %lf", n1, &a, &wa, n2, &b, &wb) == 6,
               "two leading threads: %s", one);
         printf("real: %s\n", one);
         CHECK(!strncmp(n1, "spin-", 5) && !strncmp(n2, "spin-", 5) && strcmp(n1, n2), "the spinners lead: %s", one);
-        CHECK(a >= 100 && b >= 100, "both spinners ran at least 100 ms of the window (%.1f, %.1f)", a, b);
+        CHECK(a + wa >= 200 && b + wb >= 200, "both spinners were runnable for most of the window (%.1f+%.1f, %.1f+%.1f)", a, wa, b, wb);
+        CHECK(a + b >= 100, "the spinners ran (%.1f, %.1f)", a, b);
         CHECK(!strstr(one, "wait ?"), "schedstat gives the run-queue wait: %s", one);
     }
     free(text);
