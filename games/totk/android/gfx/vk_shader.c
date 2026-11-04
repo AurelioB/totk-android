@@ -442,6 +442,11 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
     VkDescriptorSetLayoutBinding *lb = calloc((size_t)(sh->nb ? sh->nb : 1), sizeof *lb);
     for (int i = 0; i < sh->nb; i++) lb[i] = (VkDescriptorSetLayoutBinding){sh->b[i].binding, (VkDescriptorType)sh->b[i].dtype, sh->b[i].count, stage_flags(sh->stage), NULL};
     VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = (uint32_t)sh->nb, .pBindings = lb};
+    char why[128];
+    if (!vk_desc_layout_fits(lb, (uint32_t)sh->nb, why, sizeof why)) {   /* it could never be allocated: refuse it here */
+        RED(16, "descriptor set layout of %s: %s", variant, why);
+        free(lb); vkDestroyShaderModule(V.dev, sh->mod, NULL); free(sh->b); free(sh->c1); free(sh); return NULL;
+    }
     r = vkCreateDescriptorSetLayout(V.dev, &dci, NULL, &sh->dsl);
     free(lb);
     if (r) { RED(16, "descriptor set layout of %s: %d", variant, r); vkDestroyShaderModule(V.dev, sh->mod, NULL); free(sh->b); free(sh->c1); free(sh); return NULL; }

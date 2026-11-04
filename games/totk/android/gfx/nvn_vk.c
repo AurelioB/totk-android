@@ -2404,11 +2404,7 @@ static uint32_t slot_alloc_sets(void *owner, VkDescriptorSetLayout layout, uint3
             if (count > 1) { count /= 2; continue; }   /* large layouts may fit fewer than a whole batch */
             if (s->curdpool + 1 < s->ndpool) { s->curdpool++; s->curdsets = 0; continue; }
         }
-        static const VkDescriptorPoolSize sizes[] = {
-            {VK_DESCRIPTOR_TYPE_SAMPLER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192},
-            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2048}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2048}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024},
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}};
-        VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = DPOOL_SETS, .poolSizeCount = sizeof sizes / sizeof *sizes, .pPoolSizes = sizes};
+        VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = DPOOL_SETS, .poolSizeCount = VK_DESC_POOL_TYPES, .pPoolSizes = vk_desc_pool_sizes};
         if (s->ndpool == s->capdpool) { s->capdpool = s->capdpool ? 2 * s->capdpool : 4; s->dpools = VK_REALLOC(s->dpools, (size_t)s->capdpool * sizeof *s->dpools); }
         if (fresh) break;   /* a set that does not fit an empty pool */
         VKCHECK(vkCreateDescriptorPool(V.dev, &pci, NULL, &s->dpools[s->ndpool++]));

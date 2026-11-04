@@ -1400,6 +1400,15 @@ elapsed time and stay 0 unless `TOTK_VK_REC_PROFILE=1` or frame tracing enables 
 and template times. `vkdrawtest --lag-walk-bench` prints the same counts per measured frame, and the driver-level
 `vkAllocateDescriptorSets`/`vkResetDescriptorPool` counts when `TOTK_VK_TEST_CALL_COUNTS=<file>` is set.
 
+Every recorder context (1,024 sets) and primary slot (4,096 sets) makes its descriptor pools from one shape
+(`vk_desc_pool_sizes`): combined image samplers and uniform buffers 32,768, sampled images and storage buffers 8,192,
+samplers 8,192 (raised from 4,096, which was one per set in a primary pool, so a layout with two separate samplers
+filled it at half its sets), storage images and uniform texel buffers 2,048, storage texel buffers 1,024. These are every
+type a backend layout uses; input attachments and the `*_DYNAMIC` types are used by none and are not declared, since
+each declared descriptor is driver memory reserved in every pool. A type no pool declares has zero capacity and would
+fail even a fresh pool (DIE); shader loading now refuses such a layout, or one larger than a pool, with
+`descriptor set layout of <shader>: ...` (`vkdrawtest --descriptor-stock` checks both and allocates every type).
+
 `TOTK_VK_DESC_STOCK=1` (default **off**; logs `descriptor stock: on/off`) keeps each recorder context's and primary
 slot's descriptor sets per exact layout (batches 1, 1, 2, 4 … 32) and reissues them, always rewritten, only after that
 slot's own retirement, where every pool used to be reset; pools reset only after 32 generations under quarter use.

@@ -487,6 +487,34 @@ void vk_record_test_results(uint64_t *checks, uint64_t *failures, uint64_t *rese
 }
 #endif
 
+/* SAMPLER matches SAMPLED_IMAGE (one separate sampler per sampled image): at 4096 it was one per set in a primary
+   slot's 4096-set pool, so any layout with two sampler bindings filled that pool at half its sets. No layout uses
+   INPUT_ATTACHMENT (rendering is dynamic, without subpasses) or the *_DYNAMIC types (offsets are resolved into each
+   descriptor): they are not declared, since every declared descriptor is driver memory reserved in every pool. */
+const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES] = {
+    {VK_DESCRIPTOR_TYPE_SAMPLER, 8192}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
+    {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2048},
+    {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2048}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024},
+    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}};
+int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size) {
+    uint64_t need[VK_DESC_POOL_TYPES] = {0};
+    for (uint32_t i = 0; i < count; i++) {
+        unsigned t = 0;
+        while (t < VK_DESC_POOL_TYPES && vk_desc_pool_sizes[t].type != bindings[i].descriptorType) t++;
+        if (t == VK_DESC_POOL_TYPES) {
+            snprintf(why, size, "binding %u has descriptor type %d, which no descriptor pool declares",
+                bindings[i].binding, (int)bindings[i].descriptorType);
+            return 0;
+        }
+        need[t] += bindings[i].descriptorCount;
+        if (need[t] > vk_desc_pool_sizes[t].descriptorCount) {
+            snprintf(why, size, "%llu descriptors of type %d exceed a pool's %u",
+                (unsigned long long)need[t], (int)bindings[i].descriptorType, vk_desc_pool_sizes[t].descriptorCount);
+            return 0;
+        }
+    }
+    return 1;
+}
 /* Allocates count (1..VK_DESC_STOCK_BATCH) sets, fewer near the end of a pool; never fewer than one. */
 static uint32_t alloc_sets(void *owner, VkDescriptorSetLayout layout, uint32_t count, VkDescriptorSet *out) {
     rec_context *c = owner;
@@ -507,13 +535,8 @@ static uint32_t alloc_sets(void *owner, VkDescriptorSetLayout layout, uint32_t c
         }
         if (c->curdp + 1 < c->ndp) { c->curdp++; c->sets = 0; continue; }
         if (fresh) DIE("recorder descriptor set exceeds a fresh pool");
-        static const VkDescriptorPoolSize sizes[] = {
-            {VK_DESCRIPTOR_TYPE_SAMPLER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
-            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2048},
-            {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2048}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024},
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}};
         VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = REC_POOL_SETS,
-            .poolSizeCount = sizeof sizes / sizeof *sizes, .pPoolSizes = sizes};
+            .poolSizeCount = VK_DESC_POOL_TYPES, .pPoolSizes = vk_desc_pool_sizes};
         if (c->ndp == c->capdp) { c->capdp = c->capdp ? c->capdp * 2 : 4; c->dp = VK_REALLOC(c->dp, c->capdp * sizeof *c->dp); }
         VKCHECK(vkCreateDescriptorPool(V.dev, &pi, NULL, &c->dp[c->ndp++]));
         atomic_fetch_add_explicit(&memory_dpools, 1, memory_order_relaxed);

@@ -2881,6 +2881,29 @@ int main(int argc, char **argv) {
         mtl_drain();
         int stock = vk_desc_stock_enabled();
         CHECK(vk_record_test_descriptor_stock(), "layout-isolated stock checkout, retirement, batching and pressure rebuild");
+        /* The pool shape: a layout with one binding of every declared type comes from a fresh real pool (it used to
+           need SAMPLER no more than one per set); a type no pool declares is refused before it could reach one. */
+        {
+            VkDescriptorSetLayoutBinding every[VK_DESC_POOL_TYPES]; char why[128];
+            for (unsigned t = 0; t < VK_DESC_POOL_TYPES; t++)
+                every[t] = (VkDescriptorSetLayoutBinding){t, vk_desc_pool_sizes[t].type, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+            CHECK(vk_desc_layout_fits(every, VK_DESC_POOL_TYPES, why, sizeof why), "every declared type fits: %s", why);
+            VkDescriptorSetLayoutCreateInfo all = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = VK_DESC_POOL_TYPES, .pBindings = every};
+            VkDescriptorSetLayout every_dsl; VKCHECK(vkCreateDescriptorSetLayout(V.dev, &all, NULL, &every_dsl));
+            mtl_sub_begin();
+            for (int i = 0; i < 64; i++) CHECK(vk_alloc_set(every_dsl) != VK_NULL_HANDLE, "an every-type set %d comes from a real pool", i);
+            CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "every-type submission completes");
+            vkDestroyDescriptorSetLayout(V.dev, every_dsl, NULL);
+            static const VkDescriptorType undeclared[] = {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC};
+            for (unsigned i = 0; i < 3; i++) {
+                VkDescriptorSetLayoutBinding one[2] = {every[6], {1, undeclared[i], 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
+                CHECK(!vk_desc_layout_fits(one, 2, why, sizeof why) && strstr(why, "no descriptor pool declares"),
+                    "undeclared type %d is refused at layout creation: %s", (int)undeclared[i], why);
+            }
+            VkDescriptorSetLayoutBinding many = {0, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1025, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+            CHECK(!vk_desc_layout_fits(&many, 1, why, sizeof why) && strstr(why, "exceed"), "a set larger than a pool is refused: %s", why);
+        }
         /* Primary slots through real submissions: 100 sets per submission, eight warm-up submissions (one per ring
            slot), then two more passes of the ring. Each set is checked out once per submission. */
         VkDescriptorSetLayoutBinding lb = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, NULL};

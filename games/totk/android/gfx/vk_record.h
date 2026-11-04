@@ -123,6 +123,13 @@ void vk_record_walk_time(uint64_t ns);  /* submission elapsed, excluding GPU wai
 void vk_record_stats(uint64_t frame);
 void vk_record_descriptor_walk(uint64_t ns); /* walking owner: complete bind/selection time, not just driver calls */
 void vk_record_descriptor_primary(uint64_t sets, uint64_t calls, uint64_t resets); /* serialized primary owner */
+/* The one descriptor-pool shape of every recorder context and primary slot (vk_record.c). It declares every type a
+   backend layout uses: the reflected shader types (vk_reflect.py) and those of the post / presentation / frame-generation
+   layouts. A type a pool does not declare has zero capacity, so a layout using it would fail in a fresh pool (DIE);
+   vk_desc_layout_fits refuses such a layout where it is created instead, naming the type. */
+enum { VK_DESC_POOL_TYPES = 8 };
+extern const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES];
+int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size);
 /* Descriptor-set stock (TOTK_VK_DESC_STOCK=1, read once with the recorder controls). One stock per owner that
    used to reset its pools each slot generation: take only checks out sets not yet issued this generation (the
    caller rewrites every one), retire rewinds them at that same retirement point and returns 1 when the owner must
