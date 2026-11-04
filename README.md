@@ -115,7 +115,9 @@ Measured on an AYN Thor (QCS8550, Adreno 740, Android 13):
 | Storage (4 GB write / read) | internal app storage 2,060 / 2,355 MB/s; SD card 46 / 90 MB/s |
 
 On the AYN Odin 3 (Snapdragon 8 Elite class) the default profile runs at 60 fps; the Retroid Pocket Duo (Adreno 722)
-uses the Light profile at 30 fps.
+uses the Light profile at 30 fps. Per-device open-world numbers (Hateno Village, Lookout Landing, Rotsumamu Shrine,
+camera panning, default profiles) are recorded in the
+[1.0.0 performance baseline](docs/benchmarks/baseline-1.0.0.md).
 
 ## Known limitations
 
