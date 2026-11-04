@@ -81,6 +81,7 @@ int main(void) {
 @unittest.skipUnless(CC, 'needs a C compiler')
 class AudioPause(unittest.TestCase):
     def test_legacy_state_machine_and_early_resume(self):
+        assert CC is not None  # narrowed after skipUnless for the compiler invocation
         source = (ROOT / 'games/totk/runtime/audio_mixer.c').read_text()
         begin = source.index('static void output_background(Mixer *m) {')
         end = source.index('/* Reopen streams whose device went away', begin)
