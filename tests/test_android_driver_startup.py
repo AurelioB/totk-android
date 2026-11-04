@@ -92,6 +92,7 @@ static bool android_kgsl_chip_probe(void *context, uint32_t *chip) {
 }
 static void log_start(void) { assert(phase == 0); phase = 1; }
 static void log_mirror_start(void) { assert(phase == 1); }   /* after the log, before any startup boundary */
+static void live_ctl_start(void) { assert(phase == 1); }     /* the live-switch reader: after totk.env, before the game */
 static void totk_thread_game_startup(void) { check_environment(); assert(phase == 1); phase = 2; }
 static int copy_tree(const char *src, const char *dst) { (void)src; (void)dst; assert(0); return -1; }
 static int runtime_handheld_mode(void) { return 1; }

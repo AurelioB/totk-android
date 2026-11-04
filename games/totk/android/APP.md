@@ -1888,6 +1888,7 @@ needs `su`). The folder holds what the adb-shell folder holds:
 | `user-data/` | saves to import: on the first start (no private saves yet) they're copied into the app's private storage, where the game keeps its saves from then on. `install_app.sh saves` copies those to the computer. |
 | `totk.env` | options, one `NAME=value` per line (`#` comments), e.g. `TOTK_VK_SHOT=300` or `TOTK_FACE_BUTTONS=position`. Read after the launcher menu's `settings.env` (app-private `files/settings.env`, written by the menu; only the menu's own option keys are accepted there, others are logged and ignored), so a line here overrides the menu. |
 | `totk.log` | the log of the last start (`install_app.sh log`) |
+| `totk.ctl` | live switches for in-session A/B runs (below), written by `tools/bench/live.sh`; only lines appended after the start are read |
 
 ### Diagnostics: logcat copy, crash reports and the stall watchdog
 
@@ -1910,6 +1911,27 @@ needs `su`). The folder holds what the adb-shell folder holds:
   warm-up, loading screens where the backend knows them) do not count, unless a held stage lasts 60 s. With
   `TOTK_WATCH_STALL` a stall that long ends the process with status 142 (128+SIGALRM), for unattended runs. The
   `[totk-watch] on: …` / `off` line shows the arm (`tests/test_progress_watch.py`).
+
+### Live switches (`totk.ctl`)
+
+A/B measurements change experiment switches inside one running session, so both arms share one loaded scene
+(`tools/bench/ab.sh`, the `totk-benchmark` skill). A thread at nice 10 (on the slower CPUs, like the logcat copy)
+follows `<game folder>/totk.ctl` with inotify (on the file only once it exists; 250 ms polling without inotify) and
+stages each complete line appended after the start; the lines of one write are staged together:
+
+- `set KEY=VALUE` sets a live switch to a decimal inside its range; `unset KEY` returns it to its launch value
+  (`totk.env`, else the switch's default); `mark <text>` only writes a marker (the A/B arm).
+- Empty lines and `#` comments are ignored. Anything else logs `[totk-ctl] refused "<line>": <reason>` and changes
+  nothing: a malformed line, a value out of range, a key that is not live, or a startup-only key
+  (`TOTK_IDEAL_CORE_FIX`: set it in `totk.env` and restart).
+- The present path applies everything staged at the next presented frame, in file order, and advances one generation:
+  `[totk-ctl] gen=N frame=F applied KEY=VALUE unset KEY ...` and `[totk-ctl] gen=N frame=F mark <text>`. F is the
+  timing frame of `计时 至帧 F` lines: frames after F run with generation N. Each switch takes effect at its own safe
+  point after that; a busy staging lock is retried at the next frame, never waited for.
+- Cost without a control file: one relaxed load per presented frame (and per call site of a live switch); reads
+  re-look up a switch only when the generation changed (`runtime/live_ctl.h`, `totk_live_cached`).
+  `tests/test_live_ctl.py` covers the parser, the frame-boundary application, generation order, the cache, the control
+  thread on a real file and a writer / frame thread / readers race under ThreadSanitizer.
 
 ### Game data location, game lock and save signals (release app)
 

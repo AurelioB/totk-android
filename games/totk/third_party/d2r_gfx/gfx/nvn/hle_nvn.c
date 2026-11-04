@@ -2850,6 +2850,7 @@ extern unsigned runtime_cutscene_present_ticks(unsigned ticks, uint64_t refresh_
 extern void movie_host_tick(void) __attribute__((weak_import));   /* TOTK runtime/movie_host.c: pre-rendered cutscenes at their own frame rate */
 extern int movie_host_active(void) __attribute__((weak_import)); /* started host decoders, atomically observed without taking movie locks */
 extern void runtime_progress_mark(const char *stage, int held) __attribute__((weak_import)); /* TOTK runtime/threads.c: the stall watchdog's progress (absent in graphics unit tests) */
+extern void runtime_live_frame(uint64_t frame) __attribute__((weak_import)); /* TOTK runtime/live_ctl.h via frontend_android.c: staged live switches (Android app only) */
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // 宿主 hle_thread.c 提供真值；图形单测里为 0 | The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
 extern uint32_t mtl_present_qos(void);
@@ -3605,6 +3606,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
     prev_in = t0; prev_pass = ps; prev_draw = dr;
     dump_frame();
+    if (runtime_live_frame) runtime_live_frame(g_frame);   /* TOTK: live switches apply here; frames after g_frame (the timing frame) run with them */
     if (g_frame % TWIN == 0) tsummary(g_frame);
     if (call_stats_on() && g_frame % 300 == 0) {
         static uint64_t pd; uint64_t ps2, dr2; mtl_stats(&ps2, &dr2); uint64_t all = dr2 - pd; pd = dr2;

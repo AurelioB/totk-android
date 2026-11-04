@@ -9,6 +9,8 @@
      (libtotk_turnip.so beside this library, used in place), else the system's;
    - the log: stdout and stderr go to totk.log in that folder, which a low-priority thread copies to logcat (tag "totk",
      log_mirror.h; TOTK_LOGCAT=0 turns the copy off);
+   - live switches: <game folder>/totk.ctl, followed by another low-priority thread and applied at the next presented
+     frame (live_ctl.h; tools/bench/live.sh writes it);
    - the window: handed to the Vulkan backend's AHB presenter or automatic copy fallback (vk_draw.c);
    - input: the built-in controller (the AYN Thor's) or any gamepad, mapped to the Switch's buttons by position;
    - a full-screen landscape window kept on while the game runs.
@@ -34,6 +36,7 @@
 #include "present_clock.h"
 #include "thread_place.h"
 #include "log_mirror.h"
+#include "live_ctl.h"
 #include "build_kind.h"
 #include <android/api-level.h>
 #include <android/choreographer.h>
@@ -1163,6 +1166,32 @@ static void log_mirror_start(void) {
     if (error) { fprintf(stderr, "[totk-logcat] off: %s\n", strerror(error)); return; }
     pthread_detach(thread);
 }
+/* Live switches (live_ctl.h): a thread that sleeps until <game>/totk.ctl grows (or is created) and stages its new
+   lines; the present path applies them (runtime_live_frame). Nice 10 on the slower CPUs, like the logcat copy. Lines
+   written before this start are not replayed. */
+static totk_live_reader g_live_reader;
+static char g_live_path[1100];
+void runtime_live_frame(uint64_t frame) { totk_live_frame(frame); }   /* hle_nvn.c, once per presented frame */
+static void *live_ctl_thread(void *arg) {
+    (void)arg; totk_thread_start("totk-ctl", NULL);
+    errno = 0; int nice_error = setpriority(PRIO_PROCESS, 0, 10) ? errno : 0;
+    cpu_set_t allowed, slow; unsigned capacity[CPU_SETSIZE]; const char *source, *decision = "unchanged";
+    if (!sched_getaffinity(0, sizeof allowed, &allowed)) {
+        totk_thread_background_select("/sys/devices/system/cpu", &allowed, &slow, capacity, &source, &decision);
+        if (!CPU_EQUAL(&slow, &allowed) && sched_setaffinity(0, sizeof slow, &slow)) decision = "unchanged (setaffinity failed)";
+    }
+    fprintf(stderr, "[totk-ctl] following %s (set KEY=VALUE, unset KEY, mark <text>; applied at the next presented frame), nice=%d%s cpus=%s\n",
+            g_live_path, getpriority(PRIO_PROCESS, 0), nice_error ? " (setpriority failed)" : "", decision);
+    live_ctl_run(&g_live_reader);
+    return NULL;
+}
+static void live_ctl_start(void) {
+    snprintf(g_live_path, sizeof g_live_path, "%s/totk.ctl", g_data);
+    g_live_reader.path = g_live_path; g_live_reader.skip_existing = 1;
+    pthread_t thread; int error = pthread_create(&thread, NULL, live_ctl_thread, NULL);
+    if (error) { fprintf(stderr, "[totk-ctl] off: %s\n", strerror(error)); return; }
+    pthread_detach(thread);
+}
 
 /* ---------- options ---------- */
 #include "android_storage.h"   /* TOTK_DATA_DIR validation and the game lock */
@@ -1520,6 +1549,7 @@ static int start_game(const ANativeActivity *a) {
     snprintf(p, sizeof p, "%s/totk.env", g_data); env_file(p);
     android_driver_env_policy(); /* freeze driver options before any app worker or driver call */
     log_mirror_start();   /* TOTK_LOGCAT is final now */
+    live_ctl_start();     /* after totk.env: its values are the launch values a live "unset" returns to */
     totk_thread_game_startup();   /* snapshot the allowed CPUs before any guest narrows its affinity */
     setenv("TOTK_INPUT_FILE_NEW", "1", 0);   /* the command file outlives runs: read newly appended commands only */
     char version[256];
