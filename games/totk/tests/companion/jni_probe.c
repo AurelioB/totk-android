@@ -56,6 +56,7 @@ void runtime_android_game_focus(JNIEnv *env, jclass cls, jboolean focused, jbool
     atomic_fetch_add(&focus_calls, 1);
     atomic_store(&focus_flags, (focused ? 1 : 0) | (single_display ? 2 : 0));
 }
+void runtime_android_game_input_focus(JNIEnv *env, jclass cls, jboolean top) { (void)env; (void)cls; (void)top; }
 void runtime_android_motion(JNIEnv *env, jclass cls, jfloat ax, jfloat ay, jfloat az, jfloat gx, jfloat gy, jfloat gz) {
     (void)env; (void)cls; (void)ax; (void)ay; (void)az; (void)gx; (void)gy; (void)gz;
 }

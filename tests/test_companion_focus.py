@@ -228,3 +228,60 @@ class CompanionFocusTests(unittest.TestCase):
 
     def test_claims_coalesce_and_failed_or_noop_claims_can_retry_on_touch(self):
         self.probe('retry')
+
+
+class NativeInputFocusTests(unittest.TestCase):
+    def test_routing_changes_release_held_input_without_resuming_a_paused_game(self):
+        cc = shutil.which('cc')
+        if not cc:
+            self.skipTest('host C compiler required')
+        source = (ROOT / 'games/totk/runtime/frontend_android.c').read_text()
+        reset = section(source, 'void runtime_android_game_input_focus(', 'static void android_game_lifecycle_pause(')
+        gate = section(source, 'static int handle_input(', '    int pad = ')
+        prelude = r'''
+#include <stdint.h>
+#include <assert.h>
+typedef void JNIEnv;
+typedef void *jclass;
+typedef unsigned char jboolean;
+typedef struct { int type; int64_t time, down; } AInputEvent;
+enum { AINPUT_EVENT_TYPE_KEY = 1, AINPUT_EVENT_TYPE_MOTION = 2 };
+static int paused, buttons, clears, quiets;
+static int64_t game_input_after_ns, now = 100;
+static uint64_t mono_ns(void) { return (uint64_t)now; }
+static int runtime_android_game_paused(void) { return paused; }
+static void runtime_input_clear(void) { buttons = 0; clears++; }
+static void runtime_feedback_quiet(void) { quiets++; }
+static int AInputEvent_getType(AInputEvent *e) { return e->type; }
+static int AInputEvent_getSource(AInputEvent *e) { (void)e; return 0; }
+static int64_t AKeyEvent_getEventTime(AInputEvent *e) { return e->time; }
+static int64_t AKeyEvent_getDownTime(AInputEvent *e) { return e->down; }
+static int64_t AMotionEvent_getEventTime(AInputEvent *e) { return e->time; }
+'''
+        assertions = r'''
+int main(void) {
+    paused = 1; buttons = 1024;
+    runtime_android_game_input_focus(0, 0, 0);
+    assert(paused == 1 && buttons == 0 && clears == 1 && quiets == 1 && game_input_after_ns == 100);
+    now = 200; buttons = 1024;
+    runtime_android_game_input_focus(0, 0, 1);
+    assert(paused == 1 && buttons == 0 && clears == 2 && quiets == 1 && game_input_after_ns == 200);
+    AInputEvent fresh = {AINPUT_EVENT_TYPE_KEY, 201, 201};
+    assert(handle_input(&fresh) == 1); /* top-resumed cannot undo Home/recents pause */
+    paused = 0;
+    assert(handle_input(&fresh) == 0);
+    AInputEvent held = {AINPUT_EVENT_TYPE_KEY, 202, 199};
+    assert(handle_input(&held) == 1); /* held key/release from the old display is not replayed */
+    AInputEvent queued = {AINPUT_EVENT_TYPE_MOTION, 199, 0};
+    assert(handle_input(&queued) == 1);
+    queued.time = 201;
+    assert(handle_input(&queued) == 0);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='companion-input-focus-') as directory:
+            work = Path(directory)
+            probe = work / 'probe.c'
+            probe.write_text(prelude + reset + gate + '    (void)src; return 0;\n}\n' + assertions)
+            CompanionFocusTests.command([cc, '-std=c11', '-Wall', '-Wextra', '-Werror', probe, '-o', work / 'probe'])
+            CompanionFocusTests.command([work / 'probe'])

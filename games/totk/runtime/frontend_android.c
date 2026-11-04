@@ -2201,6 +2201,14 @@ void runtime_android_game_focus(JNIEnv *env, jclass cls, jboolean focused, jbool
     game_focus_paused = !focused && single_display;
     android_game_pause_update();
 }
+/* Top-resumed is global; window focus is per-display. Clear held/queued input
+ * when controller routing changes, without altering either background-pause facet. */
+void runtime_android_game_input_focus(JNIEnv *env, jclass cls, jboolean top) {
+    (void)env; (void)cls;
+    game_input_after_ns = (int64_t)mono_ns();
+    runtime_input_clear();
+    if (!top) runtime_feedback_quiet();
+}
 static void android_game_lifecycle_pause(int paused) {
     game_activity_paused = paused;
     android_game_pause_update();

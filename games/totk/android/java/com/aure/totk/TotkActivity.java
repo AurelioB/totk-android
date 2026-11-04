@@ -27,6 +27,7 @@ public final class TotkActivity extends NativeActivity {
     private static native void nativePresentTransformHint(long epoch, int hint);
     private static native void nativeTextInputDone(long serial, byte[] utf8);
     private static native void nativeGameFocus(boolean focused, boolean singleDisplay);
+    private static native void nativeGameInputFocus(boolean top);
 
     /** runtime/frontend_android.c, on this (the UI) thread: the game asks for text (nn::swkbd). TextEntry answers exactly
      * once: the UTF-8 text, or null when the player cancelled. */
@@ -113,6 +114,7 @@ public final class TotkActivity extends NativeActivity {
     }
     @Override public void onTopResumedActivityChanged(boolean top) {
         super.onTopResumedActivityChanged(top);
+        nativeGameInputFocus(top); // a release routed to another display must not leave a controller button held
         if (companion != null) companion.ownerTopResumed(top);
     }
     @Override public void onWindowFocusChanged(boolean focused) {

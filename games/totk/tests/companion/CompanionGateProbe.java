@@ -38,6 +38,9 @@ public final class CompanionGateProbe {
             check(count(6) == (kind == 0 ? 3 : 1), "focus return must wake without onResume");
         }
         check(count(5) == 6, "all focus transitions must reach the native bridge");
+        activity.onTopResumedActivityChanged(false);
+        activity.onTopResumedActivityChanged(true);
+        check(count(5) == 6, "controller routing must not change the pause-focus facet");
 
         check((CompanionNative.snapshot(0) != null) == enabled, "direct live snapshot must honor gate");
         check((source.read(1) != null) == enabled, "source full snapshot must honor gate");
