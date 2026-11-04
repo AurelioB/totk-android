@@ -399,7 +399,7 @@ esac
 '''
 
     def test_live_write(self):
-        """live.sh ends its batch with a newline: the game stages complete lines only."""
+        """live.sh ends its batch with a newline (the game stages complete lines only) and reports refusals."""
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             (d / 'bin').mkdir(); (d / 'tmp').mkdir(); (d / 'game').mkdir()
@@ -422,6 +422,10 @@ esac
             self.assertIn('gen=1 frame=9 mark ok', r.stdout)
             self.assertEqual(ctl.read_text(), 'set TOTK_VK_PIPE_BOOST=1\nmark a b\nunset TOTK_VK_PIPE_BOOST\nmark ok\n')
             self.assertEqual(oct(ctl.stat().st_mode & 0o777), '0o600')
+            r = live('[totk-ctl] refused "set TOTK_X=1": TOTK_X is not a live switch\n[totk-ctl] gen=2 frame=12 mark r\n',
+                     'set', 'TOTK_X=1', 'mark', 'r')
+            self.assertEqual(r.returncode, 4, r.stderr)
+            self.assertIn('refused', r.stdout)
             self.assertEqual(list((d / 'tmp').iterdir()), [])   # the batch's temp file is removed
 
 

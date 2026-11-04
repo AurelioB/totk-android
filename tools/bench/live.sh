@@ -8,9 +8,10 @@
 # at the same frame boundary (one generation). Root writes it with the game folder's owner, mode 0600 and SELinux
 # context (chcon --reference=<game dir>: a root-made file lacks the app's MLS categories and the app could not read
 # it). Then waits up to --wait seconds (default 10) for the game's [totk-ctl] lines in totk.log and prints them: the
-# mark's line when there is a mark, refusals always. Exit 3 when a mark was not acknowledged in time.
+# mark's line when there is a mark, refusals always. Exit 3 when a mark was not acknowledged in time, 4 when the game
+# refused a line (the other lines of the write still apply).
 set -u
-usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die() { echo "live: $*" >&2; exit 1; }
 
 SER=""; PKG=com.aure.totk; GAME=""; WAIT=10; LINES=""; MARK=""
@@ -76,3 +77,5 @@ while :; do
   sleep 0.5
 done
 [ -z "$MARK" ] || [ -n "$acked" ] || { echo "live: the game did not acknowledge 'mark $MARK' within ${WAIT}s (paused, in a menu without frames, or not reading $CTL?)" >&2; exit 3; }
+printf '%s\n' "${new:-}" | grep -q '^\[totk-ctl\] refused ' && exit 4
+exit 0

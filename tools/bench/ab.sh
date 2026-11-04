@@ -67,8 +67,9 @@ for X in $(printf '%s\n' "$ORDER" | fold -w1); do
   set --; while IFS= read -r line; do set -- "$@" "$line"; done <<EOF
 $(arm_lines "$X")
 EOF
-  ack=$(live "$@" "mark ab arm=$X block=$block scene=$SCENE") || die "block $block (arm $X) was not applied: $ack"
-  printf '%s\n' "$ack" | grep -q 'refused' && die "block $block (arm $X): a line was refused: $ack"
+  ack=$(live "$@" "mark ab arm=$X block=$block scene=$SCENE"); rc=$?
+  [ "$rc" -eq 4 ] && die "block $block (arm $X): a line was refused: $ack"
+  [ "$rc" -eq 0 ] || die "block $block (arm $X) was not applied: $ack"
   gf=$(printf '%s\n' "$ack" | grep "mark ab arm=$X block=$block " | sed -n 's/.*\] gen=\([0-9]*\) frame=\([0-9]*\) mark.*/gen=\1 frame=\2/p' | tail -n1)
   echo "$DEV $SCENE block=$block arm=$X $gf T=$(date +%s) lines=$(arm_lines "$X" | paste -sd, -)" | tee -a "$OUT/arms.txt"
   sleep "$SETTLE"

@@ -201,7 +201,8 @@ with `totk.env`.
    the blocks with their generation and frame. Arm lines are comma-separated `live.sh` lines; an arm may set several
    switches (`'A:unset TOTK_VK_DESC_STOCK,unset TOTK_PRIO_RENDER;B:set TOTK_VK_DESC_STOCK=1,set TOTK_PRIO_RENDER=-8'`).
    `unset` returns a switch to its launch value: with no developer `totk.env` that is the default (off).
-   One-off changes: `tools/bench/live.sh -s <serial> set KEY=VALUE | unset KEY | mark <text>` prints the game's answer.
+   One-off changes: `tools/bench/live.sh -s <serial> set KEY=VALUE | unset KEY | mark <text>` prints the game's answer
+   (exit 3: a mark not acknowledged, 4: a line refused).
 3. Stop the sampler, `collect.sh` (step 10), then
    `python3 tools/bench/analyze.py $OUT --arms --json $OUT/ab.json` and `python3 tools/bench/abtest.py $OUT/ab.json`.
    `analyze.py --arms` gives each 300-frame window to the generation that covered all of it (from 2 frames after its
