@@ -209,6 +209,9 @@ with `totk.env`.
    counted. `abtest.py` prints each arm against A per metric: pooled value, delta, the compare.py tolerance, the noise
    (the larger same-arm spread between blocks) and the verdict: *same* within tolerance, *within noise* up to the
    noise, *better*/*worse* beyond both (`?` when an arm ran a single block). Exit 1 when an arm is worse.
+   Beside the verdicts both print memory and pressure per arm (sampler: MemAvailable minimum, the game's RSS / swap,
+   kgsl memory, PSI cpu / memory, kswapd CPU %): an arm that only fails under memory pressure (the Duo's Lookout
+   collapse) shows it there.
 
 Time per arm: a block is about `settle + pan + ~10 s` (write, acknowledgement, the pan's frequency reads), ~55 s with
 the defaults, so ABBAABBA (4 blocks per arm) takes ~7.5 min in one scene load. A restart per arm costs ~45 s to the

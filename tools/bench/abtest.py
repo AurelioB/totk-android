@@ -9,6 +9,9 @@ mean; the >50 ms and long >=45 ms counts per window). Noise: for each arm, the s
 over that arm's blocks (each block is one application of the arm in the ABBA order); the noise of a comparison is the
 larger of the two arms' spreads.
 
+Memory and pressure (sampler.py; MemAvailable minimum, the rest maxima over each arm's windows) are printed beside the
+verdicts, not part of them: an arm that collapses under memory pressure shows it there.
+
 Verdict rule for one metric, delta = arm - reference (per window for counts):
   same            |delta| <= the compare.py tolerance of the metric (compare.py --help)
   within noise    |delta| > tolerance but <= noise: the arm's own blocks differ that much between repeats
@@ -21,7 +24,7 @@ import argparse, io, json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchlib import METRICS, PRIMARY, guard_output  # noqa: E402
-from analyze import AB_METRICS, block_metric  # noqa: E402
+from analyze import AB_METRICS, MEMORY_FIELDS, block_metric  # noqa: E402
 
 
 def metric_verdict(key, ref, arm):
@@ -95,6 +98,10 @@ def main():
                 p(f'  {label + (" /win" if rate else ""):<16} {"-" if rv is None else f"{rv:g}":>9} '
                   f'{"-" if av is None else f"{av:g}":>9} {fmt(d):>9} {"-" if tol is None else f"{tol:.2f}":>9} '
                   f'{"-" if noise is None else f"{noise:.2f}":>9}  {verdict}{" *" if key in PRIMARY else ""}')
+            mem = [(name, ref.get('memory', {}).get(name), arm.get('memory', {}).get(name)) for _, name, _, _ in MEMORY_FIELDS]
+            if any(r is not None or x is not None for _, r, x in mem):
+                p('  memory / pressure, worst over each arm\'s windows (' + a.ref + ' -> ' + name + '): ' + '; '.join(
+                    f'{k} {"-" if r is None else r} -> {"-" if x is None else x}' for k, r, x in mem if r is not None or x is not None))
         p('\n  * primary metric. Rule: same within the compare.py tolerance; better/worse only beyond both the tolerance '
           'and the same-arm block spread (noise); "?" = no noise estimate (an arm ran one block).')
     sys.stdout.write(buf.getvalue())

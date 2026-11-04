@@ -172,7 +172,9 @@ def arm_analysis(windows, gens, guard=GUARD_FRAMES):
                                          'metrics': {k: block_metric(s, k) for k in AB_METRICS}})
         arms[g['arm']]['windows'] += ws
     for a in arms.values():
-        a['summary'] = summarize(a.pop('windows'))
+        ws = a.pop('windows')
+        a['summary'] = summarize(ws)
+        a['memory'] = worst_memory([w.get('memory', {}) for w in ws])
         a['spread'] = {}
         for k in AB_METRICS:
             vs = [b['metrics'][k] for b in a['blocks'] if b['metrics'][k] is not None]
@@ -197,34 +199,85 @@ def print_arms(ab):
             print(f'    block {b["block"] if b["block"] is not None else "?"} (gen {b["gen"]}, from frame {b["frame"]}): '
                   f'{b["summary"]["windows"]} windows, fps {fmt(m["fps_mean"])}, p95 {fmt(m["p95_ms_max"])} ms, '
                   f'GPU {fmt(m["gpu_ms_mean"])} ms, >50/window {fmt(m["over50_total"])}')
+        if a.get('memory'):
+            print('    memory / pressure (worst): ' + ', '.join(f'{k} {v}' for k, v in a['memory'].items()))
         sp = a['spread']
         print(f'    same-arm spread: fps {fmt(sp["fps_mean"])}, p95 {fmt(sp["p95_ms_max"])} ms, GPU {fmt(sp["gpu_ms_mean"])} ms, '
               f'>50/window {fmt(sp["over50_total"])}' + ('' if len(a['blocks']) >= 2 else ' (one block: no noise estimate)'))
 
 
-def parse_samples(path, t0, t1):
+# Memory and pressure (sampler.py): per window and per arm the worst value, i.e. the minimum of MemAvailable and the
+# maximum of the rest. Fields a device does not expose stay null.
+MEMORY_FIELDS = (('mav', 'mem_available_min_mb', 1024, min), ('rss', 'rss_max_mb', 1024, max), ('swp', 'swap_max_mb', 1024, max),
+                 ('shm', 'shmem_max_mb', 1024, max), ('kgk', 'kgsl_kernel_max_mb', 1 << 20, max),
+                 ('kgm', 'kgsl_mapped_max_mb', 1 << 20, max), ('kgi', 'kgsl_imported_max_mb', 1 << 20, max),
+                 ('kgsl', 'kgsl_max_mb', 1 << 20, max), ('pcs', 'psi_cpu_some_max', 1, max), ('pcf', 'psi_cpu_full_max', 1, max),
+                 ('pms', 'psi_mem_some_max', 1, max), ('pmf', 'psi_mem_full_max', 1, max), ('ksw', 'kswapd_cpu_max_pct', 1, max))
+
+
+def parse_sample_rows(path):
+    """Every sampler record: time 't', frame 'f', the thermal fields, 'caps' and the memory fields (numbers or None)."""
     rows = []
     if not os.path.exists(path):
         return rows
-    for line in open(path, encoding='utf-8', errors='replace'):
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        lines = fh.readlines()
+    for line in lines:
         p = line.split()
         if len(p) < 2 or 'caps=' not in line:
             continue
         try:
-            if not (t0 <= float(p[0]) <= t1):
-                continue
+            t = float(p[0])
         except ValueError:
             continue
         d = dict(x.split('=', 1) for x in line.split('caps=', 1)[0].split()[1:] if '=' in x)
         num = lambda k: int(d[k]) if d.get(k, '').lstrip('-').isdigit() else None
+        def real(k):
+            try:
+                return float(d[k]) if d.get(k) else None
+            except ValueError:
+                return None
         caps = []
         for c in line.split('caps=', 1)[1].split():
             s, _, m = c.partition('/')
             if s.isdigit() and m.isdigit():
                 caps.append((int(s), int(m)))
-        rows.append({'cpu': num('cpu'), 'gpu': num('gpu'), 'cool': num('cool'), 'tpl': num('tpl'), 'gcap': num('gcap'),
-                     'caps': caps})
+        row = {'t': t, 'f': num('f'), 'cpu': num('cpu'), 'gpu': num('gpu'), 'cool': num('cool'), 'tpl': num('tpl'),
+               'gcap': num('gcap'), 'caps': caps}
+        for key, *_ in MEMORY_FIELDS:
+            row[key] = real(key) if key in d else None
+        parts = [row[k] for k in ('kgk', 'kgm', 'kgi') if row[k] is not None]
+        row['kgsl'] = sum(parts) if parts else None
+        rows.append(row)
     return rows
+
+
+def parse_samples(path, t0, t1, rows=None):
+    return [r for r in (parse_sample_rows(path) if rows is None else rows) if t0 <= r['t'] <= t1]
+
+
+def memory_of(rows):
+    """The worst memory / pressure values of sampler rows ({} when none has any)."""
+    out = {}
+    for key, name, unit, worst in MEMORY_FIELDS:
+        vs = [r[key] for r in rows if r.get(key) is not None]
+        if vs:
+            out[name] = round(worst(vs) / unit, 1)
+    return out
+
+
+def window_memory(end, rows):
+    """Rows sampled while the window ending at `end` ran (their newest finished window ended in [end-300, end))."""
+    return memory_of([r for r in rows if r['f'] is not None and end - 300 <= r['f'] < end])
+
+
+def worst_memory(memories):
+    out = {}
+    for _, name, _, worst in MEMORY_FIELDS:
+        vs = [m[name] for m in memories if m.get(name) is not None]
+        if vs:
+            out[name] = worst(vs)
+    return out
 
 
 def parse_freqs(path):
@@ -386,6 +439,7 @@ def main():
             print(f'\n## {dev} / {scene}')
             print('window          fps    p50    p95    max   GPU ms  long>=25  long>=45  over33/over50(stutter line)')
             windows, thermal, all_rows = [], [], []
+            samples = parse_sample_rows(os.path.join(out, f'samples-{dev}.txt'))
             for kv in plist:
                 f0, f1 = kv['F0'], kv['F1']
                 for f in sorted(x for x in timing if f0 + 600 <= x <= f1):
@@ -400,7 +454,7 @@ def main():
                           f'{w["gpu_ms"] if w["gpu_ms"] is not None else float("nan"):7.1f}  {w["long_ge25"]:>6}    '
                           f'{w["long_ge45"]:>6}    {st[0] if st else "-"}/{st[2] if st else "-"} '
                           f'(>{st[1] if st else "-"}/>{st[3] if st else "-"})')
-                rows = parse_samples(os.path.join(out, f'samples-{dev}.txt'), kv['T0'], kv['T1'])
+                rows = parse_samples(None, kv['T0'], kv['T1'], samples)
                 all_rows += rows
                 if rows:
                     capped = sorted({c for r in rows for c in r['caps'] if c[0] != c[1]})
@@ -417,6 +471,12 @@ def main():
                           f'cpufreq scaling_max<cpuinfo_max: {[f"{s}/{m}" for s, m in capped] or "none"} ({len(rows)} samples)')
                 else:
                     print(f'  no samples over the pan {utc(kv["T0"])} .. {utc(kv["T1"])}')
+            for w in windows:
+                if m := window_memory(w['frames'][1], samples):
+                    w['memory'] = m
+            memory = worst_memory([w.get('memory', {}) for w in windows])
+            if memory:
+                print('  memory / pressure (worst over the windows): ' + ', '.join(f'{k} {v}' for k, v in memory.items()))
             summary = summarize(windows, thermal)
             ab = None
             if a.arms:
@@ -436,7 +496,8 @@ def main():
                                    'freq_limits': {'start': s.get('start'), 'end': s.get('end')}}
                                   for kv, s in zip(plist, snaps)],
                          'freq_stable': stable, 'freq_changes': changes,
-                         'summary': summary, 'windows': windows, 'thermal': thermal, **({'ab': ab} if ab else {})})
+                         'summary': summary, 'windows': windows, 'thermal': thermal,
+                         **({'memory': memory} if memory else {}), **({'ab': ab} if ab else {})})
             table.append((dev, scene, summary, windows))
 
     for dev in order:

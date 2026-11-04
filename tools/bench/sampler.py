@@ -3,13 +3,17 @@
 
 Every --interval seconds, through one persistent root shell on the device (nothing is pushed), print the newest
 '计时 至帧 N' frame of totk.log, the max CPU / GPU thermal-zone temperature, the sum of the thermal cooling-device states
-(cpufreq / cpu-cluster / kgsl / gpu), the GPU's thermal_pwrlevel, clock and max_gpuclk (its effective cap), and each
-cpufreq policy's scaling_max_freq/cpuinfo_max_freq. Lines are host-timestamped (epoch seconds) and appended to
-<out>/samples-<label>.txt:
+(cpufreq / cpu-cluster / kgsl / gpu), the GPU's thermal_pwrlevel, clock and max_gpuclk (its effective cap), each
+cpufreq policy's scaling_max_freq/cpuinfo_max_freq, and memory pressure: MemAvailable, the game's VmRSS / VmSwap /
+RssShmem (kB), its kgsl memory /sys/class/kgsl/kgsl/proc/<pid>/{kernel,gpumem_mapped,imported} (bytes, whichever
+exist), PSI cpu / memory some / full avg10 (/proc/pressure), and the kswapd threads' CPU ticks, from which the host adds
+kswapd's CPU % over the interval. Lines are host-timestamped (epoch seconds) and appended to <out>/samples-<label>.txt:
 
-  <epoch> f=<frame> cpu=<mC> gpu=<mC> cool=<sum> tpl=<level> gclk=<Hz> gcap=<Hz> caps= <scaling>/<cpuinfo> ...
+  <epoch> f=<frame> cpu=<mC> gpu=<mC> cool=<sum> tpl=<level> gclk=<Hz> gcap=<Hz> mav=<kB> rss=<kB> swp=<kB> shm=<kB>
+          kgk=<B> kgm=<B> kgi=<B> pcs=<avg10> pcf=<avg10> pms=<avg10> pmf=<avg10> kst=<ticks> ksw=<%> caps= <scaling>/<cpuinfo> ...
 
-A value the device does not expose (no matching thermal zone / cooling device, no kgsl) is left empty and becomes null.
+A value the device does not expose (no matching thermal zone / cooling device, no kgsl, no PSI, the game not running)
+is left empty and becomes null.
 
 Runs until --duration elapses, or SIGINT / SIGTERM; then the device loop and its sleep are killed, so no process is left
 on the device. As a safety net the device loop also ends by itself after --max-seconds (default 3 h, or --duration + 60).
@@ -24,13 +28,20 @@ CZ=""; GZ=""; CD=""
 for z in thermal_zone*; do t=$(cat $z/type 2>/dev/null); case $t in cpu*) CZ="$CZ $z/temp";; gpuss*) GZ="$GZ $z/temp";; esac; done
 for c in cooling_device*; do t=$(cat $c/type 2>/dev/null); case $t in cpufreq-*|cpu-cluster*|thermal-cluster*|kgsl|gpu|devfreq-*kgsl*) CD="$CD $c/cur_state";; esac; done
 L=@LOG@
+PSI() { sed -n "s/^$1 avg10=\([0-9.]*\).*/\1/p" $2 2>/dev/null </dev/null; }
 while true; do
   f=$(tail -c 30000 $L 2>/dev/null | grep -ao '至帧 [0-9]*' | tail -n1 | grep -o '[0-9]*')
   # </dev/null: with an empty zone list `cat` would otherwise read this script's stdin and block.
   ct=$(cat $CZ 2>/dev/null </dev/null | sort -n | tail -n1); gt=$(cat $GZ 2>/dev/null </dev/null | sort -n | tail -n1)
   cs=""; [ -z "$CD" ] || { cs=0; for s in $(cat $CD 2>/dev/null </dev/null); do cs=$((cs+s)); done; }
   caps=""; for p in /sys/devices/system/cpu/cpufreq/policy*; do caps="$caps $(cat $p/scaling_max_freq 2>/dev/null)/$(cat $p/cpuinfo_max_freq 2>/dev/null)"; done
-  echo "f=${f:-0} cpu=$ct gpu=$gt cool=$cs tpl=$(cat /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel 2>/dev/null) gclk=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null) gcap=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null) caps=$caps"
+  P=$(pidof @PKG@ 2>/dev/null | cut -d' ' -f1); S=/proc/${P:-0}/status; K=/sys/class/kgsl/kgsl/proc/${P:-0}
+  st() { [ -n "$P" ] && grep -m1 "^$1:" $S 2>/dev/null </dev/null | tr -s ' \t' ' ' | cut -d' ' -f2; }
+  kv() { [ -n "$P" ] && cat $K/$1 2>/dev/null </dev/null; }
+  ks=""; for k in $(pgrep kswapd 2>/dev/null); do t=$(cut -d' ' -f14,15 /proc/$k/stat 2>/dev/null </dev/null); [ -n "$t" ] && ks=$(( ${ks:-0} + ${t% *} + ${t#* } )); done
+  mem="mav=$(grep -m1 '^MemAvailable:' /proc/meminfo </dev/null | tr -s ' ' | cut -d' ' -f2) rss=$(st VmRSS) swp=$(st VmSwap) shm=$(st RssShmem) kgk=$(kv kernel) kgm=$(kv gpumem_mapped) kgi=$(kv imported)"
+  psi="pcs=$(PSI some /proc/pressure/cpu) pcf=$(PSI full /proc/pressure/cpu) pms=$(PSI some /proc/pressure/memory) pmf=$(PSI full /proc/pressure/memory) kst=$ks"
+  echo "f=${f:-0} cpu=$ct gpu=$gt cool=$cs tpl=$(cat /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel 2>/dev/null) gclk=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null) gcap=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null) $mem $psi caps=$caps"
   [ $(date +%s) -lt $END ] || exit 0
   sleep @INTERVAL@
 done
@@ -39,6 +50,24 @@ done
 
 class Stop(Exception):
     pass
+
+
+USER_HZ = 100   # /proc/<pid>/stat ticks per second on Linux / Android
+
+
+def add_kswapd(line, now, previous):
+    """The device line with ksw=<kswapd CPU % since the previous sample> inserted before caps= (empty for the first
+    sample or without kst), and the new (time, ticks) state."""
+    ticks = next((t[4:] for t in line.split(' caps=', 1)[0].split() if t.startswith('kst=')), '')
+    ksw = ''
+    if ticks.isdigit():
+        if previous and now > previous[0] and int(ticks) >= previous[1]:
+            ksw = f'{(int(ticks) - previous[1]) / USER_HZ / (now - previous[0]) * 100:.1f}'
+        state = (now, int(ticks))
+    else:
+        state = None
+    head, sep, tail = line.partition(' caps=')
+    return f'{head} ksw={ksw}{sep}{tail}', state
 
 
 def main():
@@ -69,9 +98,10 @@ def main():
                          text=True, start_new_session=True)
     max_s = a.max_seconds or (int(a.duration) + 60 if a.duration else 10800)
     p.stdin.write(LOOP.replace('@LOG@', f'{game}/totk.log').replace('@INTERVAL@', str(a.interval))
+                  .replace('@PKG@', a.package)
                   .replace('@MAX@', str(max_s)))
     p.stdin.flush()
-    remote_pid, n = None, 0
+    remote_pid, n, kswapd = None, 0, None
     try:
         with open(path, 'a', buffering=1) as out:
             for line in p.stdout:
@@ -83,7 +113,9 @@ def main():
                 if not line.startswith('f='):
                     print(f'sampler: device: {line}', file=sys.stderr)
                     continue
-                out.write(f'{time.time():.1f} {line}\n')
+                now = time.time()
+                line, kswapd = add_kswapd(line, now, kswapd)
+                out.write(f'{now:.1f} {line}\n')
                 n += 1
     except Stop:
         pass

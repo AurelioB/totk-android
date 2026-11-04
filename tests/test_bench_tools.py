@@ -387,5 +387,40 @@ class InSessionAB(unittest.TestCase):
         self.assertIn('mark text', r.stderr)
 
 
+class MemorySampling(unittest.TestCase):
+    LINE = ('f={f} cpu=55000 gpu=60000 cool=0 tpl=0 gclk=1 gcap=2 mav={mav} rss=2000000 swp={swp} shm=1000 kgk=1048576 '
+            'kgm= kgi=2097152 pcs=1.50 pcf=0.00 pms={pms} pmf=3.25 kst={kst} caps= 2016000/2016000')
+
+    def test_kswapd_percent(self):
+        import sampler
+        line, st = sampler.add_kswapd(self.LINE.format(f=300, mav=1, swp=1, pms=1, kst=1000), 100.0, None)
+        self.assertIn(' ksw= caps=', line)
+        line, st = sampler.add_kswapd(self.LINE.format(f=300, mav=1, swp=1, pms=1, kst=1150), 103.0, st)
+        self.assertIn(' ksw=50.0 caps=', line)   # 150 ticks of 100 Hz in 3 s
+        self.assertEqual(st, (103.0, 1150))
+        line, st = sampler.add_kswapd('f=1 cpu= kst= caps= 1/1', 106.0, st)   # no kswapd readable
+        self.assertIn(' ksw= caps=', line)
+        self.assertIsNone(st)
+
+    def test_window_memory_and_old_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'samples-duo.txt'
+            rows = [self.LINE.format(f=f, mav=mav, swp=swp, pms=pms, kst=0) + '\n' for f, mav, swp, pms in
+                    ((300, 900000, 100000, '2.00'), (300, 400000, 500000, '9.50'), (600, 350000, 600000, '1.00'))]
+            p.write_text(''.join(f'{100 + i * 3}.0 {r}' for i, r in enumerate(rows))
+                         + '200.0 f=600 cpu=1 gpu=2 cool=0 tpl=0 gclk=1 gcap=2 caps= 1/1\n', encoding='utf-8')   # an old-format row
+            got = analyze.parse_sample_rows(p)
+        self.assertEqual(len(got), 4)
+        self.assertIsNone(got[3]['mav'])
+        m = analyze.window_memory(600, got)   # samples taken while the window ending at 600 ran: f in [300, 600)
+        self.assertEqual(m['mem_available_min_mb'], round(400000 / 1024, 1))
+        self.assertEqual(m['swap_max_mb'], round(500000 / 1024, 1))
+        self.assertEqual(m['psi_mem_some_max'], 9.5)
+        self.assertEqual(m['kgsl_max_mb'], 3.0)   # kernel + imported, mapped absent
+        self.assertNotIn('kgsl_mapped_max_mb', m)
+        self.assertEqual(analyze.window_memory(300, got), {})
+        self.assertEqual(analyze.worst_memory([m, {'mem_available_min_mb': 100.0, 'swap_max_mb': 1.0}])['mem_available_min_mb'], 100.0)
+
+
 if __name__ == '__main__':
     unittest.main()
