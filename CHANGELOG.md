@@ -5,8 +5,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 
 ## 1.0.1 (versionCode 10001), game 1.4.3
 
-A bug-fix release.
-- The game pauses, with its sound, while it's in the background or the recent-apps screen is open.
+Fixes for the first reports, plus a few improvements.
+
+### Game
+- The game pauses, with its sound, while it's in the background or the recent-apps screen is open (on dual-screen
+  devices, using the other screen doesn't pause it).
 
 ### Setup
 - The container route (XCI/NSP + update + `prod.keys`) no longer fails with "Could not create romfs.fifo" when the
@@ -16,8 +19,10 @@ A bug-fix release.
   different error).
 - Time estimates match measured runs: about 2–3 minutes from decrypted files, about 15 minutes from containers, plus the
   copy time to an SD card.
-- Setup stopped: a Share details button sends the error and the setup logs (no game files or keys) through any app, for bug reports.
-- Setup skips the second-screen art on devices with one screen; on dual-screen devices that don't have it yet, Start game offers to prepare it.
+- Setup stopped: a **Share details** button sends the error and the setup logs (no game files or keys) through any
+  app, for bug reports.
+- Setup skips the second-screen art on devices with one screen; on dual-screen devices that don't have it yet, Start
+  game offers to prepare it.
 
 ### Menu
 - The menu no longer reports "The game is running" when it isn't: its own background checks are no longer mistaken
@@ -25,7 +30,8 @@ A bug-fix release.
 - When the game really is still running in the background, the affected actions say so, and a **Close the game**
   button closes it safely (waiting for an in-progress save) and then carries on with what you chose. This also works
   after Android freezes the background game: a temporary menu binding wakes it without bringing its task forward.
-- Graphics driver: Turnip drivers can be picked as the .zip they're distributed in (AdrenoTools format), not only as a .so.
+- Graphics driver: Turnip drivers can be picked as the .zip they're distributed in (AdrenoTools format), not only as
+  a .so.
 
 ### Second screen
 - Fused materials use the game's own names (for example "Armor Shard" instead of "Obj Armor Spike B"), including world
