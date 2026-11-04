@@ -552,7 +552,7 @@ typedef struct vk_shader {
     uint8_t *c1; uint32_t c1_len;   /* the shader's own constant bank c1 (from its package) */
     uint32_t vin_mask;      /* vertex inputs read (location = NVN attribute) */
     uint8_t vin_class[32];  /* 0 float 1 uint 2 sint */
-    uint32_t fout_mask;     /* fragment colour outputs written */
+    uint32_t fout_mask;     /* fragment colour output locations declared (with TOTK_VK_UNWRITTEN_MASK, arrays span theirs) */
     int writes_depth;
     int early_tests;        /* original NVN control byte 0x718; honored by default (EARLYZ=0 is a diagnostic override) */
     int depth_spec;         /* fragment depth exports patched: + specialization constant D16_SPEC_ID (the DEPTH16 nudge, vk_draw.c) */
@@ -613,6 +613,7 @@ int vk_pipe_boost_lend(vk_lend *l);             /* 1 raised, 0 not needed or swi
 void vk_pipe_boost_restore(const vk_lend *l);   /* the worker itself, after publishing: back to VK_WORKER_NICE */
 void vk_pipe_boost_waited(uint64_t ns);         /* one join on a worker build, counted with the switch off too */
 void vk_draw_switches_init(void);               /* launch-time vk_draw.c switches, read once before any worker */
+int vk_unwritten_mask_on(void);                 /* TOTK_VK_UNWRITTEN_MASK: pipelines mask attachments without an output */
 int vk_shaders_ready(void);
 void vk_shader_seed_startup(const char *game_dir); /* freeze game-relative selection and diagnose seed before replay */
 const char *vk_shader_cache_path(const char *base, char *out, size_t size); /* folder/content-isolated disk state */

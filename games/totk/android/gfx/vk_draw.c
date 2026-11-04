@@ -3278,11 +3278,28 @@ void vk_pipe_boost_waited(uint64_t ns) {
     atomic_fetch_add_explicit(&g_boost_joins, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_boost_join_ns, ns, memory_order_relaxed);
 }
+/* TOTK_VK_UNWRITTEN_MASK=1 (default off): colour attachments the fragment shader has no output for keep their contents.
+   NVN/Maxwell leaves such a bound target untouched; Vulkan leaves it undefined and Adreno writes black. The write mask
+   derives from the key's fragment shader alone, so equal keys still build equal pipelines and the PSO key lists stay
+   valid in both arms; only the output-interface library key carries the effective mask. */
+static int g_unwritten_mask;
+static _Atomic uint64_t g_unwritten_pipes, g_unwritten_attachments;
+int vk_unwritten_mask_on(void) { return g_unwritten_mask; }
 void vk_draw_switches_init(void) {
     const char *e = getenv("TOTK_VK_PIPE_BOOST"); g_pipe_boost = e && atoi(e) == 1;
     LOGV("TOTK_VK_PIPE_BOOST=%d: %s", g_pipe_boost, g_pipe_boost ?
          "a join on a compile worker's build lends the worker the waiter's nice until it publishes" :
          "compile workers keep nice 10 while joined (default)");
+    e = getenv("TOTK_VK_UNWRITTEN_MASK"); g_unwritten_mask = e && atoi(e) == 1;
+    LOGV("TOTK_VK_UNWRITTEN_MASK=%d: %s", g_unwritten_mask, g_unwritten_mask ?
+         "colour attachments the fragment shader does not output get colorWriteMask 0" :
+         "colour write masks follow the game's channel mask only (default)");
+}
+static uint32_t pipe_write_mask(const pipe_key *k) {   /* the key's channel mask minus attachments without an output */
+    if (!g_unwritten_mask) return k->chmask;
+    uint32_t outputs = k->fs ? ((const vk_shader *)k->fs)->fout_mask : 0, mask = k->chmask;
+    for (unsigned i = 0; i < 8; i++) if (!(outputs >> i & 1)) mask &= ~(0xfu << (4 * i));
+    return mask;
 }
 #include "vk_pso_runtime.inc"
 static void pipe_enqueue(pipe_ent *e) {
@@ -3368,8 +3385,10 @@ static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkP
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = k->samples ? (VkSampleCountFlagBits)k->samples : VK_SAMPLE_COUNT_1_BIT, .alphaToCoverageEnable = k->a2c & 1};
     VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineColorBlendAttachmentState cba[8];
+    uint32_t chmask = pipe_write_mask(k), unwritten = 0;
     for (uint32_t i = 0; i < k->ncolor && i < 8; i++) {
-        uint32_t m = k->chmask >> (4 * i) & 0xf;
+        uint32_t m = chmask >> (4 * i) & 0xf;
+        unwritten += k->cfmt[i] && (k->chmask >> (4 * i) & 0xf) && !m;
         cba[i] = (VkPipelineColorBlendAttachmentState){.colorWriteMask = (m & 1 ? VK_COLOR_COMPONENT_R_BIT : 0) | (m & 2 ? VK_COLOR_COMPONENT_G_BIT : 0) | (m & 4 ? VK_COLOR_COMPONENT_B_BIT : 0) | (m & 8 ? VK_COLOR_COMPONENT_A_BIT : 0)};
         if (k->blend_en >> i & 1 && k->cfmt[i]) {
             cba[i].blendEnable = VK_TRUE;
@@ -3452,6 +3471,10 @@ static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkP
     }
     if (r != VK_PIPELINE_COMPILE_REQUIRED) { HK_ADD(pipes, 1); HK_ADD(pipe_ns, host_now_ns() - t0); }
     if (part >= 0 && r && p) vkDestroyPipeline(V.dev, p, NULL);
+    if (!r && part < 0 && unwritten) {
+        atomic_fetch_add_explicit(&g_unwritten_pipes, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_unwritten_attachments, unwritten, memory_order_relaxed);
+    }
     *out = r ? VK_NULL_HANDLE : p;
     return r;
 }
@@ -3472,7 +3495,7 @@ static pipe_library_key pipe_library_key_for(const pipe_key *k, VkPipelineLayout
         memcpy(key.k.cfmt, k->cfmt, sizeof k->cfmt); key.k.dfmt = k->dfmt; key.k.sfmt = k->sfmt;
         key.k.ncolor = k->ncolor; key.k.samples = k->samples; key.k.a2c = k->a2c;
         memcpy(key.k.blend, k->blend, sizeof k->blend);
-        key.k.blend_en = k->blend_en; key.k.chmask = k->chmask; key.k.logic_op = k->logic_op;
+        key.k.blend_en = k->blend_en; key.k.chmask = pipe_write_mask(k); key.k.logic_op = k->logic_op;
     }
     return key;
 }
@@ -9717,6 +9740,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         LOGV("frame %llu, pipeline joins: %llu waits on worker builds (graphics and compute) in %.1f ms; boosts %llu, refused %llu (TOTK_VK_PIPE_BOOST=%d)",
              (unsigned long long)n, (unsigned long long)atomic_exchange(&g_boost_joins, 0), atomic_exchange(&g_boost_join_ns, 0) / 1e6,
              (unsigned long long)atomic_exchange(&g_boost_raised, 0), (unsigned long long)atomic_exchange(&g_boost_refused, 0), g_pipe_boost);
+        if (g_unwritten_mask)
+            LOGV("frame %llu, unwritten colour attachments: %llu new pipelines masked %llu attachments their fragment shader does not output (TOTK_VK_UNWRITTEN_MASK=1)",
+                 (unsigned long long)n, (unsigned long long)atomic_exchange(&g_unwritten_pipes, 0), (unsigned long long)atomic_exchange(&g_unwritten_attachments, 0));
         if (V.has_pipeline_library) {
             static uint64_t previous[7], previous_parts[PL_COUNT], previous_ns[PL_COUNT];
             uint64_t current[7] = {atomic_load(&g_library_stats.fast_links), atomic_load(&g_library_stats.fast_link_ns),

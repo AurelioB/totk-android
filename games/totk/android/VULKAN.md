@@ -900,6 +900,13 @@ until it publishes, then returns to +10. Every 300 presents `pipeline joins: N w
 boosts B, refused R` reports both arms; compare the join ms and the frames over 50 ms. `refused` counts kernel
 refusals (no `RLIMIT_NICE` headroom), logged once as `pipe boost: ... refused`.
 
+`TOTK_VK_UNWRITTEN_MASK=1` (default unset = off) builds `colorWriteMask` 0 for every colour attachment whose location
+the fragment shader does not output (`fout` in the seed, array outputs spanning their locations). NVN/Maxwell leaves
+such a bound target untouched; Vulkan leaves it undefined and Adreno writes black, and the write also costs bandwidth.
+The mask follows the key's fragment shader, so pipeline keys and PSO lists are shared by both arms. Every 300 presents
+`unwritten colour attachments: P new pipelines masked A attachments` (switch on); compare GPU ms and look for black or
+stale targets.
+
 Build errors are no longer permanent silent skips. Each failed key logs its identity, shader variants and Vulkan
 result once, then retries synchronously after a failure is observed: one subsequent game submission for the first
 failure, then 30, 60, 120, 240 and at most 300 submissions between observations/retries. Repeated draws cannot cause

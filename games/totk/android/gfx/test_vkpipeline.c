@@ -9,7 +9,9 @@
    --target-life checks current-frame and retained 480x268 color/depth contents through real sampled draws.
    TOTK_VK_PIPE_BOOST=1 checks that the bounded graphics join and the compute dispatch join lend their waiter's nice
    to the building worker exactly for that build (through a priority hook: hosts may not lower nice); unset checks
-   that joins never touch worker priority. */
+   that joins never touch worker priority.
+   TOTK_VK_UNWRITTEN_MASK=1 checks that a fragment shader writing location 0 only leaves the second of two colour
+   targets at its clear through colorWriteMask 0; unset checks that the game's write mask is kept. */
 #include "vk_screen_classify.h"
 #include <stdio.h>
 
@@ -122,6 +124,7 @@ static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static pthread_t walk;
 static unsigned held_mask = 15, entered, release_build, failures_left, attempts[16], main_builds[16], completed[16], compute_calls;
+static unsigned two_target_builds, second_write_mask;   /* monolithic builds with two attachments; attachment 1's mask */
 static unsigned compute_hold, compute_entered, compute_recording;
 extern void vk_compute_test_counts(uint64_t out[4]);
 static unsigned failure_mask = 7;
@@ -183,6 +186,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL graphics(VkDevice dev, VkPipelineCache cac
     pthread_mutex_lock(&mu);
     attempts[mask]++;
     main_builds[mask] += pthread_equal(pthread_self(), walk) != 0;
+    if (ci->pColorBlendState->attachmentCount >= 2) { two_target_builds++; second_write_mask = ci->pColorBlendState->pAttachments[1].colorWriteMask; }
     if (mask == held_mask && !pthread_equal(pthread_self(), walk)) {
         entered = 1; held_tid = (unsigned)syscall(SYS_gettid); pthread_cond_broadcast(&cv);
         while (!release_build) pthread_cond_wait(&cv, &mu);
@@ -674,6 +678,53 @@ static void upload_probe(pool_t *pool, uint8_t *mem) {
           "every upload deswizzled %s (jobs %llu, runs %llu)", upload_pool_helpers() ? "in parallel" : "serially",
           (unsigned long long)stats.jobs, (unsigned long long)stats.runs);
 }
+/* One draw into two RGBA8 colour targets cleared blue and green; returns whether a new two-attachment pipeline was
+   built and attachment 1's write mask, with both targets read back to out. */
+static int two_target_draw(const p_bind_program *bind, tex_t color[2], uint8_t *out[2], unsigned *mask) {
+    p_set_rt rt = {.n = 2, .color = {&color[0], &color[1]}};
+    p_viewports square = viewport; square.v[0][2] = square.v[0][3] = 64;
+    p_clear_color blue = {0, 15, {0, 0, 1, 1}}, green = {1, 15, {0, 1, 0, 1}};
+    chmask_st channels = {0xff}; p_bind_state state = {.kind = 2}; memcpy(state.bytes, &channels, sizeof channels);
+    p_draw d = {4, 0, 3, 0, 0};
+    unsigned builds = graphics_count(&two_target_builds);
+    op(OP_SET_RT, &rt, sizeof rt); op(OP_CLEAR_COLOR, &blue, sizeof blue); op(OP_CLEAR_COLOR, &green, sizeof green);
+    op(OP_BIND_PROGRAM, bind, sizeof *bind); op(OP_BIND_VATTR, &attrs, sizeof attrs); op(OP_BIND_VSTREAM, &streams, sizeof streams);
+    op(OP_BIND_VBUF, &vertices, sizeof vertices); op(OP_BIND_UBO, &uniforms[0], sizeof uniforms[0]); op(OP_BIND_UBO, &uniforms[1], sizeof uniforms[1]);
+    op(OP_BIND_TEX, &texture, sizeof texture); op(OP_VIEWPORTS, &square, sizeof square); op(OP_BIND_STATE, &state, sizeof state);
+    op(OP_DRAW, &d, sizeof d);
+    for (int i = 0; i < 2; i++) {
+        memset(out[i], 0x5c, 64 * 64 * 4);
+        p_copy_b2t back = {.src = (uintptr_t)out[i], .tex = &color[i], .r = {0, 0, 0, 64, 64, 1}}; op(OP_COPY_T2B, &back, sizeof back);
+    }
+    CHECK(mtl_wait(submit(), 5000000000ull), "two-target draw submission completed");
+    pthread_mutex_lock(&mu); int built = two_target_builds > builds; *mask = second_write_mask; pthread_mutex_unlock(&mu);
+    return built;
+}
+/* The fragment shader (salt 2) outputs location 0 only. NVN leaves target 1 untouched: TOTK_VK_UNWRITTEN_MASK=1
+   builds colorWriteMask 0 for it, so it keeps its clear; unset keeps the game's mask 0xf. An array output covering
+   locations 0..1 (salt 46; the seed's fout names location 0 only) is never masked. */
+static void unwritten_probe(const tex_t *base, uint8_t *mem) {
+    const char *env = getenv("TOTK_VK_UNWRITTEN_MASK"); int on = env && atoi(env) == 1;
+    tex_t color[2] = {*base, *base};
+    for (int i = 0; i < 2; i++) { color[i].mem = mem + 0xa00000 + i * 0x10000; color[i].serial = 910 + (uint64_t)i; }
+    uint8_t *out[2] = {mem + 0xa20000, mem + 0xa30000};
+    const uint8_t *p0 = out[0] + (10 * 64 + 10) * 4, *p1 = out[1] + (10 * 64 + 10) * 4;
+    unsigned mask;
+    int built = two_target_draw(&program, color, out, &mask);
+    CHECK(built && p0[0] == 255 && p0[1] == 255 && p0[2] == 255, "location 0 draws the textured result into target 0 (%u,%u,%u)", p0[0], p0[1], p0[2]);
+    if (on) CHECK(!mask && p1[0] == 0 && p1[1] == 255 && p1[2] == 0 && p1[3] == 255,
+                  "unwritten target 1 gets colorWriteMask 0 (%#x) and keeps its green clear (%u,%u,%u,%u)", mask, p1[0], p1[1], p1[2], p1[3]);
+    else CHECK(mask == 0xf, "switch off: target 1 keeps the game's write mask (%#x; Vulkan leaves it undefined, here %u,%u,%u,%u)",
+               mask, p1[0], p1[1], p1[2], p1[3]);
+    static uint8_t control[0x880]; static prog_t arrays;
+    arrays = *program.prog; arrays.serial = 102;
+    uint8_t *code = mem + 0xa40000; shader_binary(1, 46, control, code);
+    arrays.sd[1].data = (uintptr_t)code; arrays.sd[1].control = control;
+    p_bind_program bind = {&arrays, 3};
+    built = two_target_draw(&bind, color, out, &mask);
+    CHECK(built && mask == 0xf && p0[0] == 255 && p0[1] == 255 && p0[2] == 255 && p1[0] == 255 && !p1[1] && p1[2] == 255,
+          "an array output spanning locations 0..1 writes both targets (mask %#x, target 1 %u,%u,%u)", mask, p1[0], p1[1], p1[2]);
+}
 static int finish_tests(void) {
     uint64_t lib_ns, pso_ns, lib_wait_ns, pso_wait_ns, shader_scan_ns, pso_scan_ns;
     mtl_create_ns(&lib_ns, &pso_ns); mtl_wait_stats(&lib_wait_ns, &pso_wait_ns); mtl_scan_stats(&shader_scan_ns, &pso_scan_ns);
@@ -896,6 +947,7 @@ int main(int argc, char **argv) {
     CHECK(graphics_count(&attempts[failure_mask]) == 3 && pixel[0] == 255 && pixel[1] == 255, "retry eventually recovers real geometry");
     upload_probe(&pool, mem);
     if (prediction_test) prediction_probe(&tex, pixel);
+    unwritten_probe(&tex, mem);
     return finish_tests();
 }
 #else
