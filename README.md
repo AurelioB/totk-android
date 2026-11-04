@@ -2,6 +2,8 @@
 
 # TotK Native for Android
 
+[![Support me on Ko-fi](https://img.shields.io/badge/Support_me_on_Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/J3J518XVKR)
+
 **TotK Native** (`com.aure.totk`) runs **The Legend of Zelda: Tears of the Kingdom 1.4.3** natively on Android
 handhelds with a Qualcomm Adreno GPU. It is not an emulator: the game's own code is prepared once, on your device, to
 run directly on its processor, and its graphics are drawn by a bundled Vulkan driver. The app contains **no game
