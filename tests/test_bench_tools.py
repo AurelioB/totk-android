@@ -268,5 +268,124 @@ class Ledger(unittest.TestCase):
                     self.assertEqual(ROOT / e['baseline'], benchlib.BENCH_DOCS / b['file'])
 
 
+def ab_log(windows, ctl):
+    """A synthetic totk.log: per 300-frame window end f, its timing / fps / GPU / stutter lines (values from
+    windows[f] = (fps, p95, gpu, over50)), with the [totk-ctl] lines (frame, text) placed where they happened."""
+    lines, events = [], sorted(ctl)
+    for f in range(300, max(windows) + 1, 300):
+        while events and events[0][0] < f:
+            lines.append(events.pop(0)[1])
+        fps, p95, gpu, over50 = windows.get(f, (30.0, 40.0, 20.0, 0))
+        lines += [f'[nvn] 计时 至帧 {f}： 帧时间 p50 33.30 / p95 {p95:.2f} / 最大 60.00 ms（300 帧）；',
+                  f'[nvn-vk] frame {f}: {fps:.1f} fps over the last 300, 1000 draws',
+                  f'[nvn-vk] frame {f}, per frame: recording 2.0 ms, waiting for the GPU 1.0 ms, GPU {gpu:.1f} ms',
+                  f'[nvn-vk] frame {f}, stutter: longest frame 60.0 ms, 3 frames over 33 ms, {over50} over 50 ms']
+    return '\n'.join(lines + [e[1] for e in events]) + '\n'
+
+
+class InSessionAB(unittest.TestCase):
+    CTL = [(1000, '[totk-ctl] gen=1 frame=1000 applied unset TOTK_VK_DESC_STOCK'),
+           (1000, '[totk-ctl] gen=1 frame=1000 mark ab arm=A block=1 scene=hateno'),
+           (2500, '[totk-ctl] gen=2 frame=2500 applied TOTK_VK_DESC_STOCK=1'),
+           (2500, '[totk-ctl] gen=2 frame=2500 mark ab arm=B block=2 scene=hateno'),
+           (4000, '[totk-ctl] gen=3 frame=4000 mark ab arm=B block=3 scene=hateno'),
+           (5200, '[totk-ctl] gen=4 frame=5200 applied unset TOTK_VK_DESC_STOCK'),
+           (5200, '[totk-ctl] gen=4 frame=5200 mark ab arm=A block=4 scene=hateno'),
+           (6500, '[totk-ctl] gen=5 frame=6500 mark ab done scene=hateno')]
+
+    def test_parse_ctl(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'x.log'
+            p.write_text('\n'.join(t for _, t in self.CTL) + '\n[totk-ctl] refused "x": unknown command\n', encoding='utf-8')
+            gens = analyze.parse_ctl(p)
+        self.assertEqual([(g['gen'], g['frame'], g['arm'], g['block']) for g in gens],
+                         [(1, 1000, 'A', 1), (2, 2500, 'B', 2), (3, 4000, 'B', 3), (4, 5200, 'A', 4), (5, 6500, None, None)])
+        self.assertEqual(gens[1]['applied'], ['TOTK_VK_DESC_STOCK=1'])
+
+    def test_window_generation(self):
+        gens = [{'gen': 1, 'frame': 1000, 'arm': 'A'}, {'gen': 2, 'frame': 2500, 'arm': 'B'}]
+        wg = lambda s, e, guard=2: (lambda g: g and g['gen'])(analyze.window_generation(s, e, gens, guard))
+        self.assertEqual(wg(1, 300), 0)            # before any live change
+        self.assertEqual(wg(701, 1000), 0)         # the change applies after frame 1000: the window ends before it
+        self.assertEqual(wg(901, 1200), None)      # straddles frame 1000
+        self.assertEqual(wg(1003, 1302), 1)        # starts after the change plus the guard
+        self.assertEqual(wg(1002, 1301), None)     # inside the guard
+        self.assertEqual(wg(1002, 1301, guard=0), 1)
+        self.assertEqual(wg(2201, 2500), 1)        # ends on the frame the next change follows
+        self.assertEqual(wg(2202, 2501), None)
+        self.assertEqual(wg(2801, 3100), 2)
+
+    def make_run(self, d, a_fps=(30.0, 30.2), b_fps=(28.0, 28.1)):
+        """Four ab.sh blocks A B B A, one pan each: block 3's last window straddles the change to block 4."""
+        w = {}
+        for f in (1800, 2100, 2400):
+            w[f] = (a_fps[0], 40.0, 20.0, 1)
+        for f in (3000, 3300, 3600, 3900):
+            w[f] = (b_fps[0], 42.0, 20.0, 2)
+        for f in (4500, 4800, 5100, 5400):
+            w[f] = (b_fps[1], 43.0, 20.1, 2)
+        w[6000] = (a_fps[1], 40.5, 19.9, 1)   # the last pan holds one whole window
+        (d / 'logs').mkdir()
+        (d / 'logs/thor.log').write_text(ab_log(w, self.CTL), encoding='utf-8')
+        (d / 'pans.txt').write_text(''.join(f'thor hateno F0={f0} F1={f1} T0={t} T1={t + 30} V=16000 D={dd}\n' for f0, f1, t, dd in
+                                            ((1200, 2400, 100, 1), (2400, 3900, 200, -1), (3900, 5400, 300, 1), (5400, 6000, 400, -1))))
+
+    def test_analyze_arms_and_abtest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self.make_run(d)
+            r = run(BENCH / 'analyze.py', d, '--arms', '--json', d / 'ab.json')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            doc = json.loads((d / 'ab.json').read_text(encoding='utf-8'))
+            ab = doc['runs'][0]['ab']
+            self.assertEqual(ab['windows'], {'assigned': 11, 'straddling': 1, 'unlabelled': 0})
+            arms = ab['arms']
+            self.assertEqual([b['block'] for b in arms['A']['blocks']], [1, 4])
+            self.assertEqual([b['block'] for b in arms['B']['blocks']], [2, 3])
+            self.assertEqual(arms['B']['summary']['windows'], 7)   # 5400 straddles the change at frame 5200
+            self.assertEqual(arms['A']['summary']['fps_mean'], round((30.0 * 3 + 30.2) / 4, 2))
+            self.assertEqual(arms['A']['spread']['fps_mean'], 0.2)
+            self.assertEqual(arms['B']['spread']['over50_total'], 0.0)
+            straddler = next(w for w in doc['runs'][0]['windows'] if w['frames'][1] == 5400)
+            self.assertIsNone(straddler['gen'])
+            self.assertIn('arm B: 2 blocks, 7 windows', r.stdout)
+            r = run(BENCH / 'abtest.py', d / 'ab.json')
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)   # B is 2 fps slower, beyond tolerance and noise
+            self.assertIn('arm B vs A: WORSE', r.stdout)
+            self.assertRegex(r.stdout, r'fps mean .* worse \*')
+            self.assertRegex(r.stdout, r'>50 ms frames /win +1 +2 .* worse \*')
+
+    def test_abtest_noise_and_single_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self.make_run(d, a_fps=(30.0, 27.0), b_fps=(28.0, 28.4))   # A's own blocks differ by 3 fps
+            self.assertEqual(run(BENCH / 'analyze.py', d, '--arms', '--json', d / 'ab.json').returncode, 0)
+            r = run(BENCH / 'abtest.py', d / 'ab.json')
+            self.assertRegex(r.stdout, r'fps mean .* within noise')
+            doc = json.loads((d / 'ab.json').read_text(encoding='utf-8'))
+            for a in doc['runs'][0]['ab']['arms'].values():   # one block per arm: no noise estimate
+                a['blocks'] = a['blocks'][:1]; a['spread'] = {k: None for k in a['spread']}
+            (d / 'one.json').write_text(json.dumps(doc), encoding='utf-8')
+            r = run(BENCH / 'abtest.py', d / 'one.json')
+            self.assertRegex(r.stdout, r'fps mean .* worse\?')
+            self.assertIn('arm B vs A: INCONCLUSIVE', r.stdout)
+            self.assertEqual(r.returncode, 0)
+
+    def test_scripts_parse(self):
+        for script in ('live.sh', 'ab.sh', 'pan.sh'):
+            r = subprocess.run(['sh', '-n', str(BENCH / script)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, f'{script}: {r.stderr}')
+        for script in ('live.sh', 'ab.sh'):
+            r = subprocess.run(['sh', str(BENCH / script), '--help'], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn('-s <serial>', r.stderr)
+        # live.sh validates its lines before touching adb
+        r = subprocess.run(['sh', str(BENCH / 'live.sh'), '-s', 'x', 'set', 'TOTK_VK_DESC_STOCK=on'], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('value must be a decimal', r.stderr)
+        r = subprocess.run(['sh', str(BENCH / 'live.sh'), '-s', 'x', 'mark', 'a"b'], capture_output=True, text=True)
+        self.assertIn('mark text', r.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()

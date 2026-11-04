@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""analyze.py <out-dir> [--json FILE] [--name NAME] [--date YYYY-MM-DD] [--commit SHA] [--meta FILE]
+"""analyze.py <out-dir> [--json FILE] [--name NAME] [--date YYYY-MM-DD] [--commit SHA] [--meta FILE] [--arms [--guard-frames N]]
 
 Per device x scene, the runtime's own 300-frame windows recorded while panning: from <out>/pans.txt, the windows whose
 end frame is in [F0+600, F1] (started after the stick was pushed, finished before it was released), read from
@@ -14,6 +14,15 @@ A run is freq_stable false when any effective cap (CPU scaling_max per cluster, 
 snapshots, between the sampler's records over the pans, or from the device's first scene: such a run is not usable
 for comparison and never becomes a baseline. Each device gets freq_limits (its first pan's start) and freq_signature
 (benchlib.device_signature: model + SoC, settings_env hash, CPU caps, GPU cap).
+
+--arms (in-session A/B, tools/bench/ab.sh): the log's live-switch lines ([totk-ctl] gen=N frame=F applied ... / mark
+...) split the session into generations; generation N covers the frames after F up to the next generation's frame.
+Each window goes to the generation that covered its whole span, from more than --guard-frames (default 2) frames
+after that generation started (the backend may still record a frame of the previous one); windows straddling a change
+are dropped. A generation belongs to the arm named by its "mark ... arm=<X>" (ab.sh writes "ab arm=X block=n");
+windows of generations without one are dropped too. Per arm: pooled summary metrics over its windows, and per block
+(one generation) the same metrics; the ABBA noise estimate of a metric is the spread (max - min) of its block values
+within the arm. The run gets "ab" in the JSON; abtest.py prints the verdicts.
 
 Inputs per device label (as written by collect.sh / sampler.py / pan.sh): logs/<d>.log, logs/<d>-dmesg.txt,
 samples-<d>.txt, settings-<d>.env, facts-<d>.txt, totk-env-<d>.txt (only when a developer totk.env exists), freqs.txt.
@@ -40,11 +49,15 @@ METHOD_SOURCES = {
 }
 KNOWN_SCENES = {
     'hateno': {'name': 'Hateno Village', 'save_slot': 'slot_00', 'note': 'outdoors in the village'},
-    'lookout': {'name': 'Lookout Landing', 'save_slot': 'slot_02',
+    'lookout': {'name': 'Lookout Landing', 'save_slot': 'slot_01',
                 'note': 'arrival point is inside the shelter next to Monte (indoor)'},
     'rotsumamu': {'name': 'Rotsumamu Shrine', 'save_slot': 'slot_04', 'note': 'outdoors at the shrine'},
 }
 FAULT_RE = re.compile(r'page ?fault|smmu.*fault|context fault|gpu fault|adreno.*fault', re.I)
+CTL_RE = re.compile(r'\[totk-ctl\] gen=(\d+) frame=(\d+) (applied|mark)(?: (.*))?$')
+GUARD_FRAMES = 2
+# Block metrics of the A/B noise estimate: the summary keys abtest.py compares (rates per window).
+AB_METRICS = ('fps_mean', 'fps_min', 'p50_ms_median', 'p95_ms_max', 'max_ms', 'gpu_ms_mean', 'over50_total', 'long_ge45_total')
 
 
 def parse_log(path):
@@ -69,6 +82,124 @@ def parse_log(path):
         if 'device lost' in line.lower():
             info['device_lost'] = info.get('device_lost', 0) + 1
     return timing, gpu, fps, stut, longf, info
+
+
+def parse_ctl(path):
+    """The live-switch generations of a log, in order: [{'gen', 'frame', 'applied': [tokens], 'marks': [texts],
+    'arm', 'block'}]. 'arm' / 'block' come from the generation's last mark carrying arm= / block=."""
+    gens = {}
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        lines = [line.rstrip('\n') for line in fh if '[totk-ctl]' in line]
+    for line in lines:
+        if not (m := CTL_RE.search(line)):
+            continue
+        g = gens.setdefault(int(m[1]), {'gen': int(m[1]), 'frame': int(m[2]), 'applied': [], 'marks': [], 'arm': None,
+                                        'block': None})
+        if m[3] == 'applied':
+            g['applied'].append(m[4] or '')
+        else:
+            g['marks'].append(m[4] or '')
+            kv = dict(t.split('=', 1) for t in (m[4] or '').split() if '=' in t)
+            if kv.get('arm'):
+                g['arm'] = kv['arm']
+                g['block'] = int(kv['block']) if kv.get('block', '').isdigit() else None
+    return [gens[k] for k in sorted(gens)]
+
+
+def window_generation(start, end, gens, guard=GUARD_FRAMES):
+    """The generation (its dict) that covered frames [start, end] whole, with `guard` frames of margin after it began;
+    None when a change falls inside (or within the guard before) the window. Frames up to the first generation's frame
+    belong to generation 0 (no live change yet), returned as {'gen': 0, 'frame': 0, 'arm': None, ...}."""
+    current = {'gen': 0, 'frame': 0, 'applied': [], 'marks': [], 'arm': None, 'block': None}
+    for g in gens:
+        if g['frame'] < start - guard:
+            current = g
+        elif g['frame'] < end:
+            return None   # a change applied before the window's last frame, after its start (or inside the guard)
+        else:
+            break
+    return current
+
+
+def summarize(windows, thermal=()):
+    vals = lambda k: [w[k] for w in windows if w.get(k) is not None]
+    p50s = sorted(vals('p50_ms'))
+    return {
+        'windows': len(windows),
+        'fps_min': min(vals('fps'), default=None), 'fps_max': max(vals('fps'), default=None),
+        'fps_mean': round(sum(vals('fps')) / len(vals('fps')), 2) if vals('fps') else None,
+        'p50_ms_median': p50s[len(p50s) // 2] if p50s else None,
+        'p95_ms_max': max(vals('p95_ms'), default=None), 'max_ms': max(vals('max_ms'), default=None),
+        'gpu_ms_mean': round(sum(vals('gpu_ms')) / len(vals('gpu_ms')), 2) if vals('gpu_ms') else None,
+        'long_ge45_total': sum(vals('long_ge45')), 'long_ge25_total': sum(vals('long_ge25')),
+        'over50_total': sum(vals('over50')),
+        'cpu_max_c': mx(t['cpu_max_c'] for t in thermal), 'gpu_max_c': mx(t['gpu_max_c'] for t in thermal),
+    }
+
+
+def block_metric(summary, key):
+    """A summary metric as compared: totals of rate metrics per window."""
+    v = summary.get(key)
+    if v is None:
+        return None
+    if key in ('over50_total', 'long_ge45_total'):
+        return round(v / summary['windows'], 3) if summary.get('windows') else None
+    return v
+
+
+def arm_analysis(windows, gens, guard=GUARD_FRAMES):
+    """Assigns each window (dict with 'frames' [start, end]) to its generation and arm (adds 'gen' / 'arm' to it) and
+    returns the run's "ab" record: per arm the pooled summary, per block (generation) the summary, and the spread of
+    each AB_METRICS value over the arm's blocks (None with fewer than two blocks)."""
+    counts = {'assigned': 0, 'straddling': 0, 'unlabelled': 0}
+    blocks = collections.OrderedDict()
+    for w in windows:
+        g = window_generation(w['frames'][0], w['frames'][1], gens, guard)
+        w['gen'] = g['gen'] if g else None
+        w['arm'] = g['arm'] if g else None
+        if g is None:
+            counts['straddling'] += 1
+        elif g['arm'] is None:
+            counts['unlabelled'] += 1
+        else:
+            counts['assigned'] += 1
+            blocks.setdefault(g['gen'], (g, []))[1].append(w)
+    arms = collections.OrderedDict()
+    for gen, (g, ws) in blocks.items():
+        s = summarize(ws)
+        arms.setdefault(g['arm'], {'blocks': [], 'windows': []})
+        arms[g['arm']]['blocks'].append({'gen': gen, 'block': g['block'], 'frame': g['frame'], 'summary': s,
+                                         'metrics': {k: block_metric(s, k) for k in AB_METRICS}})
+        arms[g['arm']]['windows'] += ws
+    for a in arms.values():
+        a['summary'] = summarize(a.pop('windows'))
+        a['spread'] = {}
+        for k in AB_METRICS:
+            vs = [b['metrics'][k] for b in a['blocks'] if b['metrics'][k] is not None]
+            a['spread'][k] = round(max(vs) - min(vs), 3) if len(vs) >= 2 else None
+    return {'guard_frames': guard, 'windows': counts,
+            'generations': [{k: g[k] for k in ('gen', 'frame', 'applied', 'marks', 'arm', 'block')} for g in gens],
+            'arms': arms}
+
+
+def print_arms(ab):
+    c = ab['windows']
+    print(f'  arms: {c["assigned"]} windows assigned, {c["straddling"]} dropped (straddle a live change, guard '
+          f'{ab["guard_frames"]} frames), {c["unlabelled"]} dropped (no arm mark)')
+    fmt = lambda v: '-' if v is None else f'{v:g}'
+    for arm, a in ab['arms'].items():
+        s = a['summary']
+        print(f'  arm {arm}: {len(a["blocks"])} blocks, {s["windows"]} windows: fps {fmt(s["fps_mean"])}, p50 '
+              f'{fmt(s["p50_ms_median"])} ms, p95 max {fmt(s["p95_ms_max"])} ms, GPU {fmt(s["gpu_ms_mean"])} ms, '
+              f'>50 ms {s["over50_total"]} ({fmt(block_metric(s, "over50_total"))}/window)')
+        for b in a['blocks']:
+            m = b['metrics']
+            print(f'    block {b["block"] if b["block"] is not None else "?"} (gen {b["gen"]}, from frame {b["frame"]}): '
+                  f'{b["summary"]["windows"]} windows, fps {fmt(m["fps_mean"])}, p95 {fmt(m["p95_ms_max"])} ms, '
+                  f'GPU {fmt(m["gpu_ms_mean"])} ms, >50/window {fmt(m["over50_total"])}')
+        sp = a['spread']
+        print(f'    same-arm spread: fps {fmt(sp["fps_mean"])}, p95 {fmt(sp["p95_ms_max"])} ms, GPU {fmt(sp["gpu_ms_mean"])} ms, '
+              f'>50/window {fmt(sp["over50_total"])}' + ('' if len(a['blocks']) >= 2 else ' (one block: no noise estimate)'))
 
 
 def parse_samples(path, t0, t1):
@@ -179,6 +310,9 @@ def main():
     ap.add_argument('--date', help='measurement date (default: UTC date of the first pan)')
     ap.add_argument('--commit', help='source commit of the measured APK (its assets/build.txt)')
     ap.add_argument('--meta', help='JSON object deep-merged over the result (device names, profiles, extra caveats)')
+    ap.add_argument('--arms', action='store_true', help='in-session A/B: assign windows to the arms of the live-switch marks')
+    ap.add_argument('--guard-frames', type=int, default=GUARD_FRAMES,
+                    help=f'frames after a live change before a window may start (default {GUARD_FRAMES})')
     a = ap.parse_args()
     if a.json:
         guard_output(a.json)
@@ -283,19 +417,11 @@ def main():
                           f'cpufreq scaling_max<cpuinfo_max: {[f"{s}/{m}" for s, m in capped] or "none"} ({len(rows)} samples)')
                 else:
                     print(f'  no samples over the pan {utc(kv["T0"])} .. {utc(kv["T1"])}')
-            vals = lambda k: [w[k] for w in windows if w[k] is not None]
-            p50s = sorted(vals('p50_ms'))
-            summary = {
-                'windows': len(windows),
-                'fps_min': min(vals('fps'), default=None), 'fps_max': max(vals('fps'), default=None),
-                'fps_mean': round(sum(vals('fps')) / len(vals('fps')), 2) if vals('fps') else None,
-                'p50_ms_median': p50s[len(p50s) // 2] if p50s else None,
-                'p95_ms_max': max(vals('p95_ms'), default=None), 'max_ms': max(vals('max_ms'), default=None),
-                'gpu_ms_mean': round(sum(vals('gpu_ms')) / len(vals('gpu_ms')), 2) if vals('gpu_ms') else None,
-                'long_ge45_total': sum(vals('long_ge45')), 'long_ge25_total': sum(vals('long_ge25')),
-                'over50_total': sum(vals('over50')),
-                'cpu_max_c': mx(t['cpu_max_c'] for t in thermal), 'gpu_max_c': mx(t['gpu_max_c'] for t in thermal),
-            }
+            summary = summarize(windows, thermal)
+            ab = None
+            if a.arms:
+                ab = arm_analysis(windows, parse_ctl(os.path.join(out, 'logs', f'{dev}.log')), a.guard_frames)
+                print_arms(ab)
             snaps = [freqs.get((dev, kv['T0']), {}) for kv in plist]
             first = next((s.get('start') or s.get('end') for s in snaps if s), None)
             if first and not devices[dev].get('freq_limits'):
@@ -310,7 +436,7 @@ def main():
                                    'freq_limits': {'start': s.get('start'), 'end': s.get('end')}}
                                   for kv, s in zip(plist, snaps)],
                          'freq_stable': stable, 'freq_changes': changes,
-                         'summary': summary, 'windows': windows, 'thermal': thermal})
+                         'summary': summary, 'windows': windows, 'thermal': thermal, **({'ab': ab} if ab else {})})
             table.append((dev, scene, summary, windows))
 
     for dev in order:

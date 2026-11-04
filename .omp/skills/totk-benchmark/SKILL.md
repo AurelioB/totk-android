@@ -16,7 +16,11 @@ All scripts are in `tools/bench/` (paths below are relative to the repository ro
   - **`sendevent`**: the scene is panned by writing stick events to the built-in controller's `/dev/input/event*` node
     (and menus are navigated with button events); those nodes are root-only. `getevent -p` (controller detection) too.
   - **The app's private files**: the frame timings come from the game's own log, `totk.log`, and the profile from
-    `settings.env`, both in `/data/user/0/com.aure.totk/files` (readable only by the app or root).
+    `settings.env`, both in `/data/user/0/com.aure.totk/files` (readable only by the app or root). Never rely on logcat:
+    some devices' logd drops the game's lines (the Pocket Duo showed none). A file root **writes** there (the live
+    switches' `totk.ctl`) needs the game folder's owner and SELinux context, MLS categories included:
+    `chown $(stat -c %u:%g <game dir>)` and `chcon --reference=<game dir>`, else the app cannot read it (`live.sh` does
+    both).
   - **Kernel log and sysfs**: the dmesg marker and the GPU/SMMU fault check read the kernel log; the sampler and the
     frequency snapshots read thermal zones, cooling devices, cpufreq policies and `/sys/class/kgsl` (several of them
     root-only on production builds).
@@ -81,7 +85,7 @@ All scripts are in `tools/bench/` (paths below are relative to the repository ro
   | Scene label | Save slot | App's Saves screen | Note |
   |---|---|---|---|
   | `hateno` | `slot_00` Hateno Village | Slot 1 | outdoors in the village |
-  | `lookout` | `slot_02` Lookout Landing | Slot 3 | arrives **inside** the shelter next to Monte (indoor) |
+  | `lookout` | `slot_01` Lookout Landing | Slot 2 | arrives **inside** the shelter next to Monte (indoor) |
   | `rotsumamu` | `slot_04` Rotsumamu Shrine | Slot 5 | outdoors at the shrine |
 
   The game's own Load list is ordered by save date, newest first, not by slot: pick the scene by its **name**.
@@ -173,6 +177,44 @@ Known caveats:
 - **Lookout Landing is indoors** in this save set (the shelter next to Monte).
 - Short runs (3–7 windows per scene): differences inside the tolerances are noise; repeat a run before calling a
   small change.
+
+## In-session A/B (live switches)
+
+Compares experiment switches inside ONE running session and ONE loaded scene, alternating the arms (ABBA) instead of
+restarting per arm. The APK must contain the live-switch channel (`runtime/live_ctl.h`; `[totk-ctl] following …` in
+`totk.log`). Live switches, their ranges and where each takes effect: `games/totk/android/APP.md`, *Live switches*.
+`TOTK_IDEAL_CORE_FIX` and any switch not listed there are refused (`[totk-ctl] refused …`): those still need a restart
+with `totk.env`.
+
+1. Steps 1–8 of the procedure above (profile, caps, start, load the scene from the Load list, settle 55 s once, dmesg
+   mark, sampler).
+2. Run the arms, e.g. descriptor stock off vs on on the Duo in Lookout Landing:
+   ```sh
+   tools/bench/ab.sh -s <serial> --device duo --scene lookout \
+     --arms 'A:unset TOTK_VK_DESC_STOCK;B:set TOTK_VK_DESC_STOCK=1' \
+     --order ABBAABBA --pan-seconds 30 --settle 15 --out $OUT
+   ```
+   Per block it writes the arm's lines and `mark ab arm=<X> block=<n> scene=<scene>` to `<game>/totk.ctl` with
+   `live.sh` (one write: one generation, applied at the next presented frame), waits for the game's
+   `[totk-ctl] gen=N frame=F mark …` acknowledgement (it stops on a refused line or no acknowledgement), settles, then
+   pans with `pan.sh` (right first on odd blocks, left first on even ones; the view returns each time). `arms.txt` lists
+   the blocks with their generation and frame. Arm lines are comma-separated `live.sh` lines; an arm may set several
+   switches (`'A:unset TOTK_VK_DESC_STOCK,unset TOTK_PRIO_RENDER;B:set TOTK_VK_DESC_STOCK=1,set TOTK_PRIO_RENDER=-8'`).
+   `unset` returns a switch to its launch value: with no developer `totk.env` that is the default (off).
+   One-off changes: `tools/bench/live.sh -s <serial> set KEY=VALUE | unset KEY | mark <text>` prints the game's answer.
+3. Stop the sampler, `collect.sh` (step 10), then
+   `python3 tools/bench/analyze.py $OUT --arms --json $OUT/ab.json` and `python3 tools/bench/abtest.py $OUT/ab.json`.
+   `analyze.py --arms` gives each 300-frame window to the generation that covered all of it (from 2 frames after its
+   change, `--guard-frames`) and so to the arm of that generation's mark; windows straddling a change are dropped and
+   counted. `abtest.py` prints each arm against A per metric: pooled value, delta, the compare.py tolerance, the noise
+   (the larger same-arm spread between blocks) and the verdict: *same* within tolerance, *within noise* up to the
+   noise, *better*/*worse* beyond both (`?` when an arm ran a single block). Exit 1 when an arm is worse.
+
+Time per arm: a block is about `settle + pan + ~10 s` (write, acknowledgement, the pan's frequency reads), ~55 s with
+the defaults, so ABBAABBA (4 blocks per arm) takes ~7.5 min in one scene load. A restart per arm costs ~45 s to the
+title, the load, the 55 s settle and the pan: ~3 min per arm and scene, run once per arm without a repeat to estimate
+the noise. A/B results are for deciding experiments; they are not ledger runs (no baseline, `ledger.py add` is for
+default-profile runs).
 
 ## Capture a new benchmark (any device)
 

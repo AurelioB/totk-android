@@ -1,0 +1,76 @@
+#!/bin/sh
+# live.sh -s <serial> [--package <pkg>] [--game-dir <dir>] [--wait S] <command>...
+#   commands: set KEY=VALUE | unset KEY | mark <text...> (mark takes the rest of the arguments), or whole quoted lines
+#   e.g. live.sh -s X set TOTK_VK_DESC_STOCK=1 mark ab arm=B block=2
+#        live.sh -s X 'unset TOTK_VK_DESC_STOCK' 'mark ab arm=A block=1'
+#
+# Appends the lines to the running game's control file <game>/totk.ctl (runtime/live_ctl.h) in ONE write, so they apply
+# at the same frame boundary (one generation). Root writes it with the game folder's owner, mode 0600 and SELinux
+# context (chcon --reference=<game dir>: a root-made file lacks the app's MLS categories and the app could not read
+# it). Then waits up to --wait seconds (default 10) for the game's [totk-ctl] lines in totk.log and prints them: the
+# mark's line when there is a mark, refusals always. Exit 3 when a mark was not acknowledged in time.
+set -u
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+die() { echo "live: $*" >&2; exit 1; }
+
+SER=""; PKG=com.aure.totk; GAME=""; WAIT=10; LINES=""; MARK=""
+add() {   # one validated control line
+  case $1 in
+    "set "*) kv=${1#set }; k=${kv%%=*}; v=${kv#*=}
+      case $kv in *=*) ;; *) die "set needs KEY=VALUE: $1" ;; esac
+      case $k in ""|*[!A-Z0-9_]*) die "malformed key: $1" ;; esac
+      case $v in ""|*[!0-9+-]*) die "value must be a decimal: $1" ;; esac ;;
+    "unset "*) k=${1#unset }; case $k in ""|*[!A-Z0-9_]*) die "malformed key: $1" ;; esac ;;
+    "mark "*) MARK=${1#mark }; case $MARK in *[!A-Za-z0-9_=.:/,+@\ -]*) die "mark text: letters, digits, space and _=.:/,+@- only" ;; esac ;;
+    *) die "unknown command: $1 (set KEY=VALUE, unset KEY, mark <text>)" ;;
+  esac
+  LINES="$LINES$1
+"
+}
+while [ $# -gt 0 ]; do
+  case $1 in
+    -s) SER=${2:?}; shift 2 ;;
+    --package) PKG=${2:?}; shift 2 ;;
+    --game-dir) GAME=${2:?}; shift 2 ;;
+    --wait) WAIT=${2:?}; shift 2 ;;
+    -h|--help) usage ;;
+    set|unset) [ $# -ge 2 ] || usage; add "$1 $2"; shift 2 ;;
+    mark) shift; [ $# -ge 1 ] || usage; add "mark $*"; shift $# ;;
+    *" "*) add "$1"; shift ;;
+    *) die "unknown argument $1" ;;
+  esac
+done
+[ -n "$SER" ] && [ -n "$LINES" ] || usage
+[ -n "$GAME" ] || GAME=/data/user/0/$PKG/files/game
+CTL=$GAME/totk.ctl; LOG=$GAME/totk.log
+case $GAME in *[!A-Za-z0-9_./-]*) die "--game-dir: unexpected characters" ;; esac
+adb -s "$SER" shell pidof "$PKG" >/dev/null 2>&1 || die "$PKG is not running on $SER"
+
+# Lines already in the log, so only the answer to this write is shown.
+N0=$(adb -s "$SER" shell "su -c 'grep -ac \"\\[totk-ctl\\]\" $LOG'" 2>/dev/null | tr -d '\r')
+case $N0 in ""|*[!0-9]*) N0=0 ;; esac
+# Build the batch in a root-only temp file, give the control file the game folder's owner / mode / context (create it
+# if needed), then append the whole batch with one cat (one write).
+Q=$(printf '%s' "$LINES" | sed "s/'/'\\\\''/g")
+TMP=/data/local/tmp/totk-ctl.$$
+REMOTE="umask 077; printf '%s' '$Q' > $TMP || exit 1
+[ -e $CTL ] || : > $CTL || exit 1
+chown \$(stat -c %u:%g $GAME) $CTL && chmod 0600 $CTL || exit 1
+chcon --reference=$GAME $CTL 2>/dev/null || chcon \$(ls -Zd $GAME | cut -d' ' -f1) $CTL || exit 1
+cat $TMP >> $CTL; r=\$?; rm -f $TMP; exit \$r"
+printf '%s\n' "$REMOTE" | adb -s "$SER" shell "su -c sh" || die "could not write $CTL (root, owner or SELinux context)"
+
+end=$(( $(date +%s) + WAIT )); shown=0; acked=""
+while :; do
+  new=$(adb -s "$SER" shell "su -c 'grep -a \"\\[totk-ctl\\]\" $LOG'" 2>/dev/null | tr -d '\r' | tail -n +$((N0 + 1)))
+  if [ -n "$new" ]; then
+    printf '%s\n' "$new" | tail -n +$((shown + 1))
+    shown=$(printf '%s\n' "$new" | wc -l)
+    if [ -n "$MARK" ]; then
+      printf '%s\n' "$new" | grep -q "\] gen=[0-9]* frame=[0-9]* mark $MARK\$" && { acked=1; break; }
+    fi
+  fi
+  [ "$(date +%s)" -ge "$end" ] && break
+  sleep 0.5
+done
+[ -z "$MARK" ] || [ -n "$acked" ] || { echo "live: the game did not acknowledge 'mark $MARK' within ${WAIT}s (paused, in a menu without frames, or not reading $CTL?)" >&2; exit 3; }
