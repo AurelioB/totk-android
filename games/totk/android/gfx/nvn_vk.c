@@ -216,6 +216,7 @@ static int xlate_address_fields(unsigned op, const uint8_t *a, size_t size, xlat
         case OP_RENDER_COND: XLATE_NEED(p_render_cond); XLATE_FIELD(p_render_cond, addr); break;
         case OP_CLEAR_COLOR: XLATE_NEED(p_clear_color); break;
         case OP_CLEAR_DS: XLATE_NEED(p_clear_ds); break;
+        case OP_ALPHA_REF: XLATE_NEED(p_alpha_ref); break;
         case OP_VIEWPORTS: XLATE_ARRAY(p_viewports, v, 16); break;
         case OP_SCISSOR: XLATE_NEED(p_scissor); break;
         case OP_DEPTH_RANGE: XLATE_NEED(p_depth_range); break;

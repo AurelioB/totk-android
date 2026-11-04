@@ -2677,6 +2677,54 @@ int main(int argc, char **argv) {
     p_viewports vp; memset(&vp, 0, sizeof vp); vp.n = 1; vp.v[0][2] = 64; vp.v[0][3] = 64; vp.v[0][5] = 1; op(OP_VIEWPORTS, &vp, sizeof vp);
     p_draw dw = {4, 0, 3, 0, 0}; op(OP_DRAW, &dw, sizeof dw);
     p_copy_b2t cp; memset(&cp, 0, sizeof cp); cp.src = (uint64_t)(uintptr_t)readback; cp.tex = &rt; cp.r = (NVNcopyRegion){0, 0, 0, 64, 64, 1}; op(OP_COPY_T2B, &cp, sizeof cp);
+    if (argc >= 2 && !strcmp(argv[1],"--alpha-test")) {
+        CHECK(mtl_wait(run(),5000000000ull),"alpha fixture initial draw completes");
+        const float full[]={-1,-1,3,-1,-1,3}; memcpy(vtx,full,sizeof full);
+        for (int y=0;y<64;y++) for (int x=0;x<64;x++) lin[4*(y*64+x)+3]=((x+y)&1)?192:64;
+        CHECK(!nvn_swizzle(&tx.d,0,0,lin,256,tx.mem),"alpha checkerboard is swizzled");
+        mtl_pool_invalidate(&P_cpu,(uint64_t)((uint8_t *)tx.mem-cpu_pool),tx.L.size);
+        extern void vk_draw_test_correctness_counts(uint64_t out[2]);
+        uint64_t before[2],after[2]; vk_draw_test_correctness_counts(before);
+        for (unsigned enabled=0;enabled<2;enabled++) {
+            totk_live_lines lines={0}; const char *setting=enabled ?
+                "set TOTK_VK_ALPHA_TEST=1\n" : "set TOTK_VK_ALPHA_TEST=0\n";
+            totk_live_feed(&lines,setting,strlen(setting)); totk_live_frame(enabled+1);
+            for (unsigned func=NVN_ALPHA_FUNC_NEVER;func<=NVN_ALPHA_FUNC_ALWAYS;func++) {
+                color_st color={0,NVN_LOGIC_OP_COPY,func};
+                p_bind_state state={.kind=1}; memcpy(state.bytes,&color,sizeof color);
+                p_scissor all={0,0,64,64};
+                op(OP_SET_RT,&srt,sizeof srt); op(OP_SCISSOR,&all,sizeof all); op(OP_CLEAR_COLOR,&cc,sizeof cc);
+                op(OP_BIND_STATE,&state,sizeof state); op(OP_BIND_VBUF,&vb,sizeof vb);
+                const float references[]={.5f,64.0f/255,192.0f/255,.5f};
+                for (unsigned stripe=0;stripe<4;stripe++) {
+                    p_scissor area={(int)stripe*16,0,16,64};
+                    p_alpha_ref ref={references[stripe]};
+                    op(OP_ALPHA_REF,&ref,sizeof ref); op(OP_SCISSOR,&area,sizeof area); op(OP_DRAW,&dw,sizeof dw);
+                }
+                op(OP_COPY_T2B,&cp,sizeof cp);
+                CHECK(mtl_wait(run(),5000000000ull),"alpha func %u enabled %u completes",func,enabled);
+                int bad=0;
+                for (int y=0;y<64;y++) for (int x=0;x<64;x++) {
+                    float a=(((x+y)&1)?192.0f:64.0f)/255, ref=references[x/16];
+                    int pass=!enabled || func==NVN_ALPHA_FUNC_ALWAYS ||
+                        (func==NVN_ALPHA_FUNC_LESS && a<ref) || (func==NVN_ALPHA_FUNC_EQUAL && a==ref) ||
+                        (func==NVN_ALPHA_FUNC_LEQUAL && a<=ref) || (func==NVN_ALPHA_FUNC_GREATER && a>ref) ||
+                        (func==NVN_ALPHA_FUNC_NOTEQUAL && a!=ref) || (func==NVN_ALPHA_FUNC_GEQUAL && a>=ref);
+                    const uint8_t *pixel=readback+4*(y*64+x);
+                    bad+=pass ? abs(pixel[0]-4*x)>2 || abs(pixel[1]-2*y)>2 ||
+                        pixel[2]!=128 || abs(pixel[3]-(int)(a*255+.5f))>1 :
+                        pixel[0]!=0 || pixel[1]!=0 || pixel[2]!=255 || pixel[3]!=255;
+                }
+                CHECK(!bad,"alpha checkerboard comparison %u live %u: %d incorrect pixels",func,enabled,bad);
+            }
+        }
+        vk_draw_test_correctness_counts(after);
+        CHECK(after[0]-before[0]==56 && after[1]-before[1]==28,
+            "alpha-use counters include switch-off draws, exclude ALWAYS (%llu enabled, %llu ignored)",
+            (unsigned long long)(after[0]-before[0]),(unsigned long long)(after[1]-before[1]));
+        printf("%s: alpha-test %d checks, %d failed\n",fails?"FAILED":"ok",checks,fails);
+        return fails!=0;
+    }
     if (argc == 3 && !strcmp(argv[1], "--load-elide")) {
         CHECK(mtl_wait(run(), 5000000000ull), "coverage fixture setup completes");
         shader_binary(0, 37, vctl, vcode, &vlen); memcpy(vc, vcode, vlen);

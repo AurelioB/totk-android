@@ -547,7 +547,7 @@ VkSampler vk_dummy_sampler(void);
 VkBufferView vk_dummy_tbuf(void);
 
 /* ---------- shaders and programs (vk_shader.c) ---------- */
-enum { RB_SUPPORT = 1, RB_CBUF, RB_C1, RB_DRV0, RB_DRV2, RB_SBUF, RB_SBUF_UBO, RB_UBO_PTR, RB_TEX, RB_TBUF, RB_IMG, RB_SAMP, RB_TEXSAMP };
+enum { RB_SUPPORT = 1, RB_CBUF, RB_C1, RB_DRV0, RB_DRV2, RB_SBUF, RB_SBUF_UBO, RB_UBO_PTR, RB_TEX, RB_TBUF, RB_IMG, RB_SAMP, RB_TEXSAMP, RB_ALPHA };
 typedef struct {
     uint16_t binding, count;
     uint8_t kind;           /* RB_* */
@@ -575,6 +575,7 @@ typedef struct vk_shader {
     uint32_t load_full_outputs; /* unconditional complete fragment outputs, with no discard/control-flow */
     int early_tests;        /* original NVN control byte 0x718; honored by default (EARLYZ=0 is a diagnostic override) */
     int depth_spec;         /* fragment depth exports patched: + specialization constant D16_SPEC_ID (the DEPTH16 nudge, vk_draw.c) */
+    unsigned alpha_func;    /* zero: original module; 1..7: alpha-reject fragment variant with a reference UBO */
     uint32_t local[3];      /* compute thread group size */
     uint64_t c1_sub; VkDescriptorBufferInfo c1_d;   /* vk_draw.c: this submission's copy of c1 */
     int has_storage_writes; /* reflection plus SPIR-V store marking; immutable after shader creation */
@@ -637,6 +638,7 @@ int vk_shaders_ready(void);
 void vk_shader_seed_startup(const char *game_dir); /* freeze game-relative selection and diagnose seed before replay */
 const char *vk_shader_cache_path(const char *base, char *out, size_t size); /* folder/content-isolated disk state */
 vk_shader *vk_shader_seed(const char *variant, int stage, int early_tests); /* startup/replay exact seed, no guest state */
+vk_shader *vk_shader_alpha(vk_shader *base, unsigned func);
 void vk_pipeline_prewarm(void);   /* device/cache ready, before replay: load keys and queue the compile workers */
 void vk_shader_io_take(uint64_t *n, uint64_t *ns, uint64_t *max_ns);   /* seed files read since the last call, their total and longest time */
 uint64_t vk_compute_pipe_cum_ns(void); /* recording-side compute blocking only, never background build time */
@@ -664,7 +666,7 @@ typedef struct {
     uint64_t tex[6][128], samp[6][128], img[6][32];
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][6]; float dr[2]; int has_vp; int depth_clamp, render_disabled, raster_discard;
-    float blend_color[4]; int64_t copy_stride;
+    float blend_color[4], alpha_ref; int64_t copy_stride;
     p_scissor sc; int has_sc;
     p_set_rt rt; int has_rt;
     int tex_hi[6];

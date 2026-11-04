@@ -15,6 +15,7 @@
    Every stage of a translation uses descriptor set 0; the vertex (or compute) stage keeps it and the fragment stage's
    SPIR-V is patched to set 1, so one pipeline layout holds both. */
 #include "vk_int.h"
+#include "vk_alpha_test.h"
 #include "vk_record.h"
 #include "vk_framegen.h"
 #include "vk_earlyz.h"
@@ -362,7 +363,7 @@ static int spirv_image_features_ok(const uint32_t *w, size_t nw, int can_read, i
 }
 static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
 static vk_shader *shader_load(const char *variant, int early_tests) {
-    shader_key key = {0}; snprintf(key.variant, sizeof key.variant, "%s", variant); key.early_tests = early_tests != 0;
+    shader_key key = {0}; snprintf(key.variant, sizeof key.variant, "%s", variant); key.early_tests = (uint32_t)early_tests;
     vk_shader *sh = nvn_hm_get(&g_shaders, &key);
     if (sh) return sh;
     char path[1024]; size_t spv_len = 0, vk_len = 0;
@@ -373,7 +374,7 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
         RED(16, "shader %s: malformed SPIR-V or unsupported formatless storage image capability", variant);
         free(spv); free(txt); return NULL;
     }
-    sh = calloc(1, sizeof *sh); memcpy(sh->key, key.variant, sizeof sh->key); sh->early_tests = key.early_tests;
+    sh = calloc(1, sizeof *sh); memcpy(sh->key, key.variant, sizeof sh->key); sh->early_tests = key.early_tests & 1; sh->alpha_func = key.early_tests >> 1;
     sh->spv_bytes = spv_len;
     sh->local[0] = sh->local[1] = sh->local[2] = 1;
     int capb = 0;
@@ -430,13 +431,27 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
     }
     if (sh->stage == 1) {
         size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
-        if (vk_spirv_early_tests(&words, &nw, early_tests && earlyz_on()) < 0) {
+        if (vk_spirv_early_tests(&words, &nw, sh->early_tests && earlyz_on() && !sh->alpha_func) < 0) {
             RED(16, "shader %s: invalid fragment execution modes", variant); free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
         }
         spv = (char *)words; spv_len = nw * 4;
         size_t nnw; uint32_t *pw = spirv_depth_nudge((const uint32_t *)spv, spv_len / 4, &nnw);
         if (pw) { free(spv); spv = (char *)pw; spv_len = nnw * 4; sh->depth_spec = 1; }
         patch_set((uint32_t *)spv, spv_len / 4, 1);
+        if (sh->alpha_func) {
+            unsigned binding=0;
+            for (int i=0;i<sh->nb;i++) if (sh->b[i].binding>=binding) binding=sh->b[i].binding+1;
+            pw=vk_spirv_alpha_test((const uint32_t *)spv,spv_len/4,sh->alpha_func,binding,&nnw);
+            if (!pw || binding>UINT16_MAX) {
+                RED(16,"shader %s: cannot build alpha-test comparison %u",variant,sh->alpha_func);
+                free(pw); free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
+            }
+            free(spv); spv=(char *)pw; spv_len=nnw*4;
+            sh->b=realloc(sh->b,(size_t)(sh->nb+1)*sizeof *sh->b);
+            sh->b[sh->nb++]=(vk_bind){.binding=binding,.count=1,.kind=RB_ALPHA,
+                .dtype=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,.reg=-1,.sreg=-1,.extent=16};
+            sh->load_full_outputs=0;
+        }
     }
     VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = spv_len, .pCode = (const uint32_t *)spv};
     VkResult r = vkCreateShaderModule(V.dev, &mci, NULL, &sh->mod);
@@ -459,13 +474,19 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
     if (sh->stage == 5) vk_compute_prepare(sh);
     return sh;
 }
+vk_shader *vk_shader_alpha(vk_shader *base, unsigned func) {
+    if (!base || base->stage!=1 || !func || func==NVN_ALPHA_FUNC_ALWAYS) return base;
+    if (func>NVN_ALPHA_FUNC_GEQUAL) return NULL;
+    return shader_load(base->key,base->early_tests | (int)(func<<1));
+}
 /* Startup/replay only: exact persisted or program-known variant; shader/layout maps
    remain single-owner even though compute driver calls run on a worker. */
 vk_shader *vk_shader_seed(const char *variant, int stage, int early_tests) {
     size_t n = strnlen(variant, 80);
     if (n != 64 && n != 77) return NULL;
     for (size_t i = 0; i < n; i++) if (i == 64 ? variant[i] != '-' : hexval(variant[i]) < 0) return NULL;
-    vk_shader *s = shader_load(variant, stage == 1 && early_tests);
+    if (early_tests<0 || early_tests>15 || (stage!=1 && early_tests)) return NULL;
+    vk_shader *s = shader_load(variant,stage==1 ? early_tests : 0);
     return s && s->stage == stage ? s : NULL;
 }
 

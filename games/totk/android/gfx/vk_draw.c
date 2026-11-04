@@ -88,6 +88,9 @@ static uint64_t g_native_bound_revision;
    it prepares in full. The masks and counters are walking-lock owned. */
 static int g_prepare_mask_launch, g_prepare_off, g_prepare_check, g_prepare_used;
 static totk_live_cache g_prepare_mask_live;
+static int g_alpha_launch;
+static totk_live_cache g_alpha_live;
+static uint64_t g_alpha_enabled, g_alpha_ignored;
 static uint16_t g_uniform_prepare_dirty[2] = {UINT16_MAX, UINT16_MAX};
 static uint64_t g_prepare_calls, g_prepare_skips, g_prepare_checks;
 static int prepare_mask_live(void) {
@@ -1088,6 +1091,11 @@ static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
 }
 void vk_end_rendering_at(vk_pass_end_kind reason, uint32_t detail) { VK_REC_DO(VK_REC_S_PASS, end_rendering_inner(reason, detail)); }
 void vk_end_rendering(void) { vk_end_rendering_at(VK_PASS_END_OTHER, 0); }
+#ifdef TOTK_VK_TESTS
+void vk_draw_test_correctness_counts(uint64_t out[2]) {
+    out[0]=g_alpha_enabled; out[1]=g_alpha_ignored;
+}
+#endif
 int vk_record_counter_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2 stage) {
     if (!R.open || !R.secondary) return 0;
     vk_record_timestamp(pool, query, stage); return 1;
@@ -3382,7 +3390,7 @@ static TotkPsoTraceKey pso_trace_key(const pipe_key *k) {
     TotkPsoTraceKey key = {0};
     const vk_shader *vs = k->vs, *fs = k->fs;
     key.vs_id = vs ? vs->key : NULL; key.fs_id = fs ? fs->key : NULL;
-    key.fs_early_tests = fs ? (uint32_t)fs->early_tests : 0;
+    key.fs_early_tests = fs ? (uint32_t)fs->early_tests | fs->alpha_func<<1 : 0;
     for (unsigned i = 0; i < 8; i++) key.color[i] = k->cfmt[i];
     key.depth = k->dfmt; key.stencil = k->sfmt; key.color_count = k->ncolor; key.samples = k->samples;
     for (unsigned i = 0; i < 8; i++) {
@@ -3630,6 +3638,8 @@ void vk_draw_switches_init(void) {
     LOGV("[nvn-vk] TOTK_VK_LOAD_ELIDE=%d: conservative first-draw coverage proof, next pass open", g_load_elide_launch);
     e=getenv("TOTK_VK_FEEDBACK_NARROW"); g_feedback_narrow_launch=e && atoi(e)==1;
     LOGV("[nvn-vk] TOTK_VK_FEEDBACK_NARROW=%d: texture-only feedback boundaries, next pass open",g_feedback_narrow_launch);
+    e=getenv("TOTK_VK_ALPHA_TEST"); g_alpha_launch=e && atoi(e)==1;
+    LOGV("[nvn-vk] TOTK_VK_ALPHA_TEST=%d: next draw, fragment alpha rejection with immutable reference blocks",g_alpha_launch);
     e = getenv("TOTK_VK_FEEDBACK_CUT"); g_feedback_cut_launch = e && atoi(e) == 1;
     atomic_store_explicit(&g_feedback_cut, g_feedback_cut_launch, memory_order_relaxed);
     LOGV("TOTK_VK_FEEDBACK_CUT=%d: %s", g_feedback_cut_launch, g_feedback_cut_launch ?
@@ -4140,6 +4150,7 @@ static void pipe_predict_maybe(const uint8_t *next) {
             case OP_DEPTH_CLAMP: PP_NEED(p_flag); predicted.depth_clamp = ((const p_flag *)a)->value; break;
             case OP_RENDER_ENABLE: PP_NEED(p_flag); predicted.render_disabled = !((const p_flag *)a)->value; break;
             case OP_RASTER_DISCARD: PP_NEED(p_flag); predicted.raster_discard = ((const p_flag *)a)->value; break;
+            case OP_ALPHA_REF: PP_NEED(p_alpha_ref); break; /* reference bytes are not a pipeline input */
             case OP_SET_RT:
                 PP_NEED(p_set_rt);
                 if (!rt_same(&predicted.rt, a)) goto predicted_done;
@@ -4150,6 +4161,10 @@ static void pipe_predict_maybe(const uint8_t *next) {
                 else { PP_NEED(p_draw_idx); prim = ((const p_draw_idx *)a)->prim; count = ((const p_draw_idx *)a)->count; }
                 if (!count || prim < 0 || prim == 2 || prim >= 8 || (h.op == OP_DRAW_IDX && prim == 7) ||
                     predicted.render_disabled || predicted.raster_discard || predicted.poly.cull == NVN_FACE_FRONT_AND_BACK) break;
+                /* Prediction never loads modules. Alpha variants are demand-created;
+                 * do not speculate the base module's (wrong) pipeline for this draw. */
+                if (predicted.color.alpha_func && predicted.color.alpha_func!=NVN_ALPHA_FUNC_ALWAYS &&
+                    totk_live_cached(&g_alpha_live,"TOTK_VK_ALPHA_TEST",g_alpha_launch)) break;
                 vk_shader *sh[6]; if (!vk_prog_predict(&predicted, sh)) break;
                 pipe_key k; pipe_key_fill(&k, &predicted, sh[0], sh[1], prim);
                 if (nvn_hm_get(&g_pipes, &k)) break;   /* ready and pending entries remain authoritative */
@@ -4476,6 +4491,25 @@ static void generated_desc(int kind, int stage, const uint32_t grid[3], VkDescri
     block_desc(key, blk, n, out);
     last[key].sub = sub; last[key].revision = revision; last[key].w = R.w; last[key].h = R.h; memcpy(last[key].grid, g, sizeof g); last[key].d = *out;
 }
+/* References are immutable in the submission's arena. Reuse up to 64 distinct
+ * reference words, including non-consecutive draws and hash collisions. */
+static void alpha_desc(VkDescriptorBufferInfo *out) {
+    static struct { uint64_t sub; uint32_t bits; VkDescriptorBufferInfo d; } memo[64];
+    uint32_t bits; memcpy(&bits,&S.alpha_ref,4);
+    uint64_t sub=vk_submit_serial();
+    unsigned index=(bits*2654435761u)>>26;
+    for (unsigned probe=0;probe<63 && memo[index].sub==sub && memo[index].bits!=bits;probe++)
+        index=(index+1)&63u;
+    if (memo[index].sub!=sub || memo[index].bits!=bits) {
+        VkBuffer buffer; VkDeviceSize offset;
+        float block[4]={S.alpha_ref,0,0,0};
+        void *bytes=vk_transient(sizeof block,V.props.limits.minUniformBufferOffsetAlignment,&buffer,&offset);
+        memcpy(bytes,block,sizeof block);
+        memo[index].sub=sub; memo[index].bits=bits;
+        memo[index].d=(VkDescriptorBufferInfo){buffer,offset,sizeof block};
+    }
+    *out=memo[index].d;
+}
 /* Descriptor sets already written in this submission, by their contents. Two independent 64-bit hashes, layout and
    count identify a set; no retained info arrays to compare, copy or reallocate. Pass dumps read the live infos below. */
 enum { DS_CACHE = 2048 };
@@ -4501,6 +4535,7 @@ typedef struct { uint64_t value[2]; } record_binding;
 static void record_binding_of(const vk_bind *b, int stage, record_binding *r) {
     *r = (record_binding){{0}};
     if (b->kind == RB_SUPPORT || b->kind == RB_C1) return;
+    if (b->kind == RB_ALPHA) { uint32_t bits; memcpy(&bits,&S.alpha_ref,4); r->value[0]=bits; return; }
     if (b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
         if (b->kind == RB_DRV0 || b->kind == RB_DRV2) r->value[0] = g_driver_revision[b->kind == RB_DRV2][stage];
         else if (b->reg >= 0 && b->reg < 16) {
@@ -4745,6 +4780,7 @@ static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh
         d->binding = b->binding; d->element = (uint32_t)e; d->type = (VkDescriptorType)b->dtype;
         int storage = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         if (storage || b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+            if (b->kind == RB_ALPHA) { alpha_desc(&d->b); continue; }
             if (b->kind == RB_SUPPORT || b->kind == RB_DRV0 || b->kind == RB_DRV2) { generated_desc(b->kind, stage, NULL, &d->b); continue; }
             if (b->kind == RB_C1) {
                 uint64_t sub = vk_submit_serial();
@@ -4835,6 +4871,7 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
             /* buffers */
             if (b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
                 int storage = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, ok = 0;
+                if (b->kind == RB_ALPHA) { alpha_desc(&d->b); continue; }
                 if (b->kind == RB_SUPPORT) { generated_desc(b->kind, stage, grid, &d->b); ok = 1; }
                 else if (b->kind == RB_CBUF && b->reg >= 0 && b->reg < 16) ok = ubo_desc(S.ubo[stage][b->reg].addr, S.ubo[stage][b->reg].size, &d->b, storage, storage && b->rw, b->extent, NULL);
                 else if (b->kind == RB_C1) {
@@ -5627,8 +5664,17 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (prim == 2 || prim >= 8) { RED(4, "primitive type %d not drawn", prim); g_stat_skips[3]++; return; }
     if (di && prim == 7) { RED(4, "indexed quads not drawn"); g_stat_skips[3]++; return; }
     uint32_t count = dw ? (uint32_t)dw->count : (uint32_t)di->count; if (!count) return;
+    if (S.color.alpha_func && S.color.alpha_func!=NVN_ALPHA_FUNC_ALWAYS) {
+        g_alpha_enabled++;
+        if (!totk_live_cached(&g_alpha_live,"TOTK_VK_ALPHA_TEST",g_alpha_launch)) g_alpha_ignored++;
+    }
     vk_shader *sh[6];
     if (VK_REC_VALUE(VK_REC_PROG, vk_record_enabled() ? vk_prog_resolve_record(S.prog, sh) : vk_prog_resolve(S.prog, sh)) || !sh[0]) { g_stat_skips[4]++; return; }
+    if (sh[1] && S.color.alpha_func && S.color.alpha_func!=NVN_ALPHA_FUNC_ALWAYS &&
+        totk_live_cached(&g_alpha_live,"TOTK_VK_ALPHA_TEST",g_alpha_launch)) {
+        sh[1]=vk_shader_alpha(sh[1],S.color.alpha_func);
+        if (!sh[1]) { g_stat_skips[4]++; return; }
+    }
     vk_canvas_image transfer_source,transfer_window; int canvas_transfer=0;
     if (vk_canvas_on && (vk_native_ui_enabled() ||
         ((sh[0]->canvas_ui == 2 || (sh[1] && sh[1]->canvas_transfer)) &&
@@ -6398,6 +6444,12 @@ void vk_draw_exec(uint32_t op, const void *a) {
             S.dr[0]=b->n; S.dr[1]=b->f; break;
         }
         case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
+        case OP_ALPHA_REF: {
+            float value=((const p_alpha_ref *)a)->value;
+            value=fminf(1,fmaxf(0,value));
+            if (memcmp(&S.alpha_ref,&value,4)) g_record_bind_revision[1]++;
+            S.alpha_ref=value; break;
+        }
         case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
         case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_flag *)a)->value; g_pipe_dirty = 1; break;
         case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value;
@@ -10320,6 +10372,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
              (unsigned long long)n,(unsigned long long)g_feedback_deferred,
              (unsigned long long)g_feedback_avoided,(unsigned long long)g_feedback_hazards);
         g_feedback_deferred=g_feedback_avoided=g_feedback_hazards=0;
+        LOGV("[alpha-test] frame %llu: last 300 presents enabled=%llu ignored=%llu",
+             (unsigned long long)n,(unsigned long long)g_alpha_enabled,(unsigned long long)g_alpha_ignored);
+        g_alpha_enabled=g_alpha_ignored=0;
 #ifdef TOTK_ANDROID_APP
         if (g_guest_extent_diag && vk_overlay_mode()) {
             static vk_overlay_counters previous;

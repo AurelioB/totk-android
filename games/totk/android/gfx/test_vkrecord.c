@@ -150,6 +150,13 @@ int main(int argc, char **argv) {
     if (len < 0) { perror("/proc/self/exe"); return 1; } binary[len] = 0;
     char *base = strrchr(binary, '/'); if (!base) return 1; strcpy(base + 1, "vkdrawtest");
     char dir[] = "./vkrecord-XXXXXX"; if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    if (argc==2 && !strcmp(argv[1],"--alpha-clear")) {
+        int ok=1;
+        for (unsigned workers=0;workers<2;workers++) {
+            ok &= run(binary,"--alpha-test","unused",workers?"2":"0",0);
+        }
+        rmdir(dir); return !ok;
+    }
     if (argc == 2 && (!strcmp(argv[1],"--load-elide") || !strcmp(argv[1],"--feedback-narrow"))) {
         int feedback=!strcmp(argv[1],"--feedback-narrow");
         char reference[PATH_MAX]; snprintf(reference,sizeof reference,"%s/reference.bin",dir);

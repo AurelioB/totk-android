@@ -555,6 +555,11 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   texture-only invalidations while sampled attachments remain unwritten. Earlier writes, current writes, later writes
   to previously sampled attachments, storage, aliases and unknown descriptors retain the split; the full end-of-pass
   barrier drains deferred invalidations before dependent reads. `[feedback-narrow]` counts net avoided ends per 300 presents.
+- **NVN alpha rejection** (`TOTK_VK_ALPHA_TEST=1`, default **0**, live at the next draw): select a fragment variant
+  for the NVN comparison and an immutable 16-byte reference uniform (reused by reference bits per submission).
+  Alpha rejection runs after the shader and suppresses color/depth/stencil writes; alpha variants use late tests.
+  `[alpha-test]` reports enabled and ignored draws every 300 presents **even while off**. Compare cutout/menu pixels,
+  not fps; `vkrectest --alpha-clear` checks all comparisons with a checkerboard and inline/worker recording.
 - **The uniform-update log** drops entries a newer update covers entirely (the game rewrites the same constant blocks
   many times a frame), and `ub_prune` returns at once unless a submission finished. `ub_overlaps` had been a quarter of
   the render thread.
