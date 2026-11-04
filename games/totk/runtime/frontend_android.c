@@ -2206,8 +2206,10 @@ void runtime_android_game_focus(JNIEnv *env, jclass cls, jboolean focused, jbool
 void runtime_android_game_input_focus(JNIEnv *env, jclass cls, jboolean top) {
     (void)env; (void)cls;
     game_input_after_ns = (int64_t)mono_ns();
-    runtime_input_clear();
-    if (!top) runtime_feedback_quiet();
+    /* Losing routing clears everything held; regaining it clears only the controller state, so a companion shortcut
+     * issued in between (a synthetic key with its pending edge) still reaches the game. */
+    if (top) runtime_gamepad_clear();
+    else { runtime_input_clear(); runtime_feedback_quiet(); }
 }
 static void android_game_lifecycle_pause(int paused) {
     game_activity_paused = paused;

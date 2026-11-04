@@ -285,11 +285,12 @@ typedef void *jclass;
 typedef unsigned char jboolean;
 typedef struct { int type; int64_t time, down; } AInputEvent;
 enum { AINPUT_EVENT_TYPE_KEY = 1, AINPUT_EVENT_TYPE_MOTION = 2 };
-static int paused, buttons, clears, quiets;
+static int paused, pad, synthetic, clears, pad_clears, quiets;
 static int64_t game_input_after_ns, now = 100;
 static uint64_t mono_ns(void) { return (uint64_t)now; }
 static int runtime_android_game_paused(void) { return paused; }
-static void runtime_input_clear(void) { buttons = 0; clears++; }
+static void runtime_gamepad_clear(void) { pad = 0; pad_clears++; }
+static void runtime_input_clear(void) { synthetic = 0; clears++; runtime_gamepad_clear(); }
 static void runtime_feedback_quiet(void) { quiets++; }
 static int AInputEvent_getType(AInputEvent *e) { return e->type; }
 static int AInputEvent_getSource(AInputEvent *e) { (void)e; return 0; }
@@ -299,12 +300,13 @@ static int64_t AMotionEvent_getEventTime(AInputEvent *e) { return e->time; }
 '''
         assertions = r'''
 int main(void) {
-    paused = 1; buttons = 1024;
-    runtime_android_game_input_focus(0, 0, 0);
-    assert(paused == 1 && buttons == 0 && clears == 1 && quiets == 1 && game_input_after_ns == 100);
-    now = 200; buttons = 1024;
-    runtime_android_game_input_focus(0, 0, 1);
-    assert(paused == 1 && buttons == 0 && clears == 2 && quiets == 1 && game_input_after_ns == 200);
+    paused = 1; pad = 1024; synthetic = 1;
+    runtime_android_game_input_focus(0, 0, 0);   /* routing lost: everything held is released */
+    assert(paused == 1 && pad == 0 && synthetic == 0 && clears == 1 && quiets == 1 && game_input_after_ns == 100);
+    now = 200; pad = 1024; synthetic = 1;         /* a companion shortcut issued before the reclaim lands */
+    runtime_android_game_input_focus(0, 0, 1);   /* routing back: the controller resets, the shortcut survives */
+    assert(paused == 1 && pad == 0 && synthetic == 1 && clears == 1 && pad_clears == 2 && quiets == 1
+           && game_input_after_ns == 200);
     AInputEvent fresh = {AINPUT_EVENT_TYPE_KEY, 201, 201};
     assert(handle_input(&fresh) == 1); /* top-resumed cannot undo Home/recents pause */
     paused = 0;
