@@ -123,9 +123,20 @@ void vk_record_walk_time(uint64_t ns);  /* submission elapsed, excluding GPU wai
 void vk_record_stats(uint64_t frame);
 void vk_record_descriptor_walk(uint64_t ns); /* walking owner: complete bind/selection time, not just driver calls */
 void vk_record_descriptor_primary(uint64_t sets, uint64_t calls, uint64_t resets); /* serialized primary owner */
+/* Descriptor-set stock (TOTK_VK_DESC_STOCK=1, read once with the recorder controls). One stock per owner that
+   used to reset its pools each slot generation: take only checks out sets not yet issued this generation (the
+   caller rewrites every one), retire rewinds them at that same retirement point and returns 1 when the owner must
+   reset the pools it used since the last rebuild (long-lived low use; the stock is already invalidated). */
+enum { VK_DESC_STOCK_BATCH = 32 };
+typedef struct vk_desc_stock vk_desc_stock;
+typedef uint32_t (*vk_desc_stock_alloc)(void *owner, VkDescriptorSetLayout layout, uint32_t count, VkDescriptorSet *out); /* 1..count */
+int vk_desc_stock_enabled(void);
+VkDescriptorSet vk_desc_stock_take(vk_desc_stock **stock, VkDescriptorSetLayout layout, vk_desc_stock_alloc alloc, void *owner);
+int vk_desc_stock_retire(vk_desc_stock *stock);
 int vk_record_counter_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2 stage);
 #ifdef TOTK_VK_TESTS
 void vk_record_test_descriptors(uint64_t out[8]); /* sets, allocate calls, resets, walk ns, list ns/count, template ns/count */
+int vk_record_test_descriptor_stock(void); /* isolated real-driver checkout/recycle/batch/pressure fixture */
 void vk_record_test_storage(uint64_t values[4]); /* retention budget, reclaimed slots/bytes/secondary CBs */
 void vk_record_test_primary_memory(uint64_t values[2]); /* retained primary CBs, reclaimed primary CBs */
 void vk_record_test_leases(uint64_t values[4]); /* published active leases, summed worker peak, returned leases, cold resets */

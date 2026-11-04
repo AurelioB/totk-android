@@ -73,6 +73,7 @@ typedef struct rec_context {
     struct rec_context *retired_next; int retired; /* rec_mu: return-list publication */
     VkDescriptorPool *dp; uint32_t ndp, capdp, curdp, sets;
     uint64_t descriptor_sets, descriptor_calls, descriptor_resets;
+    vk_desc_stock *stock; /* TOTK_VK_DESC_STOCK=1 only */
     struct {
         uint64_t hash[2]; VkDescriptorSetLayout layout; uint32_t count; VkDescriptorSet set;
         uint64_t guard_ticket; const vk_record_spans *guard_spans;
@@ -117,7 +118,7 @@ static rec_pass *pending_head, *pending_tail;
 static rec_job *small_head, *small_tail; static uint32_t small_jobs, small_draws;
 static rec_job *guard_building;
 static uint32_t current_slot, chunk_draws = 128, lead_draws = 32, inline_draws, pass_draws;
-static int threads = -1, ds_off, dyn_off, vma_names;
+static int threads = -1, ds_off, dyn_off, vma_names, descriptor_stock;
 static struct { uint32_t ncolor; VkFormat color[8], depth, stencil; VkSampleCountFlagBits samples; } pass;
 static uint64_t busy_ns[REC_WORKERS], chunks_parallel, chunks_inline, passes_parallel, passes_inline;
 static uint64_t next_chunk_id;
@@ -485,16 +486,23 @@ void vk_record_test_results(uint64_t *checks, uint64_t *failures, uint64_t *rese
 }
 #endif
 
-static VkDescriptorSet alloc_set(rec_context *c, VkDescriptorSetLayout layout, uint64_t *creates) {
+/* Allocates count (1..VK_DESC_STOCK_BATCH) sets, fewer near the end of a pool; never fewer than one. */
+static uint32_t alloc_sets(void *owner, VkDescriptorSetLayout layout, uint32_t count, VkDescriptorSet *out) {
+    rec_context *c = owner;
+    VkDescriptorSetLayout layouts[VK_DESC_STOCK_BATCH];
+    for (uint32_t i = 0; i < count; i++) layouts[i] = layout;
     int fresh = 0;
     for (;;) {
         if (c->curdp < c->ndp && c->sets < REC_POOL_SETS) {
+            if (count > REC_POOL_SETS - c->sets) count = REC_POOL_SETS - c->sets;
             VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                .descriptorPool = c->dp[c->curdp], .descriptorSetCount = 1, .pSetLayouts = &layout};
+                .descriptorPool = c->dp[c->curdp], .descriptorSetCount = count, .pSetLayouts = layouts};
             c->descriptor_calls++;
-            VkDescriptorSet set; VkResult r = vkAllocateDescriptorSets(V.dev, &ai, &set);
-            if (!r) { c->sets++; c->descriptor_sets++; (*creates)++; return set; }
+            VkResult r = vkAllocateDescriptorSets(V.dev, &ai, out);
+            if (!r) { c->sets += count; c->descriptor_sets += count; return count; }
             if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) DIE("recorder descriptor allocation: %d", r);
+            /* Large layouts may fit fewer than a whole batch, even in a fresh pool: never reject one that fits alone. */
+            if (count > 1) { count /= 2; continue; }
         }
         if (c->curdp + 1 < c->ndp) { c->curdp++; c->sets = 0; continue; }
         if (fresh) DIE("recorder descriptor set exceeds a fresh pool");
@@ -511,6 +519,122 @@ static VkDescriptorSet alloc_set(rec_context *c, VkDescriptorSetLayout layout, u
         c->curdp = c->ndp - 1; c->sets = 0; fresh = 1;
     }
 }
+/* Descriptor-set stock (TOTK_VK_DESC_STOCK=1): per owner, per exact immutable layout. Shared by recorder contexts
+   and the primary slots in nvn_vk.c; each owner rewinds its stock only where it used to reset its pools. */
+typedef struct desc_layout_stock {
+    struct desc_layout_stock *next;
+    VkDescriptorSet *set; uint32_t count, used, capacity;
+} desc_layout_stock;
+struct vk_desc_stock {
+    nvn_hmap layouts; desc_layout_stock *list;
+    uint64_t sets, used; uint32_t pressure;
+};
+int vk_desc_stock_enabled(void) { (void)vk_record_enabled(); return descriptor_stock; }
+/* MIT mechanism reference: Nycolazs/LASRecomp-Android-Plus @cca791a,
+   runtime/nvn/vulkan/record.c:308-436. Recycle storage, NOT descriptor contents: every checkout is rewritten.
+   Each context belongs to one recording owner and one submission slot; generation changes follow that slot's
+   own GPU/post/submit retirement, not a global completed-ticket estimate. */
+VkDescriptorSet vk_desc_stock_take(vk_desc_stock **stock, VkDescriptorSetLayout layout, vk_desc_stock_alloc alloc, void *owner) {
+    vk_desc_stock *st = *stock;
+    if (!st) { st = *stock = VK_CALLOC(1, sizeof *st); st->layouts.klen = sizeof layout; }
+    desc_layout_stock *s = nvn_hm_get(&st->layouts, &layout);
+    if (!s) { s = VK_CALLOC(1, sizeof *s); s->next = st->list; st->list = s; nvn_hm_put(&st->layouts, &layout, s); }
+    if (s->used == s->count) {
+        uint32_t batch = s->count ? (s->count < VK_DESC_STOCK_BATCH ? s->count : VK_DESC_STOCK_BATCH) : 1; /* 1,1,2,4,...32 */
+        if (s->count > UINT32_MAX - batch) DIE("descriptor stock overflow");
+        uint32_t needed = s->count + batch;
+        if (needed > s->capacity) {
+            uint32_t capacity = s->capacity ? (s->capacity <= UINT32_MAX / 2 ? s->capacity * 2 : UINT32_MAX) : 64;
+            s->capacity = capacity > needed ? capacity : needed;
+            s->set = VK_REALLOC(s->set, (size_t)s->capacity * sizeof *s->set);
+        }
+        uint32_t n = alloc(owner, layout, batch, s->set + s->count);
+        s->count += n; st->sets += n;
+    }
+    st->used++;
+    return s->set[s->used++];
+}
+int vk_desc_stock_retire(vk_desc_stock *st) {
+    if (!st) return 0;
+    /* Layout churn must not retain every historical peak forever. Rebuild only after 32 consecutive retired
+       generations using less than a quarter of the stock (minimum retained budget 1024 sets). */
+    uint64_t keep = st->used * 4;
+    if (keep < 1024) keep = 1024;
+    int rebuild = 0;
+    if (st->sets > keep) { if (++st->pressure == 32) rebuild = 1; }
+    else st->pressure = 0;
+    for (desc_layout_stock *s = st->list; s; s = s->next) { s->used = 0; if (rebuild) s->count = 0; }
+    st->used = 0;
+    if (rebuild) st->sets = st->pressure = 0;
+    return rebuild;
+}
+static VkDescriptorSet alloc_set(rec_context *c, VkDescriptorSetLayout layout) {
+    if (descriptor_stock) return vk_desc_stock_take(&c->stock, layout, alloc_sets, c);
+    VkDescriptorSet set; (void)alloc_sets(c, layout, 1, &set); return set;
+}
+static void descriptors_recycle(rec_context *c) {
+    if (descriptor_stock && !vk_desc_stock_retire(c->stock)) return;
+    /* A stock rebuild resets only pools allocated since the previous one; the default keeps the old policy. */
+    uint32_t dirty = descriptor_stock ? (c->ndp ? c->curdp + 1 : 0) : c->ndp;
+    for (uint32_t i = 0; i < dirty; i++) { VKCHECK(vkResetDescriptorPool(V.dev, c->dp[i], 0)); c->descriptor_resets++; }
+    c->curdp = c->sets = 0;
+}
+#ifdef TOTK_VK_TESTS
+int vk_record_test_descriptor_stock(void) {
+    (void)vk_record_enabled();
+    rec_context *c = VK_CALLOC(1, sizeof *c);
+    VkDescriptorSetLayout layout[2]; VkDescriptorSet first[2][100]; int ok = 1;
+    for (unsigned l = 0; l < 2; l++) {
+        VkDescriptorSetLayoutBinding binding = {.binding = 0, .descriptorCount = 1,
+            .descriptorType = l ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT};
+        VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = 1, .pBindings = &binding};
+        VKCHECK(vkCreateDescriptorSetLayout(V.dev, &ci, NULL, &layout[l]));
+    }
+    /* No GPU uses these sets: each explicit recycle models one completed owning-slot generation.
+       Actual fence/worker/writable behaviour is checked by the ordinary cross-mode draw/lag fixtures. */
+    for (unsigned epoch = 0; epoch < 10; epoch++) {
+        VkDescriptorSet current[2][100];
+        for (unsigned l = 0; l < 2; l++) for (unsigned i = 0; i < 100; i++) {
+            VkDescriptorSet set = current[l][i] = alloc_set(c, layout[l]);
+            for (unsigned k = 0; k < i; k++) ok &= current[l][k] != set;
+            if (l) for (unsigned k = 0; k < 100; k++) ok &= current[0][k] != set;
+            if (!epoch) first[l][i] = set;
+            else if (descriptor_stock) ok &= first[l][i] == set;
+        }
+        descriptors_recycle(c);
+    }
+    if (descriptor_stock) ok &= c->descriptor_sets == 256 && c->descriptor_calls == 18 && !c->descriptor_resets;
+    else ok &= c->descriptor_sets == 2000 && c->descriptor_calls == 2000 && c->descriptor_resets == 10;
+    printf("descriptor-stock stock=%d ten-generations: sets=%llu calls=%llu resets=%llu pools=%u\n", descriptor_stock,
+        (unsigned long long)c->descriptor_sets, (unsigned long long)c->descriptor_calls,
+        (unsigned long long)c->descriptor_resets, c->ndp);
+    if (descriptor_stock) {
+        for (unsigned i = 0; i < 1400; i++) (void)alloc_set(c, layout[0]);
+        descriptors_recycle(c); uint64_t resets = c->descriptor_resets;
+        for (unsigned epoch = 0; epoch < 31; epoch++) {
+            (void)alloc_set(c, layout[1]); descriptors_recycle(c);
+            ok &= c->descriptor_resets == resets;
+        }
+        (void)alloc_set(c, layout[1]); descriptors_recycle(c);
+        ok &= c->descriptor_resets > resets && !c->stock->sets;
+        uint64_t previous = c->descriptor_sets;
+        (void)alloc_set(c, layout[0]); ok &= c->descriptor_sets == previous + 1;
+        printf("descriptor-stock pressure: resets=%llu; rebuild invalidates every old stock before checkout\n",
+            (unsigned long long)(c->descriptor_resets - resets));
+    }
+    for (uint32_t i = 0; i < c->ndp; i++) vkDestroyDescriptorPool(V.dev, c->dp[i], NULL);
+    atomic_fetch_sub_explicit(&memory_dpools, c->ndp, memory_order_relaxed);
+    if (c->stock) {
+        while (c->stock->list) { desc_layout_stock *s = c->stock->list; c->stock->list = s->next; free(s->set); free(s); }
+        free(c->stock->layouts.keys); free(c->stock->layouts.vals); free(c->stock);
+    }
+    free(c->dp); free(c);
+    for (unsigned l = 0; l < 2; l++) vkDestroyDescriptorSetLayout(V.dev, layout[l], NULL);
+    return ok;
+}
+#endif
 static VkDescriptorBufferInfo zero_buffer(rec_context *c) {
     if (!c->zero.buffer) {
         VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 65536,
@@ -597,7 +721,7 @@ VkDescriptorUpdateTemplate vk_record_template(VkDescriptorSetLayout layout, cons
     if (start) descriptor_template_ns += host_now_ns() - start;
     return *found;
 }
-static VkDescriptorSet descriptor_set(rec_context *c, rec_job *j, VkDescriptorSetLayout layout, VkDescriptorUpdateTemplate update, const vk_record_descriptor *input, uint32_t count, uint64_t ticket, uint64_t *creates) {
+static VkDescriptorSet descriptor_set(rec_context *c, rec_job *j, VkDescriptorSetLayout layout, VkDescriptorUpdateTemplate update, const vk_record_descriptor *input, uint32_t count, uint64_t ticket) {
     if (count > c->capinfo) { c->capinfo = count + 16; c->info = VK_REALLOC(c->info, c->capinfo * sizeof *c->info); }
     vk_record_descriptor *info = c->info; memcpy(info, input, count * sizeof *info);
     for (uint32_t i = 0; i < count; i++) {
@@ -645,7 +769,7 @@ static VkDescriptorSet descriptor_set(rec_context *c, rec_job *j, VkDescriptorSe
         c->cache[at].guard_ticket = ticket; c->cache[at].guard_spans = c->spans;
         return c->cache[at].set;
     }
-    VkDescriptorSet set = alloc_set(c, layout, creates);
+    VkDescriptorSet set = alloc_set(c, layout);
     vkUpdateDescriptorSetWithTemplate(V.dev, set, update, info);
     c->cache[at].hash[0] = h[0]; c->cache[at].hash[1] = h[1]; c->cache[at].layout = layout;
     c->cache[at].count = count; c->cache[at].set = set;
@@ -693,8 +817,8 @@ static void record_job(rec_job *j, unsigned worker) {
         uint64_t t0 = host_now_ns();
         (void)commands_recycle(worker);
         if (c->ncb) DIE("recorder slot reused before its secondary leases retired");
-        for (uint32_t i = 0; i < c->ndp; i++) { VKCHECK(vkResetDescriptorPool(V.dev, c->dp[i], 0)); c->descriptor_resets++; }
-        c->curdp = c->sets = 0; memset(c->cache, 0, sizeof c->cache); c->generation = j->generation; c->spans = NULL;
+        descriptors_recycle(c);
+        memset(c->cache, 0, sizeof c->cache); c->generation = j->generation; c->spans = NULL;
         #ifdef TOTK_VK_TESTS
         atomic_fetch_add(&test_resets, 1);
         #endif
@@ -714,7 +838,7 @@ static void record_job(rec_job *j, unsigned worker) {
     VkDeviceSize offsets[17], sizes[17], strides[17], index_offset = 0;
     uint64_t addresses[17], raw_sizes[17]; const vk_record_spans *vertex_spans[17];
     uint32_t vertex_valid = 0, raw_valid = 0; VkIndexType index_type = VK_INDEX_TYPE_UINT32;
-    uint32_t event = 0; uint64_t draws = 0, desc_creates = 0;
+    uint32_t event = 0; uint64_t draws = 0;
     for (uint32_t i = 0; i <= j->count; i++) {
         while (event < j->nevent && j->event[event].before == i) {
             const rec_event *e = &j->event[event++];
@@ -729,7 +853,7 @@ static void record_job(rec_job *j, unsigned worker) {
         vk_record_dynamic_emit(j->cb, &d->dynamic, &dynamic, i == 0 || dyn_off);
         /* Chunk-local binding memos are valid only while the exact pipeline layout stays unchanged. */
         for (uint32_t s = 0; s < 2; s++) if (d->sets[s].count) {
-            VkDescriptorSet set = descriptor_set(c, j, d->sets[s].layout, d->sets[s].update, j->info + d->sets[s].first, d->sets[s].count, d->lag_ticket, &desc_creates);
+            VkDescriptorSet set = descriptor_set(c, j, d->sets[s].layout, d->sets[s].update, j->info + d->sets[s].first, d->sets[s].count, d->lag_ticket);
             if (ds_off || bound_set[s] != set) {
                 vkCmdBindDescriptorSets(j->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d->layout, s, 1, &set, 0, NULL); bound_set[s] = set;
             }
@@ -784,6 +908,7 @@ static void record_job(rec_job *j, unsigned worker) {
     VKCHECK(vkEndCommandBuffer(j->cb));
     project_guards(j);   /* freeze every owner/view/alias VA while this recording job still owns its inputs */
     /* Publish once per completed chunk, never a ring lock for each draw or descriptor update. */
+    uint64_t desc_creates = c->descriptor_sets; /* this job's driver allocations: published and cleared below */
     if (j->frame) {
         if (j->frame == totk_ft_work_frame()) {
             totk_ft_count(FT_COUNT_DRAWS, draws);
@@ -851,7 +976,10 @@ int vk_record_enabled(void) {
 #else
     const int default_threads = 0;
 #endif
-    const char *e = getenv("TOTK_VK_REC_THREADS"); threads = e ? atoi(e) : default_threads;
+    const char *e = getenv("TOTK_VK_DESC_STOCK"); descriptor_stock = e && atoi(e) != 0;
+    LOGV("descriptor stock: %s (TOTK_VK_DESC_STOCK=1 keeps per-layout sets per recorder/primary slot; 0/unset resets every pool per slot generation)",
+        descriptor_stock ? "on" : "off");
+    e = getenv("TOTK_VK_REC_THREADS"); threads = e ? atoi(e) : default_threads;
     if (threads < 0) threads = 0; if (threads > REC_WORKERS) threads = REC_WORKERS;
     const char *diagnostics[] = {"TOTK_VK_OCCLUSION", "TOTK_VK_PASS_DUMP", "TOTK_VK_PASS_PROFILE", "TOTK_VK_PASSPROBE", "TOTK_VK_GPU_PROFILE", "TOTK_VK_PASS_MERGE"};
     for (size_t i = 0; threads && i < sizeof diagnostics / sizeof *diagnostics; i++) {

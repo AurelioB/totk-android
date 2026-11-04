@@ -1437,6 +1437,7 @@ typedef struct {
     nvn_dirty_lag_batch walking_guards; /* walking-built, immutable until this slot's queue publication */
     arena_t ar;   /* transient memory */
     VkDescriptorPool *dpools; int ndpool, capdpool, curdpool, curdsets;   /* walk every reset pool before allocating another */
+    vk_desc_stock *dstock;   /* TOTK_VK_DESC_STOCK=1: per-layout sets kept across this slot's generations */
     VkQueryPool ts; int ts_on;   /* GPU timestamps at the start and end of the main command buffer */
     occl_page *oq, *oq_cur;   /* reset/reused only after this slot's fence and occl_complete */
     vk_gpuprof_slot *gpuprof;   /* query pool and records, reused only after the slot fence */
@@ -2225,6 +2226,17 @@ static void slot_begin_inner(void) {
       if (blocked && T_ft_walk_frame && totk_ft_on()) totk_ft_walk_wait(T_ft_walk_frame, d); }
     slot_open(s);
 }
+/* Primary-slot descriptors (immediate graphics, compute, post, presentation, frame generation) are rewound here,
+   at the same point the pools used to be reset: busy and submit_busy have retired, replay pins have released the
+   slot, or a cancelled optional pre-submit never reached the GPU. Every caller writes the set it gets. */
+static void slot_descriptors_recycle(slot_t *s) {
+    int stock = vk_desc_stock_enabled();
+    if (stock && !vk_desc_stock_retire(s->dstock)) return;
+    int dirty = stock ? (s->ndpool ? s->curdpool + 1 : 0) : s->ndpool;   /* a stock rebuild: pools used since the last */
+    for (int i = 0; i < dirty; i++) VKCHECK(vkResetDescriptorPool(V.dev, s->dpools[i], 0));
+    vk_record_descriptor_primary(0, 0, (uint64_t)dirty);
+    s->curdpool = 0; s->curdsets = 0;
+}
 static void slot_open(slot_t *s) {
     VK_REC_DO(VK_REC_O_RESET,
     if (!s->pool) {
@@ -2250,13 +2262,11 @@ static void slot_open(slot_t *s) {
         s->primary_trim_uses = s->recent_primary_peak = 0;
     }
     arena_reset(&s->ar, 4);
-    for (int i = 0; i < s->ndpool; i++) VKCHECK(vkResetDescriptorPool(V.dev, s->dpools[i], 0));
-    vk_record_descriptor_primary(0, 0, (uint64_t)s->ndpool);
+    slot_descriptors_recycle(s);
     );
     s->oq_cur = NULL;
     s->tsq_first = s->tsq_count = 0;
     for (occl_page *p = s->oq; p; p = p->next) { vkResetQueryPool(V.dev, p->qp, 0, OQ); p->used = 0; }
-    s->curdpool = 0; s->curdsets = 0;
     if (s->primary) s->cb = s->primary[0];
     s->nprimary = 1;
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -2357,9 +2367,11 @@ void *vk_transient(size_t size, size_t align, VkBuffer *buf, VkDeviceSize *off) 
     return arena_alloc(&g_cur->ar, size, align, buf, off);
 }
 #define DPOOL_SETS 4096
-VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
-    if (!g_cur) slot_begin();
-    slot_t *s = g_cur;
+/* Allocates count (1..VK_DESC_STOCK_BATCH) sets from slot s, fewer near the end of a pool; never fewer than one. */
+static uint32_t slot_alloc_sets(void *owner, VkDescriptorSetLayout layout, uint32_t count, VkDescriptorSet *out) {
+    slot_t *s = owner;
+    VkDescriptorSetLayout layouts[VK_DESC_STOCK_BATCH];
+    for (uint32_t i = 0; i < count; i++) layouts[i] = layout;
     /* TOTK (2026-10-22): sets came only from the slot's last pool, so a submission needing more than one pool made a new
        pool every time and the reset ones before it were never used again: one more pool per frame in the world (~4,400
        sets a frame), each with its driver memory, until Android ran out (~45 MB/s). Now the slot's pools are used in
@@ -2369,11 +2381,13 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
         if (s->curdpool < s->ndpool && s->curdsets >= DPOOL_SETS) {   /* counted here too: some drivers (lavapipe) never report a full pool */
             if (s->curdpool + 1 < s->ndpool) { s->curdpool++; s->curdsets = 0; continue; }
         } else if (s->curdpool < s->ndpool) {
-            VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = s->dpools[s->curdpool], .descriptorSetCount = 1, .pSetLayouts = &layout};
-            VkDescriptorSet set; VkResult r = vkAllocateDescriptorSets(V.dev, &ai, &set);
-            vk_record_descriptor_primary(!r, 1, 0);
-            if (!r) { s->curdsets++; totk_ft_count(FT_COUNT_DESC_CREATES, 1); return set; }
+            if (count > (uint32_t)(DPOOL_SETS - s->curdsets)) count = (uint32_t)(DPOOL_SETS - s->curdsets);
+            VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = s->dpools[s->curdpool], .descriptorSetCount = count, .pSetLayouts = layouts};
+            VkResult r = vkAllocateDescriptorSets(V.dev, &ai, out);
+            vk_record_descriptor_primary(r ? 0 : count, 1, 0);
+            if (!r) { s->curdsets += (int)count; totk_ft_count(FT_COUNT_DESC_CREATES, count); return count; }
             if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) DIE("vkAllocateDescriptorSets: %d", r);
+            if (count > 1) { count /= 2; continue; }   /* large layouts may fit fewer than a whole batch */
             if (s->curdpool + 1 < s->ndpool) { s->curdpool++; s->curdsets = 0; continue; }
         }
         static const VkDescriptorPoolSize sizes[] = {
@@ -2388,6 +2402,12 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
         s->curdpool = s->ndpool - 1; s->curdsets = 0; fresh = 1;
     }
     DIE("descriptor set allocation failed in a fresh pool");
+}
+VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
+    if (!g_cur) slot_begin();
+    slot_t *s = g_cur;
+    if (vk_desc_stock_enabled()) return vk_desc_stock_take(&s->dstock, layout, slot_alloc_sets, s);
+    VkDescriptorSet set; (void)slot_alloc_sets(s, layout, 1, &set); return set;
 }
 /* Submit what is recorded (pre, then main); with posts, the current submission's post ops ride along. */
 static void ub_seal(uint64_t fence); static void ub_flush(void); static void gw_seal(uint64_t fence); static void gw_prune(void);

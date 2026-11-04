@@ -2864,6 +2864,37 @@ int main(int argc, char **argv) {
         printf("%s: texture registry pixels %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
         return fails != 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "--descriptor-stock")) {
+        CHECK(mtl_wait(run(), 5000000000ull), "descriptor stock fixture warmup completes");
+        mtl_drain();
+        int stock = vk_desc_stock_enabled();
+        CHECK(vk_record_test_descriptor_stock(), "layout-isolated stock checkout, retirement, batching and pressure rebuild");
+        /* Primary slots through real submissions: 100 sets per submission, eight warm-up submissions (one per ring
+           slot), then two more passes of the ring. Each set is checked out once per submission. */
+        VkDescriptorSetLayoutBinding lb = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &lb};
+        VkDescriptorSetLayout dsl; VKCHECK(vkCreateDescriptorSetLayout(V.dev, &li, NULL, &dsl));
+        uint64_t before[8], after[8]; int unique = 1;
+        for (int round = 0; round < 24; round++) {
+            if (round == 8) vk_record_test_descriptors(before);
+            VkDescriptorSet sets[100];
+            mtl_sub_begin();
+            for (int i = 0; i < 100; i++) { sets[i] = vk_alloc_set(dsl); for (int k = 0; k < i; k++) unique &= sets[k] != sets[i]; }
+            uint64_t fence = mtl_sub_commit(); CHECK(mtl_wait(fence, 5000000000ull), "descriptor stock primary submission %d completes", round);
+        }
+        vk_record_test_descriptors(after);
+        uint64_t sets = after[0] - before[0], calls = after[1] - before[1], resets = after[2] - before[2];
+        printf("descriptor-stock primary stock=%d 16 warm submissions: sets=%llu calls=%llu resets=%llu\n", stock,
+            (unsigned long long)sets, (unsigned long long)calls, (unsigned long long)resets);
+        CHECK(unique, "primary slot never issues one set twice in a submission");
+        if (stock) CHECK(!sets && !calls && !resets, "warm primary stock needs no allocations or pool resets (%llu/%llu/%llu)",
+            (unsigned long long)sets, (unsigned long long)calls, (unsigned long long)resets);
+        else CHECK(sets == 1600 && calls == 1600 && resets >= 16, "default primary path allocates per set and resets per slot (%llu/%llu/%llu)",
+            (unsigned long long)sets, (unsigned long long)calls, (unsigned long long)resets);
+        vk_record_stats(300);
+        printf("%s: descriptor stock %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+        return fails != 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--program-resolve-bench")) {
         CHECK(mtl_wait(run(), 5000000000ull), "program benchmark warmup completes");
         vk_shader *expected[6]; int expected_result = vk_prog_resolve_record(&pg, expected), valid = !expected_result;
