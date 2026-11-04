@@ -90,7 +90,11 @@ class LiveCtl(unittest.TestCase):
         self.run_mode(self.tsan_probe(), 'core', env=os.environ | {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66'})
 
     def test_switches(self):
-        self.assertIn('ok: 300 batches toggled all 10 live switches', self.run_mode(self.probe, 'switches'))
+        # Every whitelisted switch is toggled: the probe's count must match the table in live_ctl.h.
+        table = (TOTK / 'runtime/live_ctl.h').read_text()
+        table = table[table.index('totk_live_switches[] = {'):]
+        count = table[:table.index('};')].count('{"TOTK_')
+        self.assertIn(f'ok: 300 batches toggled all {count} live switches', self.run_mode(self.probe, 'switches'))
 
     def test_switches_thread_sanitizer(self):
         self.run_mode(self.tsan_probe(), 'switches', env=os.environ | {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66'})
