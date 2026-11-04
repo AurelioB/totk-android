@@ -516,6 +516,8 @@ void vk_wb_test_fresh(uint64_t v[3]); /* landed before base quiet, bytes, releva
 uint64_t vk_wb_test_inflight(void); /* exact preflight matches on a synchronous owner's borrowed landing list */
 #endif
 void vk_res_stats(void);   /* rendered / copied / cleared by the GPU: never re-uploaded from guest memory */
+void vk_upload_threads_init(void);         /* launch-time TOTK_VK_UPLOAD_THREADS, before any upload */
+void vk_upload_report(uint64_t frame);     /* every 300 presents: uploads, their wall time and parallel deswizzles */
 void vk_texel_stats(uint64_t frame); /* opt-in CPU texel access counters, per 300 frames */
 /* the texture registered at a texture-pool id (vk_reg), resolved to its Vulkan view; NULL for an empty slot */
 VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out);

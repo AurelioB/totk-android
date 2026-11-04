@@ -9751,6 +9751,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         LOGV("walker cpu frame %llu: cpu %.3f ms/frame, wall %.3f ms/frame, draws %.3f/frame, cpu %.3f us/draw, offcpu %.3f ms/frame",
              (unsigned long long)n, cpu / 300, elapsed / 300, draws / 300.0,
              draws ? cpu * 1000 / (double)draws : 0, (elapsed - cpu) / 300);
+        vk_upload_report(n);
         g_stat_sets_new = g_stat_sets_reused = 0;
         vk_lookup_stats(n);
         vk_lag_stats(n);

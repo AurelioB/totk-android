@@ -96,7 +96,7 @@ RUNTIME_C := runtime/loader.c runtime/game_data.c $(PATCHES) runtime/world_surve
 RUNTIME_S := runtime/gate.S runtime/hle_stack.S runtime/thread_enter.S
 # The NVN layer (portable C), without the Mac's text overlay (CoreGraphics) and system-load reader (sysctl).
 ifeq ($(GPU),vk)
-  BACKEND_C := $(TOTK)/android/gfx/nvn_vk.c $(TOTK)/android/gfx/vk_load.c $(TOTK)/android/gfx/vk_fmt.c $(TOTK)/android/gfx/vk_res.c \
+  BACKEND_C := $(TOTK)/android/gfx/nvn_vk.c $(TOTK)/android/gfx/vk_load.c $(TOTK)/android/gfx/vk_fmt.c $(TOTK)/android/gfx/vk_res.c $(TOTK)/android/gfx/vk_upload_pool.c \
     $(TOTK)/android/gfx/vk_shader.c $(TOTK)/android/gfx/vk_compute.c $(TOTK)/android/gfx/vk_pcache.c $(TOTK)/android/gfx/vk_seed_io.c $(TOTK)/android/gfx/vk_shader_xlate.c $(TOTK)/android/gfx/vk_draw.c $(TOTK)/android/gfx/vk_canvas.c $(TOTK)/android/gfx/vk_post.c $(TOTK)/android/gfx/vk_framegen.c $(TOTK)/android/gfx/vk_record.c $(TOTK)/android/gfx/vk_gpuprof.c $(TOTK)/android/gfx/vk_overlay.c \
     $(TOTK)/runtime/fps_hybrid_runtime.c $(TOTK)/runtime/fps_adaptive_runtime.c
   BACKEND_C += $(TOTK)/android/gfx/vk_framegen_qcom.c $(TOTK)/android/gfx/vk_framegen_lsfg.c
@@ -224,7 +224,7 @@ $(OUT)/vkprobe: $(TOTK)/android/vkprobe/vkprobe.c
 # Their shader seed comes from android/gfx/test_vkdraw_seed.py, which needs glslangValidator.
 #   make -C android vktest TARGET=linux CC=cc OUT=<scratch>/vk
 # Builds vktest, vkdrawtest, vkrectest, vkrecspantest, vkpipetest, threadplacetest and vkdraw-seed/.
-VKTEST_SRC := $(TOTK)/android/gfx/nvn_vk.c $(TOTK)/android/gfx/vk_load.c $(TOTK)/android/gfx/vk_fmt.c $(TOTK)/android/gfx/vk_res.c \
+VKTEST_SRC := $(TOTK)/android/gfx/nvn_vk.c $(TOTK)/android/gfx/vk_load.c $(TOTK)/android/gfx/vk_fmt.c $(TOTK)/android/gfx/vk_res.c $(TOTK)/android/gfx/vk_upload_pool.c \
   $(TOTK)/android/gfx/vk_shader.c $(TOTK)/android/gfx/vk_compute.c $(TOTK)/android/gfx/vk_pcache.c $(TOTK)/android/gfx/vk_seed_io.c $(TOTK)/android/gfx/vk_shader_xlate.c $(TOTK)/android/gfx/vk_draw.c $(TOTK)/android/gfx/vk_canvas.c $(TOTK)/android/gfx/vk_post.c $(TOTK)/android/gfx/vk_framegen.c $(TOTK)/android/gfx/vk_record.c $(TOTK)/android/gfx/vk_gpuprof.c $(TOTK)/android/gfx/vk_overlay.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.c \
   $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/totk_lifelog.c \
   $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c $(TOTK)/android/gfx/host_test_support.c $(TOTK)/runtime/frame_timeline.c $(TOTK)/runtime/frame_fence.c \
@@ -280,6 +280,14 @@ texelregiontest: $(OUT)/texelregiontest
 $(OUT)/texelregiontest: $(TOTK)/android/gfx/test_texel_region.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.h
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -g $(WARN) -o $@ $(filter %.c,$^)
+# Parallel upload deswizzle: byte identity against the serial decoder with 0/1/3 helpers (no Vulkan). Under
+# CC='clang -fsanitize=thread' it is the pool's race check; --bench prints serial vs helper times.
+vktest: $(OUT)/uploadpooltest
+uploadpooltest: $(OUT)/uploadpooltest
+$(OUT)/uploadpooltest: $(TOTK)/android/gfx/test_upload_pool.c $(TOTK)/android/gfx/vk_upload_pool.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.c \
+  $(TOTK)/android/gfx/vk_upload_pool.h $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.h
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -g $(WARN) -D_GNU_SOURCE -o $@ $(filter %.c,$^) -lpthread
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest): $(TOTK)/android/gfx/vk_seed_io.h $(TOTK)/android/gfx/vk_seed_pack.h
 $(OUT)/vkseedpacktest: $(TOTK)/android/gfx/test_vk_seed_pack.c $(TOTK)/android/gfx/vk_seed_pack.h
 	@mkdir -p $(dir $@)
@@ -533,7 +541,7 @@ $(OUT)/companiontest: $(TOTK)/tests/companion/test_companion.c $(TOTK)/runtime/c
 
 clean:
 	rm -rf $(OUT)/obj $(OUT)/obj-app $(OUT)/totk-native $(OUT)/libtotk.so $(OUT)/vkprobe $(OUT)/vktest $(OUT)/vkdrawtest $(OUT)/vkrectest $(OUT)/vkrecspantest $(OUT)/vkpipetest $(OUT)/threadplacetest $(OUT)/frametimelinetest $(OUT)/framefencetest $(OUT)/acquireclocktest $(OUT)/displaypacetest $(OUT)/displayclocktest $(OUT)/acquireslacktest $(OUT)/predictpacetest $(OUT)/predictbudgettest $(OUT)/adrenogmemtest $(OUT)/fpsautotest $(OUT)/fpsautoscenetest $(OUT)/fpsautoblocktest $(OUT)/presentfencetest $(OUT)/vkdrawtest-app $(OUT)/vkoverlaytest $(OUT)/vkposttest $(OUT)/vkdraw-seed $(OUT)/companiontest $(DEV_BUILD_STAMP)
-	rm -f $(OUT)/framegenslottest $(OUT)/presentslottest $(OUT)/framegenmathtest $(OUT)/framegenbudgettest $(OUT)/vkframegentest $(OUT)/framegendeptest $(OUT)/gpuitimingtest $(OUT)/fpshybridtest $(OUT)/psotracetest
+	rm -f $(OUT)/framegenslottest $(OUT)/presentslottest $(OUT)/framegenmathtest $(OUT)/framegenbudgettest $(OUT)/vkframegentest $(OUT)/framegendeptest $(OUT)/gpuitimingtest $(OUT)/fpshybridtest $(OUT)/psotracetest $(OUT)/uploadpooltest
 	rm -f $(OUT)/framegenadaptivetest $(OUT)/framegenadaptivepresenttest $(OUT)/fpsadaptivetest $(OUT)/presentretiretest
 	rm -f $(OUT)/framegenadaptiveslottest $(OUT)/adaptiveslotclocktest $(OUT)/framegenqcompreparedtest $(OUT)/framegenadaptivepublicationtest $(OUT)/framegenadaptivelatchtest
 	rm -f $(OUT)/vkframegenpreparedtest

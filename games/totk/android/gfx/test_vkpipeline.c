@@ -112,6 +112,7 @@ static void screen_classify_cases(void) {
 #include "vk_record.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include "dm_wait_stats.h"
+#include "vk_upload_pool.h"
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -649,6 +650,30 @@ static void pipeline_library_probe(uint8_t *pixel) {
           atomic_load(&g_hk.pipe_bounds) == bounds && atomic_load(&g_hk.pipes_sync) == sync,
           "library recombination and replacement require no submission-bound join, takeover or duplicate build");
 }
+/* A mirrored block-linear texture large enough for the parallel deswizzle (TOTK_VK_UPLOAD_THREADS=1..3) reads back
+   through CopyTextureToBuffer exactly as the serial decoder lays it out, at every level, with the switch on or off. */
+static void upload_probe(pool_t *pool, uint8_t *mem) {
+    tex_t big = {.d = {.target = 1, .format = 0x25, .width = 1024, .height = 256, .depth = 1, .levels = 3}};
+    nvn_tex_layout(&big.d, &big.L); big.mem = mem + 0x800000; big.pool = pool; big.serial = 900;
+    uint32_t s = 0x9e3779b9; for (uint64_t i = 0; i < big.L.size; i++) { s ^= s << 13; s ^= s >> 17; s ^= s << 5; big.mem[i] = (uint8_t)s; }
+    upload_pool_stats stats; upload_pool_stats_take(&stats);
+    uint8_t *out = mem + 0xc00000, *expected = malloc(1024 * 256 * 4);
+    for (unsigned level = 0; level < big.d.levels; level++) {
+        uint32_t w = big.d.width >> level, h = big.d.height >> level; memset(out, 0, (size_t)w * h * 4);
+        p_copy_b2t copy = {.src = (uintptr_t)out, .tex = &big, .has_view = 1, .view = {.set_levels = 1, .base_level = (uint8_t)level, .nlevels = 1},
+                           .r = {0, 0, 0, (int)w, (int)h, 1}};
+        op(OP_COPY_T2B, &copy, sizeof copy);
+        CHECK(mtl_wait(submit(), 5000000000ull), "upload readback level %u completed", level);
+        CHECK(!nvn_deswizzle(&big.d, level, 0, big.mem, expected, (size_t)w * 4) && !memcmp(out, expected, (size_t)w * h * 4),
+              "level %u of a 1.3 MiB block-linear upload reads back byte-identical to the serial decoder", level);
+    }
+    free(expected);
+    upload_pool_stats_take(&stats);
+    /* Untracked pool bytes re-upload at every submission: one parallel job per readback. */
+    CHECK(upload_pool_helpers() ? stats.jobs == big.d.levels && stats.runs >= 2 * stats.jobs : !stats.jobs,
+          "every upload deswizzled %s (jobs %llu, runs %llu)", upload_pool_helpers() ? "in parallel" : "serially",
+          (unsigned long long)stats.jobs, (unsigned long long)stats.runs);
+}
 static int finish_tests(void) {
     uint64_t lib_ns, pso_ns, lib_wait_ns, pso_wait_ns, shader_scan_ns, pso_scan_ns;
     mtl_create_ns(&lib_ns, &pso_ns); mtl_wait_stats(&lib_wait_ns, &pso_wait_ns); mtl_scan_stats(&shader_scan_ns, &pso_scan_ns);
@@ -869,6 +894,7 @@ int main(int argc, char **argv) {
     CHECK(graphics_count(&attempts[failure_mask]) == before, "repeated failure backs off instead of retrying per draw/submission");
     for (unsigned i = 0; i < 20 && graphics_count(&attempts[failure_mask]) == before; i++) draw(failure_mask, 1);
     CHECK(graphics_count(&attempts[failure_mask]) == 3 && pixel[0] == 255 && pixel[1] == 255, "retry eventually recovers real geometry");
+    upload_probe(&pool, mem);
     if (prediction_test) prediction_probe(&tex, pixel);
     return finish_tests();
 }

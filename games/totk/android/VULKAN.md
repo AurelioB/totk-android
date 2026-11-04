@@ -2774,6 +2774,11 @@ policy as ours and measured the same dead ends (DONT_CARE loads, forced GMEM, LR
    colours. Texture copies (B2T, T2B, T2T), clears, and render targets as dynamic rendering. Textures in pools need the
    same "pool contents changed → re-upload" tracking the Metal backend has (`nvn_dirty.c`). On Linux it protects 64 KiB
    units (`TOTK_DIRTY_UNIT_KB`), because the per-process mapping limit (`vm.max_map_count`) is reached with single pages.
+   `TOTK_VK_UPLOAD_THREADS=<1..3>` (default unset/0: serial on the calling thread) splits block-linear uploads of at
+   least 512 KiB into runs of whole block rows (≥64 KiB) that 1–3 helper threads and the caller decode
+   (`vk_upload_pool.c`); the copy is recorded after every run, byte-identical to the serial path (`uploadpooltest`,
+   TSan). Helpers inherit the first uploading thread's nice and affinity. Every 300 presents `texture uploads: N (M MiB)
+   in X ms, Y ms/frame; parallel deswizzles J` reports both arms; compare Y and the over-50 ms frame counts.
    **Pipelines and draws.** Hash the NVN state into `VkPipeline`s, with dynamic state where the driver has it.
    Pipelines are created at their first draw; the `VkPipelineCache` is kept between runs in `TOTK_VK_PIPELINE_CACHE`
    (default `state/vk-pipeline-cache.bin`, `0` turns it off), checked against the driver's cache UUID when read and

@@ -607,6 +607,7 @@ static VkFormat depth_choice(VkFormat want, VkFormat fallback) {
 
 static void vk_init_once(void) {
     vk_draw_switches_init();   /* before any compile worker or shader load reads them */
+    vk_upload_threads_init();
     (void)vk_shaders_ready();   /* headless startup too; the app already froze selection against its game folder */
     { const char *fps60 = getenv("TOTK_FPS60");
       LOGV("frame policy: FPS60=%d FRAME_LAG=%d CHUNK_DRAWS=%ld",
