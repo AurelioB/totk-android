@@ -355,12 +355,17 @@ static inline void live_ctl_run(totk_live_reader *rd) {
     char dir[PATH_MAX], data[4096], events[4096]; const char *name = strrchr(rd->path, '/');
     snprintf(dir, sizeof dir, "%.*s", name ? (int)(name - rd->path) : 1, name ? rd->path : ".");
     name = name ? name + 1 : rd->path;
-    int in = inotify_init1(IN_CLOEXEC), watch = -1, fd = -1; ino_t inode = 0; off_t at = 0;
+    int in = inotify_init1(IN_CLOEXEC), watch = -1, directory = 0, fd = -1; ino_t inode = 0; off_t at = 0;
     totk_live_lines lines = {0};
     for (int first = 1;; first = 0) {
         if (fd < 0) {
-            /* The folder first, then the open: a file created in between still wakes us. */
-            if (in >= 0) { if (watch >= 0) inotify_rm_watch(in, watch); watch = inotify_add_watch(in, dir, IN_CREATE | IN_MOVED_TO); }
+            /* Keep the folder watch until our file exists. Removing it queues IN_IGNORED, so rearming after
+               unrelated folder events would wake this thread forever, even with no control-file changes. */
+            if (in >= 0 && !directory) {
+                if (watch >= 0) inotify_rm_watch(in, watch);
+                watch = inotify_add_watch(in, dir, IN_CREATE | IN_MOVED_TO);
+                directory = watch >= 0;
+            }
             fd = open(rd->path, O_RDONLY | O_CLOEXEC);
             struct stat st;
             if (fd >= 0 && fstat(fd, &st)) { close(fd); fd = -1; }
@@ -370,6 +375,7 @@ static inline void live_ctl_run(totk_live_reader *rd) {
                 if (in >= 0) {
                     if (watch >= 0) inotify_rm_watch(in, watch);
                     watch = inotify_add_watch(in, rd->path, IN_MODIFY | IN_DELETE_SELF | IN_MOVE_SELF | IN_ATTRIB);
+                    directory = 0;
                 }
             }
         }
@@ -380,18 +386,29 @@ static inline void live_ctl_run(totk_live_reader *rd) {
             }
             ssize_t r;
             while ((r = pread(fd, data, sizeof data, at)) > 0) { at += r; totk_live_feed(&lines, data, (size_t)r); }
+            if (in >= 0 && watch < 0)
+                watch = inotify_add_watch(in, rd->path, IN_MODIFY | IN_DELETE_SELF | IN_MOVE_SELF | IN_ATTRIB);
         }
         if (in >= 0 && watch >= 0) {
-            ssize_t r = read(in, events, sizeof events);
-            if (r < 0 && errno != EINTR) { close(in); in = watch = -1; }
-            else if (fd < 0) {   /* folder events: wake only for our file */
-                int ours = 0;
+            for (;;) {
+                ssize_t r = read(in, events, sizeof events);
+                if (r < 0 && errno == EINTR) continue;   /* retry the blocking read, not the open or watch */
+                if (r <= 0) { close(in); in = watch = -1; directory = 0; break; }
+                int ours = 0, lost = 0;
                 for (ssize_t i = 0; i < r; ) {
                     const struct inotify_event *ev = (const struct inotify_event *)(events + i);
-                    ours |= ev->len && !strcmp(ev->name, name);
+                    if (ev->mask & IN_Q_OVERFLOW) ours = 1;   /* our event may have been lost: recheck the path */
+                    if (ev->wd == watch) {
+                        if (ev->mask & IN_IGNORED) lost = 1;
+                        else if (fd >= 0 || ((ev->mask & (IN_CREATE | IN_MOVED_TO)) && ev->len && !strcmp(ev->name, name)))
+                            ours = 1;
+                    }
                     i += (ssize_t)sizeof *ev + ev->len;
                 }
-                if (!ours) continue;
+                if (lost) { watch = -1; directory = 0; }
+                /* A removed watch's IN_IGNORED and unrelated creates/moves do not reopen the file or
+                   rearm the directory. Stay on this blocking read until a relevant event arrives. */
+                if (ours || lost) break;
             }
         } else usleep(250000);
         __atomic_fetch_add(&rd->wakeups, 1, __ATOMIC_RELAXED);

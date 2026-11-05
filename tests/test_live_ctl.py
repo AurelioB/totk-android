@@ -3,6 +3,8 @@
 generation order, the accessor's cache, a writer / frame thread / readers race, the control thread on a real file, and
 every live switch toggled 300 times while render threads (TOTK_PRIO_RENDER by tid), game threads (TOTK_TIMER_SLACK_NS
 before their timed waits) and readers run. Both also run under ThreadSanitizer when the compiler has it.
+The isolated missing-file probe pins its control worker to an allowed CPU and measures thread CPU and real syscall
+counts after unrelated creates/deletes/moves, EINTR, late creation and repeated control-file deletion/recreation.
 
 CC accepts a shell-quoted compiler command; TMPDIR selects scratch output.
 """
@@ -108,6 +110,17 @@ class LiveCtl(unittest.TestCase):
         out = self.run_mode(self.probe, 'core')
         self.assertIn('ok: 400 batches applied', out)
         self.assertIn('ok: control thread', out)
+
+    def test_missing_file_idle(self):
+        out = self.run_mode(self.probe, 'missing')
+        self.assertIn('ok: isolated control worker pinned to allowed CPU', out)
+        self.assertIn('ok: idle absent CREATE+DELETE', out)
+        self.assertIn('ok: idle absent MOVED_TO+DELETE', out)
+        self.assertIn('ok: idle absent EINTR', out)
+        self.assertIn('ok: idle created IN_IGNORED', out)
+        self.assertIn('ok: idle recreated IN_IGNORED', out)
+        self.assertIn('ok: absent-file control reader: unrelated creates/deletes/moves, EINTR, late creation, '
+                      '4 delete/recreate cycles', out)
 
     def test_core_thread_sanitizer(self):
         self.run_mode(self.tsan_probe(), 'core', env=os.environ | {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66'})

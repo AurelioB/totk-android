@@ -7,18 +7,93 @@
  *                             registered render threads (TOTK_PRIO_RENDER by tid, through the nice hook; a walker
  *                             pinned by TOTK_PRIO_WALK), game threads applying TOTK_TIMER_SLACK_NS before their timed
  *                             waits, and readers of every other switch run
+ *   missing <dir>             one CPU-pinned control worker: unrelated creates/deletes and moves while totk.ctl
+ *                             is absent, interrupted reads, then late creation and repeated deletion/recreation;
+ *                             thread CPU and syscall/watch counts catch spins invisible to rd.wakeups
  * Every check prints FAIL: on failure; the last line is "ok: ..." or "FAIL: ...". Build it plain and with
  * -fsanitize=thread: the concurrent sections are the race check. */
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Observe only the isolated control worker's real syscalls, not the fixture's file operations. */
+static int observed_open(const char *path, int flags, ...);
+static ssize_t observed_read(int fd, void *data, size_t size);
+static ssize_t observed_pread(int fd, void *data, size_t size, off_t at);
+static int observed_stat(const char *path, struct stat *st);
+static int observed_fstat(int fd, struct stat *st);
+static int observed_close(int fd);
+static int observed_add_watch(int fd, const char *path, uint32_t mask);
+static int observed_rm_watch(int fd, int watch);
+#define open(...) observed_open(__VA_ARGS__)
+#define read(...) observed_read(__VA_ARGS__)
+#define pread(...) observed_pread(__VA_ARGS__)
+#define stat(...) observed_stat(__VA_ARGS__)
+#define fstat(...) observed_fstat(__VA_ARGS__)
+#define close(...) observed_close(__VA_ARGS__)
+#define inotify_add_watch(...) observed_add_watch(__VA_ARGS__)
+#define inotify_rm_watch(...) observed_rm_watch(__VA_ARGS__)
 #include "thread_place.h"   /* includes live_ctl.h */
+#undef open
+#undef read
+#undef pread
+#undef stat
+#undef fstat
+#undef close
+#undef inotify_add_watch
+#undef inotify_rm_watch
+
+enum { CTL_OPEN, CTL_READ, CTL_PREAD, CTL_STAT, CTL_FSTAT, CTL_CLOSE, CTL_ADD, CTL_REMOVE, CTL_CALLS };
+static _Thread_local int observe_control;
+static _Atomic unsigned long ctl_calls[CTL_CALLS], ctl_event_reads, ctl_interrupts, ctl_ignored, ctl_directory_watches;
+static void observed_call(unsigned which) { if (observe_control) atomic_fetch_add(&ctl_calls[which], 1); }
+static int observed_open(const char *path, int flags, ...) {
+    observed_call(CTL_OPEN);
+    if (!(flags & O_CREAT)) return open(path, flags);
+    va_list args; va_start(args, flags); mode_t mode = va_arg(args, mode_t); va_end(args);
+    return open(path, flags, mode);
+}
+static ssize_t observed_read(int fd, void *data, size_t size) {
+    observed_call(CTL_READ);
+    ssize_t n = read(fd, data, size); int saved = errno;
+    if (observe_control) {
+        if (n < 0 && saved == EINTR) atomic_fetch_add(&ctl_interrupts, 1);
+        if (n > 0) {
+            for (ssize_t i = 0; i < n; ) {
+                const struct inotify_event *ev = (const struct inotify_event *)((const char *)data + i);
+                if (ev->mask & IN_IGNORED) atomic_fetch_add(&ctl_ignored, 1);
+                i += (ssize_t)sizeof *ev + ev->len;
+            }
+            atomic_fetch_add(&ctl_event_reads, 1);
+        }
+    }
+    errno = saved; return n;
+}
+static ssize_t observed_pread(int fd, void *data, size_t size, off_t at) {
+    observed_call(CTL_PREAD); return pread(fd, data, size, at);
+}
+static int observed_stat(const char *path, struct stat *st) { observed_call(CTL_STAT); return stat(path, st); }
+static int observed_fstat(int fd, struct stat *st) { observed_call(CTL_FSTAT); return fstat(fd, st); }
+static int observed_close(int fd) { observed_call(CTL_CLOSE); return close(fd); }
+static int observed_add_watch(int fd, const char *path, uint32_t mask) {
+    observed_call(CTL_ADD); int watch = inotify_add_watch(fd, path, mask);
+    if (observe_control && watch >= 0 && (mask & IN_CREATE)) atomic_fetch_add(&ctl_directory_watches, 1);
+    return watch;
+}
+static int observed_rm_watch(int fd, int watch) { observed_call(CTL_REMOVE); return inotify_rm_watch(fd, watch); }
 
 static int failures;
 #define CHECK(c, ...) do { if (!(c)) { failures++; fprintf(stdout, "FAIL: "); fprintf(stdout, __VA_ARGS__); fputc('\n', stdout); } } while (0)
@@ -187,6 +262,121 @@ static void core(const char *dir) {
     printf("ok: an existing file's earlier lines are skipped\n");
 }
 
+/* ---- absent-file idle cost: wakeups alone never saw the old remove/IN_IGNORED/rearm loop ---- */
+typedef struct { unsigned long calls[CTL_CALLS], events, interrupts, ignored, wakeups; double cpu; } ctl_sample;
+static clockid_t ctl_clock;
+static ctl_sample control_sample(void) {
+    ctl_sample s = {0}; struct timespec t = {0};
+    CHECK(!clock_gettime(ctl_clock, &t), "read the control worker's CPU clock");
+    s.cpu = t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+    for (unsigned i = 0; i < CTL_CALLS; i++) s.calls[i] = atomic_load(&ctl_calls[i]);
+    s.events = atomic_load(&ctl_event_reads); s.interrupts = atomic_load(&ctl_interrupts);
+    s.ignored = atomic_load(&ctl_ignored); s.wakeups = __atomic_load_n(&rd.wakeups, __ATOMIC_RELAXED);
+    return s;
+}
+static int control_until(_Atomic unsigned long *counter, unsigned long want) {
+    double start = now_ms();
+    while (now_ms() - start < 5000) {
+        if (atomic_load(counter) >= want) return 1;
+        usleep(1000);
+    }
+    return 0;
+}
+static void *observed_control(void *arg) { observe_control = 1; live_ctl_run(arg); return NULL; }
+static void interrupt_control(int sig) { (void)sig; }
+static void control_idle(const char *dir, const char *phase, ctl_sample before, unsigned count, int moved,
+                         unsigned transitions, int directory) {
+    char other[1100], source[1100];
+    snprintf(other, sizeof other, "%s/unrelated", dir);
+    snprintf(source, sizeof source, "%s/incoming/unrelated", dir);
+    for (unsigned i = 0; i < count; i++) {
+        int fd = open(moved ? source : other, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        CHECK(fd >= 0, "%s: create unrelated file %u", phase, i);
+        if (fd >= 0) close(fd);
+        if (moved) CHECK(!rename(source, other), "%s: move unrelated file %u into watched directory", phase, i);
+        CHECK(!unlink(other), "%s: delete unrelated file %u", phase, i);
+    }
+    if (count && directory) CHECK(control_until(&ctl_event_reads, before.events + 1), "%s: consume directory events", phase);
+    usleep(300000);
+    ctl_sample after = control_sample(); unsigned long calls = 0;
+    for (unsigned i = 0; i < CTL_CALLS; i++) calls += after.calls[i] - before.calls[i];
+    unsigned long opens = after.calls[CTL_OPEN] - before.calls[CTL_OPEN];
+    unsigned long adds = after.calls[CTL_ADD] - before.calls[CTL_ADD];
+    unsigned long removes = after.calls[CTL_REMOVE] - before.calls[CTL_REMOVE];
+    /* CPU is actual thread run time, not elapsed scheduling time. A blocked reader needs far less than
+       100 ms per 300 ms window; syscall bounds catch a spin even when the pinned CPU is heavily loaded. */
+    CHECK(after.cpu - before.cpu < 100, "%s: idle control worker used %.3f ms CPU", phase, after.cpu - before.cpu);
+    CHECK(calls <= count + 32, "%s: bounded syscalls: %lu for %u unrelated events", phase, calls, count);
+    CHECK(opens <= transitions && adds <= transitions && removes <= transitions,
+          "%s: no unrelated reopen/rearm: open=%lu add=%lu remove=%lu (allowed transitions=%u)",
+          phase, opens, adds, removes, transitions);
+    if (!transitions && directory) CHECK(after.wakeups == before.wakeups, "%s: unrelated events/EINTR do not count as control wakes", phase);
+    printf("ok: idle %s cpu=%.3f ms syscalls=%lu open=%lu add=%lu remove=%lu wakeups=%lu ignored=%lu EINTR=%lu\n",
+           phase, after.cpu - before.cpu, calls, opens, adds, removes, after.wakeups - before.wakeups,
+           after.ignored - before.ignored, after.interrupts - before.interrupts);
+}
+static void missing(const char *dir) {
+    static char path[1024]; char incoming[1100];
+    snprintf(path, sizeof path, "%s/totk.ctl", dir); unlink(path);
+    snprintf(incoming, sizeof incoming, "%s/incoming", dir);
+    CHECK(!mkdir(incoming, 0700), "create the unrelated move's source directory");
+    cpu_set_t allowed, one; CPU_ZERO(&one);
+    int error = sched_getaffinity(0, sizeof allowed, &allowed), cpu = -1;
+    CHECK(!error, "read allowed host CPUs");
+    if (error) return;
+    for (int i = 0; i < CPU_SETSIZE; i++) if (CPU_ISSET(i, &allowed)) { cpu = i; CPU_SET(i, &one); break; }
+    CHECK(cpu >= 0, "an allowed host CPU exists"); if (cpu < 0) return;
+    struct sigaction action = {.sa_handler = interrupt_control};
+    sigemptyset(&action.sa_mask);
+    CHECK(!sigaction(SIGUSR1, &action, NULL), "install non-restarting signal handler");
+    pthread_attr_t attr; error = pthread_attr_init(&attr);
+    CHECK(!error, "initialize control worker attributes"); if (error) return;
+    error = pthread_attr_setaffinity_np(&attr, sizeof one, &one);
+    CHECK(!error, "pin the isolated worker to allowed CPU %d", cpu);
+    if (error) { pthread_attr_destroy(&attr); return; }
+    rd.path = path; rd.skip_existing = 1;
+    pthread_t thread; error = pthread_create(&thread, &attr, observed_control, &rd); pthread_attr_destroy(&attr);
+    CHECK(!error, "start isolated control worker"); if (error) return;
+    pthread_detach(thread);
+    error = pthread_getcpuclockid(thread, &ctl_clock);
+    CHECK(!error, "get isolated control worker CPU clock"); if (error) return;
+    CHECK(control_until(&ctl_calls[CTL_READ], 1), "absent target: directory watch armed and reader waiting");
+    CHECK(atomic_load(&ctl_directory_watches) == 1 && atomic_load(&ctl_calls[CTL_OPEN]) == 1,
+          "absent target starts with one directory watch and one open attempt");
+    printf("ok: isolated control worker pinned to allowed CPU %d\n", cpu);
+
+    /* Replay the device failure: absent target, many unrelated CREATE+DELETE pairs, then MOVED_TO+DELETE.
+       The wake counter stays zero even in the old spinning implementation, so measure CPU and syscalls too. */
+    control_idle(dir, "absent CREATE+DELETE", control_sample(), 64, 0, 0, 1);
+    control_idle(dir, "absent MOVED_TO+DELETE", control_sample(), 64, 1, 0, 1);
+    ctl_sample before = control_sample();
+    for (int i = 0; i < 8; i++) { CHECK(!pthread_kill(thread, SIGUSR1), "interrupt the blocked reader"); usleep(1000); }
+    CHECK(control_until(&ctl_interrupts, before.interrupts + 1), "blocking inotify read returns EINTR");
+    control_idle(dir, "absent EINTR", before, 0, 0, 0, 1);
+
+    uint32_t gen = totk_live_generation();
+    append(path, "set TOTK_VK_SPLIT_PASS_DRAWS=1\nmark created after unrelated events\n");
+    CHECK((gen = frames_until(gen)) && value("TOTK_VK_SPLIT_PASS_DRAWS") == 1,
+          "late-created totk.ctl is read from its beginning after unrelated events and EINTR");
+    CHECK(control_until(&ctl_ignored, 1), "consume the removed directory watch's IN_IGNORED");
+    control_idle(dir, "created IN_IGNORED", control_sample(), 16, 0, 0, 0);
+    for (int i = 0; i < 4; i++) {
+        before = control_sample(); unsigned long directories = atomic_load(&ctl_directory_watches);
+        CHECK(!unlink(path), "delete totk.ctl before recreation %d", i + 1);
+        CHECK(control_until(&ctl_directory_watches, directories + 1), "rearm one directory watch after deletion %d", i + 1);
+        char phase[64]; snprintf(phase, sizeof phase, "deleted %d %s+DELETE", i + 1, i & 1 ? "MOVED_TO" : "CREATE");
+        control_idle(dir, phase, before, 32, i & 1, 1, 1);
+        char line[128]; snprintf(line, sizeof line, "set TOTK_VK_SPLIT_PASS_DRAWS=%d\nmark recreation %d\n", i + 2, i + 1);
+        append(path, line);
+        CHECK((gen = frames_until(gen)) && value("TOTK_VK_SPLIT_PASS_DRAWS") == i + 2,
+              "totk.ctl recreation %d is read from its beginning", i + 1);
+    }
+    before = control_sample();
+    CHECK(control_until(&ctl_ignored, 5), "directory-watch IN_IGNORED events consumed across recreations");
+    control_idle(dir, "recreated IN_IGNORED", before, 16, 1, 0, 0);
+    printf("ok: absent-file control reader: unrelated creates/deletes/moves, EINTR, late creation, 4 delete/recreate cycles\n");
+}
+
 /* ---------- every live switch toggled ---------- */
 enum { RENDER = 4, SLACKERS = 4, TOGGLES = 300 };
 static _Atomic int render_tid[RENDER + 1], render_nice[RENDER + 1], render_started, stop_all;
@@ -293,14 +483,14 @@ static void switches(void) {
 
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "parse")) return parse_mode();
-    if (argc != 3 || (strcmp(argv[1], "core") && strcmp(argv[1], "switches"))) {
-        fprintf(stderr, "usage: probe parse | probe core <dir> | probe switches <dir>\n"); return 2;
+    if (argc != 3 || (strcmp(argv[1], "core") && strcmp(argv[1], "switches") && strcmp(argv[1], "missing"))) {
+        fprintf(stderr, "usage: probe parse | probe core <dir> | probe switches <dir> | probe missing <dir>\n"); return 2;
     }
     static char stderr_path[1100]; snprintf(stderr_path, sizeof stderr_path, "%s/stderr.txt", argv[2]);
     if (!freopen(stderr_path, "w", stderr)) return 3;
     setvbuf(stderr, NULL, _IONBF, 0); setvbuf(stdout, NULL, _IOLBF, 0);
     log_path = stderr_path;
-    if (!strcmp(argv[1], "core")) core(argv[2]); else switches();
+    if (!strcmp(argv[1], "core")) core(argv[2]); else if (!strcmp(argv[1], "missing")) missing(argv[2]); else switches();
     printf("%s: live switch channel\n", failures ? "FAIL" : "ok");
     return failures != 0;
 }

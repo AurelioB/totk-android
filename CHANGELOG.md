@@ -8,6 +8,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ### Runtime
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
   Normal launches no longer start its tail thread or wake logd for every frame log. Crash reports remain enabled.
+- Let the live-control reader sleep when `totk.ctl` is absent, including after unrelated files are created or deleted.
+  Keep its directory watch until the control file appears instead of repeatedly waking on its own watch removals.
 
 ### Menu
 - **Keep the GPU busy** in Graphics → Performance feeds smaller batches earlier and requests clocks that keep up.

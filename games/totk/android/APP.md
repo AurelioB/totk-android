@@ -1925,8 +1925,10 @@ needs `su`). The folder holds what the adb-shell folder holds:
 
 A/B measurements change experiment switches inside one running session, so both arms share one loaded scene
 (`tools/bench/ab.sh`, the `totk-benchmark` skill). A thread at nice 10 (on the slower CPUs, like the logcat copy)
-follows `<game folder>/totk.ctl` with inotify (on the file only once it exists; 250 ms polling without inotify) and
-stages each complete line appended after the start; the lines of one write are staged together:
+follows `<game folder>/totk.ctl` with inotify (on the file only once it exists; 250 ms polling without inotify).
+While the file is absent it retains one directory watch and ignores unrelated creates/moves without reopening
+the file or removing/rearming the watch. Explicit watch removals' `IN_IGNORED` events cannot feed a retry loop.
+It stages each complete line appended after the start; the lines of one write are staged together:
 
 - `set KEY=VALUE` sets a live switch to a decimal inside its range; `unset KEY` returns it to its launch value
   (`totk.env`, else the switch's default); `mark <text>` only writes a marker (the A/B arm).
