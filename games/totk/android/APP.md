@@ -52,9 +52,11 @@ declarations are otherwise unchanged; there is still one app card after the menu
 On dual-screen devices a normal MAIN/LAUNCHER entry returns directly to a live game without another save sync or
 startup marker; the explicit Settings VIEW shortcut always opens the menu. With no live game the normal menu/direct
 game preference still applies. A pending save-safe Close game action is not cancelled by that launcher shortcut path.
-An explicit Settings shortcut opened from the bottom panel redirects that same `SINGLE_TOP` menu to the main display
-before drawing it, so it is not hidden underneath the live companion. Existing menu content/actions stay on that
-activity; a pending Close game is not redirected or replaced.
+An explicit Settings shortcut opened from the bottom panel binds its `SINGLE_TOP` launch to its own `AppTask`
+before drawing on the main display: a normal cross-display task search cannot find a menu above the game-rooted
+task. Existing menu content and gated retry actions stay on that activity; a pending Close game is not redirected
+or replaced. A cold redirect initializes its recovery screen once, retaining Setup stopped / interrupted and Resume
+instead of applying the already-open Settings-to-Home reset. Host coverage: `tests/test_android_settings_display.py`.
 `TotkActivity` also checks resume, new-intent and configuration callbacks: a launcher can move an existing task
 without opening the menu again. If it is on the second panel, the activity relaunches its own singleTask on the main
 display, without finishing/restarting the native game; a pending-move guard prevents recursive launches. A display

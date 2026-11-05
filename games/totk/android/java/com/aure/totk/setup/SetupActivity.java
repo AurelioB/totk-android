@@ -2,6 +2,7 @@ package com.aure.totk.setup;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.ActivityOptions;
 import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
@@ -349,7 +350,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     // ---------- lifecycle ----------
     private boolean settingsMoving;
     /** Keep the Settings shortcut visible, rather than underneath the game's companion on the bottom panel.
-     * SINGLE_TOP reuses this menu and preserves its UI/actions; its translucent initial theme draws no second menu. */
+     * Bind the start to this task: a normal cross-display search cannot find a menu above the singleTask game. */
     private boolean moveSettingsToMain(Intent intent) {
         if (!intent.getBooleanExtra(EXTRA_SETTINGS, false) || closingGame || !SettingsStore.secondaryDisplay(this)) return false;
         if (getDisplay() == null || getDisplay().getDisplayId() == android.view.Display.DEFAULT_DISPLAY) {
@@ -359,9 +360,17 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         if (settingsMoving) return false;
         try {
             settingsMoving = true;
-            startActivity(new Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP),
-                    ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle());
-            return true;
+            ActivityManager manager = getSystemService(ActivityManager.class);
+            if (manager == null) throw new IllegalStateException("Activity manager unavailable");
+            for (ActivityManager.AppTask task : manager.getAppTasks()) {
+                if (task.getTaskInfo().taskId == getTaskId()) {
+                    task.startActivity(this,
+                            new Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                            ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle());
+                    return true;
+                }
+            }
+            throw new IllegalStateException("Settings task unavailable");
         } catch (RuntimeException failed) {
             settingsMoving = false;
             android.util.Log.w("TotkSetup", "Could not move Settings to the main display", failed);
@@ -411,11 +420,13 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        boolean hadUi = ui;
         setIntent(intent);
         if (moveSettingsToMain(intent)) return;
         if (!ui && intent.getBooleanExtra(EXTRA_SETTINGS, false)) showUi();
         if (returnToRunningGame(intent)) return;
-        if (ui && intent.getBooleanExtra(EXTRA_SETTINGS, false) && screen != Screen.INSTALL && !closingGame)
+        if (hadUi && intent.getBooleanExtra(EXTRA_SETTINGS, false) && screen != Screen.INSTALL
+                && !closingGame && blockedAction == null)
             replace(InstallState.read(this).installed() ? Screen.HOME : Screen.WELCOME);
         String error = intent.getStringExtra(EXTRA_GAME_ERROR);
         if (error != null) {
