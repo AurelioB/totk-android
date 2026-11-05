@@ -111,12 +111,13 @@ final class UpdateInstaller {
                 params.setSize(apk.length());
                 params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_REQUIRED);
                 session = installer.createSession(params);
-                try (PackageInstaller.Session target = installer.openSession(session);
-                     FileInputStream in = new FileInputStream(apk);
-                     OutputStream out = target.openWrite("base.apk", 0, apk.length())) {
-                    byte[] buffer = new byte[128 * 1024]; int n;
-                    while ((n = in.read(buffer)) != -1) { transfer.checkCancelled(); out.write(buffer, 0, n); }
-                    target.fsync(out);
+                try (PackageInstaller.Session target = installer.openSession(session)) {
+                    try (FileInputStream in = new FileInputStream(apk);
+                         OutputStream out = target.openWrite("base.apk", 0, apk.length())) {
+                        byte[] buffer = new byte[128 * 1024]; int n;
+                        while ((n = in.read(buffer)) != -1) { transfer.checkCancelled(); out.write(buffer, 0, n); }
+                        target.fsync(out);
+                    }
                     transfer.checkCancelled();
                     Intent callback = new Intent(activity, UpdateReceiver.class).setAction(activity.getPackageName() + ".UPDATE_INSTALL")
                             .putExtra("update_version", version);
