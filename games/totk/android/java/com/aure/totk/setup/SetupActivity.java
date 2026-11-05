@@ -368,8 +368,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             if (previous != null && previous != this && !previous.isFinishing() && !previous.isDestroyed()
                     && previous.menuTask != null) {
                 previous.menuTask.startActivity(this, new Intent(intent)
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP
-                                        | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
+                                .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
                         ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle());
                 previous.menuTask.moveToFront();
                 finish();
@@ -399,7 +398,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 if (task.getTaskInfo().taskId == getTaskId()) {
                     task.startActivity(this,
                             new Intent(intent).putExtra(EXTRA_COLD_SETTINGS, !ui)
-                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                                    .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
                             ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle());
                     return true;
                 }

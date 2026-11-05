@@ -23,6 +23,7 @@ class Intent {
     Intent putExtra(String key,boolean value){extras.put(key,value);return this;}
     Intent() {} Intent(Intent other){extras.putAll(other.extras); flags=other.flags;}
     Intent addFlags(int value){flags|=value;return this;}
+    Intent setFlags(int value){flags=value;return this;}
     Intent(Activity owner,Class<?> type){} Intent setAction(String action){return this;} int getFlags(){return flags;}
     boolean getBooleanExtra(String key,boolean fallback){return (boolean)extras.getOrDefault(key,fallback);}
     String getStringExtra(String key){return (String)extras.get(key);}
@@ -99,7 +100,7 @@ public final class SettingsDisplayProbe {
             check(a.moveSettingsToMain(i),"bottom Settings not handed off");
             ActivityManager.AppTask own=a.manager.tasks.get(1);
             check(a.manager.tasks.get(0).starts==0 && own.starts==1,"not bound to menu task");
-            check(own.options.display==0 && own.launched.flags==(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_ACTIVITY_SINGLE_TOP),"wrong display/reuse flags");
+            check(own.options.display==0 && own.launched.flags==Intent.FLAG_ACTIVITY_SINGLE_TOP,"wrong display/reuse flags");
             check(!a.moveSettingsToMain(i) && own.starts==1,"recursive handoff");
             delivered(a,i);check(!a.settingsMoving,"move guard not reset");
             a.display=new Display(4);a.settingsMoving=false;own.fail=true;
@@ -136,6 +137,7 @@ public final class SettingsDisplayProbe {
                 check(a.reuseMenuTask(i) && a.finished && !a.ui,"new entry drew a duplicate menu");
                 check(old.starts==1 && old.fronts==1 && old.options.display==0 && a.manager.tasks.get(0).starts==0,"cached menu task not foregrounded");
                 check((old.launched.flags&Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)!=0,"menu below a file picker would be duplicated");
+                check((old.launched.flags&Intent.FLAG_ACTIVITY_NEW_TASK)==0,"bound handoff incorrectly searched by root Intent");
                 previous.finished=true;SetupActivity next=owner();
                 check(!next.reuseMenuTask(i) && !next.finished,"finished menu revived");
             }
