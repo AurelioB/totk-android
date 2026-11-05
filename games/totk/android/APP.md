@@ -42,12 +42,15 @@ setting available when the menu is on the bottom screen. Only devices with a bui
 `FLAG_ACTIVITY_NEW_TASK` and `ActivityOptions.setLaunchDisplayId(DEFAULT_DISPLAY)`; single-screen devices and
 external/cast/overlay-only configurations keep Android's ordinary launch behavior. The companion's enabled setting
 does not change where the game runs.
-When a game-rooted app task already exists, `ActivityManager.AppTask.startActivity` targets that exact task with the
-same main-display options. A normal cross-display `singleTask` search is not sufficient on Android 16: with the menu
-above a stopped game on the bottom display, it can create a second `TotkActivity` on display 0. The runtime is
-process-global, so every game launch and display-recovery path uses the task-bound start rather than allowing that
-duplicate. The menu is neither moved nor relaunched; its pending close/retry actions are untouched.
-The game remains `singleTask`, with the same affinity as the menu and no manifest/launcher/recents changes.
+When a game app task already exists, `ActivityManager.moveTaskToFront(taskId, 0, options)` moves that exact task to
+the main display before the ordinary game intent is sent. This uses Android's normal `REORDER_TASKS` permission.
+A normal cross-display `singleTask` search is not sufficient on Android 16: with the menu above a stopped game on
+the bottom display, it can create a second `TotkActivity` on display 0. `AppTask.startActivity` is not a substitute:
+the task can retain the launcher's SetupActivity base Intent even after its baseActivity becomes TotkActivity, and
+Android refuses the explicit singleTask start into that task. The runtime is process-global, so every game launch
+and display-recovery path moves the existing task first. A menu in that shared task moves with it, without
+recreation, a second menu, replay extras or losing pending close/retry actions.
+The game remains `singleTask`, with the same affinity and launcher/recents declarations as before.
 `TotkActivity` also checks resume, new-intent and configuration callbacks: a launcher can move an existing task
 without opening the menu again. If it is on the second panel, the activity relaunches its own singleTask on the main
 display, without finishing/restarting the native game; a pending-move guard prevents recursive launches. A display

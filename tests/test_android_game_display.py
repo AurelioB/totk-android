@@ -28,15 +28,16 @@ FRAMEWORK = r'''
 class Bundle { int display; Bundle(int id) { display = id; } }
 class Configuration {}
 class ActivityManager {
-    static class RecentTaskInfo { Class<?> baseActivity; }
+    static class RecentTaskInfo { Class<?> baseActivity, topActivity; int taskId; }
     static class AppTask {
-        final RecentTaskInfo info = new RecentTaskInfo(); int starts;
-        AppTask(Class<?> base) { info.baseActivity = base; }
+        final RecentTaskInfo info = new RecentTaskInfo();
+        AppTask(Class<?> base) { info.baseActivity = base; info.taskId = base == TotkActivity.class ? 17 : 3; }
         RecentTaskInfo getTaskInfo() { return info; }
-        void startActivity(Context owner, Intent game, Bundle options) { starts++; ((Activity) owner).record(game, options); }
     }
     final java.util.List<AppTask> tasks = new java.util.ArrayList<>();
     java.util.List<AppTask> getAppTasks() { return tasks; }
+    int moves, movedTask; Bundle movedOptions;
+    void moveTaskToFront(int id, int flags, Bundle options) { moves++; movedTask = id; movedOptions = options; }
 }
 class Log { static int warnings; static void w(String tag, String message, Throwable error) { warnings++; } }
 class DeviceProductInfo {
@@ -144,9 +145,9 @@ public final class GameDisplayProbe {
                 owner.activities.tasks.add(menu); owner.activities.tasks.add(existing);
                 int direct = owner.directLaunches;
                 GameLaunch.start(owner);
-                require(existing.starts == 1 && menu.starts == 0 && owner.directLaunches == direct,
-                        "existing game task bypassed: Android may create another NativeActivity");
-                require(owner.options.display == 0, "task-bound launch lost main-display option");
+                require(owner.activities.moves == 1 && owner.activities.movedTask == 17 && owner.directLaunches == direct + 1,
+                        "existing game task not moved before the normal game launch");
+                require(owner.activities.movedOptions.display == 0 && owner.options.display == 0, "task move lost main-display option");
                 owner.manager.secondary = new Display[] {new Display(7, -1, null)};
                 GameLaunch.start(owner);
                 require(owner.options == null && owner.launched.flags == 0 && GameLaunch.onMainScreen(owner), "cast/overlay behavior changed");
@@ -156,7 +157,7 @@ public final class GameDisplayProbe {
                 owner.manager.secondary = new Display[0]; owner.current = owner.manager.main;
                 GameLaunch.start(owner);
                 require(owner.options == null && owner.launched.flags == 0 && GameLaunch.onMainScreen(owner), "single-screen behavior changed");
-                require(existing.starts == 1, "single-screen launch changed task routing");
+                require(owner.activities.moves == 1, "single-screen launch changed task routing");
                 break;
             }
             case "reuse": {

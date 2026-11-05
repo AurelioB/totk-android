@@ -17,16 +17,17 @@ public final class GameLaunch {
         Intent game = new Intent(owner, TotkActivity.class);
         Bundle options = null;
         if (PresentationController.deviceSecondScreen(owner) == DisplayClass.BUILT_IN) {
-            // Android 16's ordinary singleTask search can skip a task on the other display and create a second
-            // NativeActivity. Bind to the existing game-rooted task, including when its menu is currently on top.
+            // Android 16's singleTask search can skip a task on the other display and create a second NativeActivity.
+            // Move the existing task first, preserving its menu/stack; only then deliver the normal game intent.
             game.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             options = ActivityOptions.makeBasic().setLaunchDisplayId(Display.DEFAULT_DISPLAY).toBundle();
             ActivityManager manager = owner.getSystemService(ActivityManager.class);
             if (manager == null) throw new IllegalStateException("Activity manager unavailable");
             for (ActivityManager.AppTask task : manager.getAppTasks()) {
-                if (game.getComponent().equals(task.getTaskInfo().baseActivity)) {
-                    task.startActivity(owner, game, options);
-                    return;
+                ActivityManager.RecentTaskInfo info = task.getTaskInfo();
+                if (game.getComponent().equals(info.baseActivity) || game.getComponent().equals(info.topActivity)) {
+                    manager.moveTaskToFront(info.taskId, 0, options);
+                    break;
                 }
             }
         }
