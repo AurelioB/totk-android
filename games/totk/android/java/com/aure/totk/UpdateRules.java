@@ -80,6 +80,14 @@ public final class UpdateRules {
             return latest != null && compare(latest, current) > 0 ? latest : null;
         } catch (IOException | RuntimeException failed) { return null; }
     }
+    /** An offer is actionable only after :setup can recover it, including after the game process stops. */
+    public static String checkAndStore(File files, boolean enabled, boolean online, String current, String pkg,
+                                       boolean override, URI source, Head head) {
+        String version = check(enabled, online, current, pkg, override, source, head);
+        if (version == null) return null;
+        try { setPending(files, version); return version; }
+        catch (IOException | RuntimeException failed) { return null; }
+    }
     public static boolean enabled(File files) { return !"off".equals(read(files, "update-checks.txt")); }
     public static void enabled(File files, boolean on) throws IOException { store(files, "update-checks.txt", on ? "on" : "off"); }
     public static void setPending(File files, String value) throws IOException {

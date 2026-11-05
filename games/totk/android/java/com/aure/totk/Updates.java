@@ -1,13 +1,11 @@
 package com.aure.totk;
 
 import android.content.Context;
-import android.content.pm.PackageInfo;
 import android.net.ConnectivityManager;
 import android.net.NetworkCapabilities;
 import android.os.Handler;
 import android.os.Looper;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
@@ -53,7 +51,7 @@ public final class Updates {
         Context app = context.getApplicationContext();
         Handler main = new Handler(Looper.getMainLooper());
         AtomicBoolean finished = new AtomicBoolean();
-        Transfer transfer = new Transfer();
+        UpdateTransfer transfer = new UpdateTransfer();
         // Includes DNS, connect and read time, not merely each socket operation. A late worker never posts a prompt.
         Runnable deadline = () -> { if (finished.compareAndSet(false, true)) { transfer.cancel(); result.accept(null); } };
         main.postDelayed(deadline, 5000);
@@ -61,15 +59,15 @@ public final class Updates {
             String answer = null;
             try {
                 Source source = source(app);
-                answer = UpdateRules.check(UpdateRules.enabled(app.getFilesDir()), online(app), version(app), app.getPackageName(),
+                answer = UpdateRules.checkAndStore(app.getFilesDir(), UpdateRules.enabled(app.getFilesDir()), online(app), version(app), app.getPackageName(),
                         source.override, source.base, () -> {
                             HttpURLConnection connection = transfer.connect(source.latest(), "HEAD", 2400);
                             try {
                                 int status = connection.getResponseCode();
+                                transfer.checkCancelled();
                                 return status == 302 ? connection.getHeaderField("Location") : null;
                             } finally { transfer.release(connection); }
                         });
-                if (answer != null && !finished.get()) UpdateRules.setPending(app.getFilesDir(), answer);
             } catch (IOException | RuntimeException ignored) { }
             String value = answer;
             main.post(() -> { if (finished.compareAndSet(false, true)) { main.removeCallbacks(deadline); result.accept(value); } });
@@ -77,58 +75,6 @@ public final class Updates {
         worker.setDaemon(true);
         worker.start();
     }
-    /** Cancellation closes the current socket, including one waiting for response headers. */
-    public static final class Transfer {
-        private volatile boolean cancelled;
-        private volatile HttpURLConnection active;
-        public void cancel() { cancelled = true; HttpURLConnection c = active; if (c != null) c.disconnect(); }
-        public void checkCancelled() throws IOException { if (cancelled) throw new IOException("Update cancelled."); }
-        HttpURLConnection connect(URI uri, String method, int timeout) throws IOException {
-            checkCancelled();
-            HttpURLConnection c = (HttpURLConnection) uri.toURL().openConnection();
-            active = c;
-            c.setInstanceFollowRedirects(false);
-            c.setConnectTimeout(timeout); c.setReadTimeout(timeout);
-            c.setRequestProperty("User-Agent", "TotK-Native-Updater");
-            c.setRequestMethod(method);
-            c.setUseCaches(false);
-            checkCancelled();
-            return c;
-        }
-        void release(HttpURLConnection c) { c.disconnect(); if (active == c) active = null; }
-        public void download(Source source, URI start, File target, long maxBytes, Progress progress) throws IOException {
-            URI uri = start;
-            for (int redirects = 0; redirects <= 8; redirects++) {
-                if (!UpdateRules.allowedDownload(uri, source.base, source.override)) throw new IOException("Unsafe update download address.");
-                HttpURLConnection c = connect(uri, "GET", 15000);
-                try {
-                    int status = c.getResponseCode();
-                    if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
-                        String location = c.getHeaderField("Location");
-                        if (location == null) throw new IOException("Missing download redirect.");
-                        try { uri = uri.resolve(location); } catch (IllegalArgumentException bad) { throw new IOException("Invalid download redirect.", bad); }
-                        continue;
-                    }
-                    if (status != 200) throw new IOException("Update download failed (HTTP " + status + ").");
-                    long total = c.getContentLengthLong(), count = 0;
-                    if (total > maxBytes) throw new IOException("Update download is too large.");
-                    try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(target)) {
-                        byte[] bytes = new byte[128 * 1024];
-                        int n;
-                        while ((n = in.read(bytes)) != -1) {
-                            checkCancelled(); count += n;
-                            if (count > maxBytes) throw new IOException("Update download is too large.");
-                            out.write(bytes, 0, n); progress.changed(count, total);
-                        }
-                        if (total >= 0 && count != total) throw new IOException("The update download was incomplete.");
-                    }
-                    return;
-                } finally { release(c); }
-            }
-            throw new IOException("Too many update download redirects.");
-        }
-    }
-    public interface Progress { void changed(long bytes, long total); }
     public static String digest(File file) throws Exception {
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         try (InputStream in = new java.io.FileInputStream(file)) {

@@ -88,6 +88,14 @@ public class UpdateProbe {
             equal(UpdateRules.enabled(files), true);
             Files.writeString(new File(files, "pending-update.txt").toPath(), "1.0.2-rc1");
             equal(UpdateRules.pending(files, "1.0.1"), null);
+            equal(UpdateRules.checkAndStore(files, true, true, "1.0.1", "com.aure.totk", false, github, () -> tag("1.0.2")), "1.0.2");
+            equal(UpdateRules.pending(files, "1.0.1"), "1.0.2");
+            File blocked = new File(files, "not-a-directory");
+            Files.write(blocked.toPath(), new byte[]{1});
+            int[] attempted = {0};
+            equal(UpdateRules.checkAndStore(blocked, true, true, "1.0.1", "com.aure.totk", false, github,
+                    () -> { attempted[0]++; return tag("1.0.2"); }), null);
+            equal(attempted[0], 1);
             break;
         default: throw new AssertionError(args[0]);
         }

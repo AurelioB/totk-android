@@ -126,6 +126,8 @@ def manifest_tree(package, label, version_code, version_name, min_sdk, target_sd
                           (A, 'configChanges', 'hex', CONFIG_CHANGES)], [
                 ('meta-data', [(A, 'name', 'str', 'android.app.lib_name'), (A, 'value', 'str', 'totk')], []),
             ]),
+            ('activity', [(A, 'name', 'str', 'com.aure.totk.setup.UpdateEntryActivity'), (A, 'exported', 'bool', False),
+                          (A, 'process', 'str', SETUP_PROCESS), (A, 'theme', 'ref', THEME_TRANSLUCENT_FULLSCREEN)], []),
             ('service', [(A, 'name', 'str', SETUP_SERVICE), (A, 'exported', 'bool', False), (A, 'process', 'str', SETUP_PROCESS),
                          (A, 'foregroundServiceType', 'hex', FOREGROUND_DATA_SYNC)], []),
             ('service', [(A, 'name', 'str', GAME_CONTROL_SERVICE), (A, 'exported', 'bool', False)], []),

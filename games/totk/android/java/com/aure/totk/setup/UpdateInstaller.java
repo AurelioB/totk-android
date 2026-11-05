@@ -10,6 +10,7 @@ import android.content.pm.Signature;
 import android.net.Uri;
 import com.aure.totk.UpdateRules;
 import com.aure.totk.Updates;
+import com.aure.totk.UpdateTransfer;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -29,19 +30,20 @@ final class UpdateInstaller {
     private final Activity activity;
     private final Listener listener;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
-    private Updates.Transfer transfer;
+    private UpdateTransfer transfer;
     private File apk, checksum;
     private volatile boolean cancelled, disposed;
     private boolean waitingPermission;
     private int session = -1;
     private volatile boolean committed;
     String version, status = "";
+    private String expectedSha256;
     volatile long bytes, total;
     UpdateInstaller(Activity activity, Listener listener) { this.activity = activity; this.listener = listener; }
     void begin(String version) {
         this.version = version;
         cancelled = false;
-        transfer = new Updates.Transfer();
+        transfer = new UpdateTransfer();
         status = "Downloading update…";
         listener.changed();
         worker.execute(() -> {
@@ -49,14 +51,16 @@ final class UpdateInstaller {
                 Updates.Source source = Updates.source(activity);
                 apk = File.createTempFile("totk-update-", ".apk", activity.getCacheDir());
                 checksum = File.createTempFile("totk-update-", ".sha256", activity.getCacheDir());
-                transfer.download(source, source.asset(version, false), apk, 2L * 1024 * 1024 * 1024, (count, size) -> {
+                transfer.download(source.base, source.override, source.asset(version, false), apk, 2L * 1024 * 1024 * 1024, (count, size) -> {
                     bytes = count; total = size;
                     // The menu refresh timer reads these; don't queue one UI message per chunk.
                 });
                 postStatus("Verifying download…");
-                transfer.download(source, source.asset(version, true), checksum, 4096, (count, size) -> { });
-                String expected = UpdateRules.sha256(new String(java.nio.file.Files.readAllBytes(checksum.toPath()), java.nio.charset.StandardCharsets.UTF_8), UpdateRules.asset(version));
-                if (!expected.equals(Updates.digest(apk))) throw new IOException("The update checksum does not match. Nothing was installed.");
+                transfer.download(source.base, source.override, source.asset(version, true), checksum, 4096, (count, size) -> { });
+                transfer.checkCancelled();
+                transfer.finishDownloads();
+                expectedSha256 = UpdateRules.sha256(new String(java.nio.file.Files.readAllBytes(checksum.toPath()), java.nio.charset.StandardCharsets.UTF_8), UpdateRules.asset(version));
+                if (!expectedSha256.equals(Updates.digest(apk))) throw new IOException("The update checksum does not match. Nothing was installed.");
                 verifyArchive();
                 transfer.checkCancelled();
                 activity.runOnUiThread(() -> {
@@ -67,6 +71,7 @@ final class UpdateInstaller {
                     } else install();
                 });
             } catch (Exception failed) { fail(failed); }
+            finally { transfer.finishDownloads(); }
         });
     }
     private static byte[][] certificates(PackageInfo info) throws Exception {
@@ -114,8 +119,7 @@ final class UpdateInstaller {
                 try (PackageInstaller.Session target = installer.openSession(session)) {
                     try (FileInputStream in = new FileInputStream(apk);
                          OutputStream out = target.openWrite("base.apk", 0, apk.length())) {
-                        byte[] buffer = new byte[128 * 1024]; int n;
-                        while ((n = in.read(buffer)) != -1) { transfer.checkCancelled(); out.write(buffer, 0, n); }
+                        transfer.copyVerified(in, out, expectedSha256);
                         target.fsync(out);
                     }
                     transfer.checkCancelled();

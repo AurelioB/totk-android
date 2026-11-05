@@ -40,8 +40,8 @@ public final class TotkActivity extends NativeActivity {
             updateOpen = false;
             if (now) {
                 try {
-                    startActivity(new Intent(this, SetupActivity.class).setAction(Intent.ACTION_VIEW)
-                            .putExtra(SetupActivity.EXTRA_UPDATE, true));
+                    startActivity(new Intent().setClassName(this, "com.aure.totk.setup.UpdateEntryActivity")
+                            .setAction(Intent.ACTION_VIEW));
                 } catch (RuntimeException failed) { Log.w("TotkGame", "Could not open the update menu", failed); }
             }
             boolean single = PresentationController.secondScreen(this, getDisplay()) == DisplayClass.NONE;

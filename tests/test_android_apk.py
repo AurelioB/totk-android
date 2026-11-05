@@ -170,6 +170,9 @@ class ManifestTests(unittest.TestCase):
         receiver = by_name(m, 'receiver', 'com.aure.totk.setup.UpdateReceiver')
         self.assertEqual(receiver[(A, 'exported')], FALSE)
         self.assertEqual(receiver[(A, 'process')], (3, ':setup'))
+        update_entry = by_name(m, 'activity', 'com.aure.totk.setup.UpdateEntryActivity')
+        self.assertEqual(update_entry[(A, 'exported')], FALSE)
+        self.assertEqual(update_entry[(A, 'process')], (3, ':setup'))
         self.assertEqual(app[(A, 'usesCleartextTraffic')], TRUE)
         self.assertNotIn((A, 'process'), app)
         # One launcher entry: the setup screen; the game is started by it once install.json says playable.

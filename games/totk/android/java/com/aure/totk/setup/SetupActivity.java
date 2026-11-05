@@ -80,6 +80,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     /** Why the game process stopped (TotkActivity.showGameError, just before it aborted): Home says so until the next start. */
     public static final String EXTRA_GAME_ERROR = "com.aure.totk.setup.GAME_ERROR";
     public static final String EXTRA_UPDATE = "com.aure.totk.setup.UPDATE";
+    static final String EXTRA_UPDATE_AUTH = "com.aure.totk.setup.UPDATE_AUTH";
     private static final String[] ALL_ROLES = {"romfs", "exefs", "base", "update", "keys"};
     private static final int REQ_PICK = 100, REQ_DRIVER = 900, REQ_NOTIFY = 901, REQ_EXPORT = 902, REQ_IMPORT_ZIP = 903, REQ_IMPORT_TREE = 904, REQ_MIRROR = 905,
             REQ_DATA_FOLDER = 906, REQ_ACCESS = 907;
@@ -202,9 +203,18 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     private void requestedUpdate() {
         if (!started || !getIntent().getBooleanExtra(EXTRA_UPDATE, false)) return;
+        String authorization = getIntent().getStringExtra(EXTRA_UPDATE_AUTH);
         getIntent().removeExtra(EXTRA_UPDATE);
-        pendingAsked = true;
-        startAppUpdate();
+        getIntent().removeExtra(EXTRA_UPDATE_AUTH);
+        if (UpdateAuthorization.consume(authorization)) {
+            pendingAsked = true;
+            startAppUpdate();
+        } else if (updater == null && !SetupService.status.running && pendingUpdate() != null) {
+            // This activity is exported. An external UPDATE intent is only a request to show the user's choice.
+            pendingAsked = false;
+            if (screen != Screen.HOME) replace(Screen.HOME);
+            offerPendingUpdate();
+        }
     }
     private void startAppUpdate() {
         String version = pendingUpdate();

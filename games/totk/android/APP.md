@@ -44,17 +44,24 @@ prerelease tags or automatic download. A private root-written source override en
 `UpdatePrompt` reuses menu fonts, panels and controller-focusable rows over the game. It explicitly holds
 `nativeGameFocus(false, true)` while open, including on dual-screen devices; focus callbacks cannot release it.
 The version is stored atomically in private `pending-update.txt`. Next time leaves it for a menu prompt before Home
-on a later launch, without another request. Update now opens the `:setup` menu with an update intent; `SetupActivity`
-reuses `needGameClosed` / `closeGame`, save-busy, GameControlService thaw and close-request before `UpdateInstaller`.
+on a later launch, without another request. An offer is suppressed if persistence fails. Update now enters a
+non-exported `:setup` UpdateEntryActivity, which issues a short-lived one-use capability for the menu's immediate
+update path. An external UPDATE intent to the exported menu can only show Update / Not now, never authorize closing
+the game or downloading. `SetupActivity` reuses `needGameClosed` / `closeGame`, save-busy, GameControlService thaw and
+close-request before `UpdateInstaller`.
 The Updates setup step precedes Prepare; About has the same switch (`update-checks.txt`; absent means On).
 The cancellable progress screen downloads APK + checksum into cache. Every redirect requires HTTPS github.com or
-`*.githubusercontent.com`; the root-only test origin is the sole HTTP exception. SHA-256, own package, strictly newer
-versionCode and the installed current signing certificate's SHA-256 are checked. Unknown-sources permission is
+`*.githubusercontent.com`; the root-only test origin is the sole HTTP exception. One ten-minute deadline covers both
+assets and every redirect. A separate progress watchdog disconnects blocked reads when an asset transfers less than
+64 KiB in 30 seconds; redirects cannot restart either deadline. Failure removes partial downloads and keeps the
+pending version. SHA-256, own package, strictly newer versionCode and the installed current signing certificate's
+SHA-256 are checked. The exact bytes written to the PackageInstaller session are hashed again and must match before
+commit. Unknown-sources permission is
 explained and rechecked on return from Settings. Denial or installer failure keeps the pending version with a clear
 note. A PackageInstaller session and explicit non-exported `:setup` UpdateReceiver handle Android's confirmation,
 not a FileProvider. Temporary downloads are removed on completion/cancel/error or next menu startup after interruption.
 Saves/game data are untouched. New permissions: INTERNET, ACCESS_NETWORK_STATE, REQUEST_INSTALL_PACKAGES.
-Host policy coverage: `tests/test_android_updates.py`.
+Host coverage: `tests/test_android_updates.py`, `tests/test_android_update_security.py`.
 
 
 All play paths converge on `SetupActivity.launchGame`: Start game/Play now, the launcher's direct-game preference,

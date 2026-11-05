@@ -109,6 +109,8 @@ Disable it in **About → Check for updates when the game starts**, or in setup'
 **Update now** pauses the game and uses the menu's save-safe close before downloading into the app's cache.
 **Next time** keeps the version and offers **Update / Not now** before Home on the next launch, including offline.
 The download needs a connection; Cancel or an error leaves the installed app unchanged and keeps the pending version.
+If the download takes more than ten minutes, or transfers less than 64 KiB in 30 seconds, it stops with a clear
+message and removes partial files. The pending update is kept so you can try again on a faster connection.
 
 The download is checked against the release's `.sha256`, then checked for the app's package, a newer version code and
 the installed app's signing certificate. Android may ask you to enable **Allow from this source** for TotK Native;
