@@ -34,8 +34,9 @@ class ActivityManager {
     List<AppTask> getAppTasks(){return tasks;}
     static class RecentTaskInfo {int taskId; RecentTaskInfo(int id){taskId=id;}}
     static class AppTask {
-        final int id; int starts; Intent launched; Bundle options; boolean fail;
+        final int id; int starts,fronts; Intent launched; Bundle options; boolean fail;
         AppTask(int id){this.id=id;} RecentTaskInfo getTaskInfo(){return new RecentTaskInfo(id);}
+        void moveToFront(){fronts++;}
         void startActivity(Activity owner,Intent intent,Bundle bundle){
             starts++; launched=intent; options=bundle;
             if(fail)throw new SecurityException("denied");
@@ -107,7 +108,7 @@ public final class SettingsDisplayProbe {
                 ActivityManager.AppTask old=previous.manager.tasks.get(1);
                 SetupActivity a=owner();a.taskId=99; // getAppTasks no longer exposes the old task.
                 check(a.reuseMenuTask(i) && a.finished && !a.ui,"new entry drew a duplicate menu");
-                check(old.starts==1 && old.options.display==0 && a.manager.tasks.get(0).starts==0,"cached menu task not targeted");
+                check(old.starts==1 && old.fronts==1 && old.options.display==0 && a.manager.tasks.get(0).starts==0,"cached menu task not foregrounded");
                 previous.finished=true;SetupActivity next=owner();
                 check(!next.reuseMenuTask(i) && !next.finished,"finished menu revived");
             }
