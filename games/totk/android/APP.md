@@ -3856,8 +3856,9 @@ together. It feeds smaller batches earlier and requests clocks that keep up; a l
 power and heat. On only in the **60 fps** preset; off writes neither line, keeping other presets' settings.env bytes
 unchanged. With frame generation both lines are omitted because extraction cannot split passes.
 
-A 1.0.0 store without this option adopts its matching preset's value (60 fps: on; Light / Balanced / Smooth: off).
-Custom mixes stay off, and an explicit stored choice is never replaced. This keeps existing preset identities on upgrade.
+A 1.0.0 or 1.0.1 store without this option adopts its matching preset's value (60 fps: on; Light / Balanced / Smooth: off).
+Custom mixes stay off, and an explicit stored choice is never replaced. Unrelated preference metadata is ignored;
+1.0.1's update-check setting and pending offer live in separate private files and are unchanged by this migration.
 On the Odin 3 (Snapdragon 8 Elite class), the pair raised Hateno 43.3 → 56.9 fps and Lookout 53.3 → 56.8 fps
 (16/16 block pairs each), moving the GPU off its 660 MHz floor. Splits alone were neutral on Thor / Duo at their
 30 fps caps; ADPF_GPU was not tested there. Compare off/on on the same warmed route after restarting: fps, GPU-clock

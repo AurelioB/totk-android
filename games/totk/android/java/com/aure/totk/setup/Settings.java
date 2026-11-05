@@ -82,8 +82,9 @@ final class Settings {
         }
         // A hand-edited store must not hold a combination the menu cannot produce.
         if ("on".equals(get("frame_gen"))) values.put("frame_rate", "30");
-        // 1.0.0 had no gpu_feed key. Preserve its preset identity, adopting the new value only when all the old
-        // preset values match; a custom mix stays off. An explicit choice (even an invalid stored value) never migrates.
+        // 1.0.0 and 1.0.1 had no gpu_feed key. Preserve their preset identity, adopting the new value only when all
+        // the old preset values match; unrelated store metadata is ignored and a custom mix stays off.
+        // An explicit choice (even an invalid stored value) never migrates.
         if (stored != null && !stored.containsKey("gpu_feed")) {
             for (int p = 0; p < PRESETS.length; p++) if (matches(p, true)) {
                 values.put("gpu_feed", presetValue(PRESETS[p], "gpu_feed"));

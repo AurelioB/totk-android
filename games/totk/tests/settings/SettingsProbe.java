@@ -9,6 +9,7 @@ import java.util.Map;
 
 /** Host driver for tests/test_android_settings.py: one command per stdin line, one answer line per command.
  *    stored k=v...                 the values after loading this store (invalid entries fall back)
+ *    stored101 k=v...              stored values plus typed 1.0.1 preference metadata
  *    set k=v...                    defaults, then Settings.set for each pair in order; prints the values
  *    step key dir k=v...           Settings.step(key, dir) on a store; prints the values
  *    preset k=v...                 Settings.preset()
@@ -40,6 +41,12 @@ public final class SettingsProbe {
             String answer;
             switch (w[0]) {
                 case "stored": answer = dump(new Settings(pairs(w, 1))); break;
+                case "stored101": {
+                    Map<String, Object> stored = new HashMap<>(pairs(w, 1));
+                    stored.put("initialized", true); stored.put("skip_menu", true);
+                    stored.put("update_checks", false); stored.put("update_checked_at", 1793808000000L);
+                    answer = dump(new Settings(stored)); break;
+                }
                 case "set": {
                     Settings s = new Settings(null);
                     for (Map.Entry<String, String> e : pairsInOrder(w, 1)) s.set(e.getKey(), e.getValue());

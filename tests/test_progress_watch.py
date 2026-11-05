@@ -46,7 +46,8 @@ void runtime_thread_init(void) {}
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     int held = atoi(argv[1]);
-    for (int i = 0; i < 20; i++) { runtime_progress_mark(held ? "loading screen" : "present", held); usleep(16000); }
+    for (int i = 0; i < 20; i++) { runtime_progress_mark(held == 1 ? "loading screen" : "present", held == 1); usleep(16000); }
+    if (held == 2) runtime_progress_pause(1);
     usleep(2500000);
     fprintf(stderr, "probe end\n");
     return 0;
@@ -172,6 +173,26 @@ class ProgressWatch(unittest.TestCase):
         code, lines = self.run_threads(1)
         self.assertEqual((code, len(lines)), (0, 1), lines)
         self.assertTrue(lines[0].startswith('[totk-watch] on:'), lines)
+
+    def test_watchdog_thread_never_dumps_or_exits_while_paused(self):
+        code, lines = self.run_threads(2, TOTK_WATCH_STALL='0.6')
+        self.assertEqual((code, len(lines)), (0, 1), lines)
+        self.assertTrue(lines[0].startswith('[totk-watch] on:'), lines)
+
+    def test_101_lifecycle_and_single_display_focus_reach_watchdog(self):
+        source = (ROOT / 'games/totk/runtime/frontend_android.c').read_text()
+        update = source.split('static void android_game_pause_update(void) {', 1)[1].split('\n}', 1)[0]
+        self.assertIn('game_activity_paused || game_focus_paused', update)
+        self.assertIn('present_timeline_lifecycle(-1, paused);', update)
+        lifecycle = source.split('static void present_timeline_lifecycle(int window, int paused) {', 1)[1].split('\n}', 1)[0]
+        self.assertIn('!present_timeline_window || present_timeline_paused', lifecycle)
+        self.assertIn('runtime_progress_pause(watch_paused);', lifecycle)
+        self.assertIn('game_focus_paused = !focused && single_display;', source)
+        self.assertIn('game_activity_paused = paused;\n    android_game_pause_update();', source)
+        for callback in ('on_pause', 'on_stop'):
+            self.assertIn(f'static void {callback}(ANativeActivity *a) {{ (void)a; android_game_lifecycle_pause(1); }}', source)
+        resume = source.split('static void on_resume(ANativeActivity *a) {', 1)[1].split('\n}', 1)[0]
+        self.assertIn('android_game_lifecycle_pause(0);', resume)
 
     def test_watchdog_switches(self):
         self.assertEqual(self.run_threads(0, TOTK_WATCHDOG='0'), (0, ['[totk-watch] off (TOTK_WATCHDOG=0)']))
