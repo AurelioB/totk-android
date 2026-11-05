@@ -42,12 +42,19 @@ setting available when the menu is on the bottom screen. Only devices with a bui
 `FLAG_ACTIVITY_NEW_TASK` and `ActivityOptions.setLaunchDisplayId(DEFAULT_DISPLAY)`; single-screen devices and
 external/cast/overlay-only configurations keep Android's ordinary launch behavior. The companion's enabled setting
 does not change where the game runs.
+When a game-rooted app task already exists, `ActivityManager.AppTask.startActivity` targets that exact task with the
+same main-display options. A normal cross-display `singleTask` search is not sufficient on Android 16: with the menu
+above a stopped game on the bottom display, it can create a second `TotkActivity` on display 0. The runtime is
+process-global, so every game launch and display-recovery path uses the task-bound start rather than allowing that
+duplicate. The menu is neither moved nor relaunched; its pending close/retry actions are untouched.
 The game remains `singleTask`, with the same affinity as the menu and no manifest/launcher/recents changes.
 `TotkActivity` also checks resume, new-intent and configuration callbacks: a launcher can move an existing task
 without opening the menu again. If it is on the second panel, the activity relaunches its own singleTask on the main
 display, without finishing/restarting the native game; a pending-move guard prevents recursive launches. A display
 move refreshes companion selection, which still excludes the game's current display. Host decision/callback
 coverage: `tests/test_android_game_display.py`; Android task-manager behavior is checked separately on devices.
+Configuration recovery runs only while the game is resumed: moving a shared task with the menu on top must not
+bring the background game over that menu. The next Start game still targets the main display.
 
 The menu keeps its options in SharedPreferences and writes them, on every
 change and again right before the game starts, to `<private>/settings.env` (`Settings.java` is the option → variable

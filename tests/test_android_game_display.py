@@ -27,6 +27,17 @@ def local_class(source, name):
 FRAMEWORK = r'''
 class Bundle { int display; Bundle(int id) { display = id; } }
 class Configuration {}
+class ActivityManager {
+    static class RecentTaskInfo { Class<?> baseActivity; }
+    static class AppTask {
+        final RecentTaskInfo info = new RecentTaskInfo(); int starts;
+        AppTask(Class<?> base) { info.baseActivity = base; }
+        RecentTaskInfo getTaskInfo() { return info; }
+        void startActivity(Context owner, Intent game, Bundle options) { starts++; ((Activity) owner).record(game, options); }
+    }
+    final java.util.List<AppTask> tasks = new java.util.ArrayList<>();
+    java.util.List<AppTask> getAppTasks() { return tasks; }
+}
 class Log { static int warnings; static void w(String tag, String message, Throwable error) { warnings++; } }
 class DeviceProductInfo {
     final int sink; final String pnp;
@@ -57,13 +68,15 @@ class DisplayManager {
 }
 class Context {
     final DisplayManager manager = new DisplayManager();
-    <T> T getSystemService(Class<T> type) { return type.cast(manager); }
+    final ActivityManager activities = new ActivityManager();
+    <T> T getSystemService(Class<T> type) { return type.cast(type == ActivityManager.class ? activities : manager); }
 }
 class Intent {
     static final int FLAG_ACTIVITY_NEW_TASK = 0x10000000;
     final Class<?> target; int flags;
     Intent(Context owner, Class<?> target) { this.target = target; }
     Intent addFlags(int value) { flags |= value; return this; }
+    Class<?> getComponent() { return target; }
 }
 class ActivityOptions {
     int display;
@@ -73,9 +86,12 @@ class ActivityOptions {
 }
 class Activity extends Context {
     Display current = manager.main;
-    int launches; Intent launched; Bundle options; boolean fail;
+    int launches, directLaunches; Intent launched; Bundle options; boolean fail;
     Display getDisplay() { return current; }
     void startActivity(Intent intent, Bundle bundle) {
+        directLaunches++; record(intent, bundle);
+    }
+    void record(Intent intent, Bundle bundle) {
         launches++; launched = intent; options = bundle;
         if (fail) throw new SecurityException("unavailable");
     }
@@ -123,6 +139,14 @@ public final class GameDisplayProbe {
                     require(owner.options != null && owner.options.display == 0, "not routed to main");
                     require(GameLaunch.onMainScreen(owner) == (from.id == 0), "wrong move decision");
                 }
+                ActivityManager.AppTask menu = new ActivityManager.AppTask(Activity.class);
+                ActivityManager.AppTask existing = new ActivityManager.AppTask(TotkActivity.class);
+                owner.activities.tasks.add(menu); owner.activities.tasks.add(existing);
+                int direct = owner.directLaunches;
+                GameLaunch.start(owner);
+                require(existing.starts == 1 && menu.starts == 0 && owner.directLaunches == direct,
+                        "existing game task bypassed: Android may create another NativeActivity");
+                require(owner.options.display == 0, "task-bound launch lost main-display option");
                 owner.manager.secondary = new Display[] {new Display(7, -1, null)};
                 GameLaunch.start(owner);
                 require(owner.options == null && owner.launched.flags == 0 && GameLaunch.onMainScreen(owner), "cast/overlay behavior changed");
@@ -132,6 +156,7 @@ public final class GameDisplayProbe {
                 owner.manager.secondary = new Display[0]; owner.current = owner.manager.main;
                 GameLaunch.start(owner);
                 require(owner.options == null && owner.launched.flags == 0 && GameLaunch.onMainScreen(owner), "single-screen behavior changed");
+                require(existing.starts == 1, "single-screen launch changed task routing");
                 break;
             }
             case "reuse": {

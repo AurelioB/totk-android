@@ -1,6 +1,7 @@
 package com.aure.totk;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.ActivityOptions;
 import android.content.Intent;
 import android.os.Bundle;
@@ -16,10 +17,18 @@ public final class GameLaunch {
         Intent game = new Intent(owner, TotkActivity.class);
         Bundle options = null;
         if (PresentationController.deviceSecondScreen(owner) == DisplayClass.BUILT_IN) {
-            // singleTask reuses the existing game task, including one left on the second panel by an older session.
-            // NEW_TASK makes the launch-display option apply to the task, not just a new activity in the menu's stack.
+            // Android 16's ordinary singleTask search can skip a task on the other display and create a second
+            // NativeActivity. Bind to the existing game-rooted task, including when its menu is currently on top.
             game.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             options = ActivityOptions.makeBasic().setLaunchDisplayId(Display.DEFAULT_DISPLAY).toBundle();
+            ActivityManager manager = owner.getSystemService(ActivityManager.class);
+            if (manager == null) throw new IllegalStateException("Activity manager unavailable");
+            for (ActivityManager.AppTask task : manager.getAppTasks()) {
+                if (game.getComponent().equals(task.getTaskInfo().baseActivity)) {
+                    task.startActivity(owner, game, options);
+                    return;
+                }
+            }
         }
         owner.startActivity(game, options);
     }
