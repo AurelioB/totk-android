@@ -350,6 +350,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     // ---------- lifecycle ----------
     private boolean settingsMoving;
     private static final String EXTRA_COLD_SETTINGS = "com.aure.totk.setup.COLD_SETTINGS_HANDOFF";
+    private static java.lang.ref.WeakReference<SetupActivity> menuActivity = new java.lang.ref.WeakReference<>(null);
+    private ActivityManager.AppTask menuTask;
     /** A game-rooted task may still contain the menu after native exit. Cross-display launcher matching
      * cannot find that menu by base Intent, so forward to its exact task before drawing another one. */
     private boolean reuseMenuTask(Intent intent) {
@@ -357,18 +359,21 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         try {
             ActivityManager manager = getSystemService(ActivityManager.class);
             if (manager == null) return false;
-            for (ActivityManager.AppTask task : manager.getAppTasks()) {
-                ActivityManager.RecentTaskInfo info = task.getTaskInfo();
-                if (info.taskId == getTaskId() || info.topActivity == null
-                        || !getPackageName().equals(info.topActivity.getPackageName())
-                        || !SetupActivity.class.getName().equals(info.topActivity.getClassName())) continue;
-                task.startActivity(this, new Intent(intent)
+            // Cache our task handle while it is visible in recents. Android 16 hides the old same-affinity
+            // task from getAppTasks as soon as a cross-display launcher creates the undrawn new entry.
+            for (ActivityManager.AppTask task : manager.getAppTasks())
+                if (task.getTaskInfo().taskId == getTaskId()) { menuTask = task; break; }
+            SetupActivity previous = menuActivity.get();
+            if (previous != null && previous != this && !previous.isFinishing() && !previous.isDestroyed()
+                    && previous.menuTask != null) {
+                previous.menuTask.startActivity(this, new Intent(intent)
                                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP),
                         ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle());
                 finish();
                 overridePendingTransition(0, 0);
                 return true;
             }
+            menuActivity = new java.lang.ref.WeakReference<>(this);
         } catch (RuntimeException failed) {
             android.util.Log.w("TotkSetup", "Could not return to the existing menu task", failed);
         }
