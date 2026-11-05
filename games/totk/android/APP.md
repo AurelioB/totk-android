@@ -3860,16 +3860,20 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 
 **Keep the GPU busy** (Graphics → Performance) turns on `TOTK_VK_SPLIT_PASS_DRAWS=512` and `TOTK_ADPF_GPU=1`
 together. It feeds smaller batches earlier and requests clocks that keep up; a little more GPU and CPU clock costs
-power and heat. On only in the **60 fps** preset; off writes neither line, keeping other presets' settings.env bytes
-unchanged. With frame generation both lines are omitted because extraction cannot split passes.
+power and heat. On by default only on **Snapdragon 8 Elite-class** chips (Odin 3), independently of the preset.
+Other chips, including Thor and Duo, default off even when selecting **60 fps**. Off writes neither line, so Thor
+and Duo retain 1.0.1's settings.env bytes for every preset. With frame generation both lines are omitted because
+extraction cannot split passes. Presets neither change this option nor use it to decide preset identity; resetting
+the Performance tab restores its chip default.
 
-A 1.0.0 or 1.0.1 store without this option adopts its matching preset's value (60 fps: on; Light / Balanced / Smooth: off).
-Custom mixes stay off, and an explicit stored choice is never replaced. Unrelated preference metadata is ignored;
-1.0.1's update-check setting and pending offer live in separate private files and are unchanged by this migration.
-On the Odin 3 (Snapdragon 8 Elite class), the pair raised Hateno 43.3 → 56.9 fps and Lookout 53.3 → 56.8 fps
-(16/16 block pairs each), moving the GPU off its 660 MHz floor. Splits alone were neutral on Thor / Duo at their
-30 fps caps; ADPF_GPU was not tested there. Compare off/on on the same warmed route after restarting: fps, GPU-clock
-residency, power and temperature; retain `[split-pass]` and `[totk-perf] ADPF span` logs.
+A 1.0.0 or 1.0.1 store without this option adopts the chip default, including custom mixes. An explicit stored choice
+is never replaced. Unrelated preference metadata is ignored; 1.0.1's update-check setting and pending offer live
+in separate private files and are unchanged by this migration.
+Restart-based Odin 3 tests raised Hateno 46.5 → 57.3 fps and Lookout 52.2 → 57.1 fps (4/4 pairs);
+Rotsumamu was neutral at the 60 fps cap. At the 60 fps preset, the Duo (~27 fps) worsened p95 by 4–5 ms
+(4/4 pairs), while Thor (~30 fps) was neutral. These gates limit the default to the measured beneficial chip family.
+Compare off/on on the same warmed route after restarting: fps, p95, GPU-clock residency, power and temperature;
+retain `[split-pass]` and `[totk-perf] ADPF span` logs.
 
 ### Android performance hints (experimental full mode)
 

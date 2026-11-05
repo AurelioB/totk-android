@@ -15,10 +15,13 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 
 ### Menu
 - **Keep the GPU busy** in Graphics → Performance feeds smaller batches earlier and requests clocks that keep up.
-  On in the 60 fps preset only; it uses a little more GPU and CPU clock, power and heat. On the Odin 3 it raised
-  Hateno from 43.3 to 56.9 fps and Lookout from 53.3 to 56.8 fps (16/16 block pairs each).
-  Existing matching presets adopt the new value on upgrade; custom mixes stay off. Other presets' settings.env
-  text is unchanged, and frame generation leaves the option inactive.
+  On by default only on Snapdragon 8 Elite-class chips (Odin 3), independently of the chosen preset; it uses a
+  little more GPU and CPU clock, power and heat. Restart-based Odin 3 tests raised Hateno from 46.5 to 57.3 fps
+  and Lookout from 52.2 to 57.1 fps (4/4 pairs); Rotsumamu stayed at the 60 fps cap. At the 60 fps preset the
+  Duo's p95 worsened by 4–5 ms (4/4 pairs), while Thor was neutral, so both keep it off.
+  Upgrades without a stored choice adopt the chip default; explicit choices survive. Presets no longer change
+  or match this option. Thor and Duo defaults retain 1.0.1's settings.env bytes for every preset, and frame
+  generation leaves the option inactive.
 
 ## 1.0.1 (versionCode 10001), game 1.4.3
 

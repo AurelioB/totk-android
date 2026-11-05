@@ -55,14 +55,14 @@ final class Settings {
         new Option("game_language", CONTROLS, "auto", LANGUAGES),
     };
 
-    private static final String[] PRESET_KEYS = {"frame_rate", "frame_gen", "render_res", "latency", "upscaler", "aa", "shadows", "gpu_feed"};
+    private static final String[] PRESET_KEYS = {"frame_rate", "frame_gen", "render_res", "latency", "upscaler", "aa", "shadows"};
     /** Rows follow PRESETS, columns PRESET_KEYS; null = not part of that preset (Smooth: latency is set by frame generation).
      * Light is exactly the Retroid Pocket Duo's device-approved profile (540p scene, full shadows). */
     private static final String[][] PRESET_VALUES = {
-        {"30", "off", "960x540", "balanced", "off", "fxaa", "high", "off"},
-        {"30", "off", "game", "balanced", "off", "fxaa", "high", "off"},
-        {"30", "on", "1152x648", null, "off", "fxaa", "high", "off"},
-        {"60", "off", "game", "balanced", "off", "fxaa", "high", "on"},
+        {"30", "off", "960x540", "balanced", "off", "fxaa", "high"},
+        {"30", "off", "game", "balanced", "off", "fxaa", "high"},
+        {"30", "on", "1152x648", null, "off", "fxaa", "high"},
+        {"60", "off", "game", "balanced", "off", "fxaa", "high"},
     };
     /** The qualified locked frame-generation profile (android/APP.md). DM_DETCLOCK / TOTK_MFX are dead on Android. */
     private static final String[] FRAMEGEN_BLOCK = {
@@ -75,26 +75,19 @@ final class Settings {
     private final Map<String, String> values = new LinkedHashMap<>();
 
     /** Stored values (any map: SharedPreferences.getAll()); unknown keys and invalid values fall back to the defaults. */
-    Settings(Map<String, ?> stored) {
+    Settings(Map<String, ?> stored, String soc) {
         for (Option option : OPTIONS) {
             Object value = stored == null ? null : stored.get(option.key);
             values.put(option.key, value instanceof String && option.valid((String) value) ? (String) value : option.fallback);
         }
         // A hand-edited store must not hold a combination the menu cannot produce.
         if ("on".equals(get("frame_gen"))) values.put("frame_rate", "30");
-        // 1.0.0 and 1.0.1 had no gpu_feed key. Preserve their preset identity, adopting the new value only when all
-        // the old preset values match; unrelated store metadata is ignored and a custom mix stays off.
-        // An explicit choice (even an invalid stored value) never migrates.
-        if (stored != null && !stored.containsKey("gpu_feed")) {
-            for (int p = 0; p < PRESETS.length; p++) if (matches(p, true)) {
-                values.put("gpu_feed", presetValue(PRESETS[p], "gpu_feed"));
-                break;
-            }
-        }
+        // 1.0.0/1.0.1 had no gpu_feed key. Only a missing key adopts the chip default; explicit choices win.
+        if (stored == null || !stored.containsKey("gpu_feed")) values.put("gpu_feed", gpuFeedDefault(soc));
     }
     /** The first launch: shipping defaults with the profile for this chip (profile(soc)). */
     static Settings firstRun(String soc) {
-        Settings settings = new Settings(null);
+        Settings settings = new Settings(null, soc);
         settings.applyPreset(profile(soc));
         return settings;
     }
@@ -136,12 +129,11 @@ final class Settings {
 
     /** The preset whose values all match, else CUSTOM. */
     String preset() {
-        for (int p = 0; p < PRESETS.length; p++) if (matches(p, false)) return PRESETS[p];
+        for (int p = 0; p < PRESETS.length; p++) if (matches(p)) return PRESETS[p];
         return CUSTOM;
     }
-    private boolean matches(int preset, boolean legacy) {
+    private boolean matches(int preset) {
         for (int k = 0; k < PRESET_KEYS.length; k++) {
-            if (legacy && PRESET_KEYS[k].equals("gpu_feed")) continue;
             String want = PRESET_VALUES[preset][k];
             if (want != null && !want.equals(values.get(PRESET_KEYS[k]))) return false;
         }
@@ -187,6 +179,11 @@ final class Settings {
             default: return "light";   // the Eliza family (CQ7790S/M, SM7750) and every untested chip
         }
     }
+    /** Restart-based Odin 3 pairs: Hateno 46.5 -> 57.3 fps, Lookout 52.2 -> 57.1 (4/4 pairs).
+     * Duo at 60 fps worsened p95 by 4-5 ms; Thor was neutral. Keep this independent of the selected preset. */
+    static String gpuFeedDefault(String soc) {
+        return "Snapdragon 8 Elite class".equals(socClass(soc)) ? "on" : "off";
+    }
     /** Whether profile(soc) is backed by a device test (the "Recommended for this device" badge). */
     static boolean profileKnown(String soc) { return socClass(soc) != null; }
     /** Y on a tab: the device's default values for that tab (the profile's preset for Performance and Picture). */
@@ -198,6 +195,7 @@ final class Settings {
                 if (PRESET_VALUES[p][k] != null && option(PRESET_KEYS[k]).tab.equals(tab)) values.put(PRESET_KEYS[k], PRESET_VALUES[p][k]);
         }
         if ("on".equals(get("frame_gen"))) values.put("frame_rate", "30");
+        if (tab.equals(PERFORMANCE)) values.put("gpu_feed", gpuFeedDefault(soc));
     }
 
     /** settings.env: NAME=value lines in the totk.env format. locale = the device's first language as a BCP 47 tag

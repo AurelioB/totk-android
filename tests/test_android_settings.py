@@ -118,13 +118,18 @@ class SettingsTests(unittest.TestCase):
         for preset, before in LEGACY_PRESET_ENV.items():
             with self.subTest(preset=preset):
                 actual = self.run_probe(f'envpreset {preset} en-GB')[0].replace('|', '\n')
-                after = before.replace('TOTK_GPU_TIME=hardware\n',
-                                       'TOTK_GPU_TIME=hardware\n' + '\n'.join(GPU_FEED) + '\n') if preset == '60fps' else before
-                self.assertEqual(actual, after)
-                values = self.values(self.run_probe(f'apply {preset} gpu_feed=on')[0])
-                self.assertEqual(values['gpu_feed'], 'on' if preset == '60fps' else 'off')
-        sixty_off = self.env(frame_rate='60', gpu_feed='off')
-        self.assertEqual(ENV_HEADER + '\n'.join(sixty_off) + '\n', LEGACY_PRESET_ENV['60fps'])
+                self.assertEqual(actual, before)
+                for soc in ('QCS8550', 'CQ7790S'):
+                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), before)
+                for feed in ('off', 'on'):
+                    values = self.values(self.run_probe(f'apply {preset} gpu_feed={feed}')[0])
+                    self.assertEqual(values['gpu_feed'], feed)
+                    stored = ' '.join(f'{k}={v}' for k, v in values.items())
+                    self.assertEqual(self.run_probe('preset ' + stored), [preset])
+        duo = self.values(self.run_probe('applysoc 60fps CQ7790S')[0])
+        self.assertEqual((duo['frame_rate'], duo['gpu_feed']), ('60', 'off'))
+        odin = self.values(self.run_probe('applysoc light CQ8725S')[0])
+        self.assertEqual((odin['frame_rate'], odin['gpu_feed']), ('30', 'on'))
 
     def test_rumble_strength_and_motion(self):
         off = self.env(rumble='0')
@@ -210,28 +215,22 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual((applied['latency'], applied['overlay'], applied['sharpness_fsr']), ('responsive', 'full', '80'))
         self.assertEqual(self.run_probe('apply custom render_res=960x540')[0].split().count('render_res=960x540'), 1)
 
-    def test_legacy_store_keeps_its_preset_and_custom_stays_off(self):
+    def test_legacy_store_uses_chip_default_independent_of_preset(self):
         for preset in LEGACY_PRESET_ENV:
-            with self.subTest(preset=preset):
-                # SharedPreferences from 1.0.0/1.0.1 has every old option, but no gpu_feed. Adopt the matching
-                # preset's new value, preserving preset identity without changing custom mixes.
-                legacy = self.values(self.run_probe(f'apply {preset} overlay=full buttons=xbox')[0])
-                legacy.pop('gpu_feed')
-                stored = ' '.join(f'{k}={v}' for k, v in legacy.items())
-                migrated = self.values(self.run_probe('stored ' + stored)[0])
-                self.assertEqual(migrated, {**legacy, 'gpu_feed': 'on' if preset == '60fps' else 'off'})
-                self.assertEqual(self.run_probe('preset ' + stored), [preset])
-                if preset == '60fps':
-                    env = self.env(**legacy)
-                    self.assertTrue(all(line in env for line in GPU_FEED))
-                    # Once stored, turning it off is a deliberate Custom choice and must survive the next load.
-                    self.assertEqual(self.values(self.run_probe('stored ' + stored + ' gpu_feed=off')[0])['gpu_feed'], 'off')
-                    self.assertEqual(self.run_probe('preset ' + stored + ' gpu_feed=off'), ['custom'])
-                    self.assertEqual(self.values(self.run_probe('stored ' + stored + ' gpu_feed=invalid')[0])['gpu_feed'], 'off')
-                    legacy['shadows'] = 'medium'
-                    custom = ' '.join(f'{k}={v}' for k, v in legacy.items())
-                    self.assertEqual(self.values(self.run_probe('stored ' + custom)[0])['gpu_feed'], 'off')
-                    self.assertEqual(self.run_probe('preset ' + custom), ['custom'])
+            legacy = self.values(self.run_probe(f'apply {preset} overlay=full buttons=xbox')[0])
+            legacy.pop('gpu_feed')
+            for soc, default in (('CQ8725S', 'on'), ('SM8750', 'on'), ('QCS8550', 'off'),
+                                 ('CQ7790S', 'off'), ('unknown', 'off')):
+                for custom in (False, True):
+                    with self.subTest(preset=preset, soc=soc, custom=custom):
+                        old = {**legacy, **({'shadows': 'medium'} if custom else {})}
+                        stored = ' '.join(f'{k}={v}' for k, v in old.items())
+                        migrated = self.values(self.run_probe(f'stored101 {soc} ' + stored)[0])
+                        self.assertEqual(migrated, {**old, 'gpu_feed': default})
+                        self.assertEqual(self.run_probe('preset ' + stored), ['custom' if custom else preset])
+                        for explicit in ('off', 'on', 'invalid'):
+                            loaded = self.values(self.run_probe(f'storedsoc {soc} ' + stored + f' gpu_feed={explicit}')[0])
+                            self.assertEqual(loaded['gpu_feed'], 'on' if explicit == 'on' else 'off')
 
     def test_101_store_metadata_does_not_change_migration_or_env(self):
         # The update switch uses separate private files, not Settings. Extra preference metadata (including
@@ -244,7 +243,7 @@ class SettingsTests(unittest.TestCase):
                 extra = ' initialized=true skip_menu=true update_checks=off pending_update=1.0.2'
                 self.assertEqual(self.run_probe('stored ' + stored + extra), self.run_probe('stored ' + stored))
                 self.assertEqual(self.run_probe('preset ' + stored + extra), [preset])
-                self.assertEqual(self.run_probe('stored101 ' + stored), self.run_probe('stored ' + stored))
+                self.assertEqual(self.run_probe('stored101 unknown ' + stored), self.run_probe('stored ' + stored))
                 self.assertEqual(self.env(**old, update_checks='off', pending_update='1.0.2'), self.env(**old))
         rules = (TOTK / 'android/java/com/aure/totk/UpdateRules.java').read_text()
         self.assertIn('read(files, "update-checks.txt")', rules)
@@ -268,7 +267,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(self.profile('SM8650', 'SM8725', 'XSM8550', 'SM85500', 'CQ8725', 'QCS8550A', 'Tensor G3', 'unknown', '-'),
                          [untested] * 9)
 
-    def test_first_run_uses_the_profile_with_experiments_off(self):
+    def test_first_run_uses_profile_and_chip_gpu_feed_default(self):
         odin, thor, duo, unknown, none = map(self.values, self.run_probe(
             'first CQ8725S', 'first QCS8550', 'first CQ7790S', 'first SM8650', 'first'))
         experiments_off = {'frame_gen': 'off', 'upscaler': 'off', 'native_hud': 'off'}
@@ -320,8 +319,18 @@ class SettingsTests(unittest.TestCase):
         picture = self.values(self.run_probe('defaults picture QCS8550 upscaler=sgsr sharpness_sgsr=80 shadows=low render_res=960x540')[0])
         self.assertEqual((picture['upscaler'], picture['sharpness_sgsr'], picture['shadows'], picture['render_res']),
                          ('off', '50', 'high', '960x540'))
-        odin, unknown = map(self.values, self.run_probe('defaults performance CQ8725S frame_gen=on', 'defaults performance SM8650 frame_rate=60'))
-        self.assertEqual((odin['frame_rate'], odin['frame_gen'], odin['gpu_feed']), ('60', 'off', 'on'))
+        for soc, default in (('CQ8725S', 'on'), ('SM8750', 'on'), ('QCS8550', 'off'), ('QCM8550', 'off'),
+                             ('SM8550', 'off'), ('CQ7790S', 'off'), ('CQ7790M', 'off'), ('SM7750', 'off'),
+                             ('SM8650', 'off'), ('unknown', 'off')):
+            with self.subTest(soc=soc):
+                opposite = 'off' if default == 'on' else 'on'
+                reset = self.values(self.run_probe(f'defaults performance {soc} frame_gen=on gpu_feed={opposite}')[0])
+                self.assertEqual((reset['frame_gen'], reset['gpu_feed']), ('off', default))
+                first = self.values(self.run_probe(f'first {soc}')[0])
+                self.assertEqual(first['gpu_feed'], default)
+        picture = self.values(self.run_probe('defaults picture CQ7790S gpu_feed=on')[0])
+        self.assertEqual(picture['gpu_feed'], 'on')  # only Performance resets the chip default
+        unknown = self.values(self.run_probe('defaults performance SM8650 frame_rate=60')[0])
         self.assertEqual((unknown['frame_rate'], unknown['render_res'], unknown['gpu_feed']), ('30', '960x540', 'off'))
 
 

@@ -594,7 +594,7 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   **Cost:** each split stores and reloads every attachment on a tiler (GMEM), so it stays off. Try `512`, then `256`;
   `[split-pass]` logs splits, extra passes, refused candidates, depth touches and LRZ refusals per 300 presents.
   Compare p95/GPU-busy overlap, not just fps. Live (`totk.ctl`, APP.md *Live switches*): each pass (part) takes the
-  draw threshold when it opens. The 60fps preset enables `512` through "Keep the GPU busy".
+  draw threshold when it opens. "Keep the GPU busy" enables `512`, defaulting on only for Snapdragon 8 Elite-class chips.
 - **LRZ-safe splits** (`TOTK_VK_SPLIT_LRZ_SAFE=1`, default **on**, inert when pass splitting is off):
   live at the next split/depth-pass boundary; `0` restores the unsafe control. Color+depth scene passes keep their cuts,
   but depth LOAD after a command-buffer epoch change gets an exact one-texel GPU transfer write-back before rendering.

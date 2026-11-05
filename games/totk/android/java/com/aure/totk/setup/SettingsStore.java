@@ -28,7 +28,7 @@ final class SettingsStore {
             save(context, first);
             return first;
         }
-        return new Settings(prefs.getAll());
+        return new Settings(prefs.getAll(), soc());
     }
     /** Store every value and rewrite settings.env (on every change, so a game started any other way sees it too). */
     static void save(Context context, Settings settings) {

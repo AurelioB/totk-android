@@ -1411,7 +1411,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             detailText.setText(Strings.presetText(preset));
             detailDiagram.setVisibility(View.GONE);
             if (!preset.equals(Settings.CUSTOM))
-                for (String key : new String[]{"frame_rate", "frame_gen", "render_res", "latency", "gpu_feed", "upscaler", "aa", "shadows"}) {
+                for (String key : new String[]{"frame_rate", "frame_gen", "render_res", "latency", "upscaler", "aa", "shadows"}) {
                     String v = Settings.presetValue(preset, key);
                     fact(Strings.optionLabel(key), v == null ? Strings.LOCKED_FRAMEGEN : Strings.valueName(key, v));
                 }
