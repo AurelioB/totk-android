@@ -71,6 +71,7 @@ class Activity {
     boolean finished; void finish(){finished=true;} void overridePendingTransition(int a,int b){}
     boolean isFinishing(){return finished;} boolean isDestroyed(){return false;}
     Intent launched; void startActivity(Intent intent){launched=intent;}
+    Bundle options; void startActivity(Intent intent,Bundle bundle){launched=intent;options=bundle;}
 }
 class SettingsStore { static boolean dual=true; static boolean secondaryDisplay(Activity owner){return dual;} }
 class GameLock {enum State {FREE,GAME} State state=State.FREE;}
@@ -135,9 +136,9 @@ public final class SettingsDisplayProbe {
                 ActivityManager.AppTask old=previous.manager.tasks.get(1);
                 SetupActivity a=owner();a.taskId=99; // getAppTasks no longer exposes the old task.
                 check(a.reuseMenuTask(i) && a.finished && !a.ui,"new entry drew a duplicate menu");
-                check(old.starts==1 && old.fronts==1 && old.options.display==0 && a.manager.tasks.get(0).starts==0,"cached menu task not foregrounded");
-                check((old.launched.flags&Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)!=0,"menu below a file picker would be duplicated");
-                check((old.launched.flags&Intent.FLAG_ACTIVITY_NEW_TASK)==0,"bound handoff incorrectly searched by root Intent");
+                check(old.starts==0 && old.fronts==1 && previous.options.display==0 && a.launched==null,"menu owner token not used");
+                check((previous.launched.flags&Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)!=0,"menu below a file picker would be duplicated");
+                check((previous.launched.flags&Intent.FLAG_ACTIVITY_NEW_TASK)==0,"bound handoff incorrectly searched by root Intent");
                 previous.finished=true;SetupActivity next=owner();
                 check(!next.reuseMenuTask(i) && !next.finished,"finished menu revived");
             }

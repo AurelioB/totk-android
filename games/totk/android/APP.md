@@ -57,12 +57,12 @@ before drawing on the main display: a normal cross-display task search cannot fi
 task. Existing menu content and gated retry actions stay on that activity; a pending Close game is not redirected
 or replaced. A cold redirect initializes its recovery screen once, retaining Setup stopped / interrupted and Resume
 instead of applying the already-open Settings-to-Home reset. Host coverage: `tests/test_android_settings_display.py`.
-A newly created cross-display menu entry forwards to the live menu's cached `AppTask` before drawing, explicitly
-moves that task to front, and finishes only the undrawn newcomer. A weak activity reference owns this routing, not
+A newly created cross-display menu entry launches from the live menu's own activity token, explicitly moves its
+cached `AppTask` to front, and finishes only the undrawn newcomer. A weak activity reference owns this routing, not
 another persistent menu instance: Android 16 removes the old same-affinity task from `getAppTasks()` when it creates
-the new launcher entry, so rediscovering it then is too late. `REORDER_TO_FRONT` also reuses a menu below its file
-picker. This includes launcher entry after native exit, when the old task still has a game base Intent, and routes
-the action through the existing menu's safe-close guard rather than discarding its retry.
+the new launcher entry, so rediscovering it then is too late. The owner-bound `REORDER_TO_FRONT` launch has no
+`NEW_TASK` flag, so it also reuses a menu below its file picker rather than matching the task's root Intent.
+This includes launcher entry after native exit and preserves the existing menu's safe-close guard and retry.
 If no menu exists and the game is live, Settings first returns through that singleTask game on display 0, then the
 game opens the menu using its own caller token (no new-task flag). This keeps even a bottom-launcher Settings entry
 above the game in the same task: after save-safe native exit there is no separate stale game task to reveal/restart.

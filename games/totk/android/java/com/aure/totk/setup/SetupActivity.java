@@ -367,7 +367,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             SetupActivity previous = menuActivity.get();
             if (previous != null && previous != this && !previous.isFinishing() && !previous.isDestroyed()
                     && previous.menuTask != null) {
-                previous.menuTask.startActivity(this, new Intent(intent)
+                previous.startActivity(new Intent(intent)
                                 .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
                         ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle());
                 previous.menuTask.moveToFront();
