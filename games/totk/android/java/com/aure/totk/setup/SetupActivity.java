@@ -2,6 +2,7 @@ package com.aure.totk.setup;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.ActivityOptions;
 import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.ContentResolver;
@@ -346,10 +347,50 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
 
     // ---------- lifecycle ----------
+    private boolean settingsMoving;
+    /** Keep the Settings shortcut visible, rather than underneath the game's companion on the bottom panel.
+     * SINGLE_TOP reuses this menu and preserves its UI/actions; its translucent initial theme draws no second menu. */
+    private boolean moveSettingsToMain(Intent intent) {
+        if (!intent.getBooleanExtra(EXTRA_SETTINGS, false) || closingGame || !SettingsStore.secondaryDisplay(this)) return false;
+        if (getDisplay() == null || getDisplay().getDisplayId() == android.view.Display.DEFAULT_DISPLAY) {
+            settingsMoving = false;
+            return false;
+        }
+        if (settingsMoving) return false;
+        try {
+            settingsMoving = true;
+            startActivity(new Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                    ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle());
+            return true;
+        } catch (RuntimeException failed) {
+            settingsMoving = false;
+            android.util.Log.w("TotkSetup", "Could not move Settings to the main display", failed);
+            return false;
+        }
+    }
+    /** A launcher tap returns to a live game; the explicit Settings VIEW shortcut always remains a menu entry.
+     * This is a direct task return, not another startup/save sync, and must not cancel a pending safe close. */
+    private boolean returnToRunningGame(Intent intent) {
+        if (closingGame || !Intent.ACTION_MAIN.equals(intent.getAction()) || !intent.hasCategory(Intent.CATEGORY_LAUNCHER)
+                || intent.getBooleanExtra(EXTRA_SETTINGS, false) || intent.hasExtra(EXTRA_GAME_ERROR)
+                || !SettingsStore.secondaryDisplay(this)
+                || InstallState.gameState(this).state != GameLock.State.GAME) return false;
+        try {
+            GameLaunch.start(this);
+            finish();
+            overridePendingTransition(0, 0);
+            return true;
+        } catch (RuntimeException failed) {
+            android.util.Log.w("TotkSetup", "Could not return to the running game", failed);
+            return false;
+        }
+    }
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         boolean settingsShortcut = getIntent().getBooleanExtra(EXTRA_SETTINGS, false);
         gameError = getIntent().getStringExtra(EXTRA_GAME_ERROR);
+        if (moveSettingsToMain(getIntent())) return;
+        if (returnToRunningGame(getIntent())) return;
         // After a game error the menu is shown (with the reason) even when it is set to start the game directly.
         if (gameError == null && !settingsShortcut && !SetupService.status.running && !SetupService.jobActive(this) && InstallState.read(this).playable()
                 && SettingsStore.skipMenu(this) && StorageLocation.available(this) && !StorageLocation.migrationPending(this, true)) {
@@ -371,7 +412,10 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        if (ui && intent.getBooleanExtra(EXTRA_SETTINGS, false) && screen != Screen.INSTALL)
+        if (moveSettingsToMain(intent)) return;
+        if (!ui && intent.getBooleanExtra(EXTRA_SETTINGS, false)) showUi();
+        if (returnToRunningGame(intent)) return;
+        if (ui && intent.getBooleanExtra(EXTRA_SETTINGS, false) && screen != Screen.INSTALL && !closingGame)
             replace(InstallState.read(this).installed() ? Screen.HOME : Screen.WELCOME);
         String error = intent.getStringExtra(EXTRA_GAME_ERROR);
         if (error != null) {
@@ -577,14 +621,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             return;
         }
         gameError = null;
-        try {
-            // Inspect before publishing our launch marker. Recents can retain dead game tasks after an update;
-            // only the existing lock/pending-launch proof may decide whether a cold start can clear the menu task.
-            GameLock.Result previous = InstallState.gameState(this);
-            if (previous.state == GameLock.State.ERROR) throw new IOException(previous.reason);
-            GameLock.start(getFilesDir(), System.currentTimeMillis(), android.os.Process.myPid(),
-                    () -> GameLaunch.start(this, previous.free()));
-        }
+        try { GameLock.start(getFilesDir(), System.currentTimeMillis(), android.os.Process.myPid(),
+                () -> GameLaunch.start(this)); }
         catch (IOException | RuntimeException failedStart) {
             if (!ui) showUi();
             showNote(Strings.gameLockError(failedStart.toString()));

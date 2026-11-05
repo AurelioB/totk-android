@@ -42,14 +42,19 @@ setting available when the menu is on the bottom screen. Only devices with a bui
 `FLAG_ACTIVITY_NEW_TASK` and `ActivityOptions.setLaunchDisplayId(DEFAULT_DISPLAY)`; single-screen devices and
 external/cast/overlay-only configurations keep Android's ordinary launch behavior. The companion's enabled setting
 does not change where the game runs.
-On a cold dual-screen start only, `FLAG_ACTIVITY_CLEAR_TASK` gives the reused task the game's base Intent, rather
-than retaining the completed menu's launcher Intent. Android 16 can otherwise fail to find that `singleTask` game
-across displays and create a second `TotkActivity`. The existing `GameLock` state is read before publishing this
-start's marker; a live or pending game is **never cleared**. Recents metadata is not a liveness proof (dead game
-tasks can survive an update). The game base Intent lets Android reuse/reparent the existing activity on the main
-display. The native runtime is process-global; it must have exactly one NativeActivity. The menu is not replayed or
-recreated, and close/gated-retry actions remain on their original activity.
-The game keeps the same `singleTask` mode, affinity, permissions and launcher/recents declarations.
+SetupActivity declares `android:relinquishTaskIdentity="true"`: when the menu finishes, its existing same-affinity
+task adopts the game's base Intent instead of permanently retaining the launcher/menu Intent. Without this,
+Android 16 can fail to find the game across displays and create a second `TotkActivity`; neither
+`moveTaskToFront` display options nor an explicit `AppTask.startActivity` fixes that stale identity. The native runtime
+is process-global and must have exactly one NativeActivity. Game start does not replay/recreate the menu or change
+its pending close/retry actions. `singleTask`, affinity, permissions, app label/icon and launcher/recents
+declarations are otherwise unchanged; there is still one app card after the menu hands over to play.
+On dual-screen devices a normal MAIN/LAUNCHER entry returns directly to a live game without another save sync or
+startup marker; the explicit Settings VIEW shortcut always opens the menu. With no live game the normal menu/direct
+game preference still applies. A pending save-safe Close game action is not cancelled by that launcher shortcut path.
+An explicit Settings shortcut opened from the bottom panel redirects that same `SINGLE_TOP` menu to the main display
+before drawing it, so it is not hidden underneath the live companion. Existing menu content/actions stay on that
+activity; a pending Close game is not redirected or replaced.
 `TotkActivity` also checks resume, new-intent and configuration callbacks: a launcher can move an existing task
 without opening the menu again. If it is on the second panel, the activity relaunches its own singleTask on the main
 display, without finishing/restarting the native game; a pending-move guard prevents recursive launches. A display

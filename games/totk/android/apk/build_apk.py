@@ -46,6 +46,7 @@ ATTR = {
     'targetSdkVersion': 0x01010270, 'allowBackup': 0x01010280, 'isGame': 0x010103f4, 'extractNativeLibs': 0x010104ea,
     'drawable': 0x01010199, 'roundIcon': 0x0101052c, 'foregroundServiceType': 0x01010599, 'hasFragileUserData': 0x0101059a,
     'fullBackupContent': 0x010104eb, 'dataExtractionRules': 0x0101063e,
+    'relinquishTaskIdentity': 0x01010476,
 }
 THEME_NOTITLEBAR_FULLSCREEN = 0x01030007   # @android:style/Theme.NoTitleBar.Fullscreen
 THEME_TRANSLUCENT_FULLSCREEN = 0x01030011  # @android:style/Theme.Translucent.NoTitleBar.Fullscreen (no flash when setup forwards to the game)
@@ -107,7 +108,7 @@ def manifest_tree(package, label, version_code, version_name, min_sdk, target_sd
                          + ([(A, 'icon', 'ref', icon)] if icon is not None else [])
                          + ([(A, 'roundIcon', 'ref', round_icon)] if round_icon is not None else []), [
             ('activity', [(A, 'name', 'str', SETUP_ACTIVITY), (A, 'label', 'str', label), (A, 'exported', 'bool', True),
-                          (A, 'process', 'str', SETUP_PROCESS), (A, 'launchMode', 'int', SINGLE_TOP),
+                          (A, 'process', 'str', SETUP_PROCESS), (A, 'launchMode', 'int', SINGLE_TOP), (A, 'relinquishTaskIdentity', 'bool', True),
                           (A, 'theme', 'ref', THEME_TRANSLUCENT_FULLSCREEN), (A, 'configChanges', 'hex', CONFIG_CHANGES)], [
                 ('intent-filter', [], [
                     ('action', [(A, 'name', 'str', 'android.intent.action.MAIN')], []),

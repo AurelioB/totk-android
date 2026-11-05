@@ -145,6 +145,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(setup[(A, 'exported')], TRUE)
         self.assertEqual(setup[(A, 'process')], (3, ':setup'))
         self.assertEqual(setup[(A, 'launchMode')], (0x10, 1))
+        self.assertEqual(setup[(A, 'relinquishTaskIdentity')], TRUE)
         self.assertEqual(setup[(A, 'theme')], (1, 0x01030011))
         self.assertNotIn((A, 'screenOrientation'), setup)
         game = by_name(m, 'activity', 'com.aure.totk.TotkActivity')

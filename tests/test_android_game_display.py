@@ -60,7 +60,7 @@ class Context {
     <T> T getSystemService(Class<T> type) { return type.cast(manager); }
 }
 class Intent {
-    static final int FLAG_ACTIVITY_NEW_TASK = 0x10000000, FLAG_ACTIVITY_CLEAR_TASK = 0x8000;
+    static final int FLAG_ACTIVITY_NEW_TASK = 0x10000000;
     final Class<?> target; int flags;
     Intent(Context owner, Class<?> target) { this.target = target; }
     Intent addFlags(int value) { flags |= value; return this; }
@@ -121,24 +121,24 @@ public final class GameDisplayProbe {
                 owner.manager.secondary = new Display[] {new Display(4, 0, "QCM")};
                 for (Display from : new Display[] {owner.manager.main, owner.manager.secondary[0]}) {
                     owner.current = from;
-                    GameLaunch.start(owner, true);
+                    GameLaunch.start(owner);
                     require(owner.launched.target == TotkActivity.class, "wrong activity");
-                    require(owner.launched.flags == (Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK), "cold task must get game base Intent");
+                    require(owner.launched.flags == Intent.FLAG_ACTIVITY_NEW_TASK, "task launch flag missing");
                     require(owner.options != null && owner.options.display == 0, "not routed to main");
                     require(GameLaunch.onMainScreen(owner) == (from.id == 0), "wrong move decision");
                 }
                 int direct = owner.directLaunches;
-                GameLaunch.start(owner, false);
+                GameLaunch.start(owner);
                 require(owner.directLaunches == direct + 1 && owner.options.display == 0
                         && owner.launched.flags == Intent.FLAG_ACTIVITY_NEW_TASK, "existing game cleared or not routed to main");
                 owner.manager.secondary = new Display[] {new Display(7, -1, null)};
-                GameLaunch.start(owner, true);
+                GameLaunch.start(owner);
                 require(owner.options == null && owner.launched.flags == 0 && GameLaunch.onMainScreen(owner), "cast/overlay behavior changed");
                 owner.manager.secondary = new Display[] {new Display(5, 2, "DEL")};
-                GameLaunch.start(owner, false);
+                GameLaunch.start(owner);
                 require(owner.options == null && owner.launched.flags == 0, "external-monitor behavior changed");
                 owner.manager.secondary = new Display[0]; owner.current = owner.manager.main;
-                GameLaunch.start(owner, true);
+                GameLaunch.start(owner);
                 require(owner.options == null && owner.launched.flags == 0 && GameLaunch.onMainScreen(owner), "single-screen behavior changed");
                 break;
             }
