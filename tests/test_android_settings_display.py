@@ -29,13 +29,17 @@ class ActivityOptions {
     int display; static ActivityOptions makeBasic(){return new ActivityOptions();}
     ActivityOptions setLaunchDisplayId(int id){display=id;return this;} Bundle toBundle(){return new Bundle(display);}
 }
+class ComponentName {
+    final String pkg,name; ComponentName(String pkg,String name){this.pkg=pkg;this.name=name;}
+    String getPackageName(){return pkg;} String getClassName(){return name;}
+}
 class ActivityManager {
     final List<AppTask> tasks=new ArrayList<>();
     List<AppTask> getAppTasks(){return tasks;}
-    static class TaskInfo {int taskId; TaskInfo(int id){taskId=id;}}
+    static class RecentTaskInfo {int taskId; ComponentName topActivity; RecentTaskInfo(int id){taskId=id;}}
     static class AppTask {
-        final int id; int starts; Intent launched; Bundle options; boolean fail;
-        AppTask(int id){this.id=id;} TaskInfo getTaskInfo(){return new TaskInfo(id);}
+        final int id; int starts; Intent launched; Bundle options; boolean fail; ComponentName top;
+        AppTask(int id){this.id=id;} RecentTaskInfo getTaskInfo(){RecentTaskInfo i=new RecentTaskInfo(id);i.topActivity=top;return i;}
         void startActivity(Activity owner,Intent intent,Bundle bundle){
             starts++; launched=intent; options=bundle;
             if(fail)throw new SecurityException("denied");
@@ -47,6 +51,8 @@ class Activity {
     Display getDisplay(){return display;} int getTaskId(){return taskId;}
     <T> T getSystemService(Class<T> type){return type.cast(manager);}
     void setIntent(Intent intent){} protected void onNewIntent(Intent intent){}
+    boolean finished; void finish(){finished=true;} void overridePendingTransition(int a,int b){}
+    String getPackageName(){return "test.package";}
 }
 class SettingsStore { static boolean dual=true; static boolean secondaryDisplay(Activity owner){return dual;} }
 class InstallState { static InstallState read(Activity owner){return new InstallState();} boolean installed(){return true;} }
@@ -97,6 +103,17 @@ public final class SettingsDisplayProbe {
             check(a.screen==SetupActivity.Screen.DATA && a.blockedAction==retry && a.manager.tasks.get(1).starts==1,"safe close interrupted");
             a=owner();a.ui=true;a.screen=SetupActivity.Screen.DATA;check(a.moveSettingsToMain(i),"warm settings handoff missing");delivered(a,i);
             check(a.screen==SetupActivity.Screen.HOME && a.replacements==1,"ordinary warm Settings no longer returns Home");
+        }else if(args[0].equals("existing")){
+            for(Intent i:new Intent[]{new Intent(),settings()}){
+                SetupActivity a=owner();ActivityManager.AppTask old=a.manager.tasks.get(0);
+                old.top=new ComponentName(a.getPackageName(),SetupActivity.class.getName());
+                check(a.reuseMenuTask(i) && a.finished && !a.ui,"new entry drew a duplicate menu");
+                check(old.starts==1 && old.options.display==0 && a.manager.tasks.get(1).starts==0,"existing menu task not targeted");
+            }
+            SetupActivity a=owner();a.manager.tasks.get(0).top=new ComponentName("other.package",SetupActivity.class.getName());
+            check(!a.reuseMenuTask(settings()) && !a.finished,"foreign task reused");
+            a=owner();a.manager.tasks.get(0).top=new ComponentName(a.getPackageName(),"TotkActivity");
+            check(!a.reuseMenuTask(settings()),"native activity cleared for menu");
         }else if(args[0].equals("unchanged")){
             SetupActivity a=owner();Intent i=settings();a.display=new Display(0);
             check(!a.moveSettingsToMain(i),"main Settings moved");a.display=new Display(4);SettingsStore.dual=false;
@@ -157,6 +174,9 @@ class SetupActivity extends Activity {
 
     def test_main_single_external_and_normal_menu_unchanged(self):
         self.probe('unchanged')
+
+    def test_new_entry_forwards_to_existing_menu_without_drawing_or_clearing_game(self):
+        self.probe('existing')
 
 
 if __name__ == '__main__':

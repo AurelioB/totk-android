@@ -57,6 +57,12 @@ before drawing on the main display: a normal cross-display task search cannot fi
 task. Existing menu content and gated retry actions stay on that activity; a pending Close game is not redirected
 or replaced. A cold redirect initializes its recovery screen once, retaining Setup stopped / interrupted and Resume
 instead of applying the already-open Settings-to-Home reset. Host coverage: `tests/test_android_settings_display.py`.
+A newly created cross-display menu entry also forwards to an existing top-menu `AppTask` before drawing and finishes
+only the undrawn newcomer. This includes launcher entry after native exit, when the old task still has a game base
+Intent, and routes the action through the existing menu's safe-close guard rather than discarding its retry.
+Task-bound starts can report the new display configuration without delivering a new Intent; resume/configuration
+callbacks therefore finish cold UI initialization, and the handoff Intent marks cold initialization to preserve
+recovery regardless of callback order.
 `TotkActivity` also checks resume, new-intent and configuration callbacks: a launcher can move an existing task
 without opening the menu again. If it is on the second panel, the activity relaunches its own singleTask on the main
 display, without finishing/restarting the native game; a pending-move guard prevents recursive launches. A display

@@ -350,6 +350,30 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     // ---------- lifecycle ----------
     private boolean settingsMoving;
     private static final String EXTRA_COLD_SETTINGS = "com.aure.totk.setup.COLD_SETTINGS_HANDOFF";
+    /** A game-rooted task may still contain the menu after native exit. Cross-display launcher matching
+     * cannot find that menu by base Intent, so forward to its exact task before drawing another one. */
+    private boolean reuseMenuTask(Intent intent) {
+        if (!SettingsStore.secondaryDisplay(this)) return false;
+        try {
+            ActivityManager manager = getSystemService(ActivityManager.class);
+            if (manager == null) return false;
+            for (ActivityManager.AppTask task : manager.getAppTasks()) {
+                ActivityManager.RecentTaskInfo info = task.getTaskInfo();
+                if (info.taskId == getTaskId() || info.topActivity == null
+                        || !getPackageName().equals(info.topActivity.getPackageName())
+                        || !SetupActivity.class.getName().equals(info.topActivity.getClassName())) continue;
+                task.startActivity(this, new Intent(intent)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                        ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle());
+                finish();
+                overridePendingTransition(0, 0);
+                return true;
+            }
+        } catch (RuntimeException failed) {
+            android.util.Log.w("TotkSetup", "Could not return to the existing menu task", failed);
+        }
+        return false;
+    }
     /** Keep the Settings shortcut visible, rather than underneath the game's companion on the bottom panel.
      * Bind the start to this task: a normal cross-display search cannot find a menu above the singleTask game. */
     private boolean moveSettingsToMain(Intent intent) {
@@ -407,6 +431,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         super.onCreate(state);
         boolean settingsShortcut = getIntent().getBooleanExtra(EXTRA_SETTINGS, false);
         gameError = getIntent().getStringExtra(EXTRA_GAME_ERROR);
+        if (reuseMenuTask(getIntent())) return;
         if (moveSettingsToMain(getIntent())) return;
         if (returnToRunningGame(getIntent())) return;
         // After a game error the menu is shown (with the reason) even when it is set to start the game directly.
