@@ -17,7 +17,7 @@ import java.util.*;
 class Bundle { int display; Bundle(int id) { display=id; } }
 class Display { static final int DEFAULT_DISPLAY=0; int id; Display(int id) { this.id=id; } int getDisplayId(){return id;} }
 class Intent {
-    static final int FLAG_ACTIVITY_NEW_TASK=0x10000000, FLAG_ACTIVITY_SINGLE_TOP=0x20000000;
+    static final int FLAG_ACTIVITY_NEW_TASK=0x10000000, FLAG_ACTIVITY_SINGLE_TOP=0x20000000, FLAG_ACTIVITY_REORDER_TO_FRONT=0x20000;
     final Map<String,Object> extras=new HashMap<>(); int flags;
     Intent putExtra(String key,boolean value){extras.put(key,value);return this;}
     Intent() {} Intent(Intent other){extras.putAll(other.extras); flags=other.flags;}
@@ -109,6 +109,7 @@ public final class SettingsDisplayProbe {
                 SetupActivity a=owner();a.taskId=99; // getAppTasks no longer exposes the old task.
                 check(a.reuseMenuTask(i) && a.finished && !a.ui,"new entry drew a duplicate menu");
                 check(old.starts==1 && old.fronts==1 && old.options.display==0 && a.manager.tasks.get(0).starts==0,"cached menu task not foregrounded");
+                check((old.launched.flags&Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)!=0,"menu below a file picker would be duplicated");
                 previous.finished=true;SetupActivity next=owner();
                 check(!next.reuseMenuTask(i) && !next.finished,"finished menu revived");
             }
