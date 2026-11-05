@@ -64,6 +64,9 @@ class Intent {
     final Class<?> target; int flags;
     Intent(Context owner, Class<?> target) { this.target = target; }
     Intent addFlags(int value) { flags |= value; return this; }
+    boolean settings;
+    Intent putExtra(String key, boolean value) { settings = value; return this; }
+    boolean getBooleanExtra(String key, boolean fallback) { return settings; }
 }
 class ActivityOptions {
     int display;
@@ -87,6 +90,7 @@ class Activity extends Context {
     public void onConfigurationChanged(Configuration config) {}
     void moved(int id) { current = manager.getDisplay(id); onConfigurationChanged(new Configuration()); }
 }
+class SetupActivity { static int opens; static void openOnGame(Activity owner) { opens++; } }
 '''
 
 
@@ -126,6 +130,8 @@ public final class GameDisplayProbe {
                     require(owner.launched.flags == Intent.FLAG_ACTIVITY_NEW_TASK, "task launch flag missing");
                     require(owner.options != null && owner.options.display == 0, "not routed to main");
                     require(GameLaunch.onMainScreen(owner) == (from.id == 0), "wrong move decision");
+                    GameLaunch.startSettings(owner);
+                    require(owner.launched.settings && owner.options.display == 0, "Settings did not route through the live main game");
                 }
                 int direct = owner.directLaunches;
                 GameLaunch.start(owner);
@@ -162,6 +168,14 @@ public final class GameDisplayProbe {
                 owner.resumed = false;
                 owner.moved(4);
                 require(owner.launches == 4, "background configuration change dismissed the menu");
+                owner.resumed = true; owner.moved(0);
+                owner.onNewIntent(new Intent(owner, TotkActivity.class).putExtra(GameLaunch.OPEN_SETTINGS, true));
+                require(SetupActivity.opens == 1 && !owner.settingsRequested, "Settings not opened in game's task");
+                owner.current = owner.manager.secondary[0];
+                owner.onNewIntent(new Intent(owner, TotkActivity.class).putExtra(GameLaunch.OPEN_SETTINGS, true));
+                require(SetupActivity.opens == 1 && owner.settingsRequested, "Settings opened before main-display handoff");
+                owner.moved(0);
+                require(SetupActivity.opens == 2 && !owner.settingsRequested, "deferred Settings intent lost");
                 break;
             }
             default: throw new AssertionError(args[0]);
@@ -185,11 +199,11 @@ class GameDisplayTests(unittest.TestCase):
         methods = section(controller, '    private static DisplayClass.Screen[] screens(', '    private void refresh()')
         methods = methods.replace('private static Display builtInDisplay', 'static Display builtInDisplay')
         activity = (JAVA / 'TotkActivity.java').read_text()
-        callbacks = section(activity, '    private void ensureMainDisplay()', '    @Override protected void onResume()')
+        callbacks = section(activity, '    private void ensureMainDisplay()', '    @Override protected void onResume()').replace('com.aure.totk.setup.SetupActivity', 'SetupActivity')
         source = (FRAMEWORK + local_class((JAVA / 'companion/DisplayClass.java').read_text(), 'DisplayClass')
                   + local_class((JAVA / 'GameLaunch.java').read_text(), 'GameLaunch')
                   + 'class PresentationController { int changed; void onDisplayChanged(int id) { changed++; }\n'
-                  + methods + '}\nclass TotkActivity extends Activity { boolean displayMoveRequested, resumed = true; '
+                  + methods + '}\nclass TotkActivity extends Activity { boolean displayMoveRequested, settingsRequested, resumed = true; '
                   + 'PresentationController companion = new PresentationController();\n' + callbacks + '}\n' + PROBE)
         path = cls.work / 'GameDisplayProbe.java'
         path.write_text(source)

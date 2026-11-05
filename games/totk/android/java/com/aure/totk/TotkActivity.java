@@ -108,9 +108,17 @@ public final class TotkActivity extends NativeActivity {
         int given = nativeFeedbackEnabled();   // what start_game gave the game (TOTK_RUMBLE / TOTK_GYRO and the hardware)
         if (given != 0 && !isFinishing()) feedback = new GameFeedback(this, given);
     }
+    private boolean settingsRequested;
     /** Reuse/reparent the singleTask game, never finish it: NativeActivity.onDestroy exits the game process. */
     private void ensureMainDisplay() {
-        if (GameLaunch.onMainScreen(this)) { displayMoveRequested = false; return; }
+        if (GameLaunch.onMainScreen(this)) {
+            displayMoveRequested = false;
+            if (settingsRequested) {
+                settingsRequested = false;
+                com.aure.totk.setup.SetupActivity.openOnGame(this);
+            }
+            return;
+        }
         if (displayMoveRequested) return;
         displayMoveRequested = true;
         try { GameLaunch.start(this); }
@@ -122,6 +130,7 @@ public final class TotkActivity extends NativeActivity {
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        settingsRequested |= intent.getBooleanExtra(GameLaunch.OPEN_SETTINGS, false);
         ensureMainDisplay();
     }
     @Override public void onConfigurationChanged(Configuration config) {

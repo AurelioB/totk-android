@@ -69,9 +69,16 @@ class Activity {
     void setIntent(Intent intent){} protected void onNewIntent(Intent intent){}
     boolean finished; void finish(){finished=true;} void overridePendingTransition(int a,int b){}
     boolean isFinishing(){return finished;} boolean isDestroyed(){return false;}
+    Intent launched; void startActivity(Intent intent){launched=intent;}
 }
 class SettingsStore { static boolean dual=true; static boolean secondaryDisplay(Activity owner){return dual;} }
-class InstallState { static InstallState read(Activity owner){return new InstallState();} boolean installed(){return true;} }
+class GameLock {enum State {FREE,GAME} State state=State.FREE;}
+class GameLaunch {static int settings; static void startSettings(Activity owner){settings++;}}
+class InstallState {
+    static final GameLock game=new GameLock();
+    static GameLock gameState(Activity owner){return game;}
+    static InstallState read(Activity owner){return new InstallState();} boolean installed(){return true;}
+}
 class Log { static void w(String tag,String message,Throwable error){} }
 '''
 
@@ -139,6 +146,15 @@ public final class SettingsDisplayProbe {
             check(i.getBooleanExtra(SetupActivity.EXTRA_SETTINGS,false)
                     && (i.flags&Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)!=0,"shortcut cannot open menu above picker");
             a.publishShortcut();check(a.shortcuts.updates==1,"unchanged shortcut republished / rate limited");
+        }else if(args[0].equals("gameTask")){
+            SetupActivity a=owner();Intent i=settings();
+            check(!a.settingsOverGame(i),"cold Settings started a native game");
+            InstallState.game.state=GameLock.State.GAME;
+            check(a.settingsOverGame(i) && a.finished && GameLaunch.settings==1,"live Settings did not return through the game");
+            a=owner();i.putExtra("com.aure.totk.setup.IN_GAME_TASK",true);
+            check(!a.settingsOverGame(i),"game-task menu recursively routed");
+            SetupActivity.openOnGame(a);
+            check(a.launched.flags==0 && a.launched.getBooleanExtra("com.aure.totk.setup.IN_GAME_TASK",false),"menu detached from game caller task");
         }else if(args[0].equals("unchanged")){
             SetupActivity a=owner();Intent i=settings();a.display=new Display(0);
             check(!a.moveSettingsToMain(i),"main Settings moved");a.display=new Display(4);SettingsStore.dual=false;
@@ -164,7 +180,8 @@ class SettingsDisplayTests(unittest.TestCase):
         move = source[source.index('    private boolean settingsMoving;'):source.index('    /** A launcher tap')]
         new_intent = source[source.index('    @Override protected void onNewIntent(Intent intent)'):source.index('    @Override protected void onStart()')]
         shortcut = source[source.index('    private void publishShortcut()'):source.index('    private static Bitmap shortcutGlyph()')]
-        body = (move + new_intent + shortcut).replace('private boolean', 'boolean').replace('private void', 'void').replace('private static java.lang.ref.', 'static java.lang.ref.').replace('android.view.Display', 'Display').replace('android.util.Log', 'Log')
+        route = source[source.index('    public static void openOnGame('):source.index('    @Override protected void onCreate(Bundle state)')]
+        body = (move + new_intent + shortcut + route).replace('private boolean', 'boolean').replace('private void', 'void').replace('private static java.lang.ref.', 'static java.lang.ref.').replace('android.app.Activity', 'Activity').replace('android.view.Display', 'Display').replace('android.util.Log', 'Log')
         wrapper = r'''
 class SetupActivity extends Activity {
     static final String EXTRA_SETTINGS="settings",EXTRA_GAME_ERROR="error";
@@ -207,6 +224,9 @@ class SetupActivity extends Activity {
 
     def test_settings_shortcut_migrates_reorder_flags_without_repeated_updates(self):
         self.probe('shortcut')
+
+    def test_only_live_game_routes_settings_into_the_game_task(self):
+        self.probe('gameTask')
 
 
 if __name__ == '__main__':

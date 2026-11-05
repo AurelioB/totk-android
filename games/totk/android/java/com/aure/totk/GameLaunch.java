@@ -11,9 +11,16 @@ import com.aure.totk.companion.PresentationController;
 /** Route only dual-panel devices to their main screen; keep Android's normal task/recents behavior otherwise. */
 public final class GameLaunch {
     private GameLaunch() { }
+    static final String OPEN_SETTINGS = "com.aure.totk.OPEN_SETTINGS";
 
-    public static void start(Activity owner) {
+    public static void start(Activity owner) { start(owner, false); }
+
+    /** Return through the live game so Settings shares its task, rather than leaving a stale game task behind. */
+    public static void startSettings(Activity owner) { start(owner, true); }
+
+    private static void start(Activity owner, boolean settings) {
         Intent game = new Intent(owner, TotkActivity.class);
+        if (settings) game.putExtra(OPEN_SETTINGS, true);
         Bundle options = null;
         if (PresentationController.deviceSecondScreen(owner) == DisplayClass.BUILT_IN) {
             game.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);

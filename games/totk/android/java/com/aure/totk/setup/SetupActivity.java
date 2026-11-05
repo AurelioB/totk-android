@@ -350,6 +350,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     // ---------- lifecycle ----------
     private boolean settingsMoving;
     private static final String EXTRA_COLD_SETTINGS = "com.aure.totk.setup.COLD_SETTINGS_HANDOFF";
+    private static final String EXTRA_GAME_TASK = "com.aure.totk.setup.IN_GAME_TASK";
     private static java.lang.ref.WeakReference<SetupActivity> menuActivity = new java.lang.ref.WeakReference<>(null);
     private ActivityManager.AppTask menuTask;
     /** A game-rooted task may still contain the menu after native exit. Cross-display launcher matching
@@ -434,11 +435,26 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             return false;
         }
     }
+    /** Called only by the live, main-display game: its caller token keeps Settings in that same task. */
+    public static void openOnGame(android.app.Activity game) {
+        game.startActivity(new Intent(game, SetupActivity.class).setAction(Intent.ACTION_VIEW)
+                .putExtra(EXTRA_SETTINGS, true).putExtra(EXTRA_GAME_TASK, true));
+    }
+    private boolean settingsOverGame(Intent intent) {
+        if (!intent.getBooleanExtra(EXTRA_SETTINGS, false) || intent.getBooleanExtra(EXTRA_GAME_TASK, false)
+                || !SettingsStore.secondaryDisplay(this)
+                || InstallState.gameState(this).state != GameLock.State.GAME) return false;
+        GameLaunch.startSettings(this);
+        finish();
+        overridePendingTransition(0, 0);
+        return true;
+    }
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         boolean settingsShortcut = getIntent().getBooleanExtra(EXTRA_SETTINGS, false);
         gameError = getIntent().getStringExtra(EXTRA_GAME_ERROR);
         if (reuseMenuTask(getIntent())) return;
+        if (settingsOverGame(getIntent())) return;
         if (moveSettingsToMain(getIntent())) return;
         if (returnToRunningGame(getIntent())) return;
         // After a game error the menu is shown (with the reason) even when it is set to start the game directly.

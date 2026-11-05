@@ -63,6 +63,9 @@ another persistent menu instance: Android 16 removes the old same-affinity task 
 the new launcher entry, so rediscovering it then is too late. `REORDER_TO_FRONT` also reuses a menu below its file
 picker. This includes launcher entry after native exit, when the old task still has a game base Intent, and routes
 the action through the existing menu's safe-close guard rather than discarding its retry.
+If no menu exists and the game is live, Settings first returns through that singleTask game on display 0, then the
+game opens the menu using its own caller token (no new-task flag). This keeps even a bottom-launcher Settings entry
+above the game in the same task: after save-safe native exit there is no separate stale game task to reveal/restart.
 Task-bound starts can report the new display configuration without delivering a new Intent; resume/configuration
 callbacks therefore finish cold UI initialization, and the handoff Intent marks cold initialization to preserve
 recovery regardless of callback order.
