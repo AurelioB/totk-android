@@ -49,8 +49,8 @@ final class UpdateInstaller {
         worker.execute(() -> {
             try {
                 Updates.Source source = Updates.source(activity);
-                apk = File.createTempFile("totk-update-", ".apk", activity.getCacheDir());
-                checksum = File.createTempFile("totk-update-", ".sha256", activity.getCacheDir());
+                apk = own(File.createTempFile("totk-update-", ".apk", activity.getCacheDir()));
+                checksum = own(File.createTempFile("totk-update-", ".sha256", activity.getCacheDir()));
                 transfer.download(source.base, source.override, source.asset(version, false), apk, 2L * 1024 * 1024 * 1024, (count, size) -> {
                     bytes = count; total = size;
                     // The menu refresh timer reads these; don't queue one UI message per chunk.
@@ -166,9 +166,14 @@ final class UpdateInstaller {
         }
     }
     private void cleanFiles() {
-        if (apk != null) apk.delete();
-        if (checksum != null) checksum.delete();
+        if (apk != null) { apk.delete(); release(apk); }
+        if (checksum != null) { checksum.delete(); release(checksum); }
     }
+    /** Files of a running update in this process: another menu instance's leftover sweep must not delete them. */
+    private static final java.util.Set<String> OWNED = new java.util.HashSet<>();
+    private static File own(File file) { synchronized (OWNED) { OWNED.add(file.getName()); } return file; }
+    private static void release(File file) { synchronized (OWNED) { OWNED.remove(file.getName()); } }
+    static boolean owned(String name) { synchronized (OWNED) { return OWNED.contains(name); } }
     void dispose() {
         disposed = true;
         if (!cancelled) cancelWork();

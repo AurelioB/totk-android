@@ -39,8 +39,10 @@ public final class UpdateReceiver extends BroadcastReceiver {
         if (!result.isEmpty()) Inputs.prefs(context).edit().remove("updateResult").apply();
         return result;
     }
+    /** Leftovers of an interrupted update; files a running update in this process still uses are kept. */
     static void clean(Context context) {
-        File[] files = context.getCacheDir().listFiles((dir, name) -> name.startsWith("totk-update-") && (name.endsWith(".apk") || name.endsWith(".sha256")));
+        File[] files = context.getCacheDir().listFiles((dir, name) -> name.startsWith("totk-update-")
+                && (name.endsWith(".apk") || name.endsWith(".sha256")) && !UpdateInstaller.owned(name));
         if (files != null) for (File file : files) file.delete();
     }
 }
