@@ -349,6 +349,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
 
     // ---------- lifecycle ----------
     private boolean settingsMoving;
+    private static final String EXTRA_COLD_SETTINGS = "com.aure.totk.setup.COLD_SETTINGS_HANDOFF";
     /** Keep the Settings shortcut visible, rather than underneath the game's companion on the bottom panel.
      * Bind the start to this task: a normal cross-display search cannot find a menu above the singleTask game. */
     private boolean moveSettingsToMain(Intent intent) {
@@ -365,7 +366,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             for (ActivityManager.AppTask task : manager.getAppTasks()) {
                 if (task.getTaskInfo().taskId == getTaskId()) {
                     task.startActivity(this,
-                            new Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                            new Intent(intent).putExtra(EXTRA_COLD_SETTINGS, !ui)
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP),
                             ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle());
                     return true;
                 }
@@ -376,6 +378,13 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             android.util.Log.w("TotkSetup", "Could not move Settings to the main display", failed);
             return false;
         }
+    }
+    /** AppTask can move the task before the Activity receives its new display configuration or Intent. */
+    private void completeSettingsMove() {
+        if (!settingsMoving || getDisplay() == null
+                || getDisplay().getDisplayId() != android.view.Display.DEFAULT_DISPLAY) return;
+        settingsMoving = false;
+        if (!ui) showUi();
     }
     /** A launcher tap returns to a live game; the explicit Settings VIEW shortcut always remains a menu entry.
      * This is a direct task return, not another startup/save sync, and must not cancel a pending safe close. */
@@ -420,7 +429,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        boolean hadUi = ui;
+        boolean hadUi = ui && !intent.getBooleanExtra(EXTRA_COLD_SETTINGS, false);
         setIntent(intent);
         if (moveSettingsToMain(intent)) return;
         if (!ui && intent.getBooleanExtra(EXTRA_SETTINGS, false)) showUi();
@@ -455,6 +464,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     @Override protected void onResume() {
         super.onResume();
+        completeSettingsMove();
         if (ui) refreshGameState();
     }
     @Override protected void onStop() {
@@ -502,6 +512,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     @Override public void onConfigurationChanged(Configuration config) {
         super.onConfigurationChanged(config);
+        completeSettingsMove();
         if (ui) render();
     }
 

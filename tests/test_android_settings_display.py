@@ -19,6 +19,7 @@ class Display { static final int DEFAULT_DISPLAY=0; int id; Display(int id) { th
 class Intent {
     static final int FLAG_ACTIVITY_NEW_TASK=0x10000000, FLAG_ACTIVITY_SINGLE_TOP=0x20000000;
     final Map<String,Object> extras=new HashMap<>(); int flags;
+    Intent putExtra(String key,boolean value){extras.put(key,value);return this;}
     Intent() {} Intent(Intent other){extras.putAll(other.extras); flags=other.flags;}
     Intent addFlags(int value){flags|=value;return this;}
     boolean getBooleanExtra(String key,boolean fallback){return (boolean)extras.getOrDefault(key,fallback);}
@@ -78,10 +79,14 @@ public final class SettingsDisplayProbe {
             a=owner();a.manager.tasks.clear();check(!a.moveSettingsToMain(i),"missing task used unbound fallback");
         }else if(args[0].equals("cold")){
             for(SetupActivity.Screen recovery:new SetupActivity.Screen[]{SetupActivity.Screen.ERROR,SetupActivity.Screen.INTERRUPTED}){
-                SetupActivity a=owner();a.recovery=recovery;Intent i=settings();
-                check(a.moveSettingsToMain(i) && !a.ui,"cold handoff initialized bottom UI");
-                delivered(a,i);
-                check(a.ui && a.shown==1 && a.screen==recovery && a.replacements==0,"cold recovery overwritten with Home");
+                for(boolean configFirst:new boolean[]{false,true}){
+                    SetupActivity a=owner();a.recovery=recovery;Intent i=settings();
+                    check(a.moveSettingsToMain(i) && !a.ui,"cold handoff initialized bottom UI");
+                    Intent handoff=a.manager.tasks.get(1).launched;
+                    if(configFirst){a.display=new Display(0);a.completeSettingsMove();}
+                    delivered(a,handoff);
+                    check(a.ui && a.shown==1 && a.screen==recovery && a.replacements==0,"cold recovery overwritten with Home");
+                }
             }
         }else if(args[0].equals("pending")){
             SetupActivity a=owner();a.ui=true;a.screen=SetupActivity.Screen.DATA;
@@ -116,7 +121,7 @@ class SettingsDisplayTests(unittest.TestCase):
         source = SOURCE.read_text()
         move = source[source.index('    private boolean settingsMoving;'):source.index('    /** A launcher tap')]
         new_intent = source[source.index('    @Override protected void onNewIntent(Intent intent)'):source.index('    @Override protected void onStart()')]
-        body = (move + new_intent).replace('private boolean', 'boolean').replace('android.view.Display', 'Display').replace('android.util.Log', 'Log')
+        body = (move + new_intent).replace('private boolean', 'boolean').replace('private void', 'void').replace('android.view.Display', 'Display').replace('android.util.Log', 'Log')
         wrapper = r'''
 class SetupActivity extends Activity {
     static final String EXTRA_SETTINGS="settings",EXTRA_GAME_ERROR="error";
