@@ -95,13 +95,13 @@ public final class UpdateRules {
     }
     public static void clearPending(File files) throws IOException { Files.deleteIfExists(new File(files, "pending-update.txt").toPath()); }
     public static String read(File files, String name) {
-        try { return Files.readString(new File(files, name).toPath(), StandardCharsets.UTF_8).trim(); }
+        try { return new String(Files.readAllBytes(new File(files, name).toPath()), StandardCharsets.UTF_8).trim(); }
         catch (IOException failed) { return ""; }
     }
     private static void store(File files, String name, String value) throws IOException {
         File tmp = File.createTempFile(name, ".tmp", files);
         try {
-            Files.writeString(tmp.toPath(), value, StandardCharsets.UTF_8);
+            Files.write(tmp.toPath(), value.getBytes(StandardCharsets.UTF_8));
             Files.move(tmp.toPath(), new File(files, name).toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } finally { Files.deleteIfExists(tmp.toPath()); }
     }
