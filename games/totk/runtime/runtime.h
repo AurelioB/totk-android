@@ -32,7 +32,9 @@ void runtime_swkbd_probe(void);
 void runtime_swkbd_selftest(void);
 void runtime_dump_threads(void);   /* threads.c: every guest thread's wait state and guest return chain (TOTK_INPUT_FILE "threads") */   /* diagnostic "kbtest": show the text entry bar from a thread of its own */
 void runtime_thread_diag_start(void); /* optional thread diagnostics; Android app defers until environment setup */
-void runtime_progress_mark(const char *stage, int held); /* threads.c stall watchdog: a presented frame (held: a loading stage) */
+/* threads.c stall watchdog: single present-thread writer, reusing its monotonic timestamp and graphics frame number.
+   stage must be an immutable string with static lifetime; held marks a loading stage. */
+void runtime_progress_mark(uint64_t at_ns, uint64_t frame, const char *stage, int held);
 void runtime_progress_pause(int paused);                 /* threads.c stall watchdog: background / no window */
 void runtime_frame_step_pin(double ms);                  /* game_patches.c: pin the real-time frame step (diagnostics), 0 = real time */
 void runtime_frame_step_update(uint64_t now_ns);

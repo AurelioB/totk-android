@@ -2943,7 +2943,7 @@ extern float runtime_frame_step_seconds(void) __attribute__((weak_import));
 extern unsigned runtime_cutscene_present_ticks(unsigned ticks, uint64_t refresh_ns) __attribute__((weak_import));
 extern void movie_host_tick(void) __attribute__((weak_import));   /* TOTK runtime/movie_host.c: pre-rendered cutscenes at their own frame rate */
 extern int movie_host_active(void) __attribute__((weak_import)); /* started host decoders, atomically observed without taking movie locks */
-extern void runtime_progress_mark(const char *stage, int held) __attribute__((weak_import)); /* TOTK runtime/threads.c: the stall watchdog's progress (absent in graphics unit tests) */
+extern void runtime_progress_mark(uint64_t at_ns, uint64_t frame, const char *stage, int held) __attribute__((weak_import)); /* TOTK runtime/threads.c: the stall watchdog's progress (absent in graphics unit tests) */
 extern void runtime_live_frame(uint64_t frame) __attribute__((weak_import)); /* TOTK runtime/live_ctl.h via frontend_android.c: staged live switches (Android app only) */
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // 宿主 hle_thread.c 提供真值；图形单测里为 0 | The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
@@ -3539,7 +3539,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
       last_draws = draws;
       if (!gate && ((g_nvn_loadscreen_up && g_nvn_loadscreen_up()) || this_draws > 2000)) {
           gate = 1; extern void mtl_note_world(void); mtl_note_world();
-          if (runtime_progress_mark) runtime_progress_mark("first-world pipeline warm-up", 1);   /* up to 15 s without a frame: not a stall */
+          if (runtime_progress_mark) runtime_progress_mark(game_present_ns, g_frame + 1, "first-world pipeline warm-up", 1);   /* up to 15 s without a frame: not a stall */
           int ms = mtl_warm_wait(15000);
           if (ms) LOG("[nvn] 首次进局等管线预热 %d ms（本帧绘制 %llu）", ms, (unsigned long long)this_draws);
       } }
@@ -3552,9 +3552,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
               runtime_android_fps_auto_active(), g_display_mode, uncapped_now(), mfx_enabled());
       have = 1; last_guest = o->interval; last_effective = ticks; }
     uint64_t t0 = now_ns();
-    if (runtime_progress_mark) {   /* every presented frame; the watchdog waits out loading screens and host movies */
+    if (runtime_progress_mark) {   /* reuse the present timestamp / frame; loading screens and host movies are held */
         int loading = g_nvn_loadscreen_up && g_nvn_loadscreen_up(), movie = movie_host_active && movie_host_active();
-        runtime_progress_mark(loading ? "loading screen" : movie ? "host movie" : "present", loading || movie);
+        runtime_progress_mark(t0, g_frame + 1, loading ? "loading screen" : movie ? "host movie" : "present", loading || movie);
     }
     totk_perf_frame(t0, present_period(o), g_adpf_pacing_ns, o->interval);
     runtime_fps_hybrid_present(t0,auto_scene_draws,

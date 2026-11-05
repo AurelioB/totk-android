@@ -1,6 +1,6 @@
 /* The progress watchdog's decisions (threads.c runs them on a thread of its own, polling every PROGRESS_WATCH_POLL_NS),
-   as a pure state machine for the host test (tests/test_progress_watch.py). Progress is the last presented frame
-   (hle_nvn.c runtime_progress_mark); a stall is the time since then:
+   as a pure state machine for the host test (tests/test_progress_watch.py). Progress is the last presented frame's
+   existing monotonic timestamp (hle_nvn.c runtime_progress_mark), not another clock read on the present path:
    - nothing before the first progress (boot), nor while paused (background, no window);
    - a held stage (a loading screen, a host movie, the first-world pipeline warm-up) counts only once it has lasted
      PROGRESS_WATCH_HOLD_NS, so a long load is not a stall but a load that never ends still is;

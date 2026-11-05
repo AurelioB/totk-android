@@ -35,18 +35,56 @@ int main(void) {
 POLL = 250
 
 # The production watchdog thread in threads.c (CPU-only linkage of tests/guest_waits): mark frames for 300 ms from this
-# thread as the present path does, then stop and wait 2.5 s. <held> 1 marks the frames as a held stage.
+# thread as the present path does, then stop and wait 2.5 s. Also probe exact caller-sample reuse and disabled marks.
 THREADS_PROBE = r'''
 #include <time.h>
 #include "../../runtime/threads.c"
-uint64_t runtime_now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec; }
+static _Thread_local unsigned clock_reads;
+uint64_t runtime_now_ns(void) { clock_reads++; struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec; }
 _Noreturn void runtime_fail(const char *s) { fprintf(stderr, "FAIL %s\n", s); exit(1); }
 void *runtime_symbol(const char *name) { (void)name; runtime_fail("unexpected guest symbol"); }
 void runtime_thread_init(void) {}
+static void mark(uint64_t at, uint64_t frame, const char *stage, int held) {
+    unsigned before = clock_reads;
+    runtime_progress_mark(at, frame, stage, held);
+    if (clock_reads != before) runtime_fail("a progress mark read the clock again");
+}
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
+    if (!strcmp(argv[1], "sample")) {
+        if (g_progress_writer.state || atomic_load(&g_progress.ns)) runtime_fail("watchdog started before progress");
+        uint64_t at = runtime_now_ns(), frame = UINT64_C(0x100000007);
+        mark(at, frame, "first-world pipeline warm-up", 1);
+        if (g_progress_writer.state != 1 || atomic_load(&g_progress.ns) != at ||
+            atomic_load(&g_progress.frame) != frame || !atomic_load(&g_progress.held) ||
+            strcmp(atomic_load(&g_progress.stage), "first-world pipeline warm-up"))
+            runtime_fail("held mark lost the caller's sample");
+        runtime_progress_pause(1);
+        mark(at + 1, frame, "host movie", 1);   /* another stage, not another graphics frame */
+        mark(at + 2, frame + 3, "present", 0);
+        if (atomic_load(&g_progress.ns) != at + 2 || atomic_load(&g_progress.frame) != frame + 3 ||
+            atomic_load(&g_progress.held) || !atomic_load(&g_progress.paused) ||
+            strcmp(atomic_load(&g_progress.stage), "present"))
+            runtime_fail("progress did not reuse the caller's frame / timestamp / stage");
+        return 0;
+    }
+    if (!strcmp(argv[1], "disabled")) {
+        mark(100, 77, "loading screen", 1);
+        setenv("TOTK_WATCHDOG", "1", 1);
+        mark(200, 99, "present", 0);
+        if (g_progress_writer.state != -1 || atomic_load(&g_progress.ns) || atomic_load(&g_progress.frame) ||
+            atomic_load(&g_progress.stage) || atomic_load(&g_progress.held))
+            runtime_fail("disabled marks published progress or restarted the watchdog");
+        return 0;
+    }
     int held = atoi(argv[1]);
-    for (int i = 0; i < 20; i++) { runtime_progress_mark(held == 1 ? "loading screen" : "present", held == 1); usleep(16000); }
+    for (int i = 0; i < 20; i++) {
+        const char *stage = held == 1 ? "loading screen" :
+            held == 3 && i < 7 ? "first-world pipeline warm-up" : held == 3 && i < 14 ? "host movie" : "present";
+        mark(runtime_now_ns(), (uint64_t)i + 1, stage, held == 1 || (held == 3 && i < 14));
+        if (held == 4 && !i) setenv("TOTK_WATCHDOG", "0", 1);
+        usleep(16000);
+    }
     if (held == 2) runtime_progress_pause(1);
     usleep(2500000);
     fprintf(stderr, "probe end\n");
@@ -168,6 +206,39 @@ class ProgressWatch(unittest.TestCase):
         self.assertIn('exit after a stall: off', lines[0])
         self.assertRegex(lines[1], r'^\[totk-watch\] no presented frame for 1\.\d s at stage "present" \(frame 20\): thread dump 1/3$')
         self.assertEqual(lines[2], '[totk-dump] guest threads after 1 s')
+
+    def test_progress_marks_reuse_caller_samples_without_extra_clocks(self):
+        code, lines = self.run_threads('sample')
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith('[totk-watch] on:'), lines)
+
+    def test_disabled_marks_do_not_publish_or_restart(self):
+        self.assertEqual(self.run_threads('disabled', TOTK_WATCHDOG='0'),
+                         (0, ['[totk-watch] off (TOTK_WATCHDOG=0)']))
+
+    def test_watchdog_reports_latest_stage_after_held_transitions(self):
+        code, lines = self.run_threads(3)
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(len(lines), 3, lines)
+        self.assertRegex(lines[1], r'at stage "present" \(frame 20\): thread dump 1/3$')
+        self.assertEqual(lines[2], '[totk-dump] guest threads after 1 s')
+
+    def test_watchdog_switch_is_latched_at_first_frame(self):
+        code, lines = self.run_threads(4)
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(len(lines), 3, lines)
+        self.assertTrue(lines[0].startswith('[totk-watch] on:'), lines)
+        self.assertRegex(lines[1], r'at stage "present" \(frame 20\): thread dump 1/3$')
+
+    def test_present_supplies_existing_timestamp_and_graphics_frame(self):
+        source = (ROOT / 'games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c').read_text()
+        self.assertIn('runtime_progress_mark(game_present_ns, g_frame + 1, "first-world pipeline warm-up", 1);', source)
+        self.assertIn('runtime_progress_mark(t0, g_frame + 1,', source)
+        source = (ROOT / 'games/totk/runtime/threads.c').read_text()
+        mark = source.split('void runtime_progress_mark(', 1)[1].split('\n}', 1)[0]
+        self.assertNotIn('pthread_once(', mark)
+        self.assertNotIn('atomic_fetch_', mark)
 
     def test_watchdog_thread_holds_a_loading_stage(self):
         code, lines = self.run_threads(1)

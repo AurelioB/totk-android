@@ -1914,6 +1914,8 @@ needs `su`). The folder holds what the adb-shell folder holds:
   warm-up, loading screens where the backend knows them) do not count, unless a held stage lasts 60 s. With
   `TOTK_WATCH_STALL` a stall that long ends the process with status 142 (128+SIGALRM), for unattended runs. The
   `[totk-watch] on: …` / `off` line shows the arm (`tests/test_progress_watch.py`).
+  Each mark reuses the present path's existing monotonic timestamp and actual graphics frame number; it adds no
+  clock read, atomic read-modify-write, or stage-string copy. Disabled marks publish nothing.
 - **`TOTK_THREAD_SAMPLER=1`** (default off; live through `totk.ctl`). Names the threads behind long frames without root
   or logcat (the Duo's logd drops our lines): a thread at nice 10 (slower CPUs) reads `/proc/self/task/*/schedstat`
   4 times a second; each frame over 50 ms and every 300 presents log `[totk-threads] long frame F 87.3 ms, window W ms:

@@ -1835,13 +1835,20 @@ void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threa
    unset) also ends the process with 128+SIGALRM after a stall that long, for unattended runs. The switches are read once,
    at the first presented frame, which also starts the thread: a run that never presents (a probe) has none. */
 #include "progress_watch.h"
-static _Atomic uint64_t g_progress_ns, g_progress_frames;
-static _Atomic int g_progress_held, g_progress_paused;
-/* The stage: two slots, so the watchdog reads a complete one while the next is written; the writer is the present path
-   (one thread), and copies only when the stage changes (stages are literals: compared by address). */
-static char g_progress_stage[2][48];
-static _Atomic unsigned g_progress_slot;
-static const char *g_progress_last;
+/* Only the present thread publishes progress. Keep its shared sample off the writer-local and watchdog state cache
+   lines: the polling thread observes it four times a second, but never writes it. Stages are immutable literals, so
+   publishing their pointer needs neither copying nor reusable string slots that a later frame could overwrite. */
+static struct {
+    _Alignas(64) _Atomic uint64_t ns;
+    _Atomic uint64_t frame;
+    _Atomic(const char *) stage;
+    _Atomic int held, paused;
+} g_progress;
+static struct {
+    _Alignas(64) int state;     /* 0: not started, 1: watching, -1: disabled / could not start */
+    int held;
+    const char *stage;
+} g_progress_writer;
 static progress_watch g_watch;
 static void *progress_watchdog(void *arg) {
     (void)arg;
@@ -1851,14 +1858,12 @@ static void *progress_watchdog(void *arg) {
     for (;;) {
         usleep((useconds_t)(PROGRESS_WATCH_POLL_NS / 1000));
         uint64_t stalled;
-        unsigned action = progress_watch_poll(&g_watch, now_ns(), atomic_load_explicit(&g_progress_ns, memory_order_acquire),
-                                              atomic_load_explicit(&g_progress_held, memory_order_relaxed),
-                                              atomic_load_explicit(&g_progress_paused, memory_order_relaxed), &stalled);
+        unsigned action = progress_watch_poll(&g_watch, now_ns(), atomic_load_explicit(&g_progress.ns, memory_order_acquire),
+                                              atomic_load_explicit(&g_progress.held, memory_order_relaxed),
+                                              atomic_load_explicit(&g_progress.paused, memory_order_relaxed), &stalled);
         if (action == PROGRESS_WATCH_NONE) continue;
-        char stage[sizeof g_progress_stage[0]];
-        memcpy(stage, g_progress_stage[atomic_load_explicit(&g_progress_slot, memory_order_acquire) & 1], sizeof stage);
-        stage[sizeof stage - 1] = 0;
-        unsigned long long frames = (unsigned long long)atomic_load_explicit(&g_progress_frames, memory_order_relaxed);
+        const char *stage = atomic_load_explicit(&g_progress.stage, memory_order_relaxed);
+        unsigned long long frames = (unsigned long long)atomic_load_explicit(&g_progress.frame, memory_order_relaxed);
         if (action == PROGRESS_WATCH_EXIT) {
             fprintf(stderr, "[totk-watch] no presented frame for %.1f s at stage \"%s\" (frame %llu): exiting with %d (TOTK_WATCH_STALL)\n",
                     stalled / 1e9, stage, frames, 128 + SIGALRM);
@@ -1870,35 +1875,42 @@ static void *progress_watchdog(void *arg) {
     }
     return NULL;
 }
-static pthread_once_t g_watch_once = PTHREAD_ONCE_INIT;
-static void progress_watch_start(void) {
+static int progress_watch_start(void) {
     const char *on = getenv("TOTK_WATCHDOG"), *stall = getenv("TOTK_WATCH_STALL");
-    if (on && !strcmp(on, "0")) { fprintf(stderr, "[totk-watch] off (TOTK_WATCHDOG=0)\n"); return; }
+    if (on && !strcmp(on, "0")) { fprintf(stderr, "[totk-watch] off (TOTK_WATCHDOG=0)\n"); return 0; }
     if (stall && *stall) {
         char *end; double s = strtod(stall, &end);
         if (*end || !(s > 0) || s > 86400) fprintf(stderr, "[totk-watch] TOTK_WATCH_STALL=%s ignored: seconds > 0 expected\n", stall);
         else g_watch.exit_ns = (uint64_t)(s * 1e9);
     }
     pthread_t th;
-    if (pthread_create(&th, NULL, progress_watchdog, NULL)) { fprintf(stderr, "[totk-watch] off: no thread\n"); return; }
+    if (pthread_create(&th, NULL, progress_watchdog, NULL)) { fprintf(stderr, "[totk-watch] off: no thread\n"); return 0; }
     pthread_detach(th);
     fprintf(stderr, "[totk-watch] on: thread dump after >= %.0f s without a presented frame (at most %u, >= %.0f s apart; boot, the background and loading screens / host movies / pipeline warm-up up to %.0f s excluded); exit after a stall: %s%s\n",
             PROGRESS_WATCH_STALL_NS / 1e9, PROGRESS_WATCH_DUMPS, PROGRESS_WATCH_GAP_NS / 1e9, PROGRESS_WATCH_HOLD_NS / 1e9,
             g_watch.exit_ns ? stall : "off", g_watch.exit_ns ? " s (TOTK_WATCH_STALL)" : "");
+    return 1;
 }
-void runtime_progress_mark(const char *stage, int held) {
-    pthread_once(&g_watch_once, progress_watch_start);
-    if (stage != g_progress_last) {
-        unsigned next = (atomic_load_explicit(&g_progress_slot, memory_order_relaxed) + 1) & 1;
-        snprintf(g_progress_stage[next], sizeof g_progress_stage[next], "%s", stage);
-        atomic_store_explicit(&g_progress_slot, next, memory_order_release);
-        g_progress_last = stage;
+void runtime_progress_mark(uint64_t at_ns, uint64_t frame, const char *stage, int held) {
+    /* The same single present thread owns startup and all later marks; no once/RMW or clock is needed here. The
+       timestamp and frame are already known by the caller, including a held mark before the first-world warm-up. */
+    if (g_progress_writer.state != 1) {
+        if (g_progress_writer.state < 0) return;
+        g_progress_writer.state = progress_watch_start() ? 1 : -1;
+        if (g_progress_writer.state < 0) return;
     }
-    atomic_store_explicit(&g_progress_held, held, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_progress_frames, 1, memory_order_relaxed);
-    atomic_store_explicit(&g_progress_ns, now_ns(), memory_order_release);
+    if (stage != g_progress_writer.stage) {
+        atomic_store_explicit(&g_progress.stage, stage, memory_order_relaxed);
+        g_progress_writer.stage = stage;
+    }
+    if (held != g_progress_writer.held) {
+        atomic_store_explicit(&g_progress.held, held, memory_order_relaxed);
+        g_progress_writer.held = held;
+    }
+    atomic_store_explicit(&g_progress.frame, frame, memory_order_relaxed);
+    atomic_store_explicit(&g_progress.ns, at_ns, memory_order_release);
 }
-void runtime_progress_pause(int paused) { atomic_store_explicit(&g_progress_paused, paused, memory_order_relaxed); }
+void runtime_progress_pause(int paused) { atomic_store_explicit(&g_progress.paused, paused, memory_order_relaxed); }
 void runtime_thread_diag_start(void) {
     static int list_started, dump_started;
     const char *c = getenv("TOTK_LISTCHECK");

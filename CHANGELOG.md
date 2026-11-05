@@ -10,6 +10,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Normal launches no longer start its tail thread or wake logd for every frame log. Crash reports remain enabled.
 - Let the live-control reader sleep when `totk.ctl` is absent, including after unrelated files are created or deleted.
   Keep its directory watch until the control file appears instead of repeatedly waking on its own watch removals.
+- Keep the stall watchdog enabled, but reuse the present timestamp/frame instead of reading a second clock and
+  incrementing an atomic counter every frame; publish immutable stage names only when they change.
 
 ### Menu
 - **Keep the GPU busy** in Graphics → Performance feeds smaller batches earlier and requests clocks that keep up.
