@@ -236,9 +236,17 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         row.setTag("update:checks");
         Widgets.Toggle toggle = new Widgets.Toggle(this);
         toggle.set(UpdateRules.enabled(getFilesDir()));
-        row.value(toggle);
+        LinearLayout value = Widgets.row(this);
+        TextView state = Theme.text(this, UpdateRules.enabled(getFilesDir()) ? "On" : "Off", false, 22, Theme.TEXT2);
+        value.addView(state, Widgets.margins(Widgets.size(-2, -2), 0, 0, 18, 0));
+        value.addView(toggle, Widgets.size(58, 30));
+        row.value(value);
         Runnable change = () -> {
-            try { UpdateRules.enabled(getFilesDir(), !UpdateRules.enabled(getFilesDir())); toggle.set(UpdateRules.enabled(getFilesDir())); }
+            try {
+                UpdateRules.enabled(getFilesDir(), !UpdateRules.enabled(getFilesDir()));
+                boolean on = UpdateRules.enabled(getFilesDir());
+                toggle.set(on); state.setText(on ? "On" : "Off");
+            }
             catch (IOException failed) { showNote("Could not save the update setting: " + failed.getMessage()); }
         };
         row.setOnClickListener(v -> change.run());
