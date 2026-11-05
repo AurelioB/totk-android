@@ -49,16 +49,19 @@ public class Context {
 public class Intent {
     public Intent setClassName(Context context, String name) { return this; }
     public Intent putExtra(String name, String value) { return this; }
+    public boolean getBooleanExtra(String name, boolean fallback) { return fallback; }
 }''',
     'android/content/res/Configuration.java': 'package android.content.res; public final class Configuration {}',
     'com/aure/totk/GameLaunch.java': '''package com.aure.totk;
 public final class GameLaunch {
+    static final String OPEN_SETTINGS = "com.aure.totk.OPEN_SETTINGS";
     static boolean onMainScreen(Object activity) { return true; }
     static void start(Object activity) {}
 }''',
     'com/aure/totk/setup/SetupActivity.java': '''package com.aure.totk.setup;
 public final class SetupActivity {
     public static final String EXTRA_GAME_ERROR = "com.aure.totk.setup.GAME_ERROR";
+    public static void openOnGame(android.app.Activity game) {}
 }''',
     'android/os/Build.java': '''package android.os;
 public final class Build {
@@ -86,11 +89,12 @@ public class View {
 public class Window {
     public View getDecorView() { return new View(); }
 }''',
+    'android/app/Activity.java': 'package android.app; public class Activity extends android.content.Context {}',
     'android/app/NativeActivity.java': '''package android.app;
 import android.content.Context;
 import android.os.Bundle;
 import android.view.Window;
-public class NativeActivity extends Context {
+public class NativeActivity extends Activity {
     public static Runnable initialize, destroy;
     public static boolean initialized;
     protected void onCreate(Bundle state) { initialize.run(); initialized = true; }
