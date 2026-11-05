@@ -47,6 +47,11 @@ public class Context {
 }''',
     'android/content/Intent.java': '''package android.content;
 public class Intent {
+    public static final String ACTION_VIEW = "view";
+    public Intent() {}
+    public Intent(Context context, Class<?> target) {}
+    public Intent setAction(String value) { return this; }
+    public Intent putExtra(String name, boolean value) { return this; }
     public Intent setClassName(Context context, String name) { return this; }
     public Intent putExtra(String name, String value) { return this; }
     public boolean getBooleanExtra(String name, boolean fallback) { return fallback; }
@@ -61,7 +66,18 @@ public final class GameLaunch {
     'com/aure/totk/setup/SetupActivity.java': '''package com.aure.totk.setup;
 public final class SetupActivity {
     public static final String EXTRA_GAME_ERROR = "com.aure.totk.setup.GAME_ERROR";
+    public static final String EXTRA_UPDATE = "com.aure.totk.setup.UPDATE";
     public static void openOnGame(android.app.Activity game) {}
+}''',
+    'com/aure/totk/Updates.java': '''package com.aure.totk;
+public final class Updates {
+    public static void check(android.content.Context context, java.util.function.Consumer<String> result) { result.accept(null); }
+}''',
+    'com/aure/totk/setup/UpdatePrompt.java': '''package com.aure.totk.setup;
+public final class UpdatePrompt {
+    public static void show(android.app.Activity activity, String version, java.util.function.Consumer<Boolean> answer) {
+        throw new AssertionError("update networking is outside this companion fixture");
+    }
 }''',
     'android/os/Build.java': '''package android.os;
 public final class Build {
@@ -106,6 +122,7 @@ public class NativeActivity extends Activity {
     protected void onStop() {}
     protected void onDestroy() { destroy.run(); }
     public boolean isFinishing() { return false; }
+    public boolean hasWindowFocus() { return true; }
     public Window getWindow() { return new Window(); }
     public android.view.Display getDisplay() { return new android.view.Display(); }
     public void onWindowFocusChanged(boolean focused) {}

@@ -31,6 +31,10 @@ python3 games/totk/android/build_release.py --ndk <Android NDK r28> --turnip <Tu
 ## Release checklist
 
 - Build from a clean committed checkout with the release key; keep the APK's commit and SHA-256 with the test results.
+- Publish a **full release, not a pre-release**, tagged **`vX.Y.Z`**, so GitHub's `releases/latest` endpoint sees it.
+  Keep the exact asset names **`TotK-Native-<ver>.apk`** and **`TotK-Native-<ver>.apk.sha256`**; automatic updates
+  derive these names. The checksum file must be `sha256sum` format: `<64 hex>  TotK-Native-<ver>.apk`.
+  Keep versionName `X.Y.Z` and a strictly increasing versionCode; names containing `-` disable automatic checks.
 - **Test with SELinux enforcing**, not just on rooted permissive devices: decrypted setup to private storage, game
   startup/save loading and gameplay, Saves Import/Export, and container setup into picked internal shared storage and
   an SD card when present. Use the actual Settings UI for All files access. Follow

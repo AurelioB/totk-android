@@ -88,7 +88,7 @@ class InstallState {
 JAVA_ACTIVITY = r'''
 }
 public final class SetupActivity extends BaseActivity {
-    enum Screen { HOME, SAVES, WELCOME, DATA, STORAGE, SETUP_STORAGE, INSTALL }
+    enum Screen { HOME, SAVES, WELCOME, DATA, STORAGE, SETUP_STORAGE, INSTALL, UPDATE_DOWNLOAD }
     boolean ui, started = true, uiStarted, closingGame, closeSent, noteOk;
     GameLock.Result gameState = InstallState.next;
     final List<View> gameControls = new ArrayList<>();
@@ -108,6 +108,11 @@ public final class SetupActivity extends BaseActivity {
     static final long REFRESH_MS = 500;
     Screen screen = Screen.HOME;
     final File files;
+    Object updater;
+    void requestedUpdate() {}
+    void offerPendingUpdate() {}
+    void updateInstallResult() {}
+    void updateDownloadProgress() {}
     int renders, statuses, syncs, checks, notices;
     SetupActivity(File files) throws IOException { this.files = files; Files.createDirectories(new File(files, "state").toPath()); }
     File getFilesDir() { return files; }

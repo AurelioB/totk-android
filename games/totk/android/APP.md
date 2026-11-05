@@ -34,6 +34,29 @@ after success with usable art; cancellation/failure returns Home. `artDeclined` 
 install; a Game data build or deleting imported data clears it. `startAfterArt` preserves the requested build-then-play
 through activity/process recreation. Pure-Java decisions are covered by `tests/test_android_art_policy.py`.
 
+**App updates:** `TotkActivity` starts one background `Updates.check` per native game process, including skip-menu
+launches. It requires active-network INTERNET + VALIDATED capabilities, a stable `X.Y.Z` versionName and the
+default-On update switch. It performs exactly one HEAD to GitHub `releases/latest`, redirects disabled, no body read;
+connect/read timeouts plus a five-second delivery deadline bound the check. Only an exact HTTPS github.com
+`/AurelioB/totk-android/releases/tag/vX.Y.Z` Location newer by semantic version triggers a prompt. No telemetry, retry,
+prerelease tags or automatic download. A private root-written source override enables test-package checks
+([developer settings](../../../docs/developer-settings.md#private-update-source-for-device-tests)).
+`UpdatePrompt` reuses menu fonts, panels and controller-focusable rows over the game. It explicitly holds
+`nativeGameFocus(false, true)` while open, including on dual-screen devices; focus callbacks cannot release it.
+The version is stored atomically in private `pending-update.txt`. Next time leaves it for a menu prompt before Home
+on a later launch, without another request. Update now opens the `:setup` menu with an update intent; `SetupActivity`
+reuses `needGameClosed` / `closeGame`, save-busy, GameControlService thaw and close-request before `UpdateInstaller`.
+The Updates setup step precedes Prepare; About has the same switch (`update-checks.txt`; absent means On).
+The cancellable progress screen downloads APK + checksum into cache. Every redirect requires HTTPS github.com or
+`*.githubusercontent.com`; the root-only test origin is the sole HTTP exception. SHA-256, own package, strictly newer
+versionCode and the installed current signing certificate's SHA-256 are checked. Unknown-sources permission is
+explained and rechecked on return from Settings. Denial or installer failure keeps the pending version with a clear
+note. A PackageInstaller session and explicit non-exported `:setup` UpdateReceiver handle Android's confirmation,
+not a FileProvider. Temporary downloads are removed on completion/cancel/error or next menu startup after interruption.
+Saves/game data are untouched. New permissions: INTERNET, ACCESS_NETWORK_STATE, REQUEST_INSTALL_PACKAGES.
+Host policy coverage: `tests/test_android_updates.py`.
+
+
 All play paths converge on `SetupActivity.launchGame`: Start game/Play now, the launcher's direct-game preference,
 the Settings `ACTION_VIEW` shortcut followed by Start game, and success after Prepare second-screen art.
 `GameLaunch.start` uses the same `DisplayClass` built-in-panel classification as the companion, relative to

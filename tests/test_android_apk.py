@@ -134,7 +134,9 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(sorted(a[(A, 'name')][1] for t, a in m['all'] if t == 'uses-permission'),
                          sorted(['android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_DATA_SYNC',
                                  'android.permission.POST_NOTIFICATIONS', 'android.permission.WAKE_LOCK',
-                                 'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE']))
+                                 'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE',
+                                 'android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE',
+                                 'android.permission.REQUEST_INSTALL_PACKAGES']))
         app = m['application']
         self.assertEqual(app[(A, 'label')], (3, 'TotK Native'))
         for name, value in (('hasCode', TRUE), ('debuggable', FALSE), ('extractNativeLibs', TRUE), ('allowBackup', FALSE),
@@ -165,6 +167,10 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(control[(A, 'exported')], FALSE)
         self.assertNotIn((A, 'process'), control)
         self.assertNotIn((A, 'foregroundServiceType'), control)
+        receiver = by_name(m, 'receiver', 'com.aure.totk.setup.UpdateReceiver')
+        self.assertEqual(receiver[(A, 'exported')], FALSE)
+        self.assertEqual(receiver[(A, 'process')], (3, ':setup'))
+        self.assertEqual(app[(A, 'usesCleartextTraffic')], TRUE)
         self.assertNotIn((A, 'process'), app)
         # One launcher entry: the setup screen; the game is started by it once install.json says playable.
         tags = [t for t, _ in m['all']]

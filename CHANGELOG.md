@@ -7,6 +7,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 
 Fixes for the first reports, plus a few improvements.
 
+- Updates: when the game starts, the app checks GitHub for a newer version (one tiny request, only when online, never delays the game) and offers to download and install it; a setup step and a menu switch turn it off.
+
 ### Game
 - The game pauses, with its sound, while it's in the background or the recent-apps screen is open (on dual-screen
   devices, using the other screen doesn't pause it).

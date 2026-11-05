@@ -53,10 +53,11 @@ refused with an explanation. Other versions are not supported.
 
 ## Install
 
-1. Download `totk-native.apk` from the project's Releases page and install it (allow installs from your browser or file
+1. Download `TotK-Native-<version>.apk` from the project's Releases page and install it (allow installs from your browser or file
    manager). It installs side by side with older test builds.
 2. Open **TotK Native**. The setup screen asks for the files of your route. Pick them with the file picker; nothing is
    uploaded anywhere.
+   Before Prepare, the **Updates** step lets you turn off **Check for updates when the game starts** (On by default).
 3. Setup runs in the foreground (a notification shows progress; keep the device charged). It rewrites the game code for
    Android, copies and verifies the RomFS (reading, hashing and writing overlap, so the copy runs at the storage's
    speed), indexes it, writes the shared fonts from the bundled open Noto Sans font, then builds the Vulkan shader seed
@@ -95,6 +96,26 @@ directly next time*; long-press the app icon and choose *Settings* to reach the 
 **−** and then **R** quickly to cycle the performance overlay (off → FPS → full) for that session. An install without a
 usable shader seed (an earlier version's *Play now* could skip it, or its files were removed) shows *Shaders not built*
 and offers *Build shaders* in place of *Start game*; the game is not started without the seed.
+
+## Versions and updates
+
+App versions and the supported game version are separate: app 1.0.1 still runs your game dump 1.4.3.
+Install a newer APK **over the existing app**, never uninstall first: saves, imported game data and settings survive.
+Only an APK for the same package signed with the same key can update it.
+
+By default the game checks GitHub's latest stable release once at startup, in the background, only on a validated
+internet connection. It sends no personal or game information, reads no response body, and never delays launch.
+Disable it in **About → Check for updates when the game starts**, or in setup's **Updates** step.
+**Update now** pauses the game and uses the menu's save-safe close before downloading into the app's cache.
+**Next time** keeps the version and offers **Update / Not now** before Home on the next launch, including offline.
+The download needs a connection; Cancel or an error leaves the installed app unchanged and keeps the pending version.
+
+The download is checked against the release's `.sha256`, then checked for the app's package, a newer version code and
+the installed app's signing certificate. Android may ask you to enable **Allow from this source** for TotK Native;
+return to the app afterwards to continue. Denying it returns to Home and keeps the update for next time. Android's
+installer still asks for confirmation. Downloaded files are removed afterwards. The system may close the app when
+the update finishes; open it again normally.
+
 
 ## The second screen (dual-screen devices)
 

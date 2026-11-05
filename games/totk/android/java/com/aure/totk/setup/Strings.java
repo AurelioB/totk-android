@@ -16,6 +16,17 @@ final class Strings {
     static final String UPSTREAM_URL = "https://github.com/ly05010419/MacNativeGames";
     static final String ANDROID_PORT_URL = "https://github.com/kitcatkode/MacNativeGames";
 
+    static final String UPDATES = "Updates";
+    static final String UPDATE_CHECK = "Check for updates when the game starts";
+    static final String UPDATE_PRIVACY = "Only asks GitHub for the latest version number. Nothing about you or your game is sent. You choose when to install.";
+    static final String UPDATE_NOW = "Update now", UPDATE_NEXT_TIME = "Next time";
+    static final String UPDATE_CLOSE_HINT = "Close the game safely, then download and install";
+    static final String UPDATE_NEXT_HINT = "Ask in the menu next launch, even offline";
+    static final String UPDATE_GAME_BODY = "The game is paused. Your saves and game data stay on this device.";
+    static final String UPDATE_MENU_BODY = "Download and install the new version? Your saves and game data will be kept. A network connection is needed to download.";
+    static final String UPDATE_ALLOW = "Allow app updates";
+    static final String UPDATE_ALLOW_BODY = "Android needs permission for TotK Native to install its own update. Enable “Allow from this source”, then return here to continue. You will still confirm the installation.";
+    static String updateAvailable(String version) { return "TotK Native " + version + " is available"; }
     // Button prompts
     static final String P_SELECT = "Select", P_QUIT = "Quit", P_START = "Start game", P_DEFAULTS = "Defaults", P_CHANGE = "Change";
     static final String P_ADJUST = "Adjust", P_BACK = "Back", P_CHOOSE = "Choose", P_INSTALL = "Install", P_CANCEL = "Cancel";

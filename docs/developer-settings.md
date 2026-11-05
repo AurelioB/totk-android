@@ -25,6 +25,26 @@ only with root (release builds are not debuggable); developer installs made with
 A benchmark or bug report made with a `totk.env` present is not on the device's default profile: say so, or remove the
 file first (the benchmark tools warn about it, see [benchmarks](benchmarks/)).
 
+## Private update source for device tests
+
+`<filesDir>/update-source.txt` is an optional, root-written file containing only a base origin, for example
+`http://192.168.8.2:8042`. It is not an intent extra, preference, exported provider or menu option: other apps cannot
+write the app's private files. Remove it after testing. Never ship it.
+The `com.aure.totk.test` package never checks for updates unless this file exists; development versionNames containing
+`-` still never check. The ordinary update switch and validated-connectivity requirement still apply.
+
+The fake server must answer one `HEAD /AurelioB/totk-android/releases/latest` with `302` and an absolute `Location`
+on that same origin ending `/AurelioB/totk-android/releases/tag/vX.Y.Z`. Serve
+`/AurelioB/totk-android/releases/download/vX.Y.Z/TotK-Native-X.Y.Z.apk` and the same path plus `.sha256`.
+The asset prefix is the single `UpdateRules.ASSET_PREFIX` constant; test APKs can be served under that production
+filename. The checksum is `<64 hex>  TotK-Native-X.Y.Z.apk`. The APK must be the test package, newer than the installed
+test APK, and signed with its same key. HTTP and redirects within the override's exact origin are allowed only for
+this private override; production downloads require HTTPS and GitHub/GitHubusercontent hosts on every hop.
+Checks never follow redirects or read a body; the five-second whole-check deadline includes connect/read/DNS.
+Pending versions and the default-On switch live in private `pending-update.txt` and `update-checks.txt`, read across
+both processes without a SharedPreferences cache. They contain no URL; changing the source requires this private file.
+
+
 ## What the menu writes
 
 `Settings.env()` (`games/totk/android/java/com/aure/totk/setup/Settings.java`, host-tested in

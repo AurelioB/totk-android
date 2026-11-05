@@ -26,6 +26,28 @@ public final class TotkActivity extends NativeActivity {
     private AttachedSurfaceControl.OnBufferTransformHintChangedListener presentHintListener;
     private long presentEpoch;
     private boolean displayMoveRequested;
+    private static boolean updateChecked;
+    private boolean updateOpen;
+    private String updateVersion;
+    private void showUpdate() {
+        if (!resumed || updateVersion == null || updateOpen || isFinishing()) return;
+        String version = updateVersion;
+        updateVersion = null;
+        updateOpen = true;
+        // Explicitly pause on both single- and dual-screen devices, independent of window focus.
+        nativeGameFocus(false, true);
+        com.aure.totk.setup.UpdatePrompt.show(this, version, now -> {
+            updateOpen = false;
+            if (now) {
+                try {
+                    startActivity(new Intent(this, SetupActivity.class).setAction(Intent.ACTION_VIEW)
+                            .putExtra(SetupActivity.EXTRA_UPDATE, true));
+                } catch (RuntimeException failed) { Log.w("TotkGame", "Could not open the update menu", failed); }
+            }
+            boolean single = PresentationController.secondScreen(this, getDisplay()) == DisplayClass.NONE;
+            nativeGameFocus(hasWindowFocus(), single);
+        });
+    }
     private static native void nativePresentTransformHint(long epoch, int hint);
     private static native void nativeTextInputDone(long serial, byte[] utf8);
     private static native void nativeGameFocus(boolean focused, boolean singleDisplay);
@@ -107,6 +129,10 @@ public final class TotkActivity extends NativeActivity {
         saves = SaveMirror.Watcher.start(this);
         int given = nativeFeedbackEnabled();   // what start_game gave the game (TOTK_RUMBLE / TOTK_GYRO and the hardware)
         if (given != 0 && !isFinishing()) feedback = new GameFeedback(this, given);
+        if (!updateChecked) {
+            updateChecked = true;
+            Updates.check(this, version -> { updateVersion = version; showUpdate(); });
+        }
     }
     private boolean settingsRequested;
     /** Reuse/reparent the singleTask game, never finish it: NativeActivity.onDestroy exits the game process. */
@@ -145,6 +171,7 @@ public final class TotkActivity extends NativeActivity {
         ensureMainDisplay();
         GameFeedback f = feedback;
         if (f != null) f.resume();
+        showUpdate();
     }
     @Override public void onTopResumedActivityChanged(boolean top) {
         super.onTopResumedActivityChanged(top);
@@ -157,7 +184,7 @@ public final class TotkActivity extends NativeActivity {
         // focus loss must pause too, and focus return need not call onResume.
         // Never apply that policy to multi-resume on a second display.
         boolean single = PresentationController.secondScreen(this, getDisplay()) == DisplayClass.NONE;
-        nativeGameFocus(focused, single);
+        nativeGameFocus(focused && !updateOpen, single || updateOpen);
         GameFeedback f = feedback;
         if (single && f != null) {
             if (focused && resumed) f.resume();

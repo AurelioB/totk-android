@@ -36,7 +36,9 @@ SETUP_PROCESS = ':setup'
 # android/APP.md for what a Play build would have to remove).
 PERMISSIONS = ('android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_DATA_SYNC',
                'android.permission.POST_NOTIFICATIONS', 'android.permission.WAKE_LOCK',
-               'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE')
+               'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE',
+               'android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE',
+               'android.permission.REQUEST_INSTALL_PACKAGES')
 
 # android.R.attr resource ids of the manifest attributes used here (checked against aapt2 link with android.jar)
 ATTR = {
@@ -47,6 +49,7 @@ ATTR = {
     'drawable': 0x01010199, 'roundIcon': 0x0101052c, 'foregroundServiceType': 0x01010599, 'hasFragileUserData': 0x0101059a,
     'fullBackupContent': 0x010104eb, 'dataExtractionRules': 0x0101063e,
     'relinquishTaskIdentity': 0x01010476,
+    'usesCleartextTraffic': 0x010104ec,
 }
 THEME_NOTITLEBAR_FULLSCREEN = 0x01030007   # @android:style/Theme.NoTitleBar.Fullscreen
 THEME_TRANSLUCENT_FULLSCREEN = 0x01030011  # @android:style/Theme.Translucent.NoTitleBar.Fullscreen (no flash when setup forwards to the game)
@@ -102,7 +105,10 @@ def manifest_tree(package, label, version_code, version_name, min_sdk, target_sd
                          (A, 'extractNativeLibs', 'bool', True), (A, 'isGame', 'bool', True), (A, 'theme', 'ref', THEME_NOTITLEBAR_FULLSCREEN),
                          # Saves and setup state stay on the device: no cloud/adb backup of the app's private files, and
                          # Android asks before removing the (large, player-supplied) data on uninstall.
-                         (A, 'allowBackup', 'bool', False), (A, 'hasFragileUserData', 'bool', True)]
+                         (A, 'allowBackup', 'bool', False), (A, 'hasFragileUserData', 'bool', True),
+                         # Only the private, root-written update-source.txt override can use HTTP; production update
+                         # URLs and every redirect are checked in Java before opening a connection.
+                         (A, 'usesCleartextTraffic', 'bool', True)]
                          + ([(A, 'dataExtractionRules', 'ref', backup['data_extraction_rules']),
                              (A, 'fullBackupContent', 'ref', backup['backup_rules'])] if backup else [])
                          + ([(A, 'icon', 'ref', icon)] if icon is not None else [])
@@ -123,6 +129,8 @@ def manifest_tree(package, label, version_code, version_name, min_sdk, target_sd
             ('service', [(A, 'name', 'str', SETUP_SERVICE), (A, 'exported', 'bool', False), (A, 'process', 'str', SETUP_PROCESS),
                          (A, 'foregroundServiceType', 'hex', FOREGROUND_DATA_SYNC)], []),
             ('service', [(A, 'name', 'str', GAME_CONTROL_SERVICE), (A, 'exported', 'bool', False)], []),
+            ('receiver', [(A, 'name', 'str', 'com.aure.totk.setup.UpdateReceiver'), (A, 'exported', 'bool', False),
+                          (A, 'process', 'str', SETUP_PROCESS)], []),
         ]),
     ])
 

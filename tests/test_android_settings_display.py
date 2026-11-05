@@ -18,13 +18,14 @@ class Bundle { int display; Bundle(int id) { display=id; } }
 class Display { static final int DEFAULT_DISPLAY=0; int id; Display(int id) { this.id=id; } int getDisplayId(){return id;} }
 class Intent {
     static final int FLAG_ACTIVITY_NEW_TASK=0x10000000, FLAG_ACTIVITY_SINGLE_TOP=0x20000000, FLAG_ACTIVITY_REORDER_TO_FRONT=0x20000;
-    static final String ACTION_VIEW="view";
+    static final String ACTION_VIEW="view", ACTION_MAIN="main";
     final Map<String,Object> extras=new HashMap<>(); int flags;
     Intent putExtra(String key,boolean value){extras.put(key,value);return this;}
     Intent() {} Intent(Intent other){extras.putAll(other.extras); flags=other.flags;}
     Intent addFlags(int value){flags|=value;return this;}
     Intent setFlags(int value){flags=value;return this;}
     Intent(Activity owner,Class<?> type){} Intent setAction(String action){return this;} int getFlags(){return flags;}
+    String getAction(){return ACTION_VIEW;}
     boolean getBooleanExtra(String key,boolean fallback){return (boolean)extras.getOrDefault(key,fallback);}
     String getStringExtra(String key){return (String)extras.get(key);}
 }
@@ -187,10 +188,13 @@ class SettingsDisplayTests(unittest.TestCase):
         body = (move + new_intent + shortcut + route).replace('private boolean', 'boolean').replace('private void', 'void').replace('private static java.lang.ref.', 'static java.lang.ref.').replace('android.app.Activity', 'Activity').replace('android.view.Display', 'Display').replace('android.util.Log', 'Log')
         wrapper = r'''
 class SetupActivity extends Activity {
-    static final String EXTRA_SETTINGS="settings",EXTRA_GAME_ERROR="error";
+    static final String EXTRA_SETTINGS="settings",EXTRA_GAME_ERROR="error",EXTRA_UPDATE="update";
     enum Screen {HOME,WELCOME,DATA,INSTALL,ERROR,INTERRUPTED}
     boolean ui,closingGame; Runnable blockedAction; Screen screen,recovery=Screen.HOME;
     String gameError; int shown,replacements;
+    boolean pendingAsked;
+    void requestedUpdate() {}
+    void offerPendingUpdate() {}
     void showUi(){ui=true;shown++;screen=recovery;}
     boolean returnToRunningGame(Intent intent){return false;}
     void replace(Screen value){screen=value;replacements++;} void render(){}

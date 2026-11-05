@@ -46,6 +46,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import com.aure.totk.GameLaunch;
 import com.aure.totk.GameControlService;
+import com.aure.totk.UpdateRules;
+import com.aure.totk.Updates;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -77,12 +79,13 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     static final String EXTRA_SETTINGS = "com.aure.totk.setup.SETTINGS";
     /** Why the game process stopped (TotkActivity.showGameError, just before it aborted): Home says so until the next start. */
     public static final String EXTRA_GAME_ERROR = "com.aure.totk.setup.GAME_ERROR";
+    public static final String EXTRA_UPDATE = "com.aure.totk.setup.UPDATE";
     private static final String[] ALL_ROLES = {"romfs", "exefs", "base", "update", "keys"};
     private static final int REQ_PICK = 100, REQ_DRIVER = 900, REQ_NOTIFY = 901, REQ_EXPORT = 902, REQ_IMPORT_ZIP = 903, REQ_IMPORT_TREE = 904, REQ_MIRROR = 905,
             REQ_DATA_FOLDER = 906, REQ_ACCESS = 907;
     private static final String[] TABS = {Settings.PERFORMANCE, Settings.PICTURE, Settings.SCREEN};
 
-    private enum Screen { WELCOME, SETUP_STORAGE, ROUTE, FILES, INSTALL, ERROR, INTERRUPTED, HOME, GRAPHICS, CONTROLS, DATA, STORAGE, ABOUT, LICENSES,
+    private enum Screen { WELCOME, SETUP_STORAGE, ROUTE, FILES, UPDATES, UPDATE_DOWNLOAD, INSTALL, ERROR, INTERRUPTED, HOME, GRAPHICS, CONTROLS, DATA, STORAGE, ABOUT, LICENSES,
         LICENSE_TEXT, CONFIRM_DELETE, SAVE_ERROR, SAVES, BACKUPS, SAVE_IMPORT, SAVE_CONFLICT, CHOICE }
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -183,6 +186,93 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private TextView gameNotice;
     private boolean started, uiStarted;
     private Widgets.Action closeGameAction;
+    private UpdateInstaller updater;
+    private TextView updateProgress;
+    private boolean pendingAsked;
+
+    private String pendingUpdate() { return UpdateRules.pending(getFilesDir(), Updates.version(this)); }
+    private void offerPendingUpdate() {
+        if (pendingAsked || screen != Screen.HOME || getIntent().getBooleanExtra(EXTRA_UPDATE, false)) return;
+        String version = pendingUpdate();
+        if (version == null) return;
+        pendingAsked = true;
+        openChoice("about", Strings.UPDATES, Strings.updateAvailable(version), Strings.UPDATE_MENU_BODY,
+                new Object[]{"update:now", "Update", Strings.UPDATE_CLOSE_HINT, false, (Runnable) this::startAppUpdate},
+                new Object[]{"update:later", "Not now", "Keep this update for next launch", false, (Runnable) () -> replace(Screen.HOME)});
+    }
+    private void requestedUpdate() {
+        if (!started || !getIntent().getBooleanExtra(EXTRA_UPDATE, false)) return;
+        getIntent().removeExtra(EXTRA_UPDATE);
+        pendingAsked = true;
+        startAppUpdate();
+    }
+    private void startAppUpdate() {
+        String version = pendingUpdate();
+        if (version == null || updater != null) return;
+        if (SetupService.status.running) { showNote("Finish preparing the game before updating the app."); return; }
+        if (!needGameClosed("Updating the app", this::startAppUpdate)) { closeGame(); return; }
+        updater = new UpdateInstaller(this, new UpdateInstaller.Listener() {
+            @Override public void changed() { if (!isDestroyed()) replace(Screen.UPDATE_DOWNLOAD); }
+            @Override public void permission() {
+                openChoice("about", Strings.UPDATES, Strings.UPDATE_ALLOW, Strings.UPDATE_ALLOW_BODY,
+                        new Object[]{"update:allow", "Open Android settings", "Allow from this source, then return", false, (Runnable) () -> updater.openPermission()},
+                        new Object[]{"update:cancel", "Not now", "Keep the update for next launch", false, (Runnable) () -> updater.cancel()});
+            }
+            @Override public void finished(String message) { finishAppUpdate(message); }
+        });
+        updater.begin(version);
+    }
+    private void finishAppUpdate(String message) {
+        if (updater != null) { updater.dispose(); updater = null; }
+        replace(InstallState.read(this).installed() ? Screen.HOME : Screen.WELCOME);
+        note = message; noteOk = false; render();
+    }
+    private void updateInstallResult() {
+        String message = UpdateReceiver.takeResult(this);
+        if (!message.isEmpty()) finishAppUpdate(message);
+    }
+    private Widgets.Row updateSwitch(LinearLayout parent) {
+        Widgets.Row row = new Widgets.Row(this, Strings.UPDATE_CHECK, "On by default · no uploads or automatic installation", 26, 18);
+        row.setTag("update:checks");
+        Widgets.Toggle toggle = new Widgets.Toggle(this);
+        toggle.set(UpdateRules.enabled(getFilesDir()));
+        row.value(toggle);
+        Runnable change = () -> {
+            try { UpdateRules.enabled(getFilesDir(), !UpdateRules.enabled(getFilesDir())); toggle.set(UpdateRules.enabled(getFilesDir())); }
+            catch (IOException failed) { showNote("Could not save the update setting: " + failed.getMessage()); }
+        };
+        row.setOnClickListener(v -> change.run());
+        row.adjust(direction -> change.run());
+        parent.addView(row, Widgets.rowParams(108, 18));
+        return row;
+    }
+    private void updates() {
+        setupHeader(Strings.SETUP_TITLE); rail(3, false);
+        Widgets.Panel box = setupMain();
+        heading(box, Strings.UPDATES, 36);
+        lead(box, Strings.UPDATE_PRIVACY, 20);
+        primary = updateSwitch(box);
+        Widgets.Action next = new Widgets.Action(this, "Prepare", true, v -> requestNotificationsThen(() -> startSetup(null)));
+        board.put(next, 1790, 880, Widgets.Board.WRAP, Widgets.Board.WRAP, Widgets.Board.END, Widgets.Board.END);
+        prompts(prompt("A", Strings.P_SELECT, v -> selectFocused()), backPrompt(), prompt("+", "Prepare", v -> next.performClick()));
+    }
+    private void appUpdateDownload() {
+        header("about", Strings.UPDATES, 0, null);
+        Widgets.Panel box = panel(340, 240, 1240, 560, true, 50, 44);
+        heading(box, updater == null ? Strings.UPDATES : "TotK Native " + updater.version, 36);
+        updateProgress = Theme.paragraph(this, "", 26, Theme.TEXT2);
+        box.addView(updateProgress, Widgets.margins(Widgets.size(-1, -2), 0, 32, 0, 32));
+        updateDownloadProgress();
+        Widgets.Row cancel = new Widgets.Row(this, "Cancel", "Your installed app, saves and game data are unchanged", 27, 18);
+        cancel.setOnClickListener(v -> { if (updater != null) updater.cancel(); });
+        box.addView(cancel, Widgets.rowParams(100, 0));
+        primary = cancel;
+        prompts(prompt("A", Strings.P_SELECT, v -> selectFocused()), prompt("B", Strings.P_CANCEL, v -> { if (updater != null) updater.cancel(); }));
+    }
+    private void updateDownloadProgress() {
+        if (updater != null && updateProgress != null) updateProgress.setText(updater.status + "\n\n"
+                + Strings.bytes(updater.bytes) + (updater.total > 0 ? " / " + Strings.bytes(updater.total) + " · " + (updater.bytes * 100 / updater.total) + "%" : ""));
+    }
 
     /** Gated controls remain focusable on handhelds; activation records the intended retry, never the mutation. */
     private void gameControl(View view, String need, Runnable retry) {
@@ -224,7 +314,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         closeGameAction = new Widgets.Action(this, Strings.CLOSE_GAME, false, v -> closeGame());
         closeGameAction.setTag("close-game");
         board.put(closeGameAction, 1840, 930, Widgets.Board.WRAP, Widgets.Board.WRAP, Widgets.Board.END, Widgets.Board.START);
-        if (blockedAction == null && screen == Screen.FILES) { blockedAction = () -> requestNotificationsThen(() -> startSetup(null)); blockedNeed = "Installing"; }
+        if (blockedAction == null && screen == Screen.FILES) { blockedAction = () -> go(Screen.UPDATES); blockedNeed = "Installing"; }
         updateGameNotice();
     }
     private void updateGameNotice() {
@@ -421,8 +511,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
      * This is a direct task return, not another startup/save sync, and must not cancel a pending safe close. */
     private boolean returnToRunningGame(Intent intent) {
         if (closingGame || !Intent.ACTION_MAIN.equals(intent.getAction()) || !intent.hasCategory(Intent.CATEGORY_LAUNCHER)
-                || intent.getBooleanExtra(EXTRA_SETTINGS, false) || intent.hasExtra(EXTRA_GAME_ERROR)
-                || !SettingsStore.secondaryDisplay(this)
+                || intent.getBooleanExtra(EXTRA_SETTINGS, false) || intent.hasExtra(EXTRA_GAME_ERROR) || intent.hasExtra(EXTRA_UPDATE)
+                || pendingUpdate() != null || !SettingsStore.secondaryDisplay(this)
                 || InstallState.gameState(this).state != GameLock.State.GAME) return false;
         try {
             GameLaunch.start(this);
@@ -457,7 +547,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         if (moveSettingsToMain(getIntent())) return;
         if (returnToRunningGame(getIntent())) return;
         // After a game error the menu is shown (with the reason) even when it is set to start the game directly.
-        if (gameError == null && !settingsShortcut && !SetupService.status.running && !SetupService.jobActive(this) && InstallState.read(this).playable()
+        if (gameError == null && !settingsShortcut && !getIntent().getBooleanExtra(EXTRA_UPDATE, false) && pendingUpdate() == null
+                && !SetupService.status.running && !SetupService.jobActive(this) && InstallState.read(this).playable()
                 && SettingsStore.skipMenu(this) && StorageLocation.available(this) && !StorageLocation.migrationPending(this, true)) {
             // translucent theme + no content: nothing flashes before the game. A save folder is synced first (newer
             // saves from it are brought in); a conflict needs the player, so it opens the menu instead.
@@ -489,11 +580,14 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             gameError = error;
             if (!ui) showUi(); else if (screen == Screen.HOME) render();
         }
+        if (intent.getBooleanExtra(EXTRA_UPDATE, false)) { if (!ui) showUi(); requestedUpdate(); }
+        else if (Intent.ACTION_MAIN.equals(intent.getAction()) && ui) { pendingAsked = false; offerPendingUpdate(); }
     }
     @Override protected void onStart() {
         super.onStart();
         started = true;
         startUi();
+        requestedUpdate();
     }
     /** showUi can finish after onStart (a save-folder conflict while skipping the menu). Register exactly once. */
     private void startUi() {
@@ -513,6 +607,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         super.onResume();
         completeSettingsMove();
         if (ui) refreshGameState();
+        if (ui) updateInstallResult();
     }
     @Override protected void onStop() {
         started = false;
@@ -543,6 +638,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         @Override public void run() {
             if (!uiStarted) return;
             if (screen == Screen.INSTALL) onStatus();
+            if (screen == Screen.UPDATE_DOWNLOAD) updateDownloadProgress();
+            if (updater != null) updateInstallResult();
             if (cancelArmedAt != 0 && SystemClock.uptimeMillis() - cancelArmedAt > 3000) disarmCancel();
             if (SystemClock.uptimeMillis() - gameCheckedAt >= 1000) {
                 gameCheckedAt = SystemClock.uptimeMillis();
@@ -553,6 +650,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     };
     @Override protected void onDestroy() {
         cancelClose();
+        if (updater != null) updater.dispose();
         worker.shutdownNow();
         saveWorker.shutdown();   // never interrupted: an upload or swap in progress finishes (FileChannels close on interrupt)
         super.onDestroy();
@@ -578,6 +676,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
         }
         inputs = Inputs.load(this);
+        UpdateReceiver.clean(this);
         settings = SettingsStore.load(this);
         publishShortcut();
         InstallState install = InstallState.read(this);
@@ -612,12 +711,14 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         else if (!inputs.route.isEmpty() && !inputs.items.isEmpty()) { history.push(Screen.WELCOME); history.push(Screen.ROUTE); screen = Screen.FILES; }
         else screen = Screen.WELCOME;
         loadSaves();
-        if (screen == Screen.HOME) updateOutdatedArt(install);
+        if (screen == Screen.HOME && pendingUpdate() == null) updateOutdatedArt(install);
         pulledChip = SaveMirror.takePulled(this);
         if (moveNote != null) { note = moveNote; noteOk = moveOk; }
         if (screen == Screen.INSTALL && !SetupService.status.running && result.has("ok")) main.post(this::finished);
         render();
         startUi();
+        offerPendingUpdate();
+        updateInstallResult();
     }
     /** A move killed after its copy was committed (the folder choice switched or not, settings.env written or not, the
      * old copy partly removed) is made consistent again: settings.env is rewritten from the folder choice, and when the
@@ -758,6 +859,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private void replace(Screen next) { history.clear(); if (next != Screen.GRAPHICS) setupFinished = false; screen = next; note = ""; noteOk = false; restoreFocus = PRIMARY; render(); }
     private void back() {
         if (!closingGame) blockedAction = null;
+        if (updater != null && (screen == Screen.UPDATE_DOWNLOAD || screen == Screen.CHOICE)) { updater.cancel(); return; }
+        if (screen == Screen.UPDATES) { if (!history.isEmpty()) history.pop(); screen = Screen.FILES; render(); return; }
         if (screen == Screen.INSTALL && SetupService.status.running) { moveTaskToBack(true); return; }
         if (history.isEmpty()) { finish(); return; }
         setupFinished = false;
@@ -806,6 +909,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private void plus() {
         if (menuScreen()) startGame();
         else if (screen == Screen.FILES && installAction != null && installAction.isEnabled()) installAction.performClick();
+        else if (screen == Screen.UPDATES) requestNotificationsThen(() -> startSetup(null));
         else if (screen == Screen.INSTALL && playPrompt != null && playPrompt.getVisibility() == View.VISIBLE) playNow();
     }
     private void defaults() {
@@ -842,6 +946,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         storageBar = null; ring = null; installAction = null; installPrompt = cancelPrompt = playPrompt = otherPrompt = null; skipToggle = null;
         detailFacts = null; detailTitle = detailText = detailConstraint = null; detailDiagram = null; detailNote = null; detailId = "";
         slotGrid = null; slotLine = null;
+        updateProgress = null;
         primary = null; cancelArmedAt = 0;
     }
     private int seed() {
@@ -875,6 +980,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             case WELCOME: welcome(); break;
             case ROUTE: route(); break;
             case FILES: files(); break;
+            case UPDATES: updates(); break;
+            case UPDATE_DOWNLOAD: appUpdateDownload(); break;
             case INSTALL: install(); break;
             case ERROR: error(); break;
             case INTERRUPTED: interrupted(); break;
@@ -2236,6 +2343,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         Widgets.Row licencesRow = listRow(list, "about:licences", Strings.LICENCES_ROW, Strings.LICENCES_HINT, 92, 18);
         licencesRow.setOnClickListener(v -> go(Screen.LICENSES));
         Widgets.Row project = listRow(list, "about:project", Strings.PROJECT_ROW, Strings.PROJECT_URL, 92, 18);
+        Widgets.Row updateRow = updateSwitch(list);
         detailPanel();
         detailNote.setVisibility(View.GONE);
         View.OnFocusChangeListener detail = (v, has) -> {
@@ -2252,6 +2360,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             } else if (v == licencesRow) {
                 detailTitle.setText(Strings.LICENCES_ROW); detailText.setText(Strings.LICENCES_TEXT);
                 fact("Files", String.valueOf(licenceFiles().size()));
+            } else if (v == updateRow) {
+                detailTitle.setText(Strings.UPDATES); detailText.setText(Strings.UPDATE_PRIVACY);
             } else {
                 detailTitle.setText(Strings.PROJECT_ROW); detailText.setText(Strings.PROJECT_TEXT);
                 fact(Strings.UPSTREAM_ROW, Strings.UPSTREAM_BY);
@@ -2259,6 +2369,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             }
         };
         versionRow.setOnFocusChangeListener(detail); licencesRow.setOnFocusChangeListener(detail); project.setOnFocusChangeListener(detail);
+        updateRow.setOnFocusChangeListener(detail);
         primary = versionRow;
         prompts(prompt("A", Strings.P_SELECT, v -> selectFocused()), backPrompt(), startPrompt());
     }
@@ -2335,21 +2446,21 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
 
     // ---------- setup: shared ----------
-    /** The step rail (05-setup-files): 1 storage (private storage, an SD card or a folder, and the optional All files
-     * access), 2 what you have, 3 files, 4 prepare, 5 graphics. current: 0 = storage, 1..4 the others. */
+    /** Setup rail: Storage, What you have, Files, Updates, Prepare, Graphics. */
     private void rail(int current, boolean failed) {
         Widgets.Panel steps = panel(80, 186, 470, 720, false, 40, 44);
         List<String[]> items = new ArrayList<>();
         items.add(new String[]{Strings.STEP_STORAGE, current > 0 ? StorageLocation.label(this) : Strings.STEP_STORAGE_TEXT});
         items.add(new String[]{Strings.STEP_ROUTE, Strings.routeName(current > 1 ? inputs.route : "")});
         items.add(new String[]{Strings.STEP_FILES, Strings.STEP_FILES_TEXT});
+        items.add(new String[]{Strings.UPDATES, "Choose automatic version checks"});
         items.add(new String[]{Strings.STEP_PREPARE, Strings.prepareEstimate(inputs.route)});
         items.add(new String[]{Strings.STEP_GRAPHICS, Strings.STEP_GRAPHICS_TEXT});
         int at = current + 1;
         for (int i = 0; i < items.size(); i++) {
             int n = i + 1;
             int state = n < at ? Widgets.Step.DONE : n == at ? (failed ? Widgets.Step.FAILED : Widgets.Step.CURRENT) : Widgets.Step.TODO;
-            steps.addView(new Widgets.Step(this, n, items.get(i)[0], items.get(i)[1], state, i == items.size() - 1), Widgets.size(-1, 126));
+            steps.addView(new Widgets.Step(this, n, items.get(i)[0], items.get(i)[1], state, i == items.size() - 1), Widgets.size(-1, 104));
         }
     }
     /** Begin setup: the Storage step first when nothing has been imported anywhere yet. */
@@ -2459,7 +2570,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         alt.setClickable(true);
         alt.setOnClickListener(v -> { history.pop(); screen = Screen.ROUTE; chooseRoute(containers ? Inputs.DECRYPTED : Inputs.CONTAINERS); });
         board.put(alt, 640, 870, Widgets.Board.WRAP, Widgets.Board.WRAP, Widgets.Board.START, Widgets.Board.END);
-        installAction = new Widgets.Action(this, Strings.INSTALL, true, v -> requestNotificationsThen(() -> startSetup(null)));
+        installAction = new Widgets.Action(this, "Continue", true, v -> go(Screen.UPDATES));
         installAction.setTag("install");
         board.put(installAction, 1790, 880, Widgets.Board.WRAP, Widgets.Board.WRAP, Widgets.Board.END, Widgets.Board.END);
         if (primary == null) primary = installAction;
@@ -2561,8 +2672,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         }
         installAction.setEnabled(ready);
         if (installPrompt != null) installPrompt.setEnabled(ready);
-        gameControl(installAction, "Installing", () -> requestNotificationsThen(() -> startSetup(null)));
-        if (installPrompt != null) gameControl(installPrompt, "Installing", () -> requestNotificationsThen(() -> startSetup(null)));
+        gameControl(installAction, "Installing", () -> go(Screen.UPDATES));
+        if (installPrompt != null) gameControl(installPrompt, "Installing", () -> go(Screen.UPDATES));
     }
     private boolean lostRoles(String role) {
         JSONArray lost = inspection == null ? null : inspection.optJSONArray("lost");
@@ -2604,6 +2715,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     @Override protected void onActivityResult(int request, int code, Intent data) {
         super.onActivityResult(request, code, data);
+        if (request == UpdateInstaller.REQUEST_SOURCES) { if (updater != null) updater.permissionReturned(); return; }
         if (code != RESULT_OK || data == null) return;
         if (request == REQ_DRIVER) { if (data.getData() != null) installDriver(data.getData()); return; }
         if (request == REQ_EXPORT) { if (data.getData() != null) writeExport(data.getData()); return; }
@@ -2931,7 +3043,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         JSONObject result = SetupService.lastResult(this);
         String code = result.optString("code", "internal");
         setupHeader(Strings.SETUP_TITLE);
-        rail(3, true);
+        rail(4, true);
         Widgets.Panel box = panel(590, 186, 1250, 720, true, 50, 32);
         heading(box, Strings.ERROR_TITLE, 36);
         String stage = result.optString("stage", "");
@@ -3046,7 +3158,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     private void interrupted() {
         setupHeader(Strings.SETUP_TITLE);
-        rail(3, false);
+        rail(4, false);
         Widgets.Panel box = setupMain();
         heading(box, Strings.INTERRUPTED_TITLE, 36);
         lead(box, Strings.INTERRUPTED_BODY, 14);

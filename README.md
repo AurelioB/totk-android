@@ -90,13 +90,14 @@ Tested devices:
       choose work too.
    2. **What you have**: pick your route.
    3. **Choose your files** with the file picker. Each file is checked as soon as you pick it; when everything is
-      there, press **+** or *Install*.
-   4. **Prepare**: the game is built on the device. With a decrypted dump on internal storage this took about
+      there, press **+** or *Continue*.
+   4. **Updates**: choose whether to check GitHub for a newer app version when the game starts (On by default).
+   5. **Prepare**: the game is built on the device. With a decrypted dump on internal storage this took about
       1 minute 45 seconds on an AYN Thor, 1 minute 40 seconds on an Odin 3 and 3 minutes on a Retroid Pocket Duo. The
       container route also merges the base game and update: about 12 minutes on a Thor with the files and the install
       on an exFAT SD card. The optional second-screen art is skipped on single-screen devices; on dual-screen devices
       you can start playing before it is done.
-   5. **Choose graphics** opens with your device's preset selected. Press **+** to play.
+   6. **Choose graphics** opens with your device's preset selected. Press **+** to play.
 4. Nothing is uploaded: your files stay on the device.
 
 <p align="center">
@@ -373,6 +374,23 @@ component and the project's home.
 
 **X** on the main menu turns on *Open the game directly next time*; to reach the menu again, long-press the app icon
 and choose *Settings*.
+
+## Privacy and app updates
+
+When the game starts, TotK Native checks for a newer stable app release with **one tiny HEAD request to GitHub**,
+only when Android reports a validated internet connection. It runs in the background, never delays the game, and
+does not follow redirects or download a response body. GitHub sees the ordinary connection information (including
+your IP address), but the app sends no identifier, settings, saves, keys or game data. There is no telemetry.
+Offline, errors and timeouts are silent, with no retry during that game session.
+
+The **Updates** setup step and **About → Check for updates when the game starts** switch turn checks off.
+The default is On, including when updating an existing install. Development versions do not check.
+If a new version is found, a controller-friendly dialog pauses the game: **Update now** closes it safely before
+downloading; **Next time** remembers the version and asks in the menu next launch, even offline. Downloads need a
+connection and can be cancelled. The app verifies the APK checksum, package, newer version and matching installed
+signing certificate before Android asks you to allow this app as an install source and confirm installation.
+Updating keeps your saves and game data; **do not uninstall** to update.
+
 
 ## Saves and storage
 
