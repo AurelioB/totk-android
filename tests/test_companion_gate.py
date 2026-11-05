@@ -54,7 +54,7 @@ public class Intent {
     'com/aure/totk/GameLaunch.java': '''package com.aure.totk;
 public final class GameLaunch {
     static boolean onMainScreen(Object activity) { return true; }
-    static void start(Object activity) {}
+    static void start(Object activity, boolean cold) {}
 }''',
     'com/aure/totk/setup/SetupActivity.java': '''package com.aure.totk.setup;
 public final class SetupActivity {

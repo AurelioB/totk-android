@@ -27,18 +27,6 @@ def local_class(source, name):
 FRAMEWORK = r'''
 class Bundle { int display; Bundle(int id) { display = id; } }
 class Configuration {}
-class ActivityManager {
-    static class RecentTaskInfo { Class<?> baseActivity, topActivity; int taskId; }
-    static class AppTask {
-        final RecentTaskInfo info = new RecentTaskInfo();
-        AppTask(Class<?> base) { info.baseActivity = base; info.taskId = base == TotkActivity.class ? 17 : 3; }
-        RecentTaskInfo getTaskInfo() { return info; }
-    }
-    final java.util.List<AppTask> tasks = new java.util.ArrayList<>();
-    java.util.List<AppTask> getAppTasks() { return tasks; }
-    int moves, movedTask; Bundle movedOptions;
-    void moveTaskToFront(int id, int flags, Bundle options) { moves++; movedTask = id; movedOptions = options; }
-}
 class Log { static int warnings; static void w(String tag, String message, Throwable error) { warnings++; } }
 class DeviceProductInfo {
     final int sink; final String pnp;
@@ -69,15 +57,13 @@ class DisplayManager {
 }
 class Context {
     final DisplayManager manager = new DisplayManager();
-    final ActivityManager activities = new ActivityManager();
-    <T> T getSystemService(Class<T> type) { return type.cast(type == ActivityManager.class ? activities : manager); }
+    <T> T getSystemService(Class<T> type) { return type.cast(manager); }
 }
 class Intent {
-    static final int FLAG_ACTIVITY_NEW_TASK = 0x10000000;
+    static final int FLAG_ACTIVITY_NEW_TASK = 0x10000000, FLAG_ACTIVITY_CLEAR_TASK = 0x8000;
     final Class<?> target; int flags;
     Intent(Context owner, Class<?> target) { this.target = target; }
     Intent addFlags(int value) { flags |= value; return this; }
-    Class<?> getComponent() { return target; }
 }
 class ActivityOptions {
     int display;
@@ -131,33 +117,29 @@ public final class GameDisplayProbe {
                 break;
             }
             case "launch": {
-                TotkActivity owner = dual(4, 0);
+                Activity owner = new Activity();
+                owner.manager.secondary = new Display[] {new Display(4, 0, "QCM")};
                 for (Display from : new Display[] {owner.manager.main, owner.manager.secondary[0]}) {
                     owner.current = from;
-                    GameLaunch.start(owner);
+                    GameLaunch.start(owner, true);
                     require(owner.launched.target == TotkActivity.class, "wrong activity");
-                    require(owner.launched.flags == Intent.FLAG_ACTIVITY_NEW_TASK, "task launch flag missing");
+                    require(owner.launched.flags == (Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK), "cold task must get game base Intent");
                     require(owner.options != null && owner.options.display == 0, "not routed to main");
                     require(GameLaunch.onMainScreen(owner) == (from.id == 0), "wrong move decision");
                 }
-                ActivityManager.AppTask menu = new ActivityManager.AppTask(Activity.class);
-                ActivityManager.AppTask existing = new ActivityManager.AppTask(TotkActivity.class);
-                owner.activities.tasks.add(menu); owner.activities.tasks.add(existing);
                 int direct = owner.directLaunches;
-                GameLaunch.start(owner);
-                require(owner.activities.moves == 1 && owner.activities.movedTask == 17 && owner.directLaunches == direct + 1,
-                        "existing game task not moved before the normal game launch");
-                require(owner.activities.movedOptions.display == 0 && owner.options.display == 0, "task move lost main-display option");
+                GameLaunch.start(owner, false);
+                require(owner.directLaunches == direct + 1 && owner.options.display == 0
+                        && owner.launched.flags == Intent.FLAG_ACTIVITY_NEW_TASK, "existing game cleared or not routed to main");
                 owner.manager.secondary = new Display[] {new Display(7, -1, null)};
-                GameLaunch.start(owner);
+                GameLaunch.start(owner, true);
                 require(owner.options == null && owner.launched.flags == 0 && GameLaunch.onMainScreen(owner), "cast/overlay behavior changed");
                 owner.manager.secondary = new Display[] {new Display(5, 2, "DEL")};
-                GameLaunch.start(owner);
+                GameLaunch.start(owner, false);
                 require(owner.options == null && owner.launched.flags == 0, "external-monitor behavior changed");
                 owner.manager.secondary = new Display[0]; owner.current = owner.manager.main;
-                GameLaunch.start(owner);
+                GameLaunch.start(owner, true);
                 require(owner.options == null && owner.launched.flags == 0 && GameLaunch.onMainScreen(owner), "single-screen behavior changed");
-                require(owner.activities.moves == 1, "single-screen launch changed task routing");
                 break;
             }
             case "reuse": {

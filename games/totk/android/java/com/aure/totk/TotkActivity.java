@@ -113,7 +113,7 @@ public final class TotkActivity extends NativeActivity {
         if (GameLaunch.onMainScreen(this)) { displayMoveRequested = false; return; }
         if (displayMoveRequested) return;
         displayMoveRequested = true;
-        try { GameLaunch.start(this); }
+        try { GameLaunch.start(this, false); }
         catch (RuntimeException failed) {
             displayMoveRequested = false;
             Log.w("TotkGame", "Could not return the game task to the main display", failed);

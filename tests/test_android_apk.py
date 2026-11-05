@@ -134,8 +134,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(sorted(a[(A, 'name')][1] for t, a in m['all'] if t == 'uses-permission'),
                          sorted(['android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_DATA_SYNC',
                                  'android.permission.POST_NOTIFICATIONS', 'android.permission.WAKE_LOCK',
-                                 'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE',
-                                 'android.permission.REORDER_TASKS']))
+                                 'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE']))
         app = m['application']
         self.assertEqual(app[(A, 'label')], (3, 'TotK Native'))
         for name, value in (('hasCode', TRUE), ('debuggable', FALSE), ('extractNativeLibs', TRUE), ('allowBackup', FALSE),

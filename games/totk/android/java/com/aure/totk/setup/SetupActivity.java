@@ -577,8 +577,14 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             return;
         }
         gameError = null;
-        try { GameLock.start(getFilesDir(), System.currentTimeMillis(), android.os.Process.myPid(),
-                () -> GameLaunch.start(this)); }
+        try {
+            // Inspect before publishing our launch marker. Recents can retain dead game tasks after an update;
+            // only the existing lock/pending-launch proof may decide whether a cold start can clear the menu task.
+            GameLock.Result previous = InstallState.gameState(this);
+            if (previous.state == GameLock.State.ERROR) throw new IOException(previous.reason);
+            GameLock.start(getFilesDir(), System.currentTimeMillis(), android.os.Process.myPid(),
+                    () -> GameLaunch.start(this, previous.free()));
+        }
         catch (IOException | RuntimeException failedStart) {
             if (!ui) showUi();
             showNote(Strings.gameLockError(failedStart.toString()));

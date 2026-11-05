@@ -34,10 +34,9 @@ SETUP_PROCESS = ':setup'
 # MANAGE_EXTERNAL_STORAGE: optional All files access (direct file access, as Azahar's non-Play build); the app works
 # without it through the Storage Access Framework. The APK is distributed outside Google Play (see the Azahar notes in
 # android/APP.md for what a Play build would have to remove).
-# REORDER_TASKS: move our existing game task to the main display before launching it (no duplicate NativeActivity).
 PERMISSIONS = ('android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_DATA_SYNC',
                'android.permission.POST_NOTIFICATIONS', 'android.permission.WAKE_LOCK',
-               'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE', 'android.permission.REORDER_TASKS')
+               'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE')
 
 # android.R.attr resource ids of the manifest attributes used here (checked against aapt2 link with android.jar)
 ATTR = {

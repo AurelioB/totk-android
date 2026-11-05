@@ -42,15 +42,14 @@ setting available when the menu is on the bottom screen. Only devices with a bui
 `FLAG_ACTIVITY_NEW_TASK` and `ActivityOptions.setLaunchDisplayId(DEFAULT_DISPLAY)`; single-screen devices and
 external/cast/overlay-only configurations keep Android's ordinary launch behavior. The companion's enabled setting
 does not change where the game runs.
-When a game app task already exists, `ActivityManager.moveTaskToFront(taskId, 0, options)` moves that exact task to
-the main display before the ordinary game intent is sent. This uses Android's normal `REORDER_TASKS` permission.
-A normal cross-display `singleTask` search is not sufficient on Android 16: with the menu above a stopped game on
-the bottom display, it can create a second `TotkActivity` on display 0. `AppTask.startActivity` is not a substitute:
-the task can retain the launcher's SetupActivity base Intent even after its baseActivity becomes TotkActivity, and
-Android refuses the explicit singleTask start into that task. The runtime is process-global, so every game launch
-and display-recovery path moves the existing task first. A menu in that shared task moves with it, without
-recreation, a second menu, replay extras or losing pending close/retry actions.
-The game remains `singleTask`, with the same affinity and launcher/recents declarations as before.
+On a cold dual-screen start only, `FLAG_ACTIVITY_CLEAR_TASK` gives the reused task the game's base Intent, rather
+than retaining the completed menu's launcher Intent. Android 16 can otherwise fail to find that `singleTask` game
+across displays and create a second `TotkActivity`. The existing `GameLock` state is read before publishing this
+start's marker; a live or pending game is **never cleared**. Recents metadata is not a liveness proof (dead game
+tasks can survive an update). The game base Intent lets Android reuse/reparent the existing activity on the main
+display. The native runtime is process-global; it must have exactly one NativeActivity. The menu is not replayed or
+recreated, and close/gated-retry actions remain on their original activity.
+The game keeps the same `singleTask` mode, affinity, permissions and launcher/recents declarations.
 `TotkActivity` also checks resume, new-intent and configuration callbacks: a launcher can move an existing task
 without opening the menu again. If it is on the second panel, the activity relaunches its own singleTask on the main
 display, without finishing/restarting the native game; a pending-move guard prevents recursive launches. A display

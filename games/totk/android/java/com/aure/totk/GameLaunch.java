@@ -1,7 +1,6 @@
 package com.aure.totk;
 
 import android.app.Activity;
-import android.app.ActivityManager;
 import android.app.ActivityOptions;
 import android.content.Intent;
 import android.os.Bundle;
@@ -13,23 +12,16 @@ import com.aure.totk.companion.PresentationController;
 public final class GameLaunch {
     private GameLaunch() { }
 
-    public static void start(Activity owner) {
+    public static void start(Activity owner, boolean cold) {
         Intent game = new Intent(owner, TotkActivity.class);
         Bundle options = null;
         if (PresentationController.deviceSecondScreen(owner) == DisplayClass.BUILT_IN) {
-            // Android 16's singleTask search can skip a task on the other display and create a second NativeActivity.
-            // Move the existing task first, preserving its menu/stack; only then deliver the normal game intent.
             game.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            // A cold start must make the GAME the task's base Intent, not retain the finished menu's launcher
+            // Intent. Android 16 can otherwise create another singleTask game instead of finding it across displays.
+            // Never clear a task that already contains a game: its native runtime is process-global.
+            if (cold) game.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK);
             options = ActivityOptions.makeBasic().setLaunchDisplayId(Display.DEFAULT_DISPLAY).toBundle();
-            ActivityManager manager = owner.getSystemService(ActivityManager.class);
-            if (manager == null) throw new IllegalStateException("Activity manager unavailable");
-            for (ActivityManager.AppTask task : manager.getAppTasks()) {
-                ActivityManager.RecentTaskInfo info = task.getTaskInfo();
-                if (game.getComponent().equals(info.baseActivity) || game.getComponent().equals(info.topActivity)) {
-                    manager.moveTaskToFront(info.taskId, 0, options);
-                    break;
-                }
-            }
         }
         owner.startActivity(game, options);
     }
