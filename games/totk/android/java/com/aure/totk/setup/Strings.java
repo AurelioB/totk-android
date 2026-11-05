@@ -78,7 +78,7 @@ final class Strings {
     }
     static final String DETECTED = "Detected";
     static final String CHOOSE_GRAPHICS = "Choose graphics";
-    static final String SETUP_COMPLETE = "Setup complete · step 4 of 4";
+    static final String SETUP_COMPLETE = "Setup complete · step 6 of 6";
     static final String TAKES_EFFECT = "Takes effect when you start the game. Change it any time from this menu.";
     static final String GPU_COST = "GPU cost", ADDED_LATENCY = "Added latency", WORKS_WITH = "Works with", APPLIES = "Applies";
     static final String WHILE_PLAYING = "Change while playing", SOUND_BUFFER = "Sound buffer", GAME_RESOLUTION = "Game targets";
