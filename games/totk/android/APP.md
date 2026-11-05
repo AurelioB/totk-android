@@ -63,6 +63,18 @@ coverage: `tests/test_android_game_display.py`; Android task-manager behavior is
 Configuration recovery runs only while the game is resumed: moving a shared task with the menu on top must not
 bring the background game over that menu. The next Start game still targets the main display.
 
+Device acceptance (2026-11-04, release-key TEST build `ad834eab3d20`): Retroid Pocket Duo / Android 16 (secondary
+display 2) and AYN Thor / Android 13 (secondary display 4). Cold bottom-menu launches, top launches, Home + launcher
+from either panel, a live game task moved to the bottom panel, and a shared menu/game task moved there all returned
+the game to display 0 and the companion to the built-in second panel. The shared-task returns retained the same task,
+ActivityRecord and native PID (Duo task 629 / PID 8549; Thor task 28543 / PID 22586); every scenario's activity dump had
+at most one TotkActivity. The Settings VIEW shortcut from the bottom opened one visible menu on display 0; normal
+launcher taps returned to the running game without a menu. Recents retained one TEST app card with the app icon.
+Home logged game/audio pause at a guest frame boundary. A gated graphics-driver action survived Close the game,
+logged the native pipeline-cache flush/exit, and continued into the file picker; cancelling it changed no driver.
+After game exit, the next normal launcher tap showed the menu. Both devices' existing SELinux mode was Permissive
+and was left unchanged; these are display/task/lifecycle checks, not new enforcing-mode compatibility evidence.
+
 The menu keeps its options in SharedPreferences and writes them, on every
 change and again right before the game starts, to `<private>/settings.env` (`Settings.java` is the option → variable
 mapping; `tests/test_android_settings.py`). The native side refuses to start without a playable install too and
