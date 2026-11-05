@@ -89,6 +89,15 @@ logged the native pipeline-cache flush/exit, and continued into the file picker;
 After game exit, the next normal launcher tap showed the menu. Both devices' existing SELinux mode was Permissive
 and was left unchanged; these are display/task/lifecycle checks, not new enforcing-mode compatibility evidence.
 
+Follow-up Settings/task acceptance (2026-11-04, release-key TEST build `bcd059d`): the same Duo / Android 16 and
+Thor / Android 13 completed 42 scenario captures with at most one game and one menu ActivityRecord each. A shared
+game/menu task moved from display 2/4 back to 0 retained both records and the native PID (Duo task 690 / PID 27784;
+Thor task 28587 / PID 20559), including a gated graphics-driver retry. Close flushed/exited the native runtime and
+continued that retry into the file picker. Cold bottom Settings retained Setup stopped / interrupted with Resume.
+Both launchers returned a live game without a menu; after native exit they reopened the menu without restarting
+the runtime. Settings also foregrounded that same menu above its file picker. Dumps checked the menu's RESUMED state,
+not just its existence. Recents retained one TEST task; affinity and the singleTask game remained unchanged.
+
 The menu keeps its options in SharedPreferences and writes them, on every
 change and again right before the game starts, to `<private>/settings.env` (`Settings.java` is the option → variable
 mapping; `tests/test_android_settings.py`). The native side refuses to start without a playable install too and
