@@ -18,10 +18,12 @@ class Bundle { int display; Bundle(int id) { display=id; } }
 class Display { static final int DEFAULT_DISPLAY=0; int id; Display(int id) { this.id=id; } int getDisplayId(){return id;} }
 class Intent {
     static final int FLAG_ACTIVITY_NEW_TASK=0x10000000, FLAG_ACTIVITY_SINGLE_TOP=0x20000000, FLAG_ACTIVITY_REORDER_TO_FRONT=0x20000;
+    static final String ACTION_VIEW="view";
     final Map<String,Object> extras=new HashMap<>(); int flags;
     Intent putExtra(String key,boolean value){extras.put(key,value);return this;}
     Intent() {} Intent(Intent other){extras.putAll(other.extras); flags=other.flags;}
     Intent addFlags(int value){flags|=value;return this;}
+    Intent(Activity owner,Class<?> type){} Intent setAction(String action){return this;} int getFlags(){return flags;}
     boolean getBooleanExtra(String key,boolean fallback){return (boolean)extras.getOrDefault(key,fallback);}
     String getStringExtra(String key){return (String)extras.get(key);}
 }
@@ -43,10 +45,27 @@ class ActivityManager {
         }
     }
 }
+class Icon {static Object createWithBitmap(Object bitmap){return bitmap;}}
+class Strings {static final String SHORTCUT_SETTINGS="Settings";}
+class ShortcutInfo {
+    final String id; final Intent intent; ShortcutInfo(String id,Intent intent){this.id=id;this.intent=intent;}
+    String getId(){return id;} Intent getIntent(){return intent;}
+    static class Builder {
+        final String id; Intent intent; Builder(Activity owner,String id){this.id=id;}
+        Builder setShortLabel(String value){return this;} Builder setIcon(Object value){return this;}
+        Builder setIntent(Intent value){intent=value;return this;} ShortcutInfo build(){return new ShortcutInfo(id,intent);}
+    }
+}
+class ShortcutManager {
+    List<ShortcutInfo> shortcuts=new ArrayList<>(); int updates;
+    List<ShortcutInfo> getDynamicShortcuts(){return shortcuts;}
+    void setDynamicShortcuts(List<ShortcutInfo> value){shortcuts=value;updates++;}
+}
 class Activity {
     final ActivityManager manager=new ActivityManager(); Display display=new Display(4); int taskId=17;
     Display getDisplay(){return display;} int getTaskId(){return taskId;}
-    <T> T getSystemService(Class<T> type){return type.cast(manager);}
+    final ShortcutManager shortcuts=new ShortcutManager();
+    <T> T getSystemService(Class<T> type){return type.cast(type==ShortcutManager.class?shortcuts:manager);}
     void setIntent(Intent intent){} protected void onNewIntent(Intent intent){}
     boolean finished; void finish(){finished=true;} void overridePendingTransition(int a,int b){}
     boolean isFinishing(){return finished;} boolean isDestroyed(){return false;}
@@ -113,6 +132,13 @@ public final class SettingsDisplayProbe {
                 previous.finished=true;SetupActivity next=owner();
                 check(!next.reuseMenuTask(i) && !next.finished,"finished menu revived");
             }
+        }else if(args[0].equals("shortcut")){
+            SetupActivity a=owner();a.shortcuts.shortcuts.add(new ShortcutInfo("menu",new Intent()));
+            a.publishShortcut();check(a.shortcuts.updates==1,"old shortcut flags not migrated");
+            Intent i=a.shortcuts.shortcuts.get(0).getIntent();
+            check(i.getBooleanExtra(SetupActivity.EXTRA_SETTINGS,false)
+                    && (i.flags&Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)!=0,"shortcut cannot open menu above picker");
+            a.publishShortcut();check(a.shortcuts.updates==1,"unchanged shortcut republished / rate limited");
         }else if(args[0].equals("unchanged")){
             SetupActivity a=owner();Intent i=settings();a.display=new Display(0);
             check(!a.moveSettingsToMain(i),"main Settings moved");a.display=new Display(4);SettingsStore.dual=false;
@@ -137,7 +163,8 @@ class SettingsDisplayTests(unittest.TestCase):
         source = SOURCE.read_text()
         move = source[source.index('    private boolean settingsMoving;'):source.index('    /** A launcher tap')]
         new_intent = source[source.index('    @Override protected void onNewIntent(Intent intent)'):source.index('    @Override protected void onStart()')]
-        body = (move + new_intent).replace('private boolean', 'boolean').replace('private void', 'void').replace('private static java.lang.ref.', 'static java.lang.ref.').replace('android.view.Display', 'Display').replace('android.util.Log', 'Log')
+        shortcut = source[source.index('    private void publishShortcut()'):source.index('    private static Bitmap shortcutGlyph()')]
+        body = (move + new_intent + shortcut).replace('private boolean', 'boolean').replace('private void', 'void').replace('private static java.lang.ref.', 'static java.lang.ref.').replace('android.view.Display', 'Display').replace('android.util.Log', 'Log')
         wrapper = r'''
 class SetupActivity extends Activity {
     static final String EXTRA_SETTINGS="settings",EXTRA_GAME_ERROR="error";
@@ -147,6 +174,7 @@ class SetupActivity extends Activity {
     void showUi(){ui=true;shown++;screen=recovery;}
     boolean returnToRunningGame(Intent intent){return false;}
     void replace(Screen value){screen=value;replacements++;} void render(){}
+    Object shortcutGlyph(){return new Object();}
 '''
         path = cls.work / 'SettingsDisplayProbe.java'
         path.write_text(FRAMEWORK + wrapper + body + '}\n' + PROBE)
@@ -176,6 +204,9 @@ class SetupActivity extends Activity {
 
     def test_new_entry_forwards_to_existing_menu_without_drawing_or_clearing_game(self):
         self.probe('existing')
+
+    def test_settings_shortcut_migrates_reorder_flags_without_repeated_updates(self):
+        self.probe('shortcut')
 
 
 if __name__ == '__main__':

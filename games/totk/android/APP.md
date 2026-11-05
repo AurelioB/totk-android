@@ -57,9 +57,12 @@ before drawing on the main display: a normal cross-display task search cannot fi
 task. Existing menu content and gated retry actions stay on that activity; a pending Close game is not redirected
 or replaced. A cold redirect initializes its recovery screen once, retaining Setup stopped / interrupted and Resume
 instead of applying the already-open Settings-to-Home reset. Host coverage: `tests/test_android_settings_display.py`.
-A newly created cross-display menu entry also forwards to an existing top-menu `AppTask` before drawing and finishes
-only the undrawn newcomer. This includes launcher entry after native exit, when the old task still has a game base
-Intent, and routes the action through the existing menu's safe-close guard rather than discarding its retry.
+A newly created cross-display menu entry forwards to the live menu's cached `AppTask` before drawing, explicitly
+moves that task to front, and finishes only the undrawn newcomer. A weak activity reference owns this routing, not
+another persistent menu instance: Android 16 removes the old same-affinity task from `getAppTasks()` when it creates
+the new launcher entry, so rediscovering it then is too late. `REORDER_TO_FRONT` also reuses a menu below its file
+picker. This includes launcher entry after native exit, when the old task still has a game base Intent, and routes
+the action through the existing menu's safe-close guard rather than discarding its retry.
 Task-bound starts can report the new display configuration without delivering a new Intent; resume/configuration
 callbacks therefore finish cold UI initialization, and the handoff Intent marks cold initialization to preserve
 recovery regardless of callback order.

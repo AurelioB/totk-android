@@ -705,8 +705,12 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private void publishShortcut() {
         ShortcutManager shortcuts = getSystemService(ShortcutManager.class);
         if (shortcuts == null) return;
-        for (ShortcutInfo existing : shortcuts.getDynamicShortcuts()) if (existing.getId().equals("menu")) return;
-        Intent intent = new Intent(this, SetupActivity.class).setAction(Intent.ACTION_VIEW).putExtra(EXTRA_SETTINGS, true);
+        int flags = Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP;
+        for (ShortcutInfo existing : shortcuts.getDynamicShortcuts())
+            if (existing.getId().equals("menu") && existing.getIntent() != null
+                    && (existing.getIntent().getFlags() & flags) == flags) return;
+        Intent intent = new Intent(this, SetupActivity.class).setAction(Intent.ACTION_VIEW)
+                .putExtra(EXTRA_SETTINGS, true).addFlags(flags);
         ShortcutInfo info = new ShortcutInfo.Builder(this, "menu").setShortLabel(Strings.SHORTCUT_SETTINGS)
                 .setIcon(Icon.createWithBitmap(shortcutGlyph())).setIntent(intent).build();
         try { shortcuts.setDynamicShortcuts(Arrays.asList(info)); } catch (RuntimeException rateLimited) { }
