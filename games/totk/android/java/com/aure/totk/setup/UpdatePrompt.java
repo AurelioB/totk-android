@@ -44,13 +44,17 @@ public final class UpdatePrompt {
             if (code != a && code != b) return false;
             if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) {
                 if (code == b) finish.accept(false);
-                else { View focused = dialog.getCurrentFocus(); if (focused != null) focused.performClick(); }
+                else {
+                    View focused = dialog.getCurrentFocus();
+                    if (focused instanceof Widgets.Row) focused.performClick();
+                    else update.performClick();
+                }
             }
             return true;
         });
         dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Theme.INK));
         dialog.show();
         dialog.getWindow().setLayout(Theme.u(1000), -2);
-        update.requestFocusFromTouch();
+        update.post(() -> update.requestFocusFromTouch());
     }
 }
