@@ -13,6 +13,8 @@
 
 #define LOG_MIRROR_LINE 1000   /* bytes of one line kept (logcat's own limit per entry is ~4 KiB) */
 enum { LOG_MIRROR_INFO, LOG_MIRROR_WARN, LOG_MIRROR_ERROR };
+/* Mirroring is diagnostic work: only an explicit launch opt-in may start its worker. */
+static inline int log_mirror_enabled(const char *value) { return value && !strcmp(value, "1"); }
 typedef void (*log_mirror_emit)(void *context, int level, const char *line);
 typedef struct {
     char line[LOG_MIRROR_LINE + 8];   /* + room for the cut mark and the terminator */

@@ -5,6 +5,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 
 ## Unreleased
 
+### Runtime
+- Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
+  Normal launches no longer start its tail thread or wake logd for every frame log. Crash reports remain enabled.
+
 ### Menu
 - **Keep the GPU busy** in Graphics → Performance feeds smaller batches earlier and requests clocks that keep up.
   On in the 60 fps preset only; it uses a little more GPU and CPU clock, power and heat. On the Odin 3 it raised

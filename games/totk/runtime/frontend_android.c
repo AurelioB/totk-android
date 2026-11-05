@@ -8,7 +8,7 @@
    - the Vulkan driver: the player's driver.so (copied into private storage), else the Turnip the APK bundles
      (libtotk_turnip.so beside this library, used in place), else the system's;
    - the log: stdout and stderr go to totk.log in that folder, which a low-priority thread copies to logcat (tag "totk",
-     log_mirror.h; TOTK_LOGCAT=0 turns the copy off);
+     log_mirror.h; TOTK_LOGCAT=1 opts into the copy, off by default);
    - live switches: <game folder>/totk.ctl, followed by another low-priority thread and applied at the next presented
      frame (live_ctl.h; tools/bench/live.sh writes it);
    - the window: handed to the Vulkan backend's AHB presenter or automatic copy fallback (vk_draw.c);
@@ -1135,7 +1135,7 @@ static void log_start(void) {
 /* The logcat copy (log_mirror.h): a thread that sleeps until totk.log grows, then copies its new complete lines with
    tag "totk" (FATAL / CRASH / device lost as errors, red messages as warnings). It runs at nice 10, on the slower CPUs
    when the device has them, and reads the file from its start, so lines written before it started are copied too.
-   TOTK_LOGCAT=0 (totk.env) turns it off; started after the environment files, or at a refusal before them. */
+   TOTK_LOGCAT=1 (totk.env) opts in, off by default; started after the environment files, or at a refusal before them. */
 static log_mirror_tail g_log_tail;
 static void log_mirror_logcat(void *context, int level, const char *line) {
     (void)context;
@@ -1150,7 +1150,7 @@ static void *log_mirror_thread(void *arg) {
         totk_thread_background_select("/sys/devices/system/cpu", &allowed, &slow, capacity, &source, &decision);
         if (!CPU_EQUAL(&slow, &allowed) && sched_setaffinity(0, sizeof slow, &slow)) decision = "unchanged (setaffinity failed)";
     }
-    fprintf(stderr, "[totk-logcat] on: totk.log -> logcat tag totk, wake=%s nice=%d%s cpus=%s (TOTK_LOGCAT=0 turns it off)\n",
+    fprintf(stderr, "[totk-logcat] on (TOTK_LOGCAT=1): totk.log -> logcat tag totk, wake=%s nice=%d%s cpus=%s\n",
             g_log_tail.watch >= 0 ? "inotify" : "poll 20 ms", getpriority(PRIO_PROCESS, 0), nice_error ? " (setpriority failed)" : "", decision);
     log_mirror_run(&g_log_tail);
     return NULL;
@@ -1160,7 +1160,7 @@ static void log_mirror_start(void) {
     if (started || g_log_fd < 0) return;
     started = 1;
     const char *value = getenv("TOTK_LOGCAT");
-    if (value && !strcmp(value, "0")) { fprintf(stderr, "[totk-logcat] off (TOTK_LOGCAT=0): totk.log only\n"); return; }
+    if (!log_mirror_enabled(value)) { fprintf(stderr, "[totk-logcat] off (TOTK_LOGCAT!=1): totk.log only\n"); return; }
     g_log_tail.path = g_log_path; g_log_tail.emit = log_mirror_logcat;
     int error = log_mirror_open(&g_log_tail);
     pthread_t thread;
@@ -1225,8 +1225,8 @@ static void live_ctl_start(void) {
 /* ---------- options ---------- */
 #include "android_storage.h"   /* TOTK_DATA_DIR validation and the game lock */
 /* The game lock (android_storage.h), taken by start_game and held until the process ends; given back when the start is
-   refused, since the process outlives a finished activity and the launcher would otherwise see a game running. A refusal
-   also starts the logcat copy (the environment files are not read yet), so the reason reaches logcat before the exit. */
+   refused, since the process outlives a finished activity and the launcher would otherwise see a game running.
+   A refusal also honors an inherited explicit logcat opt-in; environment files are not read yet. */
 static int g_game_lock = -1;
 static int start_refused(void) { if (g_game_lock >= 0) { close(g_game_lock); g_game_lock = -1; } log_mirror_start(); return -1; }
 /* What the launcher menu may write into <private>/settings.env: the option mapping and the frame-generation timing

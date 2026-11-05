@@ -49,6 +49,10 @@ static int wait_lines(unsigned n, double *ms) {
     *ms = now_ms() - start; return 1;
 }
 int main(int argc, char **argv) {
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "enabled")) {
+        printf("%d\n", log_mirror_enabled(argc == 3 ? argv[2] : NULL));
+        return 0;
+    }
     if (argc == 3 && !strcmp(argv[1], "feed")) {
         size_t chunk = (size_t)atoi(argv[2]); static char data[1 << 20]; size_t n = fread(data, 1, sizeof data, stdin);
         log_mirror m = {0};
@@ -107,6 +111,20 @@ class LogMirror(unittest.TestCase):
                                 timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.decode().splitlines()
+
+    def test_only_explicit_one_enables_the_mirror(self):
+        for value in (None, '', '0', '1', '2', '-1', 'true', '01', '1 '):
+            with self.subTest(value=value):
+                result = subprocess.run([str(self.driver), 'enabled', *([] if value is None else [value])],
+                                        capture_output=True, text=True, check=True, timeout=30)
+                self.assertEqual(result.stdout.strip(), '1' if value == '1' else '0')
+
+    def test_frontend_gates_admission_before_opening_or_starting_the_worker(self):
+        source = (ROOT / 'games/totk/runtime/frontend_android.c').read_text()
+        start = source.split('static void log_mirror_start(void) {', 1)[1].split('\n}', 1)[0]
+        gate = start.index('if (!log_mirror_enabled(value))')
+        self.assertLess(gate, start.index('log_mirror_open('))
+        self.assertLess(gate, start.index('pthread_create('))
 
     def test_classification(self):
         lines = ('[totk] FATAL guest exited\n[nvn-vk] vkQueueSubmit failed (device lost)\n[totk] CRASH report\n'

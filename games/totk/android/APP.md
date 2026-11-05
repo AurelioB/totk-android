@@ -1892,12 +1892,15 @@ needs `su`). The folder holds what the adb-shell folder holds:
 
 ### Diagnostics: logcat copy, crash reports and the stall watchdog
 
-- **`TOTK_LOGCAT`** (default on; `0` turns it off). `totk.log` stays the primary log (written directly, so a sudden end
-  loses nothing); a thread at nice 10 (on the slower CPUs when sysfs shows them) copies its complete lines to logcat with
+- **`TOTK_LOGCAT`** (default off; only `1` opts in). `totk.log` stays the primary log (written directly, so a sudden end
+  loses nothing). Normally there is no mirror thread, watch, polling or logcat write. When opted in, a thread at nice 10
+  (on the slower CPUs when sysfs shows them) copies its complete lines to logcat with
   tag `totk`: FATAL, CRASH or "device lost" as errors, red messages (`【红】`, `[RED]`) as warnings, the rest as info;
   lines over 1000 bytes are cut and marked ` [...]`. It sleeps on an inotify watch of the file (20 ms polling only
   without inotify), so an idle log costs no wakeup (`tests/test_log_mirror.py` measures it). The log's
-  `[totk-logcat] on: ... wake=inotify nice=10` or `[totk-logcat] off` line shows the arm; `adb logcat -s totk` reads it.
+  `[totk-logcat] on (TOTK_LOGCAT=1): ... wake=inotify nice=10` or `[totk-logcat] off` line shows the arm;
+  `adb logcat -s totk` reads it. Active mirroring is diagnostic overhead even though an idle log costs no wakeups.
+  Compare long-frame tails with `TOTK_LOGCAT=1` versus unset; the default avoids duplicating frame logs through logd.
 - **Crash reports** (always on). The runtime's SIGSEGV/SIGBUS/SIGILL/SIGTRAP/SIGABRT report (`[totk] signal=` …, `[totk]
   host abort`) is written by the first crashing thread only; another crashing thread waits for it at most 5 s, then
   ends the process with `_exit(128+signal)`. After the report the handler that was there before is called once,
