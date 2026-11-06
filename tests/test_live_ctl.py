@@ -116,6 +116,7 @@ class LiveCtl(unittest.TestCase):
     def test_missing_file_idle(self):
         out = self.run_mode(self.probe, 'missing')
         self.assertIn('ok: isolated control worker pinned to allowed CPU', out)
+        self.assertIn('ok: absent unrelated CLOSE_WRITE+ATTRIB: zero inotify deliveries and reader wakeups', out)
         self.assertIn('ok: idle absent CREATE+DELETE', out)
         self.assertIn('ok: idle absent MOVED_TO+DELETE', out)
         self.assertIn('ok: idle absent EINTR', out)

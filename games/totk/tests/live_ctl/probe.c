@@ -321,10 +321,12 @@ static void control_idle(const char *dir, const char *phase, ctl_sample before, 
            after.ignored - before.ignored, after.interrupts - before.interrupts);
 }
 static void missing(const char *dir) {
-    static char path[1024]; char incoming[1100];
+    static char path[1024]; char incoming[1100], unrelated_log[1100];
     snprintf(path, sizeof path, "%s/totk.ctl", dir); unlink(path);
     snprintf(incoming, sizeof incoming, "%s/incoming", dir);
     CHECK(!mkdir(incoming, 0700), "create the unrelated move's source directory");
+    snprintf(unrelated_log, sizeof unrelated_log, "%s/unrelated.log", dir);
+    append(unrelated_log, "created before the watch\n");
     cpu_set_t allowed, one; CPU_ZERO(&one);
     int error = sched_getaffinity(0, sizeof allowed, &allowed), cpu = -1;
     CHECK(!error, "read allowed host CPUs");
@@ -349,6 +351,20 @@ static void missing(const char *dir) {
     CHECK(atomic_load(&ctl_directory_watches) == 1 && atomic_load(&ctl_calls[CTL_OPEN]) == 1,
           "absent target starts with one directory watch and one open attempt");
     printf("ok: isolated control worker pinned to allowed CPU %d\n", cpu);
+
+    /* Normal play closes logs/cache files and changes their attributes while totk.ctl never exists.
+       rd.wakeups filters unrelated events, so assert zero actual inotify deliveries/read retries as well. */
+    ctl_sample quiet_before = control_sample();
+    for (int i = 0; i < 64; i++) {
+        append(unrelated_log, "unrelated write and close\n");
+        CHECK(!chmod(unrelated_log, i & 1 ? 0600 : 0640), "change unrelated log attributes");
+    }
+    control_idle(dir, "absent unrelated CLOSE_WRITE+ATTRIB", quiet_before, 0, 0, 0, 1);
+    ctl_sample quiet_after = control_sample();
+    CHECK(quiet_after.events == quiet_before.events && quiet_after.calls[CTL_READ] == quiet_before.calls[CTL_READ],
+          "absent target: unrelated closes/attributes cause zero inotify deliveries or read retries");
+    CHECK(quiet_after.wakeups == quiet_before.wakeups, "absent target: unrelated closes/attributes cause zero reader wakeups");
+    printf("ok: absent unrelated CLOSE_WRITE+ATTRIB: zero inotify deliveries and reader wakeups\n");
 
     /* Replay the device failure: absent target, many unrelated CREATE+DELETE pairs, then MOVED_TO+DELETE.
        The wake counter stays zero even in the old spinning implementation, so measure CPU and syscalls too. */

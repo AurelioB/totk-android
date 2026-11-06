@@ -1928,10 +1928,11 @@ needs `su`). The folder holds what the adb-shell folder holds:
 A/B measurements change experiment switches inside one running session, so both arms share one loaded scene
 (`tools/bench/ab.sh`, the `totk-benchmark` skill). A thread at nice 10 (on the slower CPUs, like the logcat copy)
 follows `<game folder>/totk.ctl` with inotify (on the file only once readable; 250 ms polling without inotify).
-While the file is absent or cannot be opened it retains one directory watch, including the target's close-write
-and attribute changes (chown/chmod/SELinux context), and ignores unrelated events without reopening or rearming.
-Failed opens other than a missing file, and failed reads, also retry at most every 250 ms if no relevant event
-arrives; a missing file still blocks without polling. Explicit watch removals' `IN_IGNORED` cannot feed a retry loop.
+While the file is absent it retains one create/move-only directory watch: unrelated log/cache writes, closes and
+attribute changes cause no reader wakeups. Unrelated creates/moves are ignored without reopening or rearming.
+If a target open fails for a reason other than a missing file, a 250 ms retry handles later chown/chmod/context
+repair without subscribing to all files' close/attribute events. Failed reads use the same retry; it stops when
+the file opens successfully or disappears. Explicit watch removals' `IN_IGNORED` cannot feed a retry loop.
 It stages each complete line appended after the start; the lines of one write are staged together. `tools/bench/live.sh`
 publishes only its new batch via a same-directory temp file, with owner/mode/context set before atomic rename;
 replacement is read from the beginning, so it must not copy old commands (which would replay them).
