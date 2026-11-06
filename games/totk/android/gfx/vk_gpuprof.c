@@ -2,6 +2,10 @@
    queue. Deferred pass-end tokens retain immutable query coordinates, so recorder
    assembly never touches the walking thread's current pass. */
 #include "vk_int.h"
+#include <stdarg.h>
+#include <time.h>
+#include <unistd.h>
+#include <limits.h>
 
 #define GP_RECORDS 2048
 #define GP_GROUPS 16384
@@ -66,6 +70,101 @@ static const char *const end_names[] = {
     "copy-blit", "query-report", "compute-dispatch", "cpu-wait", "submission-end",
     "uniform-flush", "present", "diagnostic", "deferred-barrier-hazard", "early-submit-split"
 };
+static FILE *output_file;
+static char output_path[PATH_MAX];
+static uint64_t output_bytes, output_limit = UINT64_C(16) << 20, output_failures;
+static uint64_t report_end;
+static uint64_t env_u64(const char *name, uint64_t fallback, uint64_t minimum, uint64_t maximum) {
+    const char *e = getenv(name); char *end = NULL;
+    if (!e || !*e || *e == '-') return fallback;
+    unsigned long long value = strtoull(e, &end, 10);
+    return end && !*end && value >= minimum && value <= maximum ? value : fallback;
+}
+static void output_init(void) {
+    char cwd[PATH_MAX]; struct timespec now;
+    if (!getcwd(cwd, sizeof cwd) || clock_gettime(CLOCK_REALTIME, &now)) {
+        LOGV("[gpu-profile] cannot resolve output game directory"); output_failures++; return;
+    }
+    int n = snprintf(output_path, sizeof output_path, "%s/gpuprof-%llu-%ld-%09ld.jsonl",
+        cwd, (unsigned long long)now.tv_sec, (long)getpid(), now.tv_nsec);
+    if (n < 0 || (size_t)n >= sizeof output_path - 2) { output_failures++; return; }
+    output_limit = env_u64("TOTK_VK_GPU_PROFILE_MAX_BYTES", output_limit, 4096, UINT64_C(1) << 30);
+    output_file = fopen(output_path, "wb");
+    if (!output_file) output_failures++;
+    LOGV("[gpu-profile] JSONL %s path=%s max-bytes=%llu rotations=3 (TOTK_VK_GPU_PROFILE_MAX_BYTES)",
+        output_file ? "enabled" : "unavailable", output_path, (unsigned long long)output_limit);
+}
+static void output_row(const char *text) {
+    if (!output_file) return;
+    size_t n = strlen(text);
+    if (n > output_limit) { output_failures++; return; }
+    if (output_bytes + n > output_limit) {
+        fclose(output_file); output_file = NULL;
+        char from[PATH_MAX], to[PATH_MAX];
+        for (int i = 3; i > 0; i--) {
+            snprintf(to, sizeof to, "%s.%d", output_path, i);
+            if (i == 1) snprintf(from, sizeof from, "%s", output_path);
+            else snprintf(from, sizeof from, "%s.%d", output_path, i - 1);
+            if (rename(from, to) && access(from, F_OK) == 0) {
+                LOGV("[gpu-profile] JSONL rotation failed path=%s", from); output_failures++; return;
+            }
+        }
+        output_file = fopen(output_path, "wb"); output_bytes = 0;
+        if (!output_file) { output_failures++; return; }
+    }
+    if (fwrite(text, 1, n, output_file) != n) {
+        LOGV("[gpu-profile] JSONL write failed path=%s", output_path);
+        fclose(output_file); output_file = NULL; output_failures++; return;
+    }
+    output_bytes += n;
+}
+typedef struct { char data[8192]; size_t used; int failed; } gp_json;
+static void json_add(gp_json *row, const char *format, ...) {
+    if (row->failed) return;
+    va_list args; va_start(args, format);
+    int n = vsnprintf(row->data + row->used, sizeof row->data - row->used, format, args);
+    va_end(args);
+    if (n < 0 || (size_t)n >= sizeof row->data - row->used) { row->failed = 1; return; }
+    row->used += (size_t)n;
+}
+static const char *kind_name(const gp_key *key) { return key->compute ? "compute" : "render"; }
+static void output_pass(const gp_group *g, const char *type, uint64_t pass_frame) {
+    const gp_key *k = &g->key;
+    gp_json row = {0};
+    json_add(&row, "{\"schema\":2,\"type\":\"%s\",\"window_start\":%llu,\"window_end\":%llu,"
+        "\"key\":\"%016llx\",\"kind\":\"%s\",\"ordinal\":%u,\"samples\":%u,\"shader\":\"%016llx\","
+        "\"gpu_ms\":%.9f,\"count\":%llu,\"draws\":%llu,\"stats_valid\":%llu",
+        type, (unsigned long long)(window * GP_WINDOW + 1), (unsigned long long)report_end,
+        (unsigned long long)g->hash, kind_name(k), g->ordinal, k->samples, (unsigned long long)k->shader,
+        g->ms, (unsigned long long)g->count, (unsigned long long)g->draws, (unsigned long long)g->stats_count);
+    if (pass_frame) json_add(&row, ",\"frame\":%llu", (unsigned long long)pass_frame);
+    json_add(&row, ",\"attachments\":[");
+    int comma = 0;
+    for (unsigned j = 0; j < 10; j++) if (k->a[j].format) {
+        const gp_attachment *a = &k->a[j];
+        json_add(&row, "%s{\"slot\":%u,\"format\":%u,\"width_num\":%u,\"width_den\":%u,"
+            "\"height_num\":%u,\"height_den\":%u,\"load\":%u,\"store\":%u}",
+            comma++ ? "," : "", j, a->format, a->w, a->width_den, a->h, a->height_den, a->load, a->store);
+    }
+    json_add(&row, "]");
+    if (g->stats_count) {
+        static const char *const names[GP_STATS] = {"ia_vertices", "ia_primitives", "vs_invocations",
+            "clipping_invocations", "clipping_primitives", "fs_invocations"};
+        json_add(&row, ",\"stats_gpu_ms\":%.9f,\"stats_draws\":%llu,\"stats\":{",
+            g->stats_ms, (unsigned long long)g->stats_draws);
+        for (unsigned st = 0; st < GP_STATS; st++)
+            json_add(&row, "%s\"%s\":%llu", st ? "," : "", names[st], (unsigned long long)g->counters[st]);
+        json_add(&row, "},\"ratios\":{\"verts_per_draw\":%.9f,\"prims_per_draw\":%.9f,"
+            "\"fragments_per_prim\":%.9f,\"ns_per_vertex\":%.9f,\"ns_per_primitive\":%.9f}",
+            g->stats_draws ? g->counters[0] / (double)g->stats_draws : 0,
+            g->stats_draws ? g->counters[1] / (double)g->stats_draws : 0,
+            g->counters[1] ? g->counters[5] / (double)g->counters[1] : 0,
+            g->counters[0] ? g->stats_ms * 1e6 / g->counters[0] : 0,
+            g->counters[1] ? g->stats_ms * 1e6 / g->counters[1] : 0);
+    }
+    json_add(&row, "}\n");
+    if (row.failed) output_failures++; else output_row(row.data);
+}
 
 static uint64_t hash_bytes(uint64_t h, const void *data, size_t n) {
     const unsigned char *p = data;
@@ -127,13 +226,24 @@ static void report(void) {
     gp_group *rank[GP_GROUPS]; size_t n = 0;
     for (size_t i = 0; i < GP_GROUPS; i++) if (groups[i].count) rank[n++] = &groups[i];
     qsort(rank, n, sizeof *rank, rank_cmp);
+    report_end = (window + 1) * GP_WINDOW;
+    for (size_t i = 0; i < n; i++) output_pass(rank[i], "pass", 0);
+    gp_json summary = {0};
+    json_add(&summary, "{\"schema\":2,\"type\":\"window\",\"window_start\":%llu,\"window_end\":%llu,"
+        "\"frames\":300,\"partial\":false,\"measured_ms\":%.9f,\"dropped\":%llu,\"failed_slots\":%llu,"
+        "\"stats_failed_slots\":%llu,\"output_failures\":%llu}\n",
+        (unsigned long long)(window * GP_WINDOW + 1), (unsigned long long)report_end, total_ms,
+        (unsigned long long)dropped_records, (unsigned long long)failed_slots,
+        (unsigned long long)stats_failures, (unsigned long long)output_failures);
+    output_row(summary.data);
+    if (output_file) fflush(output_file);
     LOGV("[gpu-profile] frames %llu-%llu: measured %.3f ms/frame (render %.3f compute %.3f), %.2f passes+dispatches/frame; LOAD %.2f CLEAR %.2f STORE %.2f DONT_CARE-store %.2f ops/frame; logical attachment estimate load %.3f store %.3f MiB/frame (not actual traffic); unknown-byte attachments %llu; dropped %llu failed-slots %llu",
          (unsigned long long)(window * GP_WINDOW + 1), (unsigned long long)((window + 1) * GP_WINDOW),
          total_ms / GP_WINDOW, render_ms / GP_WINDOW, compute_ms / GP_WINDOW, total_records / (double)GP_WINDOW,
          loads / (double)GP_WINDOW, clears / (double)GP_WINDOW, stores / (double)GP_WINDOW, discards / (double)GP_WINDOW,
          load_bytes / (1048576.0 * GP_WINDOW), store_bytes / (1048576.0 * GP_WINDOW),
          (unsigned long long)unknown_bytes, (unsigned long long)dropped_records, (unsigned long long)failed_slots);
-    for (size_t i = 0; i < n && i < 15; i++) {
+    for (size_t i = 0; i < n && i < 5; i++) {
         const gp_group *g = rank[i]; const gp_key *k = &g->key;
         char attachments[800]; size_t used = 0; attachments[0] = 0;
         for (int j = 0; j < 10; j++) if (k->a[j].format) {
@@ -178,6 +288,7 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
             int requested = se && !strcmp(se, "1");
             stats_on = vk_gpuprof_on && requested && V.has_pipeline_statistics;
             if (requested) LOGV("[gpu-profile] geometry+fragment statistics %s (pipelineStatisticsQuery=%d; TOTK_VK_GPU_PROFILE_STATS=1)", stats_on ? "on" : "unavailable", V.has_pipeline_statistics);
+            if (vk_gpuprof_on) output_init();
         }
     }
     if (!vk_gpuprof_on) return;

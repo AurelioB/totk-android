@@ -48,3 +48,30 @@ tools/bench/collect.sh -s <serial> --device <label> --out $OUT
 python3 tools/bench/analyze.py $OUT --commit <sha> --json $OUT/result.json
 python3 tools/bench/ledger.py add $OUT/result.json --commit <sha> --apk <apk> --profile "<preset> (default)" --note "<why>"
 ```
+
+## GPU pass profile (host-only analysis)
+
+`python3 tools/bench/gpuprof.py 'capture/gpuprof-*.jsonl*' [--json analysis.json]` reads schema-2
+GPU-profiler rows, including the three `.1`/`.2`/`.3` rotations. `--json -` emits JSON only on stdout.
+The per-pass table retains the exact key and ordinal; families combine only the same kind, sample count and
+attachment slot/format/exact normalized width and height/load/store structure, ignoring shader identity.
+Times and counters are **summed before dividing**, never averages of producer ratios or per-frame ratios.
+Unavailable statistics stay unavailable. Time/draw ratios use only complete-stat rows so their denominators
+match; partial-stat rows still contribute their available counters to counter-to-counter ratios.
+
+The report includes measured/span/gap sums, absent frame IDs within the captured range, missing window summaries,
+pass/window sum mismatches, dropped/failed slots, partial windows and malformed/incomplete/duplicate/conflicting
+rows. Separate launch filenames remain separate observations; repeated rotation rows count once, while conflicting
+identities are excluded rather than choosing an arbitrary value. Complete missing leading/trailing windows cannot
+be inferred. `long_frame` tables describe selected, capped rows only; they are never added to window totals or
+treated as an unbiased latency distribution. Exit 1 means malformed/conflicting rows; a partial final JSON line
+is a reported capture warning. Exit 2 means an input/output error.
+
+`tests/test_gpuprof.py` pins the schema, ratios, optional statistics, rotation and long-frame accounting without
+Vulkan. The optional `GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs
+for modes 0/1/2/3, recorder workers 0/2, statistics on/off/unsupported, split-frame reconciliation and bounded
+file rotation. Build `vkgpuproftest` via `games/totk/android/Makefile`; it also builds the existing `vkdraw-seed`.
+Set `TOTK_SHADER_SEED_DIR` to that seed's absolute directory and select the host lavapipe loader as for `vkdrawtest`.
+The fixture verifies actual pixels and secondary recorder use; it does not establish Android overhead or speedup.
+Run host builds/matrices under `flock /home/agent/Projects/totk-android/.scratch/hosttest.lock`
+and `taskset -c 0-3 nice -n 10`; no Android device is needed.
