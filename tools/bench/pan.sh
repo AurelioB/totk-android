@@ -7,11 +7,11 @@
 # line to <out>/pans.txt:
 #   <device> <scene> F0=<last finished frame window before> F1=<after> T0=<epoch s> T1=<epoch s> V=<value> D=<1|-1>
 # (D: 1 right first, -1 left first) and two lines to <out>/freqs.txt, the frequency limits (`bench_input.sh freqs`)
-# just before and just after the pan:
+# just before and just after the pan, plus raw cumulative GPU counters at both boundaries in gpu-time-in-state.jsonl:
 #   <device> <scene> T0=<epoch s> start|end <cpuN=... gpu_...>
-# and, after the stick is released (outside the measured windows: a screencap costs about a second of CPU), takes a
-# screenshot into <out>/shots/<device>-<scene>-pan-<T0>.png unless --no-shot. The game must be running. Root commands go
-# through the serial's persistent root shell (rootsh.py), so the pan itself starts no su.
+# Each GPU record has the same device/scene/T0/boundary identity; missing counters are recorded explicitly, not inferred
+# from sampled clocks. A screenshot is taken after release (outside the measured windows) into
+# <out>/shots/<device>-<scene>-pan-<T0>.png unless --no-shot. Root commands use the persistent root shell (rootsh.py).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 
@@ -52,6 +52,11 @@ input() { "$HERE/bench_input.sh" -s "$SER" --event "$EV" --display "$DISP" "$@";
 lastf() {
   python3 "$HERE/rootsh.py" -s "$SER" run -c "grep -ao '至帧 [0-9]*' $LOG | tail -n1" | tr -d '\r' | grep -o '[0-9][0-9]*'
 }
+gpu_snapshot() {
+  python3 "$HERE/sampler.py" -s "$SER" --device "$DEV" --out "$OUT" \
+    --gpu-snapshot --scene "$SCENE" --t0 "$T0" --boundary "$1" ||
+    echo "pan: GPU $1 snapshot unavailable (see gpu-time-in-state.jsonl)" >&2
+}
 
 F0=$(lastf) || die "no '至帧 N' timing line in $LOG yet (has the game rendered 300 frames?)"
 mkdir -p "$OUT/shots"
@@ -59,12 +64,14 @@ trap 'input rstick 0' EXIT
 trap 'exit 130' INT TERM
 FS=$(input freqs) || die "cannot read the frequency limits"
 T0=$(date +%s)
+gpu_snapshot start
 input rstick "$((D * V))"
 sleep "$(awk "BEGIN { print $SECS / 2 }")"
 input rstick "$((-D * V))"
 sleep "$(awk "BEGIN { print $SECS / 2 }")"
 F1=$(lastf)
 T1=$(date +%s)
+gpu_snapshot end
 FE=$(input freqs) || echo "pan: cannot read the frequency limits after the pan" >&2
 input rstick 0
 [ -z "$SHOT" ] || input shot "$OUT/shots/$DEV-$SCENE-pan-$T0.png" >/dev/null || echo "pan: screenshot failed (continuing)" >&2

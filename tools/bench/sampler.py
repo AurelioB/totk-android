@@ -9,8 +9,9 @@ RssShmem (kB), its kgsl memory /sys/class/kgsl/kgsl/proc/<pid>/{kernel,gpumem_ma
 exist), PSI cpu / memory some / full avg10 (/proc/pressure), and the kswapd threads' CPU ticks, from which the host adds
 kswapd's CPU % over the interval. Lines are host-timestamped (epoch seconds) and appended to <out>/samples-<label>.txt:
 
-  <epoch> f=<frame> cpu=<mC> gpu=<mC> cool=<sum> tpl=<level> gclk=<Hz> gcap=<Hz> mav=<kB> rss=<kB> swp=<kB> shm=<kB>
-          kgk=<B> kgm=<B> kgi=<B> pcs=<avg10> pcf=<avg10> pms=<avg10> pmf=<avg10> kst=<ticks> ksw=<%> caps= <scaling>/<cpuinfo> ...
+  <epoch> f=<frame> cpu=<mC> gpu=<mC> cool=<sum> tpl=<level> gclk=<Hz> gcap=<Hz> ac=<0|1> usb=<0|1> level=<%>
+          mav=<kB> rss=<kB> swp=<kB> shm=<kB> kgk=<B> kgm=<B> kgi=<B> pcs=<avg10> pcf=<avg10> pms=<avg10> pmf=<avg10>
+          kst=<ticks> ksw=<%> caps= <scaling>/<cpuinfo> ...
 
 A value the device does not expose (no matching thermal zone / cooling device, no kgsl, no PSI, the game not running)
 is left empty and becomes null.
@@ -19,8 +20,12 @@ Runs until --duration elapses, or SIGINT / SIGTERM; then the device loop and its
 on the device. As a safety net the device loop also ends by itself after --max-seconds (default 3 h, or --duration + 60).
 (The loop sleeps with `sleep`: mksh's `read -t` under su overshoots its timeout by seconds on some devices.) The loop
 pins itself, and so every command it starts, to the slowest cpufreq cluster (rootsh.PIN_SH); the cleanup goes through
-the serial's persistent root shell (rootsh.py), so sampling costs two su sessions in all."""
-import argparse, os, signal, subprocess, sys, threading, time
+the serial's persistent root shell (rootsh.py), so sampling costs two su sessions in all.
+
+--gpu-snapshot --scene LABEL --t0 EPOCH --boundary start|end writes one raw cumulative GPU counter snapshot to
+<out>/gpu-time-in-state.jsonl through rootsh. parse_gpu_time_in_state, parse_gpu_snapshots and gpu_residency_delta
+are importable; counter units are kept from the source header, or unknown, never assumed to be seconds."""
+import argparse, hashlib, json, math, os, re, signal, subprocess, sys, threading, time
 
 import rootsh
 
@@ -32,6 +37,12 @@ CZ=""; GZ=""; CD=""
 for z in thermal_zone*; do t=$(cat $z/type 2>/dev/null); case $t in cpu*) CZ="$CZ $z/temp";; gpuss*) GZ="$GZ $z/temp";; esac; done
 for c in cooling_device*; do t=$(cat $c/type 2>/dev/null); case $t in cpufreq-*|cpu-cluster*|thermal-cluster*|kgsl|gpu|devfreq-*kgsl*) CD="$CD $c/cur_state";; esac; done
 L=@LOG@
+AC=""; USB=""; BAT=""
+for p in /sys/class/power_supply/*; do
+  t=$(cat "$p/type" 2>/dev/null)
+  case $t in Mains) AC="$AC $p/online" ;; USB|USB_*) USB="$USB $p/online" ;; Battery) [ -n "$BAT" ] || BAT=$p/capacity ;; esac
+done
+online() { [ -z "$1" ] || cat $1 2>/dev/null </dev/null | sort -n | tail -n1; }
 PSI() { sed -n "s/^$1 avg10=\([0-9.]*\).*/\1/p" $2 2>/dev/null </dev/null; }
 while true; do
   f=$(tail -c 30000 $L 2>/dev/null | grep -ao '至帧 [0-9]*' | tail -n1 | grep -o '[0-9]*')
@@ -45,11 +56,204 @@ while true; do
   ks=""; for k in $(pgrep kswapd 2>/dev/null); do t=$(cut -d' ' -f14,15 /proc/$k/stat 2>/dev/null </dev/null); [ -n "$t" ] && ks=$(( ${ks:-0} + ${t% *} + ${t#* } )); done
   mem="mav=$(grep -m1 '^MemAvailable:' /proc/meminfo </dev/null | tr -s ' ' | cut -d' ' -f2) rss=$(st VmRSS) swp=$(st VmSwap) shm=$(st RssShmem) kgk=$(kv kernel) kgm=$(kv gpumem_mapped) kgi=$(kv imported)"
   psi="pcs=$(PSI some /proc/pressure/cpu) pcf=$(PSI full /proc/pressure/cpu) pms=$(PSI some /proc/pressure/memory) pmf=$(PSI full /proc/pressure/memory) kst=$ks"
-  echo "f=${f:-0} cpu=$ct gpu=$gt cool=$cs tpl=$(cat /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel 2>/dev/null) gclk=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null) gcap=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null) $mem $psi caps=$caps"
+  echo "f=${f:-0} cpu=$ct gpu=$gt cool=$cs tpl=$(cat /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel 2>/dev/null) gclk=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null) gcap=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null) ac=$(online "$AC") usb=$(online "$USB") level=$(cat $BAT 2>/dev/null </dev/null) $mem $psi caps=$caps"
   [ $(date +%s) -lt $END ] || exit 0
   sleep @INTERVAL@
 done
 '''
+
+
+GPU_SNAPSHOT_SCHEMA = 'totk-gpu-time-in-state/1'
+GPU_SNAPSHOT_FILE = 'gpu-time-in-state.jsonl'
+GPU_SNAPSHOT_SH = r'''
+K=/sys/class/kgsl/kgsl-3d0
+for f in "$K/devfreq/trans_stat" /sys/class/devfreq/*/trans_stat "$K/gpu_clock_stats" \
+    "$K/devfreq/time_in_state" /sys/class/devfreq/*/time_in_state; do
+  case $f in *kgsl*|*gpu*|*mali*) ;; *) continue ;; esac
+  [ -r "$f" ] || continue
+  printf 'source=%s\n' "$f"
+  printf 'boot_id=%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+  printf 'reset_count=%s\n' "$(cat "$K/reset_count" 2>/dev/null)"
+  printf 'frequencies=%s\n' "$(cat "$K/gpu_available_frequencies" 2>/dev/null)"
+  printf 'uptime_start=%s\n' "$(cut -d' ' -f1 /proc/uptime)"
+  printf 'raw_begin\n'
+  cat "$f"
+  rc=$?
+  printf '\nraw_end\n'
+  printf 'uptime_end=%s\n' "$(cut -d' ' -f1 /proc/uptime)"
+  exit "$rc"
+done
+echo 'no readable GPU cumulative time-in-state source' >&2
+exit 3
+'''
+
+
+def parse_gpu_time_in_state(text, source, frequencies=None):
+    """Parse kernel cumulative counters, retaining units and integer precision.
+
+    trans_stat: the last column is time-in-state, NOT the transition matrix. Its
+    time(...) header declares the counter unit. gpu_clock_stats: a KGSL vector in
+    gpu_available_frequencies order; this counts active clock time, not idle time.
+    Plain devfreq time_in_state pairs have an undocumented counter unit here.
+    Raises ValueError for unsupported, incomplete or ambiguous data.
+    """
+    if not isinstance(text, str) or not isinstance(source, str):
+        raise ValueError('missing GPU counter text or source')
+    name = source.rsplit('/', 1)[-1]
+    counters, unit, kind = {}, 'unknown', 'residency'
+
+    def add(freq, count):
+        if freq in counters:
+            raise ValueError(f'duplicate GPU frequency {freq}')
+        counters[freq] = count
+
+    if name == 'trans_stat':
+        headers = []
+        for line in text.splitlines():
+            if m := re.search(r'\btime\s*\(([^)]+)\)\s*$', line, re.I):
+                cols = line[:m.start()].strip().lstrip(':').split()
+                if headers or not cols or not all(c.isdigit() for c in cols):
+                    raise ValueError('invalid trans_stat frequency header')
+                headers = [int(c) for c in cols]
+                if len(set(headers)) != len(headers):
+                    raise ValueError('duplicate trans_stat header frequency')
+                unit = m[1].strip()
+            elif m := re.fullmatch(r'\s*\*?\s*(\d+)\s*:\s*([\d\s]+)', line):
+                values = [int(v) for v in m[2].split()]
+                if not headers or len(values) != len(headers) + 1:
+                    raise ValueError('incomplete trans_stat row')
+                add(int(m[1]), values[-1])
+            elif re.match(r'\s*\*?\s*\d', line):
+                raise ValueError('malformed trans_stat row')
+        if not headers or set(counters) != set(headers):
+            raise ValueError('missing trans_stat time-in-state rows')
+    elif name == 'gpu_clock_stats':
+        values = text.split()
+        freqs = frequencies.split() if isinstance(frequencies, str) else []
+        if (not values or not freqs or len(values) != len(freqs)
+                or not all(v.isdigit() for v in values + freqs)):
+            raise ValueError('gpu_clock_stats needs a matching gpu_available_frequencies vector')
+        for freq, count in zip(freqs, values):
+            add(int(freq), int(count))
+        kind = 'active'
+    elif name == 'time_in_state':
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            if not (m := re.fullmatch(r'\s*(\d+)\s+(\d+)\s*', line)):
+                raise ValueError('malformed time_in_state pair')
+            add(int(m[1]), int(m[2]))
+    else:
+        raise ValueError(f'unsupported GPU counter source {source!r}')
+    if not counters:
+        raise ValueError('empty GPU time-in-state snapshot')
+    return {'source': source, 'counter_unit': unit, 'frequency_unit': 'Hz', 'counter_kind': kind,
+            'counters': counters}
+
+
+def parse_gpu_snapshots(path):
+    """Read JSONL as {(device, T0): {'start': record, 'end': record}}.
+
+    A missing file returns {}, leaving gpu_residency_delta to reject missing
+    boundaries per pan. Failed captures remain records with status/error/raw.
+    Invalid records or duplicate boundaries raise ValueError, never overwrite.
+    """
+    snapshots = {}
+    if not os.path.exists(path):
+        return snapshots
+    with open(path, encoding='utf-8') as fh:
+        for n, line in enumerate(fh, 1):
+            try:
+                record = json.loads(line)
+                if (not isinstance(record, dict) or record.get('schema') != GPU_SNAPSHOT_SCHEMA
+                        or not isinstance(record.get('device'), str) or not record['device']
+                        or not isinstance(record.get('scene'), str) or not record['scene']
+                        or type(record.get('T0')) is not int
+                        or record.get('boundary') not in ('start', 'end')):
+                    raise ValueError('invalid snapshot identity')
+                pair = snapshots.setdefault((record['device'], record['T0']), {})
+                if record['boundary'] in pair:
+                    raise ValueError('duplicate snapshot boundary')
+                pair[record['boundary']] = record
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f'{path}:{n}: {exc}') from exc
+    return snapshots
+
+
+def gpu_residency_delta(start, end):
+    """Delta two raw records; raises ValueError for missing, reset or mismatched snapshots.
+
+    Returns source/counter_unit/frequency_unit/counter_kind, integer deltas,
+    total_delta and fractions keyed by frequency in Hz. Fractions describe only
+    the counter's coverage (active time for gpu_clock_stats), not wall seconds.
+    """
+    parsed = []
+    for boundary, record in (('start', start), ('end', end)):
+        if not isinstance(record, dict):
+            raise ValueError(f'missing GPU {boundary} snapshot')
+        if record.get('schema') != GPU_SNAPSHOT_SCHEMA or record.get('boundary') != boundary:
+            raise ValueError(f'invalid GPU {boundary} snapshot identity')
+        if record.get('status') != 'ok':
+            raise ValueError(f'GPU {boundary} snapshot unavailable: {record.get("error", "capture failed")}')
+        for key in ('device', 'scene', 'serial_sha256', 'boot_id'):
+            if not isinstance(record.get(key), str) or not record[key]:
+                raise ValueError(f'missing GPU {boundary} snapshot {key}')
+        if type(record.get('T0')) is not int:
+            raise ValueError(f'missing GPU {boundary} snapshot T0')
+        for key in ('uptime_start', 'uptime_end'):
+            value = record.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f'missing GPU {boundary} snapshot {key}')
+        if record['uptime_end'] < record['uptime_start']:
+            raise ValueError(f'GPU {boundary} snapshot uptime reset')
+        parsed.append(parse_gpu_time_in_state(record.get('raw'), record.get('source'), record.get('frequencies')))
+    for key in ('device', 'scene', 'T0', 'serial_sha256', 'boot_id', 'source', 'reset_count'):
+        if start.get(key) != end.get(key):
+            raise ValueError(f'mismatched GPU snapshot {key}')
+    if end['uptime_start'] < start['uptime_end']:
+        raise ValueError('GPU snapshot uptime reset or reversed boundaries')
+    before, after = parsed
+    for key in ('counter_unit', 'frequency_unit', 'counter_kind'):
+        if before[key] != after[key]:
+            raise ValueError(f'mismatched GPU snapshot {key}')
+    if before['counters'].keys() != after['counters'].keys():
+        raise ValueError('mismatched GPU snapshot frequencies')
+    deltas = {f: after['counters'][f] - count for f, count in before['counters'].items()}
+    if any(d < 0 for d in deltas.values()):
+        raise ValueError('GPU cumulative counter reset')
+    total = sum(deltas.values())
+    if not total:
+        raise ValueError('GPU cumulative counters did not advance')
+    return {k: before[k] for k in ('source', 'counter_unit', 'frequency_unit', 'counter_kind')} | {
+        'deltas': deltas, 'total_delta': total, 'fractions': {f: d / total for f, d in deltas.items()}}
+
+
+def capture_gpu_snapshot(serial, device, scene, t0, boundary):
+    """Capture through the persistent root shell; failures are explicit, serializable records."""
+    record = {'schema': GPU_SNAPSHOT_SCHEMA, 'device': device, 'scene': scene, 'T0': t0, 'boundary': boundary,
+              'serial_sha256': hashlib.sha256(serial.encode()).hexdigest(), 'host_epoch_ns': time.time_ns(),
+              'status': 'error', 'raw': ''}
+    rc, out, err = rootsh.run(serial, GPU_SNAPSHOT_SH)
+    text = out.decode('utf-8', errors='replace').replace('\r\n', '\n')
+    head, marker, rest = text.partition('raw_begin\n')
+    raw, end_marker, tail = rest.rpartition('\nraw_end\n')
+    metadata = dict(line.split('=', 1) for line in (head + tail).splitlines() if '=' in line)
+    record.update({k: metadata.get(k, '') for k in ('source', 'boot_id', 'reset_count', 'frequencies')})
+    record['raw'] = raw if marker and end_marker else text
+    try:
+        if rc or not marker or not end_marker:
+            raise ValueError(f'rootsh status {rc}: {err.decode(errors="replace").strip() or "incomplete capture"}')
+        for key in ('uptime_start', 'uptime_end'):
+            record[key] = float(metadata[key])
+            if not math.isfinite(record[key]) or record[key] < 0:
+                raise ValueError(f'invalid {key}')
+        if not record['boot_id'] or record['uptime_end'] < record['uptime_start']:
+            raise ValueError('missing boot identity or uptime reset during capture')
+        parse_gpu_time_in_state(record['raw'], record['source'], record['frequencies'])
+        record['status'] = 'ok'
+    except (KeyError, ValueError) as exc:
+        record['error'] = str(exc)
+    return record
 
 
 class Stop(Exception):
@@ -84,9 +288,22 @@ def main():
     ap.add_argument('--max-seconds', type=int, help='device-side safety deadline (default 10800, or --duration + 60)')
     ap.add_argument('--package', default='com.aure.totk')
     ap.add_argument('--game-dir', help='default /data/user/0/<package>/files/game')
+    ap.add_argument('--gpu-snapshot', action='store_true', help='capture one raw cumulative GPU counter boundary')
+    ap.add_argument('--scene', help='scene identity for --gpu-snapshot')
+    ap.add_argument('--t0', type=int, help='pan T0 identity for --gpu-snapshot')
+    ap.add_argument('--boundary', choices=('start', 'end'), help='pan boundary for --gpu-snapshot')
     a = ap.parse_args()
     game = a.game_dir or f'/data/user/0/{a.package}/files/game'
     os.makedirs(a.out, exist_ok=True)
+    if a.gpu_snapshot:
+        if not a.scene or a.t0 is None or not a.boundary:
+            ap.error('--gpu-snapshot requires --scene, --t0 and --boundary')
+        record = capture_gpu_snapshot(a.serial, a.device, a.scene, a.t0, a.boundary)
+        with open(os.path.join(a.out, GPU_SNAPSHOT_FILE), 'a', encoding='utf-8') as out:
+            out.write(json.dumps(record, ensure_ascii=False) + '\n')
+        if record['status'] != 'ok':
+            sys.exit(f'sampler: GPU {a.boundary} snapshot unavailable: {record["error"]}')
+        return
     path = os.path.join(a.out, f'samples-{a.device}.txt')
 
     def stop(*_):
