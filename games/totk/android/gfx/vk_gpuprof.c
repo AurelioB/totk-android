@@ -3,6 +3,9 @@
    assembly never touches the walking thread's current pass. */
 #include "vk_int.h"
 #include "vk_gpuprof_time.h"
+#include "vk_gpuprof_pipe.h"
+#include "vk_record.h"
+#include <sys/random.h>
 #include "../../runtime/thread_place.h"
 #include <stdarg.h>
 #include <time.h>
@@ -42,11 +45,21 @@ typedef struct {
 typedef struct {
     uint64_t frame;
     uint32_t first, last, first_valid, last_valid, timestamp_count;
+    uint32_t pipeline_observed, pipeline_dropped, pipeline_selected, pipeline_timestamps;
+    uint32_t pipeline_population, pipeline_phase, pipeline_unretained, pipeline_out_of_range;
 } gp_segment;
+typedef struct {
+    uint64_t frame, pipeline, primitives, unknown_draws, draws, dispatches;
+    uint32_t parent, ordinal, query1, timestamps, selected, population;
+    char shader[3][80]; /* exact selected VS/FS/CS variants, copied before publication */
+} gp_pipeline;
 struct vk_gpuprof_slot {
-    VkQueryPool pool, stats;
+    VkQueryPool pool, stats, pipeline_pool;
+    gp_pipeline *pipeline;
+    vk_gpuprof_timestamp *pipeline_ticks;
+    uint32_t npipeline, pipeline_timed, pipeline_unselected;
     uint32_t n, dropped, ns, nt, span_writes;
-    uint64_t sealed, sequence;
+    uint64_t sealed, sequence, lease;
     uint32_t nsegment, has_pre;
     int discard;
     VkCommandBuffer pre_cb;
@@ -68,6 +81,15 @@ typedef struct {
 } gp_group;
 
 int vk_gpuprof_on;
+int vk_gpuprof_pipeline_on;
+static uint32_t pipeline_phase, pipeline_launch_phase, pipeline_ordinal;
+static uint32_t pipeline_population = VK_GPUPROF_PIPE_ORDINALS;
+static gp_pipeline *pipeline_open;
+static VkPipeline pipeline_last;
+static vk_shader *pipeline_shaders[3];
+static VkCommandBuffer pipeline_cb;
+static int pipeline_secondary, pipeline_random;
+static uint64_t pipeline_lease;
 static int stats_on, secondary_pass;
 static uint32_t sample_budget, sample_previous_passes, sample_selected;
 static uint64_t sample_cursor;
@@ -226,6 +248,11 @@ static void output_init(void) {
     output_limit = env_u64("TOTK_VK_GPU_PROFILE_MAX_BYTES", output_limit, 4096, UINT64_C(1) << 30);
     gp_json *row = &output_header;
     json_add(row, "{\"schema\":3,\"type\":\"header\",\"launch_id\":"); json_string(row, output_launch);
+    if (vk_gpuprof_pipeline_on) json_add(row,
+        ",\"pipeline_budget\":%d,\"pipeline_population\":%u,\"pipeline_phase\":%u,"
+        "\"pipeline_random_phase\":%s,\"pipeline_query_limit\":%u",
+        vk_gpuprof_pipeline_on, VK_GPUPROF_PIPE_ORDINALS, pipeline_launch_phase,
+        pipeline_random ? "true" : "false", 2 * VK_GPUPROF_PIPE_BUDGET * GP_SEGMENTS);
     json_add(row, ",\"build_commit\":"); json_string(row, output_commit[0] ? output_commit : NULL);
     json_add(row, ",\"build_asset\":"); json_string(row, output_build[0] ? output_build : NULL);
     json_add(row, ",\"build_identity_source\":"); json_string(row, output_commit[0] ? "apk:assets/build.txt" : "unavailable");
@@ -248,6 +275,7 @@ static void output_init(void) {
     static const char *const names[] = {
         "TOTK_VK_DRIVER", "TOTK_VK_GPU_PROFILE", "TOTK_VK_GPU_PROFILE_STATS", "TOTK_VK_GPU_PROFILE_ORDINALS",
         "TOTK_VK_GPU_PROFILE_SAMPLE",
+        "TOTK_VK_GPU_PROFILE_PIPELINES",
         "TOTK_VK_GPU_PROFILE_LONG_MS", "TOTK_VK_GPU_PROFILE_LONG_FRAMES", "TOTK_VK_GPU_PROFILE_MAX_BYTES",
         "TOTK_VK_REC_THREADS", "TOTK_VK_REC_CHUNK_DRAWS", "TOTK_VK_REC_INLINE_DRAWS", "TOTK_VK_REC_LEAD_DRAWS",
         "TOTK_OPERATION_MODE", "TOTK_RENDER_RES", "TOTK_FPS60", "TOTK_SCENE_SCALE", "TOTK_VK_PRESENT",
@@ -762,6 +790,22 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
             sample_budget = (uint32_t)env_u64("TOTK_VK_GPU_PROFILE_SAMPLE", 0, 0, 16);
             LOGV("[gpu-profile] sample-budget=%u (TOTK_VK_GPU_PROFILE_SAMPLE; 0=full, 1..16=rotating passes; timestamps/frame <=2k+2)",
                 sample_budget);
+            vk_gpuprof_pipeline_on = (int)env_u64("TOTK_VK_GPU_PROFILE_PIPELINES", 0, 0, VK_GPUPROF_PIPE_BUDGET);
+            if (!vk_gpuprof_on) vk_gpuprof_pipeline_on = 0;
+            if (vk_gpuprof_pipeline_on) {
+                uint32_t random;
+                ssize_t n;
+                do { n = getrandom(&random, sizeof random, 0); } while (n < 0 && errno == EINTR);
+                pipeline_random = n == sizeof random;
+                if (!pipeline_random) {
+                    /* No deterministic fallback may masquerade as a probability sample. */
+                    LOGV("[gpu-profile] pipeline sampling unavailable: random launch phase failed");
+                    vk_gpuprof_pipeline_on = 0;
+                } else {
+                    pipeline_launch_phase = random;
+                    pipeline_phase = random & (pipeline_population - 1);
+                }
+            }
             if (vk_gpuprof_on) {
                 const char *mode = getenv("TOTK_OPERATION_MODE"), *resolution = getenv("TOTK_RENDER_RES");
                 int handheld = mode && !strcmp(mode, "handheld");
@@ -786,6 +830,8 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
             }
             if (vk_gpuprof_on) background_start();
         } else LOGV("[gpu-profile] disabled (TOTK_VK_GPU_PROFILE=%s; default=0)", e ? e : "unset");
+        LOGV("[gpu-profile] pipeline-budget=%d (TOTK_VK_GPU_PROFILE_PIPELINES; default=0; population=%u; phase=%u; extra timestamps/frame<=2k)",
+            vk_gpuprof_pipeline_on, VK_GPUPROF_PIPE_ORDINALS, pipeline_launch_phase);
     }
     current = NULL;
     if (!vk_gpuprof_on || atomic_load_explicit(&background_closing, memory_order_acquire)) { *slot = NULL; return; }
@@ -799,7 +845,9 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
     atomic_fetch_add_explicit(&leases_acquired, 1, memory_order_relaxed);
     current->span_writes = 0;
     current->ns = current->nt = 0; current->has_pre = 0; current->pre_cb = VK_NULL_HANDLE;
+    current->npipeline = current->pipeline_timed = current->pipeline_unselected = 0;
     current->discard = 0; current->sequence = 0;
+    current->lease = ++pipeline_lease;
     current->nsegment = 1; current->segment[0] = (gp_segment){frame, 0, 0};
     current->domain = current_time_domain();
     if (sample_budget) sampled_frame_begin(cb);
@@ -829,6 +877,7 @@ void vk_gpuprof_slot_cancel(vk_gpuprof_slot **slot) {
     if (current == *slot) {
         if (sample_budget && current && current->segment[0].first_valid) sample_frame_started = 0;
         current = NULL; open_record = NULL; scope_n = scope_overflow = 0;
+        pipeline_open = NULL; pipeline_last = VK_NULL_HANDLE;
     }
     background_enqueue(slot, 1);
 }
@@ -859,6 +908,72 @@ void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot) {
         atomic_fetch_add_explicit(&queries_submitted, slot_queries(slot), memory_order_relaxed);
     }
     current = NULL;
+}
+static void output_pipelines(vk_gpuprof_slot *slot) {
+    if (!slot->pipeline_pool) return;
+    VkResult result = !slot->discard && slot->pipeline_timed ? vkGetQueryPoolResults(V.dev,
+        slot->pipeline_pool, 0, slot->pipeline_timed * 2,
+        slot->pipeline_timed * 2 * sizeof *slot->pipeline_ticks, slot->pipeline_ticks,
+        sizeof *slot->pipeline_ticks, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) : VK_SUCCESS;
+    for (uint32_t i = 0; i < slot->npipeline; i++) {
+        const gp_pipeline *p = &slot->pipeline[i];
+        const gp_record *parent = &slot->rec[p->parent];
+        const char *status = p->ordinal >= p->population ? "out-of-range" : "not-selected";
+        vk_gpuprof_interval timing = {.status = GP_TIME_MISSING};
+        if (p->selected && !slot->discard) {
+            status = "query-overflow";
+            if (p->query1) {
+                uint32_t q = p->query1 - 1;
+                if (p->timestamps != 2) status = "incomplete";
+                else if (!query_readable(result)) status = "query-failed";
+                else {
+                    timing = vk_gpuprof_interval_check(slot->pipeline_ticks[q], slot->pipeline_ticks[q + 1],
+                        slot->domain, slot->domain);
+                    status = vk_gpuprof_time_reason(timing.status);
+                }
+            }
+        }
+        if (slot->discard) status = "discarded";
+        if (!p->draws && !p->dispatches && !slot->discard) status = "no-work";
+        int valid = !slot->discard && timing.status == GP_TIME_OK && p->timestamps == 2 && (p->draws || p->dispatches);
+        gp_json row = {0};
+        json_add(&row, "{\"schema\":3,\"type\":\"pipeline\",\"frame\":%llu,\"group\":%u,"
+            "\"pass_ordinal\":%u,\"pass_key\":\"%016llx\",\"kind\":\"%s\","
+            "\"pipeline\":\"%016llx\",\"pipeline_identity\":\"launch-local-vulkan-handle\",\"vs\":",
+            (unsigned long long)p->frame, p->ordinal, parent->instance, (unsigned long long)key_hash(&parent->key),
+            parent->key.compute == 1 ? "compute" : "render", (unsigned long long)p->pipeline);
+        json_string(&row, p->shader[0][0] ? p->shader[0] : NULL);
+        json_add(&row, ",\"fs\":"); json_string(&row, p->shader[1][0] ? p->shader[1] : NULL);
+        json_add(&row, ",\"cs\":"); json_string(&row, p->shader[2][0] ? p->shader[2] : NULL);
+        json_add(&row, ",\"draws\":%llu,\"dispatches\":%llu,\"known_primitives\":%llu,"
+            "\"unknown_primitive_draws\":%llu,\"primitives\":",
+            (unsigned long long)p->draws, (unsigned long long)p->dispatches,
+            (unsigned long long)p->primitives, (unsigned long long)p->unknown_draws);
+        if (p->unknown_draws || parent->key.compute) json_add(&row, "null");
+        else json_add(&row, "%llu", (unsigned long long)p->primitives);
+        json_add(&row, ",\"primitive_reason\":");
+        json_string(&row, parent->key.compute ? "not-graphics" : p->unknown_draws ? "indexed-restart-or-unknown-count" : NULL);
+        json_add(&row, ",\"selected\":%s,\"status\":\"%s\",\"gpu_ms\":",
+            p->selected ? "true" : "false", status);
+        if (valid) json_add(&row, "%.9f", timing.ms); else json_add(&row, "null");
+        json_add(&row, ",\"timestamp_count\":%u,\"selection_numerator\":%u,\"selection_denominator\":%u}\n",
+            p->timestamps, p->ordinal < p->population ? (unsigned)vk_gpuprof_pipeline_on : 0, p->population);
+        if (row.failed) output_failures++; else output_row(row.data);
+    }
+    for (uint32_t i = 0; i < slot->nsegment; i++) {
+        const gp_segment *s = &slot->segment[i];
+        if (!s->pipeline_observed) continue;
+        gp_json row = {0};
+        json_add(&row, "{\"schema\":3,\"type\":\"pipeline_coverage\",\"frame\":%llu,\"slot_sequence\":%llu,"
+            "\"lease\":%llu,\"observed_groups\":%u,\"dropped_groups\":%u,\"selected_groups\":%u,"
+            "\"timestamp_count\":%u,\"unretained_groups\":%u,\"out_of_range_groups\":%u,"
+            "\"population\":%u,\"phase\":%u,\"discarded\":%s}\n",
+            (unsigned long long)s->frame, (unsigned long long)slot->sequence, (unsigned long long)slot->lease,
+            s->pipeline_observed, s->pipeline_dropped, s->pipeline_selected, s->pipeline_timestamps,
+            s->pipeline_unretained, s->pipeline_out_of_range, s->pipeline_population, s->pipeline_phase,
+            slot->discard ? "true" : "false");
+        output_row(row.data);
+    }
 }
 static void ingest_record(gp_record *r, double ms, int stats_valid, int sampled) {
     completed.measured += ms;
@@ -991,6 +1106,7 @@ static void complete_closure(gp_closure close) {
     advance(close.frame / GP_WINDOW);
 }
 static void background_prepare(vk_gpuprof_slot *slot) {
+    if (slot->pipeline_pool) vkResetQueryPool(V.dev, slot->pipeline_pool, 0, 2 * VK_GPUPROF_PIPE_BUDGET * GP_SEGMENTS);
     vkResetQueryPool(V.dev, slot->pool, 0, GP_TIMESTAMPS);
     if (stats_on) vkResetQueryPool(V.dev, slot->stats, 0, GP_RECORDS);
     memset(slot->timestamp_marks, 0, sizeof slot->timestamp_marks);
@@ -1031,6 +1147,13 @@ static void *background_main(void *unused) {
         VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
             .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GP_TIMESTAMPS};
         VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &slot->pool));
+        if (vk_gpuprof_pipeline_on) {
+            slot->pipeline = calloc(GP_RECORDS, sizeof *slot->pipeline);
+            slot->pipeline_ticks = calloc(2 * VK_GPUPROF_PIPE_BUDGET * GP_SEGMENTS, sizeof *slot->pipeline_ticks);
+            if (!slot->pipeline || !slot->pipeline_ticks) DIE("GPU pipeline profiler allocation");
+            qi.queryCount = 2 * VK_GPUPROF_PIPE_BUDGET * GP_SEGMENTS;
+            VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &slot->pipeline_pool));
+        }
         if (stats_on) {
             qi.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS; qi.queryCount = GP_RECORDS; qi.pipelineStatistics = GP_STATS_MASK;
             VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &slot->stats));
@@ -1063,6 +1186,7 @@ static void *background_main(void *unused) {
             vk_gpuprof_slot *slot = background_queue[background_head++ % GP_BACKLOG];
             background_active = 1;
             pthread_mutex_unlock(&background_mu);
+            output_pipelines(slot);
             if (!slot->discard) process_slot(slot);
             background_prepare(slot);
             atomic_fetch_add_explicit(&background_processed_slots, 1, memory_order_relaxed);
@@ -1090,6 +1214,8 @@ static void *background_main(void *unused) {
     while (background_nfree) {
         vk_gpuprof_slot *slot = background_free[--background_nfree];
         if (slot->stats) vkDestroyQueryPool(V.dev, slot->stats, NULL);
+        if (slot->pipeline_pool) vkDestroyQueryPool(V.dev, slot->pipeline_pool, NULL);
+        free(slot->pipeline); free(slot->pipeline_ticks);
         vkDestroyQueryPool(V.dev, slot->pool, NULL); free(slot);
     }
     for (uint32_t i = 0; i < long_frames; i++) free(long_ring[i].pass);
@@ -1188,6 +1314,66 @@ void vk_gpuprof_begin(VkCommandBuffer cb, const VkRenderingInfo *ri, const VkFor
         k->a[j] = (gp_attachment){formats[j], widths[j], heights[j], a->loadOp, a->storeOp, bytes};
     }
 }
+/* Walker only. Query events copy pool/index/stage into the recorder's immutable
+   job stream. A boundary can land in a later chunk; GPU execute order, not CPU
+   worker completion order, joins the two endpoints. No worker reads these globals. */
+static void pipeline_timestamp(VkCommandBuffer cb, uint32_t query) {
+    if (pipeline_secondary) vk_record_timestamp(current->pipeline_pool, query, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+    else vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pipeline_pool, query);
+    current->segment[current->nsegment - 1].pipeline_timestamps++;
+}
+void vk_gpuprof_pipeline_break(VkCommandBuffer cb) {
+    if (pipeline_open && pipeline_open->query1) {
+        pipeline_timestamp(cb, pipeline_open->query1);
+        pipeline_open->timestamps++;
+    }
+    pipeline_open = NULL; pipeline_last = VK_NULL_HANDLE;
+}
+void vk_gpuprof_pipeline_begin(VkCommandBuffer cb, VkPipeline pipeline, vk_shader *const shaders[6]) {
+    if (!vk_gpuprof_pipeline_on || !current) return;
+    int compute = open_record && open_record->key.compute == 1;
+    vk_shader *selected[3] = {compute ? NULL : shaders[0], compute ? NULL : shaders[1], compute ? shaders[5] : NULL};
+    if (pipeline_last && pipeline == pipeline_last && pipeline_cb == cb &&
+        !memcmp(selected, pipeline_shaders, sizeof selected)) return;
+    vk_gpuprof_pipeline_break(pipeline_cb);
+    gp_segment *segment = &current->segment[current->nsegment - 1];
+    segment->pipeline_population = pipeline_population; segment->pipeline_phase = pipeline_phase;
+    segment->pipeline_observed++;
+    uint32_t ordinal = pipeline_ordinal++;
+    int timed = vk_gpuprof_pipe_selected(ordinal, pipeline_phase, (uint32_t)vk_gpuprof_pipeline_on, pipeline_population);
+    segment->pipeline_out_of_range += ordinal >= pipeline_population;
+    /* Unselected detail is optional. Reserve the maximum selected count so a
+       long pass can never crowd later selected groups out of immutable storage. */
+    if (!timed && current->pipeline_unselected == GP_RECORDS - VK_GPUPROF_PIPE_BUDGET * GP_SEGMENTS) {
+        pipeline_last = pipeline; pipeline_cb = cb;
+        memcpy(pipeline_shaders, selected, sizeof selected);
+        segment->pipeline_unretained++; return;
+    }
+    pipeline_last = pipeline; pipeline_cb = cb;
+    memcpy(pipeline_shaders, selected, sizeof selected);
+    if (!open_record || current->npipeline == GP_RECORDS) { segment->pipeline_dropped++; return; }
+    gp_pipeline *p = &current->pipeline[current->npipeline++];
+    *p = (gp_pipeline){.frame = frame, .pipeline = (uint64_t)(uintptr_t)pipeline,
+        .parent = (uint32_t)(open_record - current->rec), .ordinal = ordinal, .population = pipeline_population};
+    pipeline_open = p;
+    pipeline_secondary = secondary_pass && !open_record->key.compute;
+    for (unsigned i = 0; i < 3; i++) if (selected[i]) memcpy(p->shader[i], selected[i]->key, sizeof p->shader[i]);
+    p->selected = timed;
+    current->pipeline_unselected += !timed;
+    segment->pipeline_selected += timed;
+    if (!p->selected || current->pipeline_timed == VK_GPUPROF_PIPE_BUDGET * GP_SEGMENTS) return;
+    p->query1 = current->pipeline_timed++ * 2 + 1;
+    pipeline_timestamp(cb, p->query1 - 1); p->timestamps++;
+}
+void vk_gpuprof_pipeline_count(int prim, uint32_t count, uint32_t instances, int indexed) {
+    if (!pipeline_open) return;
+    if (prim < 0) { pipeline_open->dispatches++; return; }
+    pipeline_open->draws++;
+    uint64_t primitives;
+    if (vk_gpuprof_pipe_primitives(prim, count, instances, indexed, &primitives))
+        pipeline_open->primitives += primitives;
+    else pipeline_open->unknown_draws++;
+}
 void vk_gpuprof_dispatch_begin(VkCommandBuffer cb) { begin_record(cb, 1); }
 void vk_gpuprof_draw(vk_shader *const shaders[6]) {
     if (!open_record) return;
@@ -1218,6 +1404,7 @@ void vk_gpuprof_end_emit(VkCommandBuffer cb, const vk_gpuprof_end_token *token) 
     if (token->timestamp_count) (*token->timestamp_count)++;
 }
 void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpuprof_end_token *token) {
+    if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(pipeline_cb);
     memset(token, 0, sizeof *token);
     if (!open_record) return;
     open_record->reason = (uint32_t)reason; open_record->detail = detail;
@@ -1231,6 +1418,7 @@ void vk_gpuprof_end(VkCommandBuffer cb, vk_pass_end_kind reason, uint32_t detail
     vk_gpuprof_end_emit(cb, &token);
 }
 void vk_gpuprof_scope_begin(VkCommandBuffer cb, const char *label) {
+    if (vk_gpuprof_pipeline_on && cb == pipeline_cb) vk_gpuprof_pipeline_break(cb);
     if (scope_n == sizeof scopes / sizeof *scopes) { scope_overflow++; return; }
     gp_scope *scope = &scopes[scope_n++];
     *scope = (gp_scope){.parent = open_record, .parent_cb = open_cb,
@@ -1265,6 +1453,15 @@ static void present_at(VkCommandBuffer cb) {
     if (sample_budget) {
         sample_previous_passes = frame_instance;
         sample_cursor += sample_budget; sample_selected = 0;
+    }
+    if (vk_gpuprof_pipeline_on) {
+        /* Retain all launch-random bits: shrinking them to the initial domain
+           would bias selection after domain growth. Growth never removes tails
+           from stable layouts, and needs no per-frame random syscall. */
+        pipeline_population = vk_gpuprof_pipe_population(pipeline_population, pipeline_ordinal);
+        pipeline_phase = (pipeline_launch_phase + (uint32_t)frame * (uint32_t)vk_gpuprof_pipeline_on) &
+            (pipeline_population - 1);
+        pipeline_ordinal = 0;
     }
     frame++;
     frame_instance = 0;

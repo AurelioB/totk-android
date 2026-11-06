@@ -32,6 +32,219 @@ SPAN_LIMIT_MS = 10000
 HISTOGRAM_BUCKETS = 272
 MAX_SAMPLE_BUDGET = 16
 RATIOS = ('verts_per_draw', 'prims_per_draw', 'fragments_per_prim', 'ns_per_vertex', 'ns_per_primitive')
+PIPELINE_POPULATION = 2048
+PIPELINE_STATUSES = {'ok', 'not-selected', 'out-of-range', 'query-overflow', 'incomplete',
+                     'query-failed', 'unavailable-timestamp', 'timestamp-domain-mismatch',
+                     'implausible-timestamp', 'discarded', 'no-work'}
+
+
+def pipeline_population(row, key):
+    population = int(number(row, key, True, PIPELINE_POPULATION))
+    if population > 1 << 31 or population & (population - 1):
+        raise ValueError(f'{key}: expected bounded power-of-two population')
+    return population
+
+
+def pipeline_report(by_type, loss):
+    """Never infer equal draw work or multiply by observed/sample frequencies."""
+    headers = {}
+    for observation in by_type['header']:
+        row = observation['row']
+        if 'pipeline_budget' in row:
+            headers.setdefault(observation['stream'], set()).add(
+                (row['pipeline_budget'], row['pipeline_phase']))
+    coverage = dict(observed_groups=0, dropped_groups=0, unretained_groups=0, out_of_range_groups=0,
+                    discarded_segments=0, selected_groups=0, timestamp_count=0,
+                    invalid_coverage=0, missing_headers=0, rows=len(by_type['pipeline']))
+    contexts = {}
+
+    def context(stream, frame):
+        return contexts.setdefault((stream, frame), dict(
+            observed_groups=0, dropped_groups=0, unretained_groups=0, out_of_range_groups=0,
+            selected_groups=0, timestamp_count=0, rows=0, row_selected=0, row_stamps=0,
+            populations=set(), phases=set()))
+
+    for observation in by_type['pipeline_coverage']:
+        row = observation['row']
+        c = context(observation['stream'], row['frame'])
+        for key in ('observed_groups', 'dropped_groups', 'unretained_groups', 'out_of_range_groups',
+                    'selected_groups', 'timestamp_count'):
+            c[key] += row[key]
+            coverage[key] += row[key]
+        c['populations'].add(row['population'])
+        c['phases'].add(row['phase'])
+        coverage['discarded_segments'] += row['discarded']
+    for observation in by_type['pipeline']:
+        row, stream = observation['row'], observation['stream']
+        c = context(stream, row['frame'])
+        c['rows'] += 1
+        c['row_selected'] += row['selected']
+        c['row_stamps'] += row['timestamp_count']
+        configs = headers.get(stream, set())
+        if len(configs) != 1:
+            coverage['missing_headers'] += 1
+            continue
+        budget, seed = next(iter(configs))
+        population = row['selection_denominator']
+        phase = (seed + (row['frame'] - 1) * budget) % population
+        expected = row['group'] < population and (row['group'] - phase) % population < budget
+        if row['selected'] != expected or c['populations'] != {population} or c['phases'] != {phase} or (
+                row['selection_numerator'] != (budget if row['group'] < population else 0)):
+            coverage['invalid_coverage'] += 1
+    for (stream, _), c in contexts.items():
+        configs = headers.get(stream, set())
+        budget = next(iter(configs))[0] if len(configs) == 1 else 0
+        if c['rows'] != c['observed_groups'] - c['dropped_groups'] - c['unretained_groups'] or (
+                c['selected_groups'] != c['row_selected'] or c['timestamp_count'] != c['row_stamps'] or
+                c['selected_groups'] > budget or c['timestamp_count'] > 2 * budget):
+            coverage['invalid_coverage'] += 1
+        if not c['dropped_groups'] and len(c['populations']) == len(c['phases']) == 1:
+            population, phase = next(iter(c['populations'])), next(iter(c['phases']))
+            expected = sum((phase + i) % population < min(c['observed_groups'], population) for i in range(budget))
+            if c['selected_groups'] != expected or c['out_of_range_groups'] != max(0, c['observed_groups'] - population):
+                coverage['invalid_coverage'] += 1
+    domain_excluded = {ident for ident, c in contexts.items() if c['out_of_range_groups']}
+    loss_keys = ('malformed_rows', 'truncated_rows', 'conflicting_rows', 'missing_frame_ids',
+                 'missing_windows', 'rotation_evictions', 'missing_rotation_files', 'header_conflicts',
+                 'output_failures', 'background_dropped_slots', 'background_dropped_closures')
+    complete = not any(coverage[key] for key in (
+        'dropped_groups', 'discarded_segments', 'invalid_coverage', 'missing_headers')) and not any(
+            loss.get(key, 0) for key in loss_keys)
+
+    def aggregate_groups(pair_only):
+        groups = {}
+        for observation in by_type['pipeline']:
+            row, stream = observation['row'], observation['stream']
+            pair = (row['kind'], row['vs'], row['fs'], row['cs'])
+            ident = pair if pair_only else (stream, row['pipeline'], *pair)
+            if ident not in groups:
+                groups[ident] = dict(kind=row['kind'], vs=row['vs'], fs=row['fs'], cs=row['cs'],
+                                     identities=set(), pass_keys=set(), groups=0, selected_groups=0,
+                                     samples=0, missing_selected=0, out_of_range=0, discarded_groups=0,
+                                     eligible_samples=0, eligible_missing_selected=0, eligible_weighted_gpu_ms=0.0,
+                                     draws=0, dispatches=0, known_primitives=0, unknown_primitive_draws=0,
+                                     gpu_ms=0.0, weighted_gpu_ms=0.0, sampled_draws=0, sampled_dispatches=0)
+            g = groups[ident]
+            g['identities'].add((stream, row['pipeline']))
+            g['pass_keys'].add(row['pass_key'])
+            if row['status'] == 'discarded':
+                g['discarded_groups'] += 1
+                continue
+            g['groups'] += 1
+            for key in ('draws', 'dispatches', 'known_primitives', 'unknown_primitive_draws'):
+                g[key] += row[key]
+            g['selected_groups'] += row['selected']
+            g['out_of_range'] += not row['selection_numerator']
+            eligible = (stream, row['frame']) not in domain_excluded
+            if row['status'] == 'ok':
+                weighted = row['gpu_ms'] * row['selection_denominator'] / row['selection_numerator']
+                g['samples'] += 1
+                g['gpu_ms'] += row['gpu_ms']
+                g['weighted_gpu_ms'] += weighted
+                g['sampled_draws'] += row['draws']
+                g['sampled_dispatches'] += row['dispatches']
+                if eligible:
+                    g['eligible_samples'] += 1
+                    g['eligible_weighted_gpu_ms'] += weighted
+            elif row['selected'] and row['status'] != 'no-work':
+                g['missing_selected'] += 1
+                g['eligible_missing_selected'] += eligible
+        result = []
+        for g in groups.values():
+            g['identities'] = [dict(stream=stream, pipeline=pipeline) for stream, pipeline in sorted(g['identities'])]
+            g['pass_keys'] = sorted(g['pass_keys'])
+            g['primitives'] = None if g['unknown_primitive_draws'] or g['kind'] == 'compute' else g['known_primitives']
+            g['counts_complete'] = not (coverage['unretained_groups'] or coverage['dropped_groups'])
+            g['counts_scope'] = 'retained groups only; optional unselected detail may be omitted'
+            g['coverage_complete'] = complete and not (domain_excluded or g['missing_selected'])
+            g['estimated_gpu_ms'] = g['weighted_gpu_ms'] if g['coverage_complete'] and g['samples'] else None
+            g['eligible_estimated_gpu_ms'] = g['eligible_weighted_gpu_ms'] if (
+                complete and g['eligible_samples'] and not g['eligible_missing_selected']) else None
+            g['thin'] = g['eligible_samples'] < 10
+            g['mean_group_ms'] = ratio(g['gpu_ms'], g['samples'])
+            result.append(g)
+        return sorted(result, key=lambda g: (-g['eligible_weighted_gpu_ms'], str(g['vs']), str(g['fs']), str(g['cs'])))
+
+    return dict(coverage=coverage, pipelines=aggregate_groups(False), shader_pairs=aggregate_groups(True),
+                domain_excluded_frames=[dict(stream=stream, frame=frame) for stream, frame in sorted(domain_excluded)],
+                eligible_frames=len(contexts) - len(domain_excluded),
+                method='Actual contiguous GPU group brackets, not per-draw apportionment. Handles are launch-local; '
+                       'shader-pair view merges exact variant names across launches. Weighted sum = sum(valid group ms '
+                       '* population/budget), a Horvitz-Thompson estimate conditional on complete domain coverage, '
+                       'uniform launch bits and workload independent of sampling. Population grows after larger '
+                       'observed frames; selected metadata has reserved capacity, so tail pipelines remain eligible. '
+                       'eligible_estimated_gpu_ms ranks the explicitly named eligible frame population, excluding '
+                       'only frames whose observed group count exceeds their domain; it is NOT a whole-capture total. '
+                       'estimated_gpu_ms remains null when any such frame exists. Optional unselected-detail omission '
+                       'does not bias selected timing, but counts are retained subtotals when counts_complete=false. '
+                       'True drops, missing selected results or authority/capture loss withhold estimates. '
+                       'Rotation is correlated, not IID: periodic work can alias; thin samples are not reliable '
+                       'rankings and no confidence intervals are implied. No samples means unknown, not zero cost. '
+                       'Timing overlaps pass timing; never add them. Brackets include state/setup and timestamp cost.')
+
+
+def validate_pipeline(row):
+    number(row, 'frame', True, 1)
+    if row['type'] == 'pipeline_coverage':
+        for key in ('slot_sequence', 'observed_groups', 'dropped_groups', 'selected_groups', 'timestamp_count',
+                    'unretained_groups', 'out_of_range_groups'):
+            number(row, key, True)
+        population = pipeline_population(row, 'population')
+        if number(row, 'phase', True) >= population:
+            raise ValueError('pipeline phase outside population')
+        number(row, 'lease', True, 1)
+        if not isinstance(row.get('discarded'), bool):
+            raise ValueError('discarded: expected boolean')
+        if row['dropped_groups'] + row['unretained_groups'] > row['observed_groups'] or (
+                row['selected_groups'] > row['observed_groups'] or row['out_of_range_groups'] > row['observed_groups']):
+            raise ValueError('pipeline coverage exceeds observed groups')
+        if row['timestamp_count'] > 2 * row['selected_groups']:
+            raise ValueError('pipeline timestamps exceed selected group bound')
+        return row
+    ordinal = number(row, 'group', True)
+    number(row, 'pass_ordinal', True, 1)
+    for key in ('pipeline', 'pass_key'):
+        if not isinstance(row.get(key), str) or not re.fullmatch('[0-9a-f]{16}', row[key]):
+            raise ValueError(f'{key}: expected 16-digit identity')
+    if row.get('pipeline_identity') != 'launch-local-vulkan-handle':
+        raise ValueError('pipeline_identity: expected launch-local-vulkan-handle')
+    if row.get('kind') not in ('render', 'compute'):
+        raise ValueError('pipeline kind must distinguish render and compute')
+    for key in ('vs', 'fs', 'cs'):
+        if key not in row or (row[key] is not None and (not isinstance(row[key], str) or not row[key])):
+            raise ValueError(f'{key}: expected nullable exact shader variant')
+    compute = row['kind'] == 'compute'
+    if (compute and (not row['cs'] or row['vs'] is not None or row['fs'] is not None)) or (
+            not compute and (not row['vs'] or row['cs'] is not None)):
+        raise ValueError('pipeline shader stages differ from kind')
+    draws = number(row, 'draws', True)
+    dispatches = number(row, 'dispatches', True)
+    known = number(row, 'known_primitives', True)
+    unknown = number(row, 'unknown_primitive_draws', True)
+    if unknown > draws or (compute and (draws or known or unknown)) or (not compute and dispatches):
+        raise ValueError('pipeline counters differ from draw/compute kind')
+    if compute or unknown:
+        if row.get('primitives', False) is not None or not row.get('primitive_reason'):
+            raise ValueError('unknown/not-graphics primitives require null and reason')
+    elif number(row, 'primitives', True) != known or row.get('primitive_reason') is not None:
+        raise ValueError('known primitives differ from total')
+    if not isinstance(row.get('selected'), bool) or row.get('status') not in PIPELINE_STATUSES:
+        raise ValueError('pipeline requires selected boolean and explicit status')
+    stamps = number(row, 'timestamp_count', True)
+    numerator = number(row, 'selection_numerator', True)
+    population = pipeline_population(row, 'selection_denominator')
+    if numerator > MAX_SAMPLE_BUDGET or bool(numerator) != (ordinal < population):
+        raise ValueError('pipeline selection probability outside frame population')
+    if stamps > 2 or (not row['selected'] and stamps) or (row['selected'] and not numerator):
+        raise ValueError('pipeline timestamp/selection mismatch')
+    if row['status'] == 'ok':
+        if not row['selected'] or stamps != 2 or not (draws or dispatches):
+            raise ValueError('valid pipeline timing requires selected nonempty complete bracket')
+        if number(row, 'gpu_ms') > SPAN_LIMIT_MS:
+            raise ValueError('pipeline duration exceeds timestamp sanity bound')
+    elif row.get('gpu_ms', False) is not None:
+        raise ValueError('unmeasured pipeline timing must be null, not zero')
+    return row
 
 
 def number(row, key, integer=False, minimum: float = 0):
@@ -136,6 +349,8 @@ def validate(row):
     if not isinstance(row, dict) or type(row.get('schema')) is not int or row['schema'] != 3:
         raise ValueError('expected object with schema=3')
     kind = row.get('type')
+    if kind in ('pipeline', 'pipeline_coverage'):
+        return validate_pipeline(row)
     if kind == 'header':
         if not isinstance(row.get('launch_id'), str) or not row['launch_id']:
             raise ValueError('launch_id: expected nonempty string')
@@ -154,6 +369,12 @@ def validate(row):
             number(row, 'background_slots', True, 1)
         if 'background_closures' in row:
             number(row, 'background_closures', True, 1)
+        if 'pipeline_budget' in row:
+            sample_budget(row, 'pipeline_budget')
+            if row.get('pipeline_population') != PIPELINE_POPULATION or row.get('pipeline_random_phase') is not True:
+                raise ValueError('pipeline header requires initial population and uniform random launch bits')
+            if number(row, 'pipeline_phase', True) > UINT32_MAX:
+                raise ValueError('pipeline launch phase exceeds uint32')
         return row
     if kind == 'session_end':
         if not isinstance(row.get('launch_id'), str) or not row['launch_id']:
@@ -309,6 +530,10 @@ def identity(stream, row):
         fields = ('launch_id',)
     elif kind == 'window':
         fields = ('window_start', 'window_end')
+    elif kind == 'pipeline':
+        fields = ('frame', 'group')
+    elif kind == 'pipeline_coverage':
+        fields = ('frame', 'lease')
     elif kind == 'pass':
         fields = ('window_start', 'window_end', 'key', 'ordinal', *REFERENCE)
     elif kind == 'frame':
@@ -971,7 +1196,8 @@ def analyze(paths, legacy_span_replay=False, per_window=False, frame_close_repla
         raise ValueError('frame-close replay requires schema-3 pass/window authority, not legacy timing-only replay')
     paths = inputs(paths)
     observations, counts, issues = load(paths, legacy_span_replay)
-    by_type = {kind: [] for kind in ('header', 'session_end', 'window', 'pass', 'frame', 'long_frame')}
+    by_type = {kind: [] for kind in ('header', 'session_end', 'window', 'pass', 'frame', 'long_frame',
+                                    'pipeline', 'pipeline_coverage')}
     for observation in observations:
         by_type[observation['row']['type']].append(observation)
     windows = {(o['stream'], o['row']['window_start'], o['row']['window_end']): o['row']
@@ -1071,6 +1297,8 @@ def analyze(paths, legacy_span_replay=False, per_window=False, frame_close_repla
                   'Legacy replay reads frame/window timing only; it cannot reconstruct query availability, original '
                   'endpoints or schema-3 attachment/reference semantics.',
     }
+    if by_type['pipeline'] or by_type['pipeline_coverage']:
+        report['pipelines'] = pipeline_report(by_type, report['coverage'])
     if sampling is not None:
         report['sampling'] = sampling
         report['method'] += (
@@ -1172,6 +1400,14 @@ def render(report, out=sys.stdout):
         print('Sampling: ' + ' '.join(f'{key}={value}' for key, value in sampling.items() if key != 'frames'), file=out)
         for frame in sampling['frames']:
             print('Sampled frame: ' + ' '.join(f'{key}={value}' for key, value in frame.items()), file=out)
+    if 'pipelines' in report:
+        print('\n## Pipeline/shader groups (separate from pass totals)', file=out)
+        print(report['pipelines']['method'], file=out)
+        print('Pipeline coverage: ' + json.dumps(report['pipelines']['coverage'], sort_keys=True), file=out)
+        print('Domain-excluded frames (not included in eligible estimates): ' +
+              json.dumps(report['pipelines']['domain_excluded_frames'], sort_keys=True), file=out)
+        for group in report['pipelines']['shader_pairs']:
+            print(json.dumps(group, sort_keys=True), file=out)
     for issue in report['issues']:
         print(f'WARNING: {issue}', file=out)
     render_table('Per pass (exact key; ordinal 0 = all)', report['passes'], out)

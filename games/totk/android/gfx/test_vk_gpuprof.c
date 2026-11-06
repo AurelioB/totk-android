@@ -13,6 +13,7 @@
 #include "vk_int.h"
 #include "vk_record.h"
 #include "vk_gpuprof_time.h"
+#include "vk_gpuprof_pipe.h"
 #include "vk_load.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include <errno.h>
@@ -83,6 +84,35 @@ static void timestamp_contract(void) {
     CHECK(vk_gpuprof_interval_check(first, last, domain, domain).status == GP_TIME_DOMAIN,
         "invalid timestamp period is rejected");
 }
+static void pipeline_contract(void) {
+    for (unsigned budget = 1; budget <= VK_GPUPROF_PIPE_BUDGET; budget++) {
+        unsigned hits[VK_GPUPROF_PIPE_ORDINALS] = {0};
+        for (unsigned phase = 0; phase < VK_GPUPROF_PIPE_ORDINALS; phase++) {
+            for (unsigned i = 0; i < budget; i++) {
+                unsigned ordinal = (phase + i) % VK_GPUPROF_PIPE_ORDINALS;
+                CHECK(vk_gpuprof_pipe_selected(ordinal, phase, budget, VK_GPUPROF_PIPE_ORDINALS), "rotating window selects each bounded group");
+                hits[ordinal]++;
+            }
+            CHECK(!vk_gpuprof_pipe_selected((phase + budget) % VK_GPUPROF_PIPE_ORDINALS, phase, budget, VK_GPUPROF_PIPE_ORDINALS),
+                "next ordinal never exceeds the hard frame budget");
+            CHECK(!vk_gpuprof_pipe_selected(VK_GPUPROF_PIPE_ORDINALS, phase, budget, VK_GPUPROF_PIPE_ORDINALS),
+                "unknown tail is never presented as an equal-probability sample");
+        }
+        for (unsigned i = 0; i < VK_GPUPROF_PIPE_ORDINALS; i++)
+            CHECK(hits[i] == budget, "uniform phase gives every ordinal exactly k/N inclusion");
+    }
+    CHECK(vk_gpuprof_pipe_population(2048, 4000) == 4096 &&
+        vk_gpuprof_pipe_population(4096, 2000) == 4096, "domain grows to cover whole layouts and never shrinks");
+    CHECK(vk_gpuprof_pipe_selected(3000, 3000, 16, 4096),
+        "newly observed tail groups become eligible after domain growth");
+    uint64_t n = UINT64_MAX;
+    CHECK(vk_gpuprof_pipe_primitives(4, 9, 3, 0, &n) && n == 9, "triangle input counts include instances");
+    CHECK(vk_gpuprof_pipe_primitives(7, 12, 2, 0, &n) && n == 12, "quads count actual emitted triangles");
+    CHECK(vk_gpuprof_pipe_primitives(5, 7, 2, 0, &n) && n == 10, "non-indexed strip primitives are known");
+    CHECK(!vk_gpuprof_pipe_primitives(5, 7, 2, 1, &n), "indexed restart is explicitly unknown without payload reads");
+    CHECK(vk_gpuprof_pipe_primitives(0, UINT32_MAX, UINT32_MAX, 0, &n) &&
+        n == (uint64_t)UINT32_MAX * UINT32_MAX, "primitive products do not truncate at 32 bits");
+}
 static void unavailable_query_contract(void) {
     if (!V.has_host_query_reset) return;
     VkQueryPool pool;
@@ -134,6 +164,7 @@ static void submit(int frame_end) {
     if (frame_end) { vk_end_rendering(); vk_gpuprof_test_frame(vk_cb()); }
     wait_submission(mtl_sub_commit());
 }
+static int pipeline_groups;
 static void record_draws(tex_t *target, prog_t *program, uint8_t *memory, unsigned draws) {
     p_set_rt rt = {.n = 1}; rt.color[0] = target; op(OP_SET_RT, &rt, sizeof rt);
     p_bind_program bind = {program, 3}; op(OP_BIND_PROGRAM, &bind, sizeof bind);
@@ -155,7 +186,14 @@ static void record_draws(tex_t *target, prog_t *program, uint8_t *memory, unsign
      * rather than alternating LOAD vs CLEAR attachment operations. */
     p_clear_color clear = {0, 15, {0, 0, 0, 1}}; op(OP_CLEAR_COLOR, &clear, sizeof clear);
     p_draw draw = {4, 0, 3, 0, 0};
-    for (unsigned i = 0; i < draws; i++) op(OP_DRAW, &draw, sizeof draw);
+    for (unsigned i = 0; i < draws; i++) {
+        if (pipeline_groups && draws >= 9) {
+            chmask_st channels = {pipeline_groups == 2 ? (i & 1 ? 7 : 15) : i < 3 || i >= 5 ? 15 : 7};
+            p_bind_state state = {.kind = 2}; memcpy(state.bytes, &channels, sizeof channels);
+            op(OP_BIND_STATE, &state, sizeof state);
+        }
+        op(OP_DRAW, &draw, sizeof draw);
+    }
 }
 static uint8_t *readback_bytes(tex_t *target, uint8_t *memory) {
     return memory + 0x40000 + (target->d.width == 64 ? 0 : 0x10000);
@@ -585,6 +623,7 @@ static int run_unavailable_span(int supported) {
 }
 int main(int argc, char **argv) {
     timestamp_contract();
+    pipeline_contract();
     unsigned frames = 302, passes = 180, draws = 2000, textures = 16;
     int areas = argc == 2 && !strcmp(argv[1], "--areas");
     int unavailable_span = argc == 2 && !strcmp(argv[1], "--unavailable-span");
@@ -596,6 +635,9 @@ int main(int argc, char **argv) {
     int last_closed = argc == 2 && !strcmp(argv[1], "--last-closed");
     int shutdown_inflight = argc == 2 && !strcmp(argv[1], "--shutdown-inflight") ? 1 :
         argc == 2 && !strcmp(argv[1], "--shutdown-timeout") ? 2 : 0;
+    pipeline_groups = argc == 2 && !strcmp(argv[1], "--pipeline-groups") ? 1 :
+        argc == 2 && !strcmp(argv[1], "--pipeline-overflow") ? 2 : 0;
+    if (pipeline_groups == 2) frames = 2;
     if (scaled || (argc == 3 && !strcmp(argv[1], "--frames"))) {
         for (int i = scaled ? 2 : 1; i < argc; i += 2) {
             if (i + 1 == argc) return 2;
@@ -609,7 +651,7 @@ int main(int argc, char **argv) {
         }
         if (scaled && draws < passes) return 2;
     } else if (argc != 1 && !areas && !unavailable_span && !sampling && !backpressure && !cancel &&
-               !sealed_present && !last_closed && !shutdown_inflight) return 2;
+               !sealed_present && !last_closed && !shutdown_inflight && !pipeline_groups) return 2;
     /* Force short secondary chunks so workers=2 tests a real parallel pass,
      * rather than merely checking an enabled worker setting on inline draws. */
     setenv("TOTK_VK_REC_CHUNK_DRAWS", scaled ? "16" : "1", 1);
@@ -664,6 +706,12 @@ int main(int argc, char **argv) {
     }
     const float triangle[] = {-1, -1, 3, -1, -1, 3}; memcpy(memory + 0x20000, triangle, sizeof triangle);
     if (scaled) return run_scaled(memory, &pool, targets, &programs[0], frames, passes, draws, textures, supported);
+    static uint8_t compute_control[0x880]; prog_t compute = {.nstage = 1, .serial = 85999};
+    if (pipeline_groups == 1) {
+        shader_binary(5, 3, compute_control, memory + 0x8000);
+        compute.sd[0].control = compute_control;
+        compute.sd[0].data = (NVNbufferAddress)(uintptr_t)(memory + 0x8000);
+    }
     if (sealed_present || last_closed || shutdown_inflight)
         return run_sealed_present(memory, targets, programs, last_closed || shutdown_inflight ? 1 : 302,
                                   supported, shutdown_inflight);
@@ -675,6 +723,7 @@ int main(int argc, char **argv) {
         for (unsigned part = 0; part < (sampling ? 2u : 1u); part++) {
             unsigned index = sampling ? part : frame & 1;
             target = &targets[index]; draws = index ? 3 : 1;
+            if (pipeline_groups) draws = pipeline_groups == 2 ? 2049 : 9;
             record_draws(target, &programs[(frame / 2) & 1], memory, draws);
             record_readback(target, memory);
             expected_draws += draws; expected_passes++;
@@ -686,9 +735,21 @@ int main(int argc, char **argv) {
             record_readback(target, memory);
             expected_draws += draws; expected_passes++;
         }
+        if (pipeline_groups == 1) {
+            p_bind_program bind = {&compute, 1u << 5};
+            p_bind_buf output = {5, 0, (uint64_t)(uintptr_t)(memory + 0x1c0000), 256};
+            p_dispatch dispatch = {1, 1, 1};
+            op(OP_BIND_PROGRAM, &bind, sizeof bind); op(OP_BIND_UBO, &output, sizeof output);
+            op(OP_DISPATCH, &dispatch, sizeof dispatch);
+        }
         submit(1);
         check_pixels(target, memory);
         if (sampling) check_pixels(&targets[0], memory);
+        if (pipeline_groups == 1) {
+            uint32_t *result = (uint32_t *)(memory + 0x1c0000);
+            for (unsigned i = 0; i < 64; i++)
+                CHECK(result[i] == (i ^ 0x12345678u), "pipeline compute timing preserves real dispatch output");
+        }
     }
     if (backpressure) {
         uint64_t counts[3]; vk_gpuprof_test_background(counts);

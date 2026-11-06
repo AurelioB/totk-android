@@ -1087,6 +1087,7 @@ static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
     }
     g_feedback_avoided += R.feedback_continued - (uint32_t)R.feedback_restore;
     VkCommandBuffer cb = vk_cb();
+    if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(cb);
     if (R.secondary) {
         int parked;
         if (__builtin_expect(vk_gpuprof_on, 0)) {
@@ -3406,6 +3407,7 @@ static void clear_color(const p_clear_color *c) {
     VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)c->index, v};
     VkClearRect cr = {clear_rect(), 0, 1};
     if (cr.rect.extent.width && cr.rect.extent.height) {
+        if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(vk_cb());
         if (R.secondary) vk_record_clear(&ca, &cr); else vkCmdClearAttachments(vk_cb(), 1, &ca, 1, &cr);
         if (pso_life_active() && full && (c->mask & 15) == 15) PL.color_clear |= 1u << c->index;
         pso_life_view_write(R.ctex[c->index], PL.color_view[c->index], VK_IMAGE_ASPECT_COLOR_BIT,
@@ -3435,6 +3437,7 @@ static void clear_ds(const p_clear_ds *c) {
     VkClearRect cr = {clear_rect(), 0, 1};
     if (cr.rect.extent.width && cr.rect.extent.height) {
         if (as & VK_IMAGE_ASPECT_DEPTH_BIT) g_clear_inline_d++;
+        if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(vk_cb());
         if (R.secondary) vk_record_clear(&ca, &cr); else vkCmdClearAttachments(vk_cb(), 1, &ca, 1, &cr);
         if (pso_life_active() && full && (!sm || sm == 255)) PL.depth_clear |= as;
         for (unsigned bit = VK_IMAGE_ASPECT_DEPTH_BIT; bit <= VK_IMAGE_ASPECT_STENCIL_BIT; bit <<= 1)
@@ -5869,6 +5872,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             }
         }
     }
+    if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_begin(cb, p, sh);
     if (R.secondary) g_record_draw = vk_record_draw_begin(p, layout);
     else { VK_REC_DO(VK_REC_CMD, if (p != g_bound_pipe) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); g_bound_pipe = p; }); }
     { static const char *vt = (const char *)1; if (vt == (const char *)1) vt = getenv("TOTK_VK_PASS_DUMP_VSTEX");
@@ -5913,6 +5917,8 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     uint32_t inst = dw ? (dw->instances > 1 ? (uint32_t)dw->instances : 1) : (di->instances > 1 ? (uint32_t)di->instances : 1);
     uint32_t base_inst = dw ? (uint32_t)dw->base_instance : (uint32_t)di->base_instance;
     if (!VK_REC_VALUE(VK_REC_VERTEX, draw_buffers(cb, sh[0], dw, di, prim, count, inst, base_inst))) return;
+    if (vk_gpuprof_pipeline_on && !(dw && prim == 7 && count < 4))
+        vk_gpuprof_pipeline_count(prim, count, inst, di != NULL);
     if (g_record_draw) { vk_record_draw_commit(); g_record_draw = NULL; }
     overlay_scene_draw();
 
@@ -5984,7 +5990,12 @@ static void dispatch(const p_dispatch *dp) {
     pd_dispatch(sh[5], grid);
     int pi = pp_begin(cb, 1);
     if (vk_gpuprof_on) { vk_gpuprof_dispatch_begin(cb); vk_gpuprof_draw(sh); }
+    if (vk_gpuprof_pipeline_on) {
+        vk_gpuprof_pipeline_begin(cb, p, sh);
+        vk_gpuprof_pipeline_count(-1, 0, 0, 0);
+    }
     vkCmdDispatch(cb, grid[0], grid[1], grid[2]);
+    if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(cb);
     shader_xlate_first_command(sh[5], "dispatch");
     if (vk_fg_extract_active && grid[0] && grid[1] && grid[2]) fg_extract_compute(sh);
     vk_barrier_all(cb);

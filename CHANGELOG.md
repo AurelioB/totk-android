@@ -27,6 +27,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Keep its directory watch until the control file appears instead of repeatedly waking on its own watch removals.
 - Keep the stall watchdog enabled, but reuse the present timestamp/frame instead of reading a second clock and
   incrementing an atomic counter every frame; publish immutable stage names only when they change.
+- Add default-off `TOTK_VK_GPU_PROFILE_PIPELINES=1..16`: bounded rotating GPU timestamp brackets for
+  contiguous actual-pipeline/full-shader-variant groups, including recorder secondaries and separate compute.
+  Schema-3 rows retain draw/primitive knownness and sampling/loss authority; the host analyzer ranks exact
+  pipelines and shader pairs without treating a pass's first shader or draw count as their cost.
+  Existing pass profiling stays unchanged when this switch is off; on-device overhead still needs calibration.
 
 ### Menu
 - Add **40 fps** to Frame rate without changing existing presets or 30/60 settings. It caps real game updates

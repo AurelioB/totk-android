@@ -253,6 +253,54 @@ not one estimate per 300-frame window. Optional `--per-window` adds `per_window`
 breakdown while retaining those interval tables. Use a capture containing only the intended warmed measured
 interval when interpreting a result; missing/evicted files are censored coverage, not zero observations.
 
+### Pipeline/shader groups
+
+`TOTK_VK_GPU_PROFILE_PIPELINES=1..16` (default `0`, requires `GPU_PROFILE=1/2/3`) adds actual GPU
+brackets for contiguous pipeline/full-VS-FS-variant groups and separate CS dispatch groups. Recommended
+starting capture: `TOTK_VK_GPU_PROFILE=1 TOTK_VK_GPU_PROFILE_SAMPLE=2
+TOTK_VK_GPU_PROFILE_PIPELINES=4 TOTK_VK_GPU_PROFILE_STATS=0`. Do not infer shader work from old pass rows:
+`shader` is only the pass's first draw signature; `draws` belongs to the entire pass.
+
+The existing analyzer automatically adds `pipelines` to its JSON result and a shader-pair text table:
+`pipelines.pipelines` keeps stream-scoped actual Vulkan handle identities, and `pipelines.shader_pairs`
+merges exact full variant names across streams. Raw additive schema-3 `pipeline` rows identify
+`frame/group`, `pass_key/pass_ordinal`, actual `pipeline`, `vs/fs/cs`, `draws/dispatches`, nullable total
+`primitives`, `known_primitives/unknown_primitive_draws/primitive_reason`, `selected/status`,
+nullable `gpu_ms`, `timestamp_count` and `selection_numerator/selection_denominator`.
+`pipeline_coverage` rows identify each lease/frame, observed/dropped/selected groups, recorded timestamp
+count, domain population/phase, optional `unretained_groups`, `out_of_range_groups` and discard state.
+Pass frame/window timestamp counts exclude this separate pool.
+
+Uniform 32-bit launch bits plus rotating phase give every in-domain ordinal probability `budget/N`.
+Population `N` starts at 2048 and grows to the next power of two after larger observed frames; it never
+shrinks (implementation ceiling `2^31` groups/frame). Phase is `(launch_bits + (frame-1)*budget) mod N`,
+so growth preserves uniform marginal probability without another random syscall. A newly growing tail
+is uncovered only for its first frame, NOT permanently excluded. Stable layouts eventually cover every
+ordinal across passes AND groups within `ceil(N/budget)` frames. There is no per-pass prefix timing cap.
+At most `2*budget` extra writes/frame; 2048 metadata records and 1024 timestamp pairs/lease bound storage.
+ALL selected groups have reserved metadata space; at most 1024 additional unselected groups/lease retain
+optional detail. Excess unselected detail is explicitly `unretained`, not a timing loss or zero-cost shader.
+Observed counters in aggregate rows are retained subtotals when `counts_complete:false`.
+`weighted_gpu_ms` is `sum(valid group ms * N/budget)`, NOT equal draw work or observed/sample scaling.
+`estimated_gpu_ms` estimates the whole captured group population only with complete domain/selection
+authority and no selected query loss. Growing-frame tails withhold that estimate. The separately named
+`eligible_estimated_gpu_ms` ranks only the domain-covered frames, explicitly reporting
+`domain_excluded_frames` and `eligible_frames`; it is never a whole-capture total when exclusions exist.
+True dropped selected metadata/results or capture/authority loss withholds both estimates; optional
+unselected detail omission does not bias timing. The valid-sample weighted subtotal is NOT loss correction.
+No samples mean null estimate, not zero shader cost. `thin` warns below ten eligible group samples.
+Selection is correlated, not IID: periodic work may alias; repeat launches for independent phases.
+Input primitive counts include instances and quad-to-triangle conversion, not clipping/rasterization.
+Indexed restart without index payload authority is null with a known subtotal/unknown draw count; compute
+has null primitives and explicit dispatch counts. Unselected/unavailable/invalid/discarded timing is null.
+
+These are instrumented GPU intervals including state/setup and timestamps, NOT isolated shader cost;
+never add them to overlapping pass totals. The bound does not prove cheap device behavior: ALL_COMMANDS
+may serialize work, and metadata/output still costs CPU/IO. First calibrate off/on in same-APK ABBA runs,
+then keep pass sampling fixed and ABBA PIPELINES=0/4. Match driver, exact seed manifest/module hashes,
+save/route, render size/FPS cap and thermals; inspect CPU p50/p95, GPU span, clocks, query counts and loss.
+Uniform phase alone cannot remove instrumentation-driven workload changes or prove statistical confidence.
+
 ### Sampled queries and interpretation
 
 `TOTK_VK_GPU_PROFILE_SAMPLE` defaults to **`0`**, including unset: existing full-mode behavior is unchanged.
@@ -494,6 +542,11 @@ thin warnings and optional per-window output, without changing full-mode output.
 The explicit CPU-close replay fixtures pin opt-in-only behavior, original invalidity/provenance, complete
 frame/pass/window consistency and rejection of missing build/domain/endpoint authority, gaps, true query
 failures, background losses, corrupt timestamps and negative full-mode gaps.
+Pipeline fixtures additionally pin probability/rotation bounds, unknown primitive semantics, null missing
+timings, explicit overflow/discard loss, full variant mapping and fixed inverse-probability weighting.
+The real `--pipeline-groups` fixture changes actual color-mask pipelines within a pass (3/2/4 draws), spans
+one-draw secondary chunks and executes a real seeded compute dispatch; `--pipeline-overflow` exercises
+2049 alternating groups. The existing mode/default-off and sealed-present fixtures also cover this switch.
 The optional `GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs for
 modes 0/1/2/3, recorder workers 0/2, statistics on/off/unsupported, ordinal windows off/on, split-frame and
 unsent multi-frame reconciliation, direct pre uploads while main rendering is open, default row/byte reduction

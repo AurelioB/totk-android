@@ -137,6 +137,25 @@ def sampled_window(**changes):
     return row
 
 
+def pipeline_row(**changes):
+    row = dict(schema=3, type='pipeline', frame=1, group=0, pass_ordinal=1, pass_key='a' * 16,
+               kind='render', pipeline='1' * 16, pipeline_identity='launch-local-vulkan-handle',
+               vs='0123456789abcdef_vs_d16', fs='fedcba9876543210_fs_alpha7', cs=None,
+               draws=3, dispatches=0, known_primitives=3, unknown_primitive_draws=0,
+               primitives=3, primitive_reason=None, selected=True, status='ok', gpu_ms=0.25,
+               timestamp_count=2, selection_numerator=2, selection_denominator=2048)
+    row.update(changes)
+    return row
+
+
+def pipeline_coverage(**changes):
+    row = dict(schema=3, type='pipeline_coverage', frame=1, lease=1, slot_sequence=1,
+               observed_groups=1, dropped_groups=0, selected_groups=1, timestamp_count=2, discarded=False,
+               unretained_groups=0, out_of_range_groups=0, population=2048, phase=0)
+    row.update(changes)
+    return row
+
+
 class Analyzer(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -150,6 +169,95 @@ class Analyzer(unittest.TestCase):
 
     def analyze(self, rows):
         return gpuprof.analyze([self.file('gpuprof-fixture.jsonl', rows)])
+
+    def pipeline_analysis(self, rows, coverage=None, **header_changes):
+        return self.analyze([header(pipeline_budget=2, pipeline_population=2048,
+                                    pipeline_phase=0, pipeline_random_phase=True, **header_changes),
+                             *(coverage if coverage is not None else [
+                                 pipeline_coverage(observed_groups=len(rows),
+                                                   selected_groups=sum(r['selected'] for r in rows),
+                                                   timestamp_count=sum(r['timestamp_count'] for r in rows))]),
+                             *rows])['pipelines']
+
+    def test_pipeline_weights_do_not_apportion_pass_draws(self):
+        rows = [pipeline_row(), pipeline_row(group=1, pipeline='2' * 16, draws=9,
+                                            known_primitives=9, primitives=9, gpu_ms=0.75)]
+        report = self.pipeline_analysis(rows)
+        self.assertEqual(len(report['pipelines']), 2)
+        self.assertEqual(len(report['shader_pairs']), 1)
+        pair = report['shader_pairs'][0]
+        self.assertEqual(pair['gpu_ms'], 1)
+        self.assertEqual(pair['estimated_gpu_ms'], 1024)
+        self.assertEqual(pair['draws'], 12)
+        self.assertTrue(pair['thin'])
+        self.assertEqual(pair['vs'], rows[0]['vs'])
+        self.assertEqual(pair['fs'], rows[0]['fs'])
+        self.assertNotIn('pipelines', self.analyze([pass_row()]),
+                         'first-draw pass shader/draws cannot reconstruct pipeline work')
+
+    def test_pipeline_unsampled_missing_and_unknown_are_not_zero_cost(self):
+        unsampled = pipeline_row(group=2, selected=False, status='not-selected', gpu_ms=None, timestamp_count=0)
+        group = self.pipeline_analysis([unsampled])['shader_pairs'][0]
+        self.assertIsNone(group['estimated_gpu_ms'])
+        missing = pipeline_row(status='unavailable-timestamp', gpu_ms=None)
+        group = self.pipeline_analysis([missing])['shader_pairs'][0]
+        self.assertEqual(group['missing_selected'], 1)
+        self.assertIsNone(group['estimated_gpu_ms'])
+        unknown = pipeline_row(primitives=None, unknown_primitive_draws=3, known_primitives=0,
+                               primitive_reason='indexed-restart-or-unknown-count')
+        group = self.pipeline_analysis([unknown])['shader_pairs'][0]
+        self.assertIsNone(group['primitives'])
+        self.assertEqual(group['unknown_primitive_draws'], 3)
+        for changes in (dict(status='not-selected', gpu_ms=0, selected=False, timestamp_count=0),
+                        dict(selected=False), dict(timestamp_count=3), dict(selection_numerator=17),
+                        dict(primitives=0, unknown_primitive_draws=1),
+                        dict(kind='compute'), dict(group=2048)):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                gpuprof.validate(pipeline_row(**changes))
+
+    def test_pipeline_compute_and_censored_overflow(self):
+        compute = pipeline_row(kind='compute', vs=None, fs=None, cs='compute_variant_8x8',
+                               draws=0, dispatches=1, primitives=None, known_primitives=0,
+                               primitive_reason='not-graphics')
+        self.assertEqual(gpuprof.validate(compute)['dispatches'], 1)
+        report = self.pipeline_analysis([pipeline_row()], coverage=[
+            pipeline_coverage(observed_groups=2, dropped_groups=1)])
+        self.assertEqual(report['coverage']['dropped_groups'], 1)
+        self.assertIsNone(report['shader_pairs'][0]['estimated_gpu_ms'])
+        report = self.pipeline_analysis([pipeline_row(status='discarded', gpu_ms=None)], coverage=[
+            pipeline_coverage(discarded=True)])
+        self.assertEqual(report['shader_pairs'][0]['discarded_groups'], 1)
+        self.assertIsNone(report['shader_pairs'][0]['estimated_gpu_ms'])
+
+    def test_pipeline_selection_authority_and_local_handles(self):
+        report = self.pipeline_analysis([pipeline_row(group=2)])
+        self.assertGreater(report['coverage']['invalid_coverage'], 0)
+        self.assertIsNone(report['shader_pairs'][0]['estimated_gpu_ms'])
+        tail = pipeline_row(group=2048, selection_numerator=0, selected=False,
+                            status='out-of-range', gpu_ms=None, timestamp_count=0)
+        self.assertIsNone(self.pipeline_analysis([tail])['shader_pairs'][0]['estimated_gpu_ms'])
+        report = self.pipeline_analysis([pipeline_row()], coverage=[])
+        self.assertGreater(report['coverage']['invalid_coverage'], 0)
+        self.assertIsNone(report['shader_pairs'][0]['estimated_gpu_ms'])
+
+    def test_pipeline_tail_domain_growth_preserves_selection_weighting(self):
+        rows = [header(pipeline_budget=2, pipeline_population=2048, pipeline_phase=2998, pipeline_random_phase=True),
+                pipeline_coverage(observed_groups=4000, unretained_groups=3998, out_of_range_groups=1952,
+                                  phase=950, selected_groups=2, timestamp_count=4),
+                pipeline_row(group=950), pipeline_row(group=951),
+                pipeline_coverage(frame=2, lease=2, slot_sequence=2, observed_groups=4000,
+                                  unretained_groups=3998, population=4096, phase=3000,
+                                  selected_groups=2, timestamp_count=4),
+                pipeline_row(frame=2, group=3000, vs='tail_variant', selection_denominator=4096),
+                pipeline_row(frame=2, group=3001, vs='tail_variant', selection_denominator=4096)]
+        report = self.analyze(rows)['pipelines']
+        self.assertEqual(report['coverage']['invalid_coverage'], 0)
+        self.assertEqual(report['eligible_frames'], 1)
+        self.assertEqual(report['domain_excluded_frames'][0]['frame'], 1)
+        tail = next(pair for pair in report['shader_pairs'] if pair['vs'] == 'tail_variant')
+        self.assertIsNone(tail['estimated_gpu_ms'], 'growing first frame is not extrapolated')
+        self.assertEqual(tail['eligible_estimated_gpu_ms'], 1024, 'tail is rankable over the named fully covered population')
+        self.assertFalse(tail['counts_complete'])
 
     def test_sums_precede_ratios_not_ratio_averages(self):
         a = pass_row(gpu_ms=2, count=1, stats_valid=1, draws=1, stats=counters(3, 1, 100))
@@ -1370,7 +1478,8 @@ class Analyzer(unittest.TestCase):
 class Lavapipe(unittest.TestCase):
     def launch(self, mode, workers, stats, *, unsupported=False, rotate=False, areas=False, ordinals=None,
                unavailable_span=False, sampling=False, sample_budget=None, backpressure=False, cancel=False,
-               sealed_present=False, last_closed=False, shutdown_inflight=False, shutdown_timeout=False):
+               sealed_present=False, last_closed=False, shutdown_inflight=False, shutdown_timeout=False,
+               pipeline_budget=None, pipeline_groups=False, pipeline_overflow=False):
         binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
         self.assertTrue(binary.is_file(), f'no fixture binary: {binary}')
         seed = Path(os.environ.get('TOTK_SHADER_SEED_DIR', binary.parent / 'vkdraw-seed')).resolve()
@@ -1388,6 +1497,9 @@ class Lavapipe(unittest.TestCase):
                 env.pop(key, None)
             env.pop('TOTK_VK_GPU_PROFILE_ORDINALS', None)
             env.pop('TOTK_VK_GPU_PROFILE_SAMPLE', None)
+            env.pop('TOTK_VK_GPU_PROFILE_PIPELINES', None)
+            if pipeline_budget is not None:
+                env['TOTK_VK_GPU_PROFILE_PIPELINES'] = str(pipeline_budget)
             if sample_budget is not None:
                 env['TOTK_VK_GPU_PROFILE_SAMPLE'] = str(sample_budget)
             if ordinals is not None:
@@ -1401,6 +1513,7 @@ class Lavapipe(unittest.TestCase):
                          ['--sealed-present'] if sealed_present else ['--last-closed'] if last_closed else
                          ['--shutdown-timeout'] if shutdown_timeout else
                          ['--shutdown-inflight'] if shutdown_inflight else
+                         ['--pipeline-groups'] if pipeline_groups else ['--pipeline-overflow'] if pipeline_overflow else
                          ['--sampling'] if sampling else ['--frames', '302'])
             result = subprocess.run([str(binary), *arguments], cwd=temporary, env=env,
                                     capture_output=True, text=True, timeout=180)
@@ -1572,6 +1685,11 @@ class Lavapipe(unittest.TestCase):
                 self.check_sampling(report, observations, frames, passes, draws, sample_budget,
                                     bool(enabled), mode)
                 return report
+            if pipeline_overflow:
+                self.assertEqual(report['coverage']['frame_rows'], frames)
+                self.assertEqual(report['coverage']['windows'], 1)
+                self.assertEqual(sum(g['draws'] for g in report['passes'] if g['kind'] == 'render'), draws)
+                return report
             self.assertEqual(report['coverage']['frame_rows'], frames)
             self.assertEqual(report['coverage']['windows'], 2)
             self.assertEqual(report['coverage']['window_sum_mismatches'], 0, report['issues'])
@@ -1622,6 +1740,55 @@ class Lavapipe(unittest.TestCase):
             else:
                 self.assertEqual(report['coverage']['long_frames'], 0)
             return report
+
+    def test_pipeline_groups_direct_and_deferred(self):
+        for workers in (0, 2):
+            with self.subTest(workers=workers):
+                report = self.launch(1, workers, 0, pipeline_budget=16, pipeline_groups=True)
+                rows = [r for r in report['_fixture_rows'] if r['type'] == 'pipeline']
+                first = [r for r in rows if r['frame'] == 1 and r['kind'] == 'render']
+                self.assertEqual([r['draws'] for r in first], [3, 2, 4])
+                self.assertEqual(first[0]['pipeline'], first[2]['pipeline'])
+                self.assertNotEqual(first[0]['pipeline'], first[1]['pipeline'])
+                self.assertEqual({(r['vs'], r['fs']) for r in first}, {(first[0]['vs'], first[0]['fs'])})
+                self.assertTrue(all(r['primitives'] == r['draws'] for r in rows if r['kind'] == 'render'))
+                compute = [r for r in rows if r['kind'] == 'compute']
+                self.assertTrue(compute)
+                self.assertTrue(all(r['dispatches'] == 1 and r['draws'] == 0 and r['primitives'] is None and
+                                    r['cs'] and r['vs'] is None and r['fs'] is None for r in compute))
+                self.assertTrue(all(r['timestamp_count'] == (2 if r['selected'] else 0) for r in rows))
+                self.assertTrue(all(r['status'] == ('ok' if r['selected'] else 'not-selected') for r in rows))
+                self.assertGreater(sum(r['selected'] for r in rows), 0, 'rotation reaches groups across passes')
+                coverage = report['pipelines']['coverage']
+                self.assertEqual(coverage['invalid_coverage'], 0)
+                self.assertEqual(coverage['dropped_groups'], 0)
+                self.assertEqual(sum(r['draws'] for r in rows),
+                                 sum(g['draws'] for g in report['passes'] if g['kind'] == 'render'))
+
+    def test_pipeline_sealed_deferred_ownership(self):
+        report = self.launch(1, 2, 0, pipeline_budget=16, sealed_present=True)
+        rows = [r for r in report['_fixture_rows'] if r['type'] == 'pipeline']
+        self.assertTrue(rows)
+        self.assertEqual(report['pipelines']['coverage']['invalid_coverage'], 0)
+        self.assertTrue(all(r['timestamp_count'] == (2 if r['selected'] else 0) for r in rows))
+        self.assertTrue(all(r['status'] == ('ok' if r['selected'] else 'not-selected') for r in rows))
+
+    def test_pipeline_metadata_bound_is_explicit(self):
+        report = self.launch(1, 2, 0, pipeline_budget=16, pipeline_overflow=True)
+        self.assertGreater(report['pipelines']['coverage']['unretained_groups'], 0)
+        self.assertEqual(report['pipelines']['coverage']['dropped_groups'], 0)
+        self.assertEqual(report['pipelines']['coverage']['invalid_coverage'], 0)
+        coverage = [r for r in report['_fixture_rows'] if r['type'] == 'pipeline_coverage']
+        self.assertTrue(any(r['frame'] == 2 and r['population'] == 4096 for r in coverage))
+        self.assertTrue(all(g['estimated_gpu_ms'] is None for g in report['pipelines']['shader_pairs']))
+
+    def test_pipeline_default_off_and_invalid_budgets(self):
+        for value in (None, 0, -1, 17, 'invalid'):
+            with self.subTest(value=value):
+                report = self.launch(1, 2, 0, pipeline_budget=value, last_closed=True)
+                self.assertNotIn('pipelines', report)
+        self.launch(0, 2, 0, pipeline_budget=16)
+
 
     def check_sealed_present(self, report, observations, stdout, frames, passes, draws, budget, stats_enabled,
                              *, shutdown_inflight=False):

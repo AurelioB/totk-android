@@ -1524,9 +1524,9 @@ measurements, the ownership contract is:
   absolute area, scene reference and scene role remains available, including passes with zero samples.
   Only selected passes get timestamp/statistics queries. Rotation is not random sampling: periodic key
   churn or a short route can under-cover a key, so inspect coverage rather than assuming representativeness.
-  Each frame emits actual profiler-owned `vkCmdWriteTimestamp2` command `timestamp_count`, including
-  deferred ends after assembly, not the game's independent timestamp reports. It is at least the two
-  whole-main-frame endpoints and at most **`2k+2`**. There are no additional pre/slot timestamp pairs.
+  Each frame emits pass-profiler-owned `vkCmdWriteTimestamp2` command `timestamp_count`, including
+  deferred ends after assembly, not the game's independent timestamp reports or the optional pipeline pool.
+  It is at least the two whole-main-frame endpoints and at most **`2k+2`**. There are no additional pre/slot pairs.
   The whole pair uses completion-accurate `ALL_COMMANDS`, spanning main submissions through present.
   When CPU present finds no open command buffer, SAMPLE must issue **one small marker-only main
   submission** for the real end timestamp (the start was written earlier). This is an explicit extra
@@ -1546,6 +1546,69 @@ measurements, the ownership contract is:
   stutter-tail estimate; histogram precision does not establish statistical confidence.
   Overlapping family frame populations expose bounds rather than fabricated exact unions. A missing key
   observation in a censored capture is not a zero-cost pass.
+- **Pipeline/shader group profiler:** `TOTK_VK_GPU_PROFILE_PIPELINES=0` (unset/invalid/out-of-range also off)
+  preserves pass profiling. With `GPU_PROFILE=1/2/3`, budget `1`–`16` enables an independent bounded sampler;
+  initial capture: `GPU_PROFILE=1 SAMPLE=2 PIPELINES=4 STATS=0` (full `TOTK_VK_` names). Startup logs
+  `[gpu-profile] pipeline-budget=...`; requesting only PIPELINES while the parent profiler is off stays off.
+  A group is consecutive draws with the same actual `VkPipeline` and exact selected VS/FS variants, within
+  one pass part. Changes, inline clears and pass ends close it; returning to an earlier pipeline creates a
+  new group. Compute dispatches are separate groups with CS identity and dispatch counts, never graphics
+  draws or zero-primitives. The legacy pass `shader` is ONLY its first draw's signature: neither it nor
+  the whole-pass draw count is a pipeline/shader work proxy.
+  Graphics brackets start before pipeline bind/state setup; ends precede the next pipeline bind or clear/
+  EndRendering. Direct rendering writes on its original command buffer. Deferred rendering copies exact
+  pool/index/stage timestamp events into the ordered secondary job stream. A group may span several
+  chunks, and an end-only chunk is retained before the original pass flush. Workers/assembly never consult
+  the walker's current group/pass; pool leases, coordinates and copied variant names survive until the
+  existing fence and profiler-worker read/reset. No waits, forced-inline workers or per-group submissions.
+  Every frame uses one global ordinal sequence across all passes/groups (not a per-pass prefix).
+  `getrandom` supplies uniform 32-bit launch bits once. Population `N` starts at **2048** and grows to
+  the next power of two after observing a larger frame (never shrinks, max `2^31` groups/frame).
+  Frame `f` selects `k` consecutive positions starting at `(launch_bits + (f-1)*k) mod N`.
+  Keeping ALL launch bits preserves uniform phase after growth: no random syscall is needed per frame.
+  A growing frame's new tail is explicitly uncovered for that frame, then becomes eligible; stable layouts
+  including >2048 groups cover EVERY ordinal within `ceil(N/k)` frames. Failure to obtain uniform launch
+  bits disables this sampler rather than inventing authority. Selection is correlated systematic sampling,
+  not IID; periodic scenes may alias. Each in-domain group has marginal probability `k/N`, independent
+  of draw count/pass length. The Horvitz-Thompson sum is **measured group ms × N/k**, never equal draw
+  work or observed/sample scaling. This is conditional on domain coverage and workload independent of
+  instrumentation, NOT proof of unperturbed cost or confidence. Headers retain the initial population and
+  full launch bits (`pipeline_phase`); coverage rows retain each frame's actual population/phase.
+  Actual GPU timing includes timestamp cost and intervening GPU state/setup; ALL_COMMANDS can serialize
+  work/change tiled scheduling. A group is not an isolated shader invocation or marginal cost.
+  Bounds: at most **2k extra timestamp writes/frame**, 2048 metadata records/lease and 1024 query pairs/
+  lease (64 frame segments × max budget 16); sixteen existing leases bound backlog. Space for ALL selected
+  groups is reserved; optional unselected detail uses at most 1024 records/lease, with additional omitted
+  detail explicitly counted as `unretained_groups`, not a selected timing drop. Thus a long pass cannot
+  crowd tail samples out. All arrays/pools exist only when PIPELINES is enabled. The walker compares three
+  pointers, copies names only at retained group boundaries, never scans bindings or allocates group storage.
+  Pass `timestamp_count` remains unchanged; sum `pipeline_coverage.timestamp_count` for the extra pool.
+  With pass sample budget `s`, the combined normal-frame write bound is **2s + 2 + 2k**.
+  Additive schema-3 `pipeline` rows name frame/global group, pass key/ordinal, launch-local Vulkan handle,
+  full `vs`/`fs`/`cs` variant names, actual emitted draw/dispatch counts, input primitive counts/knownness,
+  selected/status, nullable `gpu_ms`, timestamp count and probability numerator/denominator.
+  Primitive counts include instances and generated quad triangles, not clipped/rasterized primitives.
+  Indexed restart strips are unknown without index reads (`primitives:null`, known subtotal and unknown
+  draw count); compute is `null`/`not-graphics`. This backend lowers guest draws to concrete direct draws:
+  it does not synthesize zero primitive counts for unavailable GPU-indirect argument buffers.
+  Each lease/frame emits `pipeline_coverage`: observed/dropped/selected/unretained/out-of-range groups,
+  timestamp count, immutable lease/submission IDs, population/phase and discard state. Unselected or
+  unavailable/invalid/incomplete/discarded timings have `gpu_ms:null`, never fake zero durations. Setup
+  attempts rejected before drawing have zero draws and explicit `no-work` status, not a shader-cost sample.
+  A frame larger than its domain censors the WHOLE-capture `estimated_gpu_ms`. The analyzer separately
+  ranks `eligible_estimated_gpu_ms` over its explicitly named domain-covered frames, with exclusions
+  retained as `domain_excluded_frames`; it never pretends that subtotal includes the growing frame's tail.
+  True metadata/query loss or missing authority still withholds estimates. Omitting only unselected
+  detail does not change inclusion probabilities, but draw/primitive sums become retained subtotals
+  (`counts_complete:false`), not whole-workload counts. Zero samples mean unknown cost. Pipeline handles
+  remain launch-local; only full shader variants are merged across launches.
+  Join seed manifest/module hashes externally before treating name parity as exact device seed parity.
+  Calibration: first run all profiling off versus `GPU_PROFILE=1 SAMPLE=2 PIPELINES=4 STATS=0` on the
+  same signed APK, driver/seed, warmed save/route, FPS cap, render size and thermal state in **A/B/B/A**
+  order; collect equal stationary and moving intervals and report CPU frame p50/p95, GPU span, fps,
+  query counts and drops. Then hold pass sampling fixed and ABBA PIPELINES=0/4 to isolate incremental
+  cost. Repeat fresh launches (independent phases), extend beyond several rotations and require adequate
+  per-pair samples before ranking. No device calibration was performed as part of the implementation.
 - **Profiler capture lifecycle:** the default is 128 MiB per JSONL file × four files; compact windows
   target a 6–8-minute pan without rotation, not a guaranteed duration for arbitrary pass counts/raw modes.
   Each rotation repeats a schema-3 header with launch ID, APK `assets/build.txt` commit, package/versionCode
