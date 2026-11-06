@@ -197,7 +197,7 @@ def main():
           'and (all pair signs agree or exact two-sided sign p < 0.05 with >=6 pairs); at least two pairs covering both '
           'directions. "lean" = only paired delta crosses tolerance (or pooled sign differs), informational only; '
           '"?" = insufficient pairs. A pooled or paired dip fraction difference above 0.05 absolute overrides the '
-          'arm result: verdict confounded by dips. Same-arm spread is informational. Prefer ABBAABBA or longer at 60 fps.')
+          'arm result as dip-confounded. Same-arm spread is informational. Prefer ABBAABBA or longer at 60 fps.')
     sys.stdout.write(buf.getvalue())
     if a.out:
         with open(a.out, 'w', encoding='utf-8') as f:

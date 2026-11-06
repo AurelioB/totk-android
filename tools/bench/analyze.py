@@ -57,11 +57,13 @@ FAULT_RE = re.compile(r'page ?fault|smmu.*fault|context fault|gpu fault|adreno.*
 CTL_RE = re.compile(r'\[totk-ctl\] gen=(\d+) frame=(\d+) (applied|mark)(?: (.*))?$')
 GUARD_FRAMES = 2
 # Block metrics compared by abtest.py (rates per window).
-AB_METRICS = ('fps_mean', 'fps_min', 'p50_ms_median', 'p95_ms_max', 'max_ms', 'gpu_ms_mean', 'over50_total', 'long_ge45_total')
+AB_METRICS = ('fps_steady', 'dip_time_fraction', 'fps_mean', 'fps_min', 'p50_ms_median', 'p95_ms_max', 'max_ms', 'gpu_ms_mean', 'over50_total', 'long_ge45_total')
 
 
 def parse_log(path):
     timing, gpu, fps, stut, longf, info = {}, {}, {}, {}, [], {}
+    frame_ms, near33 = {}, {}
+    last_window = None
     for line in open(path, encoding='utf-8', errors='replace'):
         if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):
             timing[int(m[1])] = tuple(float(x) for x in m.groups()[1:])
@@ -69,10 +71,19 @@ def parse_log(path):
             gpu[int(m[1])] = float(m[4])
         if m := re.search(r'\[nvn-vk\] frame (\d+): ([\d.]+) fps over the last 300', line):
             fps[int(m[1])] = float(m[2])
+            last_window = int(m[1])
         if m := re.search(r'\[nvn-vk\] frame (\d+), stutter: longest frame ([\d.]+) ms, (\d+) frames over (\d+) ms, (\d+) over (\d+) ms', line):
             stut[int(m[1])] = (int(m[3]), int(m[4]), int(m[5]), int(m[6]))
         if m := re.search(r'\[长帧\] 帧 (\d+)（([\d.]+) s）整帧 ([\d.]+) ms', line):
             longf.append((int(m[1]), float(m[3])))
+            frame_ms[int(m[1])] = float(m[3])
+        if m := re.search(r'\[frame-tl late\] frame=(\d+).*?\bgame_iv=([\d.]+)', line):
+            frame_ms.setdefault(int(m[1]), float(m[2]))
+        if last_window is not None and (m := re.search(
+                r'window present-fence interval bins ms \[<12.5,12.5-20.9,20.9-29,29-37.5,37.5-45.8,>=45.8\]: all=(\d+)/(\d+)/(\d+)/(\d+)/(\d+)/(\d+)', line)):
+            bins = [int(x) for x in m.groups()]
+            if sum(bins) == 300:
+                near33[last_window] = bins[3]
         if 'game_version' not in info and (m := re.search(r'^\[totk\] game version (\S+)', line)):
             info['game_version'] = m[1]
         if 'turnip' not in info and (m := re.search(r'driver sha256=([0-9a-f]{64})', line)):
@@ -81,7 +92,39 @@ def parse_log(path):
             info['settings'] = dict(kv.split('=', 1) for kv in m[1].split() if '=' in kv)
         if 'device lost' in line.lower():
             info['device_lost'] = info.get('device_lost', 0) + 1
+    info['frame_ms'], info['near33'] = frame_ms, near33
     return timing, gpu, fps, stut, longf, info
+
+
+
+def pacing_of(end, fps, target, info):
+    """Classify >=20% half-rate frames as a dip; otherwise use fps < 5/6 target when frame coverage is incomplete.
+
+    Complete raw durations take precedence over the fence interval histogram. Sparse long-frame/late traces are
+    lower bounds, never proof that unlogged frames were fast. A 30-target run's normal 33 ms frames are not dips.
+    """
+    times = [info.get('frame_ms', {})[f] for f in range(end - 299, end + 1) if f in info.get('frame_ms', {})]
+    count = sum(29 <= ms < 37.5 for ms in times)
+    full = len(times) == 300
+    if full:
+        source = 'frame-durations'
+    elif end in info.get('near33', {}):
+        count, source = info['near33'][end], 'present-fence-histogram'
+        full = True
+    else:
+        source = 'sparse-frame-durations-lower-bound' if times else 'unavailable'
+    dip = None
+    classification = 'unknown'
+    if target:
+        if target == 60 and (full or count >= 60):
+            dip, classification = count >= 60, source
+        else:
+            dip = fps < target * 5 / 6 if fps is not None else None
+            classification = 'window-fps' if dip is not None else 'unknown'
+    return {'pacing_state': 'dip' if dip else 'steady' if dip is False else 'unknown',
+            'pacing_source': classification, 'target_fps': target,
+            'duration_s': 300 / fps if fps and fps > 0 else None,
+            'frames_near33': count if full or times else None, 'frames_near33_source': source}
 
 
 def pan_direction(block):
@@ -130,8 +173,29 @@ def window_generation(start, end, gens, guard=GUARD_FRAMES):
 def summarize(windows, thermal=()):
     vals = lambda k: [w[k] for w in windows if w.get(k) is not None]
     p50s = sorted(vals('p50_ms'))
+    classified = [w for w in windows if w.get('pacing_state') in ('steady', 'dip')]
+    pacing = {}
+    if classified:
+        steady = [w['fps'] for w in classified if w['pacing_state'] == 'steady' and w.get('fps')]
+        durations = [w for w in classified if w.get('duration_s')]
+        total_time = sum(w['duration_s'] for w in durations)
+        pacing = {
+            'fps_steady': round(sum(steady) / len(steady), 2) if steady else None,
+            'dip_windows': sum(w['pacing_state'] == 'dip' for w in classified),
+            'pacing_windows': len(classified),
+            'dip_time_fraction': round(sum(w['duration_s'] for w in durations if w['pacing_state'] == 'dip') /
+                                       total_time, 6) if total_time else None,
+            'measured_window_time_s': total_time,
+            'fps_time_mean': round(300 * len(durations) / total_time, 2) if total_time else None,
+            'frames_near33': sum(w['frames_near33'] for w in classified if w.get('frames_near33') is not None)
+                             if any(w.get('frames_near33') is not None for w in classified) else None,
+            'frames_near33_windows': sum(w.get('frames_near33') is not None for w in classified),
+            'frames_near33_lower_bound': any(w.get('frames_near33_source') != 'frame-durations' and
+                                           w.get('frames_near33_source') != 'present-fence-histogram' for w in classified),
+        }
     return {
         'windows': len(windows),
+        **pacing,
         'fps_min': min(vals('fps'), default=None), 'fps_max': max(vals('fps'), default=None),
         'fps_mean': round(sum(vals('fps')) / len(vals('fps')), 2) if vals('fps') else None,
         'p50_ms_median': p50s[len(p50s) // 2] if p50s else None,
@@ -373,6 +437,8 @@ def main():
     ap.add_argument('--commit', help='source commit of the measured APK (its assets/build.txt)')
     ap.add_argument('--meta', help='JSON object deep-merged over the result (device names, profiles, extra caveats)')
     ap.add_argument('--arms', action='store_true', help='in-session A/B: assign windows to the arms of the live-switch marks')
+    ap.add_argument('--target-fps', type=int, choices=(30, 60),
+                    help='override pacing target (otherwise pans.txt TARGET_FPS or preset TOTK_FPS60)')
     ap.add_argument('--guard-frames', type=int, default=GUARD_FRAMES,
                     help=f'frames after a live change before a window may start (default {GUARD_FRAMES})')
     a = ap.parse_args()
@@ -451,6 +517,8 @@ def main():
             samples = parse_sample_rows(os.path.join(out, f'samples-{dev}.txt'))
             for kv in plist:
                 f0, f1 = kv['F0'], kv['F1']
+                preset = devices[dev]['settings_env'].get('TOTK_FPS60')
+                target = a.target_fps or kv.get('TARGET_FPS') or (60 if preset == '1' else 30 if preset == '0' else None)
                 for f in sorted(x for x in timing if f0 + 600 <= x <= f1):
                     lf = [x for x in longf if f - 300 < x[0] <= f]
                     st = stut.get(f)
@@ -458,11 +526,13 @@ def main():
                          'max_ms': round(timing[f][2], 1), 'gpu_ms': gpu.get(f), 'long_ge25': sum(x[1] >= 25 for x in lf),
                          'long_ge45': sum(x[1] >= 45 for x in lf), 'over33': st[0] if st else None,
                          'over50': st[2] if st else None}
+                    w.update(pacing_of(f, w['fps'], target, info))
                     windows.append(w)
                     print(f'{f-299:>6}-{f:<6} {w["fps"] or 0:5.1f} {w["p50_ms"]:6.2f} {w["p95_ms"]:6.2f} {w["max_ms"]:6.1f} '
                           f'{w["gpu_ms"] if w["gpu_ms"] is not None else float("nan"):7.1f}  {w["long_ge25"]:>6}    '
                           f'{w["long_ge45"]:>6}    {st[0] if st else "-"}/{st[2] if st else "-"} '
-                          f'(>{st[1] if st else "-"}/>{st[3] if st else "-"})')
+                          f'(>{st[1] if st else "-"}/>{st[3] if st else "-"}) {w["pacing_state"]} '
+                          f'near33={w["frames_near33"]} ({w["pacing_source"]})')
                 rows = parse_samples(None, kv['T0'], kv['T1'], samples)
                 all_rows += rows
                 if rows:
@@ -487,6 +557,14 @@ def main():
             if memory:
                 print('  memory / pressure (worst over the windows): ' + ', '.join(f'{k} {v}' for k, v in memory.items()))
             summary = summarize(windows, thermal)
+            if summary.get('pacing_windows'):
+                steady = summary['fps_steady']
+                print(f'  pacing: steady fps {steady if steady is not None else "-"}; mean fps {summary["fps_mean"]} '
+                      f'(time-weighted {summary["fps_time_mean"]}); dip windows {summary["dip_windows"]}/{len(windows)}, '
+                      f'dip time {100 * summary["dip_time_fraction"]:.1f}%; ~33 ms frames {summary["frames_near33"]}'
+                      f'{" (lower bound / incomplete coverage)" if summary["frames_near33_lower_bound"] else ""}')
+            else:
+                caveats.append(f'{dev}/{scene}: pacing target unknown; use --target-fps or collect settings.env.')
             ab = None
             if a.arms:
                 ab = arm_analysis(windows, parse_ctl(os.path.join(out, 'logs', f'{dev}.log')), a.guard_frames)

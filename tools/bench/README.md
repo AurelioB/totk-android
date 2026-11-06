@@ -35,6 +35,27 @@ GPU cap), listed in `docs/benchmarks/baselines/index.json`. Only `ledger.py add`
 `analyze.py`/`compare.py` refuse to write any baseline path. `baseline-1.0.0.json` is registered there without a GPU
 cap, so it gives reference-only comparisons.
 
+### Pacing states, not just a session average
+
+`analyze.py` uses the preset's `TOTK_FPS60` (`1`: 60 target, `0`: 30 target), recorded pan target, or explicit
+`--target-fps 30|60`. Unknown targets remain unclassified, never silently treated as 60. At 60, a window with
+at least 60/300 frames in 29–37.5 ms is a dip: complete frame durations take priority, then the complete
+present-fence interval histogram. Sparse `[长帧]` / `[frame-tl late]` traces only establish lower bounds; otherwise
+the fallback is window fps below 5/6 of target (below 50 for 60). A normal 30-target 33 ms window is steady.
+Fence signals are a framework pacing proxy, **not guaranteed hardware scanout** and not proof of controller causality.
+
+The JSON and console separate `fps_steady` (mean of non-dip window fps), `dip_windows`, `dip_time_fraction`
+(sum of dip-window seconds / classified-window seconds, using 300/fps), `frames_near33`, and `fps_mean`
+(legacy arithmetic window mean). `fps_time_mean` is the actual throughput over those complete windows, i.e.
+total frames / total time; neither mean includes warm-up, dropped edge windows or screenshot time. Missing frame
+counts remain null; `frames_near33_lower_bound` and coverage describe sparse traces. Do not infer counts from fps or
+from the stutter line's >33 ms total, which misses frames just below 33 ms.
+
+A/B comparisons report steady fps and dip time independently; a dip-time difference above 0.05 (five percentage
+points) says **verdict confounded by dips** rather than declaring a speed win from mean fps. All-dip arms have no
+steady-fps estimate. Historical JSON without pacing data is labelled unavailable and retains legacy comparisons;
+re-analyze its original logs with the preset target to obtain a pacing-aware comparison.
+
 Example (one device, one scene; placeholders in `<>`):
 
 ```sh

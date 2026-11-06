@@ -169,11 +169,17 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
   (`[长帧]`) come from `totk.log`; temperatures, cooling states, GPU `thermal_pwrlevel` and cpufreq limits from the
   sampler over each pan; the frequency limits (per cluster `related_cpus`, `scaling_min/max`, `cpuinfo_max`; GPU cap,
   hardware maximum and power levels) from `freqs.txt` (`freq_limits` per pan, `freq_stable` per run).
-- `compare.py` verdicts: per metric `better` / `worse` / `same` within documented tolerances (`compare.py --help`); a
-  scene is worse if fps mean, p50, p95, GPU ms or >50 ms frames (per window) got worse. Each device pair is labelled by
-  frequency signature: **match** (a regression check; exit status 1 when such a scene is worse), **reference only**
-  (the reference has no GPU cap: indicative) or **NOT COMPARABLE** (signatures differ or are unknown: loud warning,
-  never decides the exit status).
+- Read **steady fps, dip-window count, dip time fraction, ~33 ms frame count, and mean fps separately**. At a 60 target,
+  >=60/300 frames in 29–37.5 ms makes a dip window (complete durations, else complete fence histogram); without full
+  frame evidence the fallback is fps <50. At 30 target the fallback is <25; normal ~33 ms pacing is not a dip.
+  Sparse long-frame logs give lower-bound counts, not a complete duration trace. `--target-fps 30|60` overrides the
+  recorded target/preset; an unknown target must not be guessed. Dip time weights each window by 300/fps, not one vote.
+  `fps_mean` is the legacy arithmetic mean of window fps; `fps_time_mean` is frames / elapsed window time.
+- `compare.py` / `abtest.py` compare steady fps and dip time separately. A dip fraction difference >0.05 (five
+  percentage points) reports **verdict confounded by dips**, not an optimization win/loss from a controller state.
+  All-dip arms have no steady estimate; historic results without pacing data keep labelled legacy comparisons.
+  Per-metric tolerances remain documented in `compare.py --help`. Frequency signatures still gate comparisons:
+  **match** (regression check), **reference only** (indicative), **NOT COMPARABLE** (never decides exit status).
 - Other **not comparable** warnings: a different `settings_env`, different cpufreq caps, or `freq_stable: false`.
 - Temperatures depend on how long the device has been running the game: a one-scene session ends cooler than the
   1.0.0 round, which measured three scenes back to back. They are reported, not part of the scene verdict.

@@ -287,6 +287,48 @@ def ab_log(windows, ctl):
     return '\n'.join(lines + [e[1] for e in events]) + '\n'
 
 
+class Pacing(unittest.TestCase):
+    def test_steady_and_dip_report_separate_time_weighted_states(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'logs').mkdir()
+            (d / 'logs/odin.log').write_text(ab_log(
+                {600: (57, 20, 10, 0), 900: (34, 34, 10, 0)}, []), encoding='utf-8')
+            (d / 'settings-odin.env').write_text('TOTK_FPS60=1\n')
+            (d / 'pans.txt').write_text('odin hateno F0=0 F1=900 T0=100 T1=120 V=16000\n')
+            result = run(BENCH / 'analyze.py', d, '--json', d / 'result.json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads((d / 'result.json').read_text())['runs'][0]
+        s = record['summary']
+        self.assertEqual(s['fps_steady'], 57)
+        self.assertEqual(s['fps_mean'], 45.5)
+        self.assertEqual(s['dip_windows'], 1)
+        self.assertAlmostEqual(s['dip_time_fraction'], (300 / 34) / (300 / 57 + 300 / 34), places=6)
+        self.assertIsNone(s['frames_near33'])  # fps cannot recover individual frame counts
+        self.assertEqual([w['pacing_source'] for w in record['windows']], ['window-fps'] * 2)
+
+    def test_raw_durations_and_fence_histogram_precede_window_fps(self):
+        raw = {f: 33.33 if f <= 75 else 16.67 for f in range(1, 301)}
+        w = analyze.pacing_of(300, 51, 60, {'frame_ms': raw})
+        self.assertEqual((w['pacing_state'], w['frames_near33']), ('dip', 75))
+        self.assertEqual(w['pacing_source'], 'frame-durations')
+        self.assertEqual(analyze.pacing_of(300, 30, 30, {'frame_ms': raw})['pacing_state'], 'steady')
+        # Incomplete traces are not evidence that the unlogged frames were steady.
+        w = analyze.pacing_of(300, 34, 60, {'frame_ms': {1: 33.3}})
+        self.assertEqual((w['pacing_state'], w['pacing_source']), ('dip', 'window-fps'))
+        self.assertEqual(w['frames_near33'], 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'totk.log'
+            p.write_text('[nvn-vk] frame 300: 51.0 fps over the last 300, 1000 draws\n'
+                         '[nvn-vk] window present-fence interval bins ms '
+                         '[<12.5,12.5-20.9,20.9-29,29-37.5,37.5-45.8,>=45.8]: '
+                         'all=0/225/0/75/0/0; adjacent immutable interval2=0/0/0/70/0/0\n')
+            info = analyze.parse_log(p)[5]
+        w = analyze.pacing_of(300, 51, 60, info)
+        self.assertEqual((w['pacing_state'], w['frames_near33_source']), ('dip', 'present-fence-histogram'))
+        self.assertEqual(w['frames_near33'], 75)
+
+
 class InSessionAB(unittest.TestCase):
     CTL = [(1000, '[totk-ctl] gen=1 frame=1000 applied unset TOTK_VK_DESC_STOCK'),
            (1000, '[totk-ctl] gen=1 frame=1000 mark ab arm=A block=1 scene=hateno'),
@@ -406,7 +448,7 @@ class InSessionAB(unittest.TestCase):
                                  long_ge45=summary['long_ge45_total'] / summary['windows'])] * summary['windows']
             spreads = {}
             for key in analyze.AB_METRICS:
-                values = [analyze.block_metric(b['summary'], key) for b in blocks]
+                values = [value for b in blocks if (value := analyze.block_metric(b['summary'], key)) is not None]
                 spreads[key] = max(values) - min(values) if len(values) > 1 else None
             pooled = analyze.summarize(windows)
             pooled['fps_min'] = min(b['summary']['fps_min'] for b in blocks)
