@@ -196,6 +196,24 @@ Known caveats:
 - Short runs (3–7 windows per scene): differences inside the tolerances are noise; repeat a run before calling a
   small change.
 
+### Uncapped throughput comparisons
+
+When capped 60-target A/B arms enter different stretches of the game's 60/30 controller, first report both pacing
+states and the confounding; do not call the lower session mean a code regression. For a **separate throughput
+experiment**, select the 60 fps preset and put `TOTK_UNCAPPED=1` in the developer `<game>/totk.env` for **both** arms,
+then restart the game. `TOTK_FPS60=1` is required: FPS60 off explicitly disables this uncapped path. Keep the rest of
+the environment identical, collect it, and label the result **uncapped profiling**, not Recommended/capped gameplay.
+The current legacy FPS60 uncapped policy uses a 120-Hz clock, not a promise of unlimited output; controller/present
+intervals can still change. Inspect `[fps-policy]` effective interval/uncapped lines to confirm the actual path;
+conflicting physical-clock/display modes may override uncapped controls. Never assume the switch erased every dip.
+
+Use this when isolating CPU/GPU throughput changes that a capped controller plateau would hide or decide, with the
+same save, camera, caps, cache and thermal state, long pans and reversed arm order. It can change GPU load, residency,
+power, thermals and latency: retain a capped 60-preset round for user-facing acceptance, and never pool capped and
+uncapped results or compare either to the other's baseline. Preserve the previous `totk.env`, restore it after the
+experiment and restart to restore normal behavior; benchmark tooling never enables uncapped mode by default.
+
+
 ## In-session A/B (live switches)
 
 Compares experiment switches inside ONE running session and ONE loaded scene, alternating the arms (ABBA) instead of
