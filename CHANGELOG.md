@@ -29,6 +29,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Upgrades without a stored choice adopt the chip default; explicit choices survive. Presets no longer change
   or match this option. Thor and Duo defaults retain 1.0.1's settings.env bytes for every preset, and frame
   generation leaves the option inactive.
+- Make controller hysteresis part of the Odin / Snapdragon 8 Elite-class native 60-fps menu profile:
+  `TOTK_FPS60_HYSTERESIS=1` is generated only for `CQ8725S`/`SM8750` at 60 fps without frame generation,
+  including existing stores and custom mixes, independently of GPU busy. No extra visible option or stored
+  preference is added. Runtime unset remains native/off; developer `totk.env` `=0` overrides the menu.
+  Other chips and every non-60 preset keep their previous settings.env bytes. Device validation is required
+  before this branch is merged.
 
 ## 1.0.1 (versionCode 10001), game 1.4.3
 

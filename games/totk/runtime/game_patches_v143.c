@@ -37,6 +37,36 @@ static const Patch fps60[] = {
     {0x2db34c, 0x1a9fa555},
 };
 
+/* Optional policy experiment: keep the measured-work calculation, candidate
+   clamps, callbacks/veto and window setter; change only the native counter
+   limits. Fixed experiment limits intentionally replace configuration overrides. */
+static void patch_fps60_hysteresis(Module *m) {
+    const char *e = getenv("TOTK_FPS60_HYSTERESIS");
+    int on = e && !strcmp(e, "1");
+    fprintf(stderr, "[totk] TOTK_FPS60_HYSTERESIS=%d: %s\n", on,
+            on ? "over limit 6 (raise on seventh consecutive over-budget call), cooldown reload 2" :
+                 "native over-limit/cooldown configuration");
+    if (!on) return;
+#if TARGET_OS_IPHONE
+    runtime_fail("TOTK_FPS60_HYSTERESIS requires a runtime-patched main");
+#else
+    static const Patch sites[] = {
+        {0x2db2b8, 0x528000cc}, /* ldr w12,[x20,#0x10] -> mov w12,#6 */
+        {0x2db354, 0x5280004c}, /* ldr w12,[x20,#0x14] -> mov w12,#2 */
+        {0x2db3f0, 0x52800049}, /* ldr w9,[x20,#0x14] -> mov w9,#2 */
+    };
+    uint32_t original[3];
+    for (unsigned i = 0; i < 3; i++)
+        if (sites[i].off + 4 > m->text_end)
+            runtime_fail("1.4.3 FPS60 hysteresis site outside text");
+    if (!code_guard(m, SITES(sites), original,
+                    "ea577c9101d653362c01f832a336c10798bc2e2845bf77fed4b26fafb51197cc"))
+        runtime_fail("1.4.3 FPS60 hysteresis original instruction mismatch");
+    for (unsigned i = 0; i < 3; i++)
+        memcpy(m->base + sites[i].off, &sites[i].replacement, 4);
+#endif
+}
+
 
 static _Atomic uint64_t *frame_step_data;
 static _Atomic uint32_t *frame_interval_data;
@@ -962,6 +992,7 @@ void runtime_game_patches(Module *m) {
     const char *enabled = getenv("TOTK_FPS60");
     if (enabled && !strcmp(enabled, "0")) {
         fprintf(stderr, "[totk] 1.4.3 shipping frame controller (TOTK_FPS60=0)\n");
+        fprintf(stderr, "[totk] TOTK_FPS60_HYSTERESIS=0: inactive in shipping-30 mode\n");
         return;
     }
 #if !TARGET_OS_IPHONE
@@ -981,6 +1012,7 @@ void runtime_game_patches(Module *m) {
         memcpy(m->base + fps60[i].off, &fps60[i].replacement, 4);
  #endif
     fprintf(stderr, "[totk] 1.4.3 60 FPS: seven verified controller instructions; original game frame-time calculation\n");
+    patch_fps60_hysteresis(m);
     patch_fps60_hardening(m);
     #if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
     patch_thermal_step(m);

@@ -3846,6 +3846,7 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 | Frame-rate option | Android default | Effect |
 | --- | --- | --- |
 | `TOTK_FPS60` | `0` | `1` permits the game's 60-fps controller; `0` retains the shipping 30-fps minimum interval. |
+| `TOTK_FPS60_HYSTERESIS` | `0` (native) when unset; menu writes `1` only for Snapdragon 8 Elite-class native 60 fps | Startup-only, FPS60/v143: raise after seven consecutive over-budget decisions instead of three, then reload cooldown 2 instead of 6. `<game>/totk.env` `=0` overrides the menu. Compare interval-2 share/episode length and missed-refresh tails; details below. |
 | `TOTK_FPS_AUTO` | `0` (off) | `1`, only with `TOTK_FPS60=1`, selects effective 60/30 presentation intervals from measured sustainability; guest code is not repatched. |
 | `TOTK_GPU_TIME` | `hardware` when `TOTK_FPS60` is unset/`0`; `latency` when `TOTK_FPS60=1` | Android shipping-30 mode defaults to replay-free hardware-equivalent GPU reports. Explicit `hardware` or `latency` overrides either mode; unknown values log and retain latency. DRS also consumes these reports; they are not physical busy-time measurements. |
 | `TOTK_FRAME_LAG` | `0` on every platform and in every FPS mode | Only explicit `TOTK_FRAME_LAG=1` enables protected lag; unset, `0` and every other value leave it off. |
@@ -3914,6 +3915,14 @@ Rotsumamu was neutral at the 60 fps cap. At the 60 fps preset, the Duo (~27 fps)
 (4/4 pairs), while Thor (~30 fps) was neutral. These gates limit the default to the measured beneficial chip family.
 Compare off/on on the same warmed route after restarting: fps, p95, GPU-clock residency, power and temperature;
 retain `[split-pass]` and `[totk-perf] ADPF span` logs.
+
+The **60 fps** preset on Snapdragon 8 Elite-class chips (`CQ8725S`/`SM8750`, the same exact chip-class check as
+GPU busy) also writes `TOTK_FPS60_HYSTERESIS=1`. This is internal profile policy, not another visible option:
+it follows any 60-fps custom mix, independently of GPU busy, and is omitted at 30 fps or with frame generation.
+Existing stores adopt it when loaded without adding or replacing a preference; the menu already rewrites
+`settings.env` at game start. Light, Balanced and Smooth retain their previous bytes on every chip, as do all
+Thor/Duo/unknown-chip presets. The runtime remains native when the switch is unset, and developer
+`<game>/totk.env` `TOTK_FPS60_HYSTERESIS=0` still wins. This branch's default awaits device validation before merging.
 
 ### Android performance hints (experimental full mode)
 
@@ -4015,6 +4024,53 @@ Over-budget work, a freeze/explicit policy change, or a listener veto can theref
 Stored `min/max=2/3` with FPS60 enabled is **expected**: the patch changes comparison/select
 instructions, not those configuration words. Native emulation explicitly checks that interval 1 is
 selected while the stored words remain 2/3; seeing 2/3 is not evidence that the patch is absent.
+
+**Odin dip policies (both startup-only; runtime defaults off, with hysteresis enabled by the Odin native-60 menu profile):**
+`TOTK_FPS60_HYSTERESIS=1` requires FPS60/v143 and changes three guarded controller loads:
+over-limit 6 (raise on the seventh consecutive over-budget decision, versus native limit 2/third),
+cooldown reload 2 versus native 6. Work/bias math, min/max, freeze, listener veto and interval setter
+remain native; fixed experiment limits replace configuration overrides, while logged `limits` remain stored words.
+Compare interval-2 frame/time share and episode length, not only mean fps; shorter cooldown can increase chatter,
+and tolerating late work can produce missed-display judder. No 60 interval is forced under sustained overload.
+
+`TOTK_GPU_TIME_FPS_MEDIAN=1` requires `TOTK_GPU_TIME=hardware` and filters only the two known FPS END
+consumers with a three-unique-report median (no synthetic warmup zeros; duplicate reads do not advance it).
+Invalid reports hold the last filtered work; DRS/absolute timestamps/raw GPU profiling are unchanged.
+Startup logs the effective mode and `[fps-policy] GPU FPS median frame` reports raw/filtered means and changed reads.
+An isolated spike is rejected, but a sustained rise passes on its second sample; recovery also needs two samples.
+This is a controller-noise experiment, **not** evidence that hardware timings are wrong, and cannot fix CPU-triggered dips.
+
+The existing `[fps-policy]` decision logs distinguish these causes: on Odin shadow A2,
+frame 7302 drops with CPU/GPU 14.063/18.584 ms and recovers at 7470 (168 interval-2 frames);
+frame 8555 drops with 19.587/12.875 ms and recovers at 8694 (139 frames).
+At frame 7500 the hardware producer means are 14.403/11.561 ms before/after removal,
+with zero fallback/clamps/invalid/withheld samples; the mean cannot disprove a transient over-budget input.
+The ~33-ms cadence is a game policy result, not a shader-compile count or raw GPU busy duration.
+Setters and 300-frame summaries do not retain all preceding inputs, so the native three-late rule comes from
+instruction emulation, not an invented per-frame trace. Boot/scripted-camera floors must be excluded from pans.
+
+The pacing-aware analyzer classifies a 60-target window as a dip when at least 60/300 measured intervals
+are 29..37.5 ms (otherwise it uses a clearly labelled incomplete-coverage fps fallback). Its Odin shadow
+re-analysis retains 31 windows per arm: A/B each have seven dip windows, taking 29.31/29.45% of measured
+window time, with 1,348/1,331 near-33-ms frames. Steady fps is 57.35/57.52 versus time-weighted
+52.29/52.36 overall: avoiding those windows could recover about 5 fps, not evidence of faster steady rendering.
+That **dip-window time fraction** is distinct from interval-2 frame share/time and extra-refresh tax.
+Near-33 cadence can also include missed refreshes at interval 1; do not identify every such frame as a controller drop.
+
+Device qualification: use the same release APK, Recommended60 preset, 60-Hz panel, GPU busy On,
+Hateno save/view, warmed seed, fixed resolution/DRS and recording threads. Fresh launch each arm:
+control `TOTK_FPS60_HYSTERESIS=0 TOTK_GPU_TIME_FPS_MEDIAN=0`; then hysteresis-only `1/0`;
+then median-only `0/1`, each interleaved ABBA. For every fresh launch run the existing
+`tools/bench/pan.sh -s <odin-serial> --device odin --scene hateno --out <arm-dir> --target-fps 60 --repeat 3`;
+retain all three pans, with the script's target-aware duration and settle, then analyze with the pacing-aware
+`tools/bench/analyze.py`. Compare `dip_time_fraction` and `fps_steady` separately; mean fps is informational.
+Keep `TOTK_GPU_TIME=hardware`, `TOTK_FPS_AUTO=0`, `TOTK_FRAMEGEN=0` and thermal/ADPF settings identical.
+Require the switch startup logs, controller=sys+0x200, zero hardware fallback/invalid/withheld, and no cutscene floor.
+Join every drop/recovery decision to immutable interval-1/2 cadence, CPU/GPU scores and GPU FPS median summaries;
+report the analyzer's dip-window fraction/steady fps alongside interval-2 frame/time share and extra-refresh tax, plus p95/p99/>50ms,
+physical GPU ms/DRS, CPU/GPU clocks, power and temperature. Reject apparent fps gains with worse missed-refresh
+tails, altered time/physics, freeze/veto violations, sustained report withholding or rising thermal cost.
+Only test `1/1` after each independent arm qualifies; no device result is claimed by these host experiments.
 
 **Thermal frame step (Android, opt-in):** `TOTK_THERMAL_STEP=1` (default `0`, startup-only)
 raises the v143 FPS60 controller's minimum result to two 60-Hz ticks when the running interval is one

@@ -73,9 +73,13 @@ final class Settings {
             + "# Do not edit: the menu overwrites it. Developer overrides belong in <game>/totk.env, which is read after this file.\n";
 
     private final Map<String, String> values = new LinkedHashMap<>();
+    private final boolean fps60Hysteresis;
 
     /** Stored values (any map: SharedPreferences.getAll()); unknown keys and invalid values fall back to the defaults. */
     Settings(Map<String, ?> stored, String soc) {
+        // Internal 60 fps profile policy, using the same chip class as gpu_feed. Recomputed for old stores too:
+        // no preference key or menu option to migrate, and an explicit totk.env value still wins.
+        fps60Hysteresis = "Snapdragon 8 Elite class".equals(socClass(soc));
         for (Option option : OPTIONS) {
             Object value = stored == null ? null : stored.get(option.key);
             values.put(option.key, value instanceof String && option.valid((String) value) ? (String) value : option.fallback);
@@ -214,6 +218,7 @@ final class Settings {
             line(out, "TOTK_FPS60=" + (sixty ? "1" : "0"));
             // The device-tested 60 fps profile reports hardware GPU time (the FPS60 default, latency, overstates it).
             if (sixty) line(out, "TOTK_GPU_TIME=hardware");
+            if (sixty && fps60Hysteresis) line(out, "TOTK_FPS60_HYSTERESIS=1");
             // Extraction cannot split passes. Leave both hints out with frame generation, retaining its timing block.
             if ("on".equals(get("gpu_feed"))) {
                 line(out, "TOTK_VK_SPLIT_PASS_DRAWS=512");
