@@ -14,11 +14,11 @@ enum { GP_IA_VERTICES, GP_IA_PRIMITIVES, GP_VS, GP_CLIP_INVOCATIONS, GP_CLIP_PRI
     VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT | \
     VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)
 
-typedef struct { uint32_t format, w, h, load, store, bytes; } gp_attachment;
+typedef struct { uint32_t format, w, h, load, store, bytes, width_den, height_den; } gp_attachment;
 typedef struct {
     gp_attachment a[10];
     uint64_t shader;
-    uint32_t w, h, samples, colors, bucket, compute;
+    uint32_t w, h, samples, colors, compute;
 } gp_key;
 typedef struct {
     gp_key key; uint64_t frame, counters[GP_STATS];
@@ -35,6 +35,7 @@ struct vk_gpuprof_slot {
 };
 typedef struct {
     gp_key key; uint64_t hash, count, draws, counters[GP_STATS], stats_count, stats_draws;
+    uint32_t ordinal;
     double ms, stats_ms;
 } gp_group;
 typedef struct {
@@ -71,8 +72,31 @@ static uint64_t hash_bytes(uint64_t h, const void *data, size_t n) {
     for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= UINT64_C(1099511628211); }
     return h;
 }
-static uint64_t key_hash(const gp_key *key) { return hash_bytes(UINT64_C(14695981039346656037), key, sizeof *key); }
-static uint32_t bucket(uint32_t draws) { uint32_t b = 0; while (draws) { b++; draws >>= 1; } return b; }
+static uint32_t gcd_u32(uint32_t a, uint32_t b) {
+    while (b) { uint32_t r = a % b; a = b; b = r; }
+    return a ? a : 1;
+}
+static uint64_t key_hash(const gp_key *key) {
+    uint64_t h = UINT64_C(14695981039346656037);
+    h = hash_bytes(h, &key->shader, sizeof key->shader);
+    const uint32_t fields[] = {key->samples, key->colors, key->compute};
+    h = hash_bytes(h, fields, sizeof fields);
+    for (unsigned j = 0; j < 10; j++) {
+        const gp_attachment *a = &key->a[j];
+        const uint32_t values[] = {a->format, a->w, a->width_den, a->h, a->height_den, a->load, a->store};
+        h = hash_bytes(h, values, sizeof values);
+    }
+    return h;
+}
+static int key_equal(const gp_key *a, const gp_key *b) {
+    if (a->shader != b->shader || a->samples != b->samples || a->colors != b->colors || a->compute != b->compute) return 0;
+    for (unsigned j = 0; j < 10; j++) {
+        const gp_attachment *x = &a->a[j], *y = &b->a[j];
+        if (x->format != y->format || x->w != y->w || x->h != y->h || x->width_den != y->width_den ||
+            x->height_den != y->height_den || x->load != y->load || x->store != y->store) return 0;
+    }
+    return 1;
+}
 /* Core VkFormat families are contiguous. Use the VIEW format, not guest storage: a BC
    texture can have an uncompressed attachment view and depth formats can be substituted. */
 static uint32_t texel_bytes(VkFormat f) {
@@ -114,12 +138,12 @@ static void report(void) {
         char attachments[800]; size_t used = 0; attachments[0] = 0;
         for (int j = 0; j < 10; j++) if (k->a[j].format) {
             const gp_attachment *a = &k->a[j];
-            int nn = snprintf(attachments + used, sizeof attachments - used, " %c%d=%u:%ux%u:%u/%u", j < 8 ? 'c' : 'd', j, a->format, a->w, a->h, a->load, a->store);
+            int nn = snprintf(attachments + used, sizeof attachments - used, " %c%d=%u:%u/%ux%u/%u:%u/%u", j < 8 ? 'c' : 'd', j, a->format, a->w, a->width_den, a->h, a->height_den, a->load, a->store);
             if (nn < 0 || (size_t)nn >= sizeof attachments - used) break;
             used += (size_t)nn;
         }
-        LOGV("[gpu-profile] #%zu sig=%016llx %s %ux%u samples=%u colors=%u draws-bucket=%u shader=%016llx: %.3f ms/frame %.2f%% %.2f instances/frame %.2f draws/frame; attachments(fmt:WxH:load/store)%s",
-             i + 1, (unsigned long long)g->hash, k->compute ? "compute" : "render", k->w, k->h, k->samples, k->colors, k->bucket,
+        LOGV("[gpu-profile] #%zu sig=%016llx %s ordinal=%u samples=%u colors=%u shader=%016llx: %.3f ms/frame %.2f%% %.2f instances/frame %.2f draws/frame; attachments(fmt:relative-widthxheight:load/store)%s",
+             i + 1, (unsigned long long)g->hash, k->compute ? "compute" : "render", g->ordinal, k->samples, k->colors,
              (unsigned long long)k->shader, g->ms / GP_WINDOW, total_ms ? 100 * g->ms / total_ms : 0,
              g->count / (double)GP_WINDOW, g->draws / (double)GP_WINDOW, attachments);
         LOGV("[gpu-profile scale] sig=%016llx: %.2f draws/instance, %.1f ns/draw (whole pass); geometry-stats %s valid=%llu/%llu IA-vertices=%.0f IA-primitives=%.0f VS=%.0f clipping-invocations=%.0f clipping-primitives=%.0f fragments=%.0f/frame; %.2f verts/draw %.2f prims/draw %.3f fragments/prim %.3f ns/vertex %.3f ns/primitive",
@@ -193,7 +217,6 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
         uint64_t delta = slot->ticks[2 * i + 1] - slot->ticks[2 * i];
         if (V.timestamp_bits < 64) delta &= (UINT64_C(1) << V.timestamp_bits) - 1;
         double ms = (double)delta * V.props.limits.timestampPeriod / 1e6;
-        r->key.bucket = bucket(r->draws);
         total_records++; total_ms += ms; if (r->key.compute) compute_ms += ms; else render_ms += ms;
         for (int j = 0; j < 10; j++) {
             const gp_attachment *a = &r->key.a[j]; if (!a->format) continue;
@@ -203,7 +226,7 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
             if (a->load == VK_ATTACHMENT_LOAD_OP_CLEAR) clears++;
             if (a->store == VK_ATTACHMENT_STORE_OP_STORE) { stores++; store_bytes += bytes; } else discards++;
         }
-        uint64_t hash = key_hash(&r->key); size_t at = hash % GP_GROUPS, tries = 0;
+        uint64_t hash = key_hash(&r->key); size_t at = (hash ^ r->instance) % GP_GROUPS, tries = 0;
         if (vk_gpuprof_on == 2) {
             const char *reason = r->reason < sizeof end_names / sizeof *end_names ? end_names[r->reason] : "unknown";
             LOGV("[gpu-split] frame=%llu instance=%u sig=%016llx kind=%s end=%s detail=%#x draws=%u ms=%.4f; emitted-tail srcStage=%#llx srcAccess=%#llx dstStage=%#llx dstAccess=%#llx",
@@ -211,9 +234,9 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
                  (unsigned long long)VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, (unsigned long long)VK_ACCESS_2_MEMORY_WRITE_BIT,
                  (unsigned long long)VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, (unsigned long long)(VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT));
         }
-        while (groups[at].count && (groups[at].hash != hash || memcmp(&groups[at].key, &r->key, sizeof r->key)) && ++tries < GP_GROUPS) at = (at + 1) % GP_GROUPS;
+        while (groups[at].count && (groups[at].hash != hash || groups[at].ordinal != r->instance || !key_equal(&groups[at].key, &r->key)) && ++tries < GP_GROUPS) at = (at + 1) % GP_GROUPS;
         if (tries == GP_GROUPS) { dropped_records++; continue; }
-        gp_group *g = &groups[at]; if (!g->count) { g->key = r->key; g->hash = hash; }
+        gp_group *g = &groups[at]; if (!g->count) { g->key = r->key; g->hash = hash; g->ordinal = r->instance; }
         g->count++; g->draws += r->draws; g->ms += ms;
         if (r->stats_count && !r->stats_invalid && sr == VK_SUCCESS) {
             for (unsigned st = 0; st < GP_STATS; st++) g->counters[st] += r->counters[st];
@@ -260,7 +283,8 @@ void vk_gpuprof_begin(VkCommandBuffer cb, const VkRenderingInfo *ri, const VkFor
         if (j == 9) bytes = 1;
         else if (j == 8 && formats[j] == VK_FORMAT_D32_SFLOAT_S8_UINT) bytes = 4;
         else if (j == 8 && formats[j] == VK_FORMAT_D24_UNORM_S8_UINT) bytes = 3;
-        k->a[j] = (gp_attachment){formats[j], widths[j], heights[j], a->loadOp, a->storeOp, bytes};
+        uint32_t gw = gcd_u32(widths[j], k->w), gh = gcd_u32(heights[j], k->h);
+        k->a[j] = (gp_attachment){formats[j], widths[j] / gw, heights[j] / gh, a->loadOp, a->storeOp, bytes, k->w / gw, k->h / gh};
         open_audit.lo[j] = (uint64_t)(uintptr_t)t->mem;
         open_audit.hi[j] = open_audit.lo[j] + t->L.size;
         if (a->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) vk_gpuprof_read(open_audit.lo[j], t->L.size);
@@ -314,7 +338,7 @@ void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpupro
     *token = (vk_gpuprof_end_token){current->pool, current->stats, current->n * 2 + 1, open_record->stats_q1};
     if (!open_record->key.compute) {
         if (audit_n == audit_cap) { audit_cap = audit_cap ? 2 * audit_cap : 256; audit = realloc(audit, audit_cap * sizeof *audit); if (!audit) DIE("GPU profiler audit allocation"); }
-        open_audit.key = open_record->key; open_audit.key.bucket = bucket(open_record->draws);
+        open_audit.key = open_record->key;
         audit[audit_n++] = open_audit;
     }
     current->n++; open_record = NULL;

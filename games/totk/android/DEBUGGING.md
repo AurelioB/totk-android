@@ -1763,12 +1763,12 @@ Read `[gpu-profile] frames A-B` for summed measured render/compute ms/frame, act
 CLEAR, STORE and DONT_CARE-store attachment operations/frame and logical attachment load/store
 MiB/frame (**not actual traffic**). It is **not** the whole-frame GPU span: transfers, pre-command-buffer uploads,
 presentation/compositor work, queue bubbles and gaps between timed passes are excluded.
-The following top **15** signature rows are sorted by total GPU ms/frame; percentages are
-shares of the measured total, not the full GPU span. Signatures include every attachment's
-format, mip extent and load/store ops, render extent, sample count, color slot count, first
-draw's combined resolved shader-key hash, render/compute kind and draw-count bucket.
-Bucket 0 is no draws; bucket 1 is one draw, 2 is 2–3, 3 is 4–7, etc. Raw Vulkan load/store
-enum values are shown (`LOAD=0`, `CLEAR=1`, `DONT_CARE=2`; `STORE=0`, `DONT_CARE=1`).
+The compact top-N signature rows are sorted by total GPU ms/frame; percentages are
+shares of the measured total, not the full GPU span. Stable keys include render/compute
+kind, ordered attachment formats, exact reduced attachment-width/render-width and
+attachment-height/render-height fractions, sample count, color slot count, load/store
+ops and the first draw's combined resolved shader-key hash. Draw counts and absolute
+render dimensions are not identity. Frame ordinals are reported separately.
 Actual attachment identities/guest addresses are deliberately absent from signatures.
 
 Traffic is an **uncompressed logical estimate**, render area × bytes/texel × samples per
