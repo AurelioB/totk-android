@@ -61,8 +61,8 @@ def validate(row):
         for key in ('key', 'shader', 'kind'):
             if not isinstance(row.get(key), str) or not row[key]:
                 raise ValueError(f'{key}: expected nonempty string')
-        if row['kind'] not in ('render', 'compute'):
-            raise ValueError('kind: expected render or compute')
+        if row['kind'] not in ('render', 'compute', 'upload', 'transfer', 'post', 'upscale', 'present', 'framegen'):
+            raise ValueError('kind: unknown GPU scope kind')
         number(row, 'ordinal', True)
         number(row, 'gpu_ms')
         count = number(row, 'count', True, 1)
@@ -299,7 +299,7 @@ def analyze(paths):
         'method': 'Sum times/counters before division; ratios never averaged. Time/draw ratios use only rows with '
                   'complete statistics; partial-stat counters remain in counter-to-counter ratios. Families ignore '
                   'shader/key/ordinal but keep kind, samples and exact attachment rationals/load/store. '
-                  'Long-frame rows are selected/capped, not a complete frame population. Window/frame timing '
+                  'Long-frame rows are threshold-selected, not a complete frame population. Window/frame timing '
                   'are separate views, never added together. Missing leading/trailing captures cannot be inferred.',
     }
 

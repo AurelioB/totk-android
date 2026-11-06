@@ -1800,7 +1800,7 @@ are unique. Existing pipeline/dynamic guards already removed redundant calls, so
 All 0/2/3 baseline-vs-revised output files compare identically. Normal and TSan identity matrices pass at default,
 chunk 1, inline/chunk 512, leading chunks disabled, profile disabled, and linear-span/dedup/dynamic diagnostics off.
 The test-only API wrappers also run clean under TSan with recorder workers enabled. Direct
-`REC_THREADS=2 GPU_PROFILE=2` execution logs forced inline recording and passes the draw fixture.
+`REC_THREADS=2 GPU_PROFILE=2` execution in that pre-v2 test logged forced inline recording and passed the draw fixture; the v2 profiler above now retains workers.
 
 Inspected Mesa source anchors (relative to `src/`): `vulkan/runtime/vk_command_pool.c:141` (pool walk),
 `vulkan/runtime/vk_command_buffer.c:92` (implicit reset), `freedreno/vulkan/tu_cmd_buffer.cc:4371`

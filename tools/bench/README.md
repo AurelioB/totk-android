@@ -63,14 +63,17 @@ The report includes measured/span/gap sums, absent frame IDs within the captured
 pass/window sum mismatches, dropped/failed slots, partial windows and malformed/incomplete/duplicate/conflicting
 rows. Separate launch filenames remain separate observations; repeated rotation rows count once, while conflicting
 identities are excluded rather than choosing an arbitrary value. Complete missing leading/trailing windows cannot
-be inferred. `long_frame` tables describe selected, capped rows only; they are never added to window totals or
-treated as an unbiased latency distribution. Exit 1 means malformed/conflicting rows; a partial final JSON line
-is a reported capture warning. Exit 2 means an input/output error.
+be inferred. `long_frame` tables describe over-threshold frames and retained-history diagnostics; they are never
+added to window totals or treated as an unbiased latency distribution. `TOTK_VK_GPU_PROFILE_LONG_FRAMES` bounds
+the history ring, **not** the number of over-threshold frames that can be dumped; a zero long-frame threshold
+selects every frame. Exit 1 means malformed/conflicting rows; a partial final JSON line is a reported capture
+warning. Exit 2 means an input/output error.
 
 `tests/test_gpuprof.py` pins the schema, ratios, optional statistics, rotation and long-frame accounting without
 Vulkan. The optional `GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs
-for modes 0/1/2/3, recorder workers 0/2, statistics on/off/unsupported, split-frame reconciliation and bounded
-file rotation. Build `vkgpuproftest` via `games/totk/android/Makefile`; it also builds the existing `vkdraw-seed`.
+for modes 0/1/2/3, recorder workers 0/2, statistics on/off/unsupported, split-frame and unsent multi-frame
+reconciliation, direct pre uploads while main rendering is open, and bounded file rotation.
+Build `vkgpuproftest` via `games/totk/android/Makefile`; it also builds the existing `vkdraw-seed`.
 Set `TOTK_SHADER_SEED_DIR` to that seed's absolute directory and select the host lavapipe loader as for `vkdrawtest`.
 The fixture verifies actual pixels and secondary recorder use; it does not establish Android overhead or speedup.
 Run host builds/matrices under `flock /home/agent/Projects/totk-android/.scratch/hosttest.lock`

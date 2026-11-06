@@ -118,6 +118,23 @@ class Analyzer(unittest.TestCase):
         self.assertEqual(group['stats_missing'], 2)
         self.assertEqual(group['ns_per_draw'], 1e6)
 
+    def test_nonrender_scope_kinds_have_separate_families_and_optional_stats(self):
+        kinds = ('compute', 'upload', 'transfer', 'post', 'upscale', 'present', 'framegen')
+        rows = [pass_row()]
+        for kind in kinds:
+            row = pass_row(kind=kind, key=kind, attachments=[], samples=0, stats_valid=0, count=1, draws=0)
+            del row['stats']
+            rows.append(row)
+        report = self.analyze([window(measured_ms=80, span_ms=82), *rows])
+        self.assertEqual(report['coverage']['malformed_rows'], 0)
+        self.assertEqual(report['coverage']['window_sum_mismatches'], 0)
+        self.assertEqual(len(report['families']), 8)
+        for group in report['families']:
+            if group['kind'] != 'render':
+                self.assertIsNone(group['stats'])
+                self.assertIsNone(group['ratios'])
+        self.assertEqual(report['coverage']['stats_missing'], 7)
+
     def test_mixed_availability_uses_only_matched_time_and_draws(self):
         measured = pass_row(gpu_ms=2, count=1, stats_valid=1, draws=1, stats=counters(3, 1, 20))
         missing = pass_row(window_start=301, window_end=600, gpu_ms=100, count=4, stats_valid=0, draws=100)
@@ -154,6 +171,13 @@ class Analyzer(unittest.TestCase):
         self.assertEqual(report['coverage']['long_frames'], 1)
         self.assertEqual(report['timing']['window']['measured_ms'], 10)
         self.assertEqual(report['timing']['frame']['measured_ms'], 10)
+
+    def test_long_frame_history_does_not_impose_a_dump_limit(self):
+        rows = [pass_row(type='long_frame', frame=n, count=1, stats_valid=1, gpu_ms=n) for n in range(1, 10)]
+        report = self.analyze(rows)
+        self.assertEqual(report['coverage']['long_frames'], 9)
+        self.assertEqual(report['long_frame_passes'][0]['gpu_ms'], 45)
+        self.assertEqual(report['passes'], [])
 
     def test_censoring_frame_gaps_and_reconciliation_are_explicit(self):
         report = self.analyze([window(dropped=3, failed_slots=1, stats_failed_slots=2, partial=True), pass_row(),
@@ -307,29 +331,39 @@ class Lavapipe(unittest.TestCase):
             self.assertEqual(report['coverage']['reconciliation_failures'], 0, report['issues'])
             self.assertEqual(report['coverage']['dropped'], 0)
             self.assertEqual(report['coverage']['failed_slots'], 0)
-            self.assertEqual(sum(g['count'] for g in report['passes']), passes)
-            self.assertEqual(sum(g['draws'] for g in report['passes']), draws)
-            self.assertGreater(sum(g['gpu_ms'] for g in report['passes']), 0)
-            self.assertEqual(len({g['key'] for g in report['passes']}), 1,
-                             'draw-count buckets, code addresses and absolute extent must not change pass keys')
+            render_groups = [g for g in report['passes'] if g['kind'] == 'render']
+            other_groups = [g for g in report['passes'] if g['kind'] != 'render']
+            self.assertEqual(sum(g['count'] for g in render_groups), passes)
+            self.assertEqual(sum(g['draws'] for g in render_groups), draws)
+            self.assertGreater(sum(g['gpu_ms'] for g in render_groups), 0)
+            self.assertEqual(len({g['key'] for g in render_groups}), 1,
+                             'draw-count buckets, code addresses and absolute extent must not change render keys')
+            self.assertGreaterEqual(sum(g['count'] for g in other_groups if g['kind'] == 'transfer'), passes,
+                                    'each real readback must have a measured transfer scope')
+            self.assertTrue(any(g['kind'] == 'upload' for g in other_groups),
+                            'direct pre upload while a main record is open must survive')
+            self.assertAlmostEqual(report['timing']['window']['measured_ms'],
+                                   report['timing']['frame']['measured_ms'], delta=0.01,
+                                   msg='all measured kinds must reconcile, not only render rows')
             self.assertEqual(bool(enabled), bool(stats and supported and not unsupported))
             for observation in observations:
                 row = observation['row']
                 if row['type'] in ('pass', 'long_frame'):
-                    self.assertEqual('stats' in row, bool(enabled))
-                    self.assertEqual(row['stats_valid'], row['count'] if enabled else 0)
-                    if enabled:
+                    available = bool(enabled and row['kind'] == 'render')
+                    self.assertEqual('stats' in row, available)
+                    self.assertEqual(row['stats_valid'], row['count'] if available else 0)
+                    if available:
                         self.assertEqual(row['stats']['ia_vertices'], row['draws'] * 3)
                         self.assertEqual(row['stats']['ia_primitives'], row['draws'])
                         self.assertGreater(row['stats']['fs_invocations'], 0)
                 if row['type'] == 'frame':
                     self.assertFalse(row['reconciliation_failed'])
                     self.assertEqual(row['dropped'], 0)
-            self.assertEqual(report['coverage']['stats_missing'], 0 if enabled else passes)
+            missing = sum(g['count'] for g in other_groups) + (0 if enabled else passes)
+            self.assertEqual(report['coverage']['stats_missing'], missing)
             if mode == 3:
-                self.assertGreater(report['coverage']['long_frames'], 0)
-                self.assertLessEqual(report['coverage']['long_frames'], 4,
-                                     'two selected long frames at most per 300-frame window')
+                self.assertEqual(report['coverage']['long_frames'], frames,
+                                 'threshold zero must dump every frame, independent of history ring retention')
             else:
                 self.assertEqual(report['coverage']['long_frames'], 0)
             return report
@@ -342,14 +376,14 @@ class Lavapipe(unittest.TestCase):
                     with self.subTest(mode=mode, workers=workers, stats=stats):
                         report = self.launch(mode, workers, stats)
                         if report:
-                            keys = {(g['key'], g['ordinal'], g['shader']) for g in report['passes']}
+                            keys = {(g['key'], g['shader']) for g in report['passes'] if g['kind'] == 'render'}
                             if reference is None:
                                 reference = keys
                             self.assertEqual(keys, reference, 'recorder/mode/stats must not change pass keys')
         for workers in (0, 2):
             with self.subTest(unsupported=True, workers=workers):
                 report = self.launch(1, workers, 1, unsupported=True)
-                self.assertEqual({(g['key'], g['ordinal'], g['shader']) for g in report['passes']}, reference)
+                self.assertEqual({(g['key'], g['shader']) for g in report['passes'] if g['kind'] == 'render'}, reference)
 
     def test_bounded_output_rotation_retains_whole_schema_rows(self):
         self.launch(3, 2, 1, rotate=True)

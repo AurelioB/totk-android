@@ -1865,28 +1865,27 @@ For NVN/texture barriers `detail` is the **original NVN barrier-bit mask**:
 primitive order `0x1`, fragment order `0x2`, tiled fragment order `0x4`, indirect data `0x8`,
 texture invalidation `0x10`, shader invalidation `0x20`, descriptor invalidation `0x40`,
 ZCULL invalidation `0x80`. NVN's recorded command contains **no original Vulkan source or
-destination stage/access masks**. `emitted-tail srcStage/srcAccess/dstStage/dstAccess` reports
-the Vulkan barrier actually emitted by this backend: ALL_COMMANDS/MEMORY_WRITE →
-ALL_COMMANDS/MEMORY_READ|MEMORY_WRITE. The source of a split and its expensive broad Vulkan
-implementation are separate facts.
+destination stage/access masks**. Rendering pass-end barriers currently use
+ALL_COMMANDS/MEMORY_WRITE → ALL_COMMANDS/MEMORY_READ|MEMORY_WRITE; named backend
+scope ends do not invent that barrier. Split reason/detail and Vulkan synchronization
+implementation remain separate facts.
 
 ### Draw/fragment cost observations
 
 Every top signature now has a `[gpu-profile scale]` row: mean draws/instance and whole-pass
-ns/draw. Add **`TOTK_VK_GPU_PROFILE_STATS=1`** (default off, requires GPU_PROFILE 1 or 2)
-to request `VK_QUERY_TYPE_PIPELINE_STATISTICS` fragment shader invocation counts. Startup
+ns/draw. Add **`TOTK_VK_GPU_PROFILE_STATS=1`** (default off, requires GPU_PROFILE 1, 2 or 3)
+to request six `VK_QUERY_TYPE_PIPELINE_STATISTICS` geometry and fragment counters. Startup
 logs whether `pipelineStatisticsQuery` is supported/enabled; unsupported devices retain
-timings and explicitly report statistics unavailable. No device extension is assumed from
-the existing abbreviated Turnip probe.
+timings and omit statistics fields. No device extension is inferred from an abbreviated probe.
 
 Statistics have another per-slot query pool, reset on slot reuse and read only after the
 same existing fence, with no new GPU wait. Rows show valid statistics samples/instances,
-invocations/frame, invocations/instance and whole-pass ns/invocation; failed slots are
-explicit. Compute rows do not have fragment counts. Invocation counts are driver-defined
-shader invocations, potentially including helper/sample-frequency work, **not shaded pixels
-or guaranteed visible fragments**. Statistics can themselves affect performance.
-Interpret invocation-normalized time only when valid statistics samples match all render
-instances in that signature. Occlusion and pipeline-statistics queries may coexist: Vulkan
+the six counters and derived geometry/fragment ratios; failed slots are explicit. Compute
+and transfer/backend scopes do not have graphics counters. Fragment invocation counts are
+driver-defined shader invocations, potentially including helper/sample-frequency work,
+**not shaded pixels or guaranteed visible fragments**. Statistics can affect performance.
+Ratios use matching statistics-valid time/draw denominators; JSONL preserves valid/total
+instance counts. Occlusion and pipeline-statistics queries may coexist: Vulkan
 requires active query types to differ, not to be globally exclusive.
 
 These are workload-normalized observations, not a causal timing decomposition: vertex,
@@ -1896,8 +1895,8 @@ to distinguish draw-heavy from fragment-heavy scaling; a single sample cannot pr
 
 ### `TOTK_VK_PASS_MERGE=1` (default off)
 
-`TOTK_VK_PASS_MERGE=1` forces `REC_THREADS` effectively to **0**, with the same diagnostic
-guard as GPU_PROFILE=1/2. Its host pixel-identity acceptance exercises the primary recorder.
+`TOTK_VK_PASS_MERGE=1` forces `REC_THREADS` effectively to **0**; GPU_PROFILE itself no
+longer does. Its host pixel-identity acceptance exercises the primary recorder.
 The reason-aware pass-end implementation retains the threaded recorder's drain/parking/assembly path.
 Merging disables itself, with a log, if `TOTK_VK_STORE_CLEAR=1`: that optimizer chooses
 DONT_CARE at pass begin using assumptions about intervening pass boundaries.

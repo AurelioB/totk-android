@@ -323,7 +323,7 @@ static void report(void) {
             used += (size_t)nn;
         }
         LOGV("[gpu-profile] #%zu sig=%016llx %s ordinal=%u samples=%u colors=%u shader=%016llx: %.3f ms/frame %.2f%% %.2f instances/frame %.2f draws/frame; attachments(fmt:relative-widthxheight:load/store)%s",
-             i + 1, (unsigned long long)g->hash, k->compute ? "compute" : "render", g->ordinal, k->samples, k->colors,
+             i + 1, (unsigned long long)g->hash, kind_name(k), g->ordinal, k->samples, k->colors,
              (unsigned long long)k->shader, g->ms / GP_WINDOW, total_ms ? 100 * g->ms / total_ms : 0,
              g->count / (double)GP_WINDOW, g->draws / (double)GP_WINDOW, attachments);
         LOGV("[gpu-profile scale] sig=%016llx: %.2f draws/instance, %.1f ns/draw (whole pass); geometry-stats %s valid=%llu/%llu IA-vertices=%.0f IA-primitives=%.0f VS=%.0f clipping-invocations=%.0f clipping-primitives=%.0f fragments=%.0f/frame; %.2f verts/draw %.2f prims/draw %.3f fragments/prim %.3f ns/vertex %.3f ns/primitive",
@@ -636,8 +636,8 @@ void vk_gpuprof_scope_end(VkCommandBuffer cb) {
     open_record = scope->parent; open_audit = scope->audit;
     open_cb = scope->parent_cb; secondary_pass = scope->secondary;
 }
-void vk_gpuprof_present(void) {
-    if (current) frame_marker(vk_cb());
+static void present_at(VkCommandBuffer cb) {
+    if (current) frame_marker(cb);
     for (size_t i = 0; i < audit_n; i++) {
         uint32_t unused = audit[i].stored & ~audit[i].read;
         audit_load_passes += audit[i].load_dead != 0; audit_store_passes += unused != 0;
@@ -661,10 +661,11 @@ void vk_gpuprof_present(void) {
     frame++;
     frame_instance = 0;
 }
+void vk_gpuprof_present(void) { present_at(current ? vk_cb() : VK_NULL_HANDLE); }
 #ifdef TOTK_VK_TESTS
 void vk_gpuprof_test_frame(VkCommandBuffer cb) {
     if (!vk_gpuprof_on) return;
-    (void)cb; vk_gpuprof_present();
+    present_at(cb);
 }
 void vk_gpuprof_test_flush(void) {
     if (!vk_gpuprof_on || !window_frames) return;
