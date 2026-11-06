@@ -319,7 +319,8 @@ class Analyzer(unittest.TestCase):
                                  pipeline_coverage(observed_groups=len(rows),
                                                    selected_groups=sum(r['selected'] for r in rows),
                                                    timestamp_count=sum(r['timestamp_count'] for r in rows))]),
-                             *rows, session_end()])['pipelines']
+                             *rows, session_end(last_frame=max((r['frame'] for r in rows), default=0),
+                                                last_window_sequence=0, last_window_end=0)])['pipelines']
 
     def test_pipeline_weights_do_not_apportion_pass_draws(self):
         rows = [pipeline_row(), pipeline_row(group=1, pipeline='2' * 16, draws=9,
@@ -392,7 +393,7 @@ class Analyzer(unittest.TestCase):
                                   selected_groups=2, timestamp_count=4),
                 pipeline_row(frame=2, group=3000, vs='tail_variant', selection_denominator=4096),
                 pipeline_row(frame=2, group=3001, vs='tail_variant', selection_denominator=4096),
-                session_end(last_frame=2)]
+                session_end(last_frame=2, last_window_sequence=0, last_window_end=0)]
         report = self.analyze(rows)['pipelines']
         self.assertEqual(report['coverage']['invalid_coverage'], 0)
         self.assertEqual(report['eligible_frames'], 1)
