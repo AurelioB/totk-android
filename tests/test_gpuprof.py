@@ -156,6 +156,148 @@ def pipeline_coverage(**changes):
     return row
 
 
+def compact_header(**changes):
+    return header(pipeline_budget=4, pipeline_population=2048, pipeline_phase=17,
+                  pipeline_random_phase=True, pipeline_output='compact', pipeline_compact_version=1,
+                  pipeline_window_columns=list(gpuprof.PIPELINE_WINDOW_COLUMNS), **changes)
+
+
+def compact_runs(*, frames=1207, losses=False, truth=False):
+    """Serialize one logical run twice; never handmatch independent expected totals.
+
+    The 4096-key pool has full variants and launch-local handles. Sparse raw rows
+    retain selected work and one optional unselected observation of a selected key;
+    coverage explicitly accounts for all other unselected metadata omissions.
+    Truth mode changes active sets only at complete 512-frame N/budget rotation
+    blocks, crossing 300-frame output boundaries. Each active key then has a
+    fixed known cost in every frame; estimator truth is independent of encoding.
+    """
+    pool = []
+    for key in range(4096):
+        compute = key % 7 == 0
+        pool.append(dict(schema=3, type='pipeline_key', id=key + 1,
+                         pipeline=f'{key + 1:016x}', kind='compute' if compute else 'render',
+                         vs=None if compute else f'{key % 512:016x}_vs_full_variant_d16_s8',
+                         fs=None if compute else f'{key % 193:016x}_fs_full_variant_alpha7',
+                         cs=f'{key % 97:016x}_cs_full_variant_8x8' if compute else None))
+    raw: list[dict] = [header(pipeline_budget=4, pipeline_population=2048, pipeline_phase=17,
+                  pipeline_random_phase=True, pipeline_output='raw')]
+    compact: list[dict] = [compact_header()]
+    for start in range(1, frames + 1, 300):
+        end = min(frames, start + 299)
+        groups, exposures = {}, {}
+        cov: dict = dict(schema=3, type='pipeline_window_coverage', window_start=start, window_end=end,
+                   frames=end - start + 1, eligible_frames=0, domain_excluded_frames=0,
+                   observed_groups=0, selected_groups=0, valid_samples=0, missing_selected=0,
+                   timestamp_count=0, dropped_groups=0, unretained_groups=0, out_of_range_groups=0,
+                   discarded_groups=0, counts_complete=False, aggregation_cpu_ms=0.5,
+                   aggregation_flush_cpu_ms=0.1, serialized_bytes=1234, worker_peak_backlog=2,
+                   aggregation_memory_bytes=8192, **dict.fromkeys(gpuprof.PIPELINE_COMPACT_LOSS, 0))
+        for f in range(start, end + 1):
+            population = 2048 if truth or f <= 101 else 4096
+            observed = 2048 if truth else 1600 if f <= 100 else 3072 if f == 101 else 4096
+            phase = (17 + (f - 1) * 4) % population
+            fps = 20 + (f * 13) % 41
+            discarded = losses and f == 131
+            dropped = int(losses and f == 151)
+            outside = max(0, observed - population)
+            eligible = not (outside or dropped or discarded)
+            selected_ordinals = [(phase + i) % population for i in range(4)
+                                 if (phase + i) % population < observed]
+            logical = []
+            for i, ordinal in enumerate(selected_ordinals):
+                key = ((ordinal + ((f - 1) // 512) * 2048) if truth else
+                       ordinal + ((f - 1) // 300) * 769 + f % fps) % len(pool)
+                identity = pool[key]
+                compute = identity['kind'] == 'compute'
+                unknown = not compute and key % 11 == 0
+                status = 'discarded' if discarded else (
+                    'unavailable-timestamp' if losses and f == 23 and i == 0 else
+                    'query-failed' if losses and f == 41 and i == 0 else
+                    'implausible-timestamp' if losses and f == 83 and i == 0 else 'ok')
+                duration = (0.01 + (key % 19) * 0.001) if truth else (key % 13 + 1) * 0.0001 * fps / 20
+                row = pipeline_row(frame=f, group=ordinal, kind=identity['kind'], pipeline=identity['pipeline'],
+                                   vs=identity['vs'], fs=identity['fs'], cs=identity['cs'],
+                                   selected=True, selection_numerator=4, selection_denominator=population,
+                                   status=status, gpu_ms=duration if status == 'ok' else None,
+                                   draws=0 if compute else 3, dispatches=int(compute),
+                                   known_primitives=0 if compute or unknown else 3,
+                                   unknown_primitive_draws=3 if unknown else 0,
+                                   primitives=None if compute or unknown else 3,
+                                   primitive_reason='not-graphics' if compute else 'unknown' if unknown else None)
+                logical.append((key, row))
+            if logical and not discarded and not truth:
+                key, row = logical[0]
+                optional = dict(row, group=(phase + 4) % population, selected=False,
+                                status='not-selected', gpu_ms=None, timestamp_count=0)
+                logical.append((key, optional))
+            selected = sum(r['selected'] for _, r in logical)
+            stamps = sum(r['timestamp_count'] for _, r in logical)
+            omitted = observed - len(logical) - dropped
+            raw.append(pipeline_coverage(frame=f, lease=f, slot_sequence=f, observed_groups=observed,
+                                         selected_groups=selected, timestamp_count=stamps, discarded=discarded,
+                                         dropped_groups=dropped, unretained_groups=omitted,
+                                         out_of_range_groups=outside, population=population, phase=phase))
+            raw.extend(r for _, r in logical)
+            exposure = exposures.setdefault(population, [population, 4, population, 0, 0, 0, 0])
+            exposure[3] += 1
+            exposure[4] += eligible
+            cov['eligible_frames'] += eligible
+            cov['domain_excluded_frames'] += not eligible
+            if not discarded:
+                exposure[5] += observed
+                exposure[6] += selected
+                for k, value in (('observed_groups', observed), ('selected_groups', selected),
+                                 ('timestamp_count', stamps), ('unretained_groups', omitted),
+                                 ('out_of_range_groups', outside), ('dropped_groups', dropped)):
+                    cov[k] += value
+            for key, row in logical:
+                c = groups.setdefault(key, dict.fromkeys(gpuprof.PIPELINE_WINDOW_COLUMNS, 0))
+                if discarded:
+                    c['discarded_groups'] += 1
+                    cov['discarded_groups'] += 1
+                    continue
+                c['observed_groups'] += 1
+                c['selected_groups'] += row['selected']
+                for k in ('draws', 'dispatches', 'known_primitives', 'unknown_primitive_draws'):
+                    c[k] += row[k]
+                if row['status'] == 'ok':
+                    duration = row['gpu_ms']
+                    weighted = duration * population / 4
+                    c['valid_samples'] += 1
+                    cov['valid_samples'] += 1
+                    c['gpu_ms_sum'] += duration
+                    c['gpu_ms_square_sum'] += duration ** 2
+                    c['weighted_gpu_ms_sum'] += weighted
+                    c['sampled_draws'] += row['draws']
+                    c['sampled_dispatches'] += row['dispatches']
+                    if eligible:
+                        c['eligible_samples'] += 1
+                        c['eligible_gpu_ms_sum'] += duration
+                        c['eligible_weighted_gpu_ms_sum'] += weighted
+                        c['eligible_weighted_gpu_ms_square_sum'] += weighted ** 2
+                elif row['selected']:
+                    c['missing_selected'] += 1
+                    c['eligible_missing_selected'] += eligible
+                    cov['missing_selected'] += 1
+                    loss_key = {'unavailable-timestamp': 'unavailable_timestamps',
+                                'query-failed': 'query_failures', 'implausible-timestamp': 'invalid_timestamps'}[row['status']]
+                    cov[loss_key] += 1
+        for key, c in sorted(groups.items()):
+            compact.append(pool[key])
+            compact.append(dict(schema=3, type='pipeline_window', window_start=start, window_end=end,
+                                key_id=key + 1, v=[c[k] for k in gpuprof.PIPELINE_WINDOW_COLUMNS]))
+        cov['population_exposure'] = list(exposures.values())
+        compact.append(cov)
+        parent = window(window_start=start, window_end=end, frames=end - start + 1,
+                        partial=end - start + 1 < 300, sequence=(start - 1) // 300 + 1,
+                        measured_ms=0, span_ms=0, gap_ms=0)
+        raw.append(parent)
+        compact.append(parent)
+    footer = session_end(last_frame=frames, last_window_end=frames, last_window_sequence=(frames - 1) // 300 + 1)
+    return [*raw, footer], [*compact, footer]
+
+
 class Analyzer(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -258,6 +400,242 @@ class Analyzer(unittest.TestCase):
         self.assertIsNone(tail['estimated_gpu_ms'], 'growing first frame is not extrapolated')
         self.assertEqual(tail['eligible_estimated_gpu_ms'], 1024, 'tail is rankable over the named fully covered population')
         self.assertFalse(tail['counts_complete'])
+
+    def compare_pipeline_runs(self, raw_rows, compact_rows, *, rotate=False):
+        def analyze_rows(rows, name):
+            if not rotate:
+                return self.analyze(rows)
+            chunks, chunk = [], []
+            for row in rows[1:]:
+                chunk.append(row)
+                if row['type'] == 'window':
+                    chunks.append(chunk)
+                    chunk = []
+            chunks[-1].extend(chunk)
+            self.assertLessEqual(len(chunks), 4, 'truth run retains every rotated file')
+            paths = []
+            for rotation, chunk in enumerate(chunks):
+                suffix = len(chunks) - rotation - 1
+                filename = f'{name}.jsonl' + (f'.{suffix}' if suffix else '')
+                paths.append(self.file(filename, [dict(rows[0], rotation=rotation), *chunk]))
+            return gpuprof.analyze(paths)
+        raw = analyze_rows(raw_rows, 'raw-equivalence')
+        compact = analyze_rows(compact_rows, 'compact-equivalence')
+        for report in (raw, compact):
+            self.assertEqual(report['coverage']['malformed_rows'], 0, report['issues'])
+            self.assertEqual(report['pipelines']['coverage']['invalid_coverage'], 0, report['issues'])
+        a, b = raw['pipelines'], compact['pipelines']
+        for key in ('eligible_frames', 'domain_excluded_frame_count', 'coverage_complete', 'censored'):
+            self.assertEqual(a[key], b[key], key)
+        for key in ('observed_groups', 'selected_groups', 'valid_samples', 'missing_selected',
+                    'timestamp_count', 'dropped_groups', 'unretained_groups', 'out_of_range_groups', 'discarded_groups'):
+            self.assertEqual(a['coverage'][key], b['coverage'][key], key)
+        counters = ('groups', 'selected_groups', 'samples', 'missing_selected', 'out_of_range', 'discarded_groups',
+                    'eligible_samples', 'eligible_missing_selected', 'draws', 'dispatches', 'known_primitives',
+                    'unknown_primitive_draws', 'sampled_draws', 'sampled_dispatches', 'primitives',
+                    'counts_complete', 'coverage_complete', 'thin')
+        moments = ('gpu_ms', 'weighted_gpu_ms', 'eligible_gpu_ms', 'gpu_ms_square_sum',
+                   'eligible_weighted_gpu_ms', 'eligible_weighted_gpu_ms_square_sum',
+                   'estimated_gpu_ms', 'eligible_estimated_gpu_ms', 'mean_group_ms')
+        for view in ('pipelines', 'shader_pairs'):
+            def identity(g):
+                return (g['kind'], g['vs'], g['fs'], g['cs'],
+                        tuple(i['pipeline'] for i in g['identities']) if view == 'pipelines' else ())
+            left, right = ({identity(g): g for g in report[view]} for report in (a, b))
+            self.assertEqual(left.keys(), right.keys(), view)
+            for key, g in left.items():
+                h = right[key]
+                for field in counters:
+                    self.assertEqual(g[field], h[field], (view, key, field))
+                for field in moments:
+                    if g[field] is None:
+                        self.assertIsNone(h[field], (view, key, field))
+                    else:
+                        self.assertTrue(math.isclose(g[field], h[field], rel_tol=1e-9, abs_tol=1e-9),
+                                        (view, key, field, g[field], h[field]))
+                self.assertIsNone(h['pass_keys'], 'compact output cannot reconstruct pass keys')
+        return raw, compact
+
+    def test_pipeline_compact_and_raw_recover_known_truth_across_churn_blocks(self):
+        reports = self.compare_pipeline_runs(*compact_runs(frames=1024, truth=True), rotate=True)
+        truth = {f'{key + 1:016x}': 512 * (0.01 + (key % 19) * 0.001) for key in range(4096)}
+        for report in reports:
+            self.assertEqual(len(report['files']), 4)
+            self.assertEqual(report['coverage']['rotation_evictions'], 0)
+            pipeline = report['pipelines']
+            self.assertFalse(pipeline['censored'], pipeline['censor_reasons'])
+            self.assertTrue(pipeline['coverage_complete'])
+            self.assertEqual(len(pipeline['pipelines']), len(truth))
+            for view in ('pipelines', 'shader_pairs'):
+                estimated_total = 0
+                for group in pipeline[view]:
+                    expected = sum(truth[i['pipeline']] for i in group['identities'])
+                    for field in ('estimated_gpu_ms', 'eligible_estimated_gpu_ms'):
+                        self.assertTrue(math.isclose(group[field], expected, rel_tol=1e-10, abs_tol=1e-10),
+                                        (view, field, group['identities'], group[field], expected))
+                    estimated_total += group['estimated_gpu_ms']
+                self.assertTrue(math.isclose(estimated_total, sum(truth.values()), rel_tol=1e-10, abs_tol=1e-8),
+                                'known fixed-key truth, not merely raw/compact agreement')
+
+    def test_pipeline_rotation_prefix_unselected_loss_has_explicit_reason(self):
+        # Retained P1 shape: rotation20 begins mid-lease with 63/70 optional
+        # rows, then intact86+11. No selected/query loss explains the seven
+        # absent rows; independent rotation/backlog authority still censors.
+        rows: list[dict] = [header(pipeline_budget=2, pipeline_population=2048, pipeline_phase=0,
+                       pipeline_random_phase=True, rotation=rotation) for rotation in range(20, 24)]
+        f = 5296
+        phase = ((f - 1) * 2) % 2048
+        for lease, first, count, observed in ((63799, 1194, 63, 70), (63800, 1257, 86, 86),
+                                             (63801, 1343, 11, 11)):
+            rows.extend(pipeline_row(frame=f, group=g, selected=False, status='not-selected',
+                                     gpu_ms=None, timestamp_count=0) for g in range(first, first + count))
+            rows.append(pipeline_coverage(frame=f, lease=lease, slot_sequence=lease, observed_groups=observed,
+                                           selected_groups=0, timestamp_count=0, phase=phase))
+        for f in range(5297, 5434):
+            phase = ((f - 1) * 2) % 2048
+            rows.extend([pipeline_row(frame=f, group=phase),
+                         pipeline_coverage(frame=f, lease=f, slot_sequence=f, observed_groups=phase + 1,
+                                           unretained_groups=phase, phase=phase)])
+        rows.extend([window(window_start=5101, window_end=5400, sequence=18, measured_ms=0,
+                            span_ms=0, gap_ms=0, background_dropped_slots=73),
+                     window(window_start=5401, window_end=5433, sequence=19, frames=33, partial=True,
+                            measured_ms=0, span_ms=0, gap_ms=0, background_dropped_slots=73),
+                     session_end(last_frame=5433, last_window_end=5433, last_window_sequence=19,
+                                 background_dropped_slots=73)])
+        report = self.analyze(rows)
+        pipeline = report['pipelines']
+        self.assertEqual(pipeline['coverage']['invalid_coverage'], 1)
+        self.assertEqual(pipeline['coverage']['missing_selected'], 0)
+        self.assertEqual(report['coverage']['rotation_evictions'], 20)
+        self.assertEqual(report['coverage']['missing_windows'], 17)
+        self.assertEqual(report['coverage']['background_dropped_slots'], 73)
+        reason, = pipeline['invalid_reasons']
+        self.assertEqual(reason['reason'], 'retained-row-count-mismatch')
+        self.assertEqual(reason['frame'], 5296)
+        self.assertEqual(reason['expected_retained_rows'] - reason['retained_rows'], 7)
+        self.assertTrue({'rotation_evictions', 'missing_windows', 'background_dropped_slots', 'invalid_coverage'}
+                        <= set(pipeline['censor_reasons']))
+        group, = pipeline['shader_pairs']
+        self.assertEqual(group['samples'], 137)
+        self.assertIsNone(group['estimated_gpu_ms'])
+        self.assertIsNone(group['eligible_estimated_gpu_ms'])
+
+    def test_pipeline_compact_same_run_churn_growth_and_partial_window(self):
+        raw, compact = self.compare_pipeline_runs(*compact_runs())
+        self.assertEqual(compact['coverage']['frame_rows'], 0)
+        self.assertEqual(compact['coverage']['missing_frame_ids'], 0, 'advertised omission is not capture loss')
+        self.assertIsNone(compact['pipelines']['domain_excluded_frames'])
+        self.assertEqual(compact['pipelines']['domain_excluded_windows'][0]['frames'], 1)
+        self.assertTrue(any(g['eligible_estimated_gpu_ms'] is not None for g in compact['pipelines']['pipelines']))
+        self.assertTrue(all(g['estimated_gpu_ms'] is None for g in compact['pipelines']['pipelines']))
+        self.assertEqual(compact['sessions'][0]['end']['last_frame'], 1207)
+        self.assertEqual(raw['pipelines']['eligible_frames'], 1206)
+
+    def test_pipeline_compact_same_run_true_loss_and_discard(self):
+        _, compact = self.compare_pipeline_runs(*compact_runs(losses=True))
+        self.assertTrue(compact['pipelines']['censored'])
+        self.assertEqual(compact['pipelines']['coverage']['missing_selected'], 3)
+        self.assertGreater(compact['pipelines']['coverage']['discarded_groups'], 0)
+        self.assertTrue(all(g['eligible_estimated_gpu_ms'] is None for g in compact['pipelines']['pipelines']))
+
+    def test_pipeline_compact_same_run_rotation_eviction(self):
+        raw_rows, compact_rows = compact_runs(frames=307)
+        for rows in (raw_rows, compact_rows):
+            rows[0] = dict(rows[0], rotation=4)
+        raw, compact = self.compare_pipeline_runs(raw_rows, compact_rows)
+        self.assertGreater(compact['coverage']['rotation_evictions'], 0)
+        self.assertTrue(raw['pipelines']['censored'])
+        self.assertTrue(all(g['eligible_estimated_gpu_ms'] is None for g in compact['pipelines']['shader_pairs']))
+
+    def test_pipeline_compact_strict_numeric_columns_and_exposure(self):
+        _, rows = compact_runs(frames=1)
+        summary = next(r for r in rows if r['type'] == 'pipeline_window')
+        coverage = next(r for r in rows if r['type'] == 'pipeline_window_coverage')
+        for values in (summary['v'][:-1], [*summary['v'], 0]):
+            with self.subTest(values=len(values)), self.assertRaises(ValueError):
+                gpuprof.validate(dict(summary, v=values))
+        for column, value in (('valid_samples', 100), ('missing_selected', 100),
+                              ('eligible_samples', 100), ('gpu_ms_sum', math.inf),
+                              ('gpu_ms_square_sum', 0), ('eligible_weighted_gpu_ms_sum', math.nan),
+                              ('sampled_draws', -1), ('draws', True)):
+            values = list(summary['v'])
+            values[gpuprof.PIPELINE_WINDOW_COLUMNS.index(column)] = value
+            with self.subTest(column=column), self.assertRaises(ValueError):
+                gpuprof.validate(dict(summary, v=values))
+        for changes in (dict(population_exposure=[[2048, 4, 4096, 1, 1, 1600, 4]]),
+                        dict(population_exposure=[]), dict(counts_complete=True),
+                        dict(eligible_frames=2), dict(timestamp_count=0),
+                        dict(aggregation_cpu_ms=math.inf), dict(frames=2)):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                gpuprof.validate(dict(coverage, **changes))
+        bad = dict(compact_header(), pipeline_window_columns=list(reversed(gpuprof.PIPELINE_WINDOW_COLUMNS)))
+        with self.assertRaises(ValueError):
+            gpuprof.validate(bad)
+
+    def test_pipeline_compact_dictionary_authority_and_overflow_are_not_estimates(self):
+        _, rows = compact_runs(frames=2)
+        summary = next(r for r in rows if r['type'] == 'pipeline_window')
+        key = next(r for r in rows if r['type'] == 'pipeline_key' and r['id'] == summary['key_id'])
+        no_key = [r for r in rows if r is not key]
+        late_key = [r for r in no_key if r is not summary] + [summary, key]
+        for broken in (no_key, late_key):
+            with self.subTest(authority='missing' if broken is no_key else 'late'):
+                report = self.analyze(broken)['pipelines']
+                self.assertGreater(report['coverage']['missing_dictionary'], 0)
+                self.assertTrue(all(g['eligible_estimated_gpu_ms'] is None for g in report['pipelines']))
+        for field in gpuprof.PIPELINE_COMPACT_LOSS:
+            changed = [dict(r, **{field: 1}, counts_complete=False)
+                       if r['type'] == 'pipeline_window_coverage' else r for r in rows]
+            with self.subTest(loss=field):
+                report = self.analyze(changed)['pipelines']
+                self.assertTrue(report['censored'])
+                self.assertTrue(all(g['estimated_gpu_ms'] is None and g['eligible_estimated_gpu_ms'] is None
+                                    for g in report['pipelines']))
+        missing_coverage = self.analyze([r for r in rows if r['type'] != 'pipeline_window_coverage'])['pipelines']
+        self.assertGreater(missing_coverage['coverage']['missing_compact_windows'], 0)
+        first = self.file('dict-rotation.jsonl.1', [rows[0], key])
+        second = self.file('dict-rotation.jsonl', [dict(rows[0], rotation=1), *no_key[1:]])
+        report = gpuprof.analyze([first, second])['pipelines']
+        self.assertGreater(report['coverage']['missing_dictionary'], 0,
+                           'dictionary from a different file cannot authorize a rotation-local reference')
+        conflict = self.analyze([*rows, dict(key, vs='different_full_variant')])
+        self.assertGreater(conflict['coverage']['conflicting_rows'], 0)
+        self.assertTrue(conflict['pipelines']['censored'])
+
+    def test_pipeline_unfinished_exposure_is_explicitly_censored_not_completed(self):
+        _, rows = compact_runs(frames=1)
+        changed = []
+        for original in rows:
+            row = dict(original)
+            if row['type'] == 'pipeline_window':
+                c = dict(zip(gpuprof.PIPELINE_WINDOW_COLUMNS, row['v']))
+                for key in ('eligible_samples', 'eligible_gpu_ms_sum', 'eligible_weighted_gpu_ms_sum',
+                            'eligible_weighted_gpu_ms_square_sum', 'eligible_missing_selected'):
+                    c[key] = 0
+                c['weighted_gpu_ms_sum'] *= 2  # unfinished population4096 rather than2048
+                row['v'] = [c[k] for k in gpuprof.PIPELINE_WINDOW_COLUMNS]
+            elif row['type'] == 'pipeline_window_coverage':
+                # One completed empty frame plus unfinished selected observations;
+                # the latter carry no completed/eligible frame authority.
+                row.update(frame_overflow=1, population_exposure=[
+                    [2048, 4, 2048, 1, 1, 0, 0],
+                    [4096, 4, 4096, 0, 0, row['observed_groups'], row['selected_groups']]])
+                with self.assertRaises(ValueError):
+                    gpuprof.validate(dict(row, frame_overflow=0))
+            changed.append(row)
+        report = self.analyze(changed)
+        self.assertEqual(report['coverage']['malformed_rows'], 0, report['issues'])
+        self.assertEqual(report['pipelines']['coverage']['invalid_coverage'], 0)
+        self.assertEqual(report['pipelines']['eligible_frames'], 1)
+        self.assertIn('frame_overflow', report['pipelines']['censor_reasons'])
+        self.assertTrue(all(g['eligible_estimated_gpu_ms'] is None for g in report['pipelines']['pipelines']))
+        footer = session_end(last_frame=0, last_window_sequence=0, last_window_end=0,
+                             unclosed_pipeline_groups=3, unclosed_pipeline_frames=1)
+        no_completed = self.analyze([compact_header(), footer])['pipelines']
+        self.assertEqual(no_completed['eligible_frames'], 0)
+        self.assertEqual(no_completed['pipelines'], [])
+        self.assertTrue(no_completed['censored'])
+        self.assertIn('unclosed_pipeline_groups', no_completed['censor_reasons'])
 
     def test_sums_precede_ratios_not_ratio_averages(self):
         a = pass_row(gpu_ms=2, count=1, stats_valid=1, draws=1, stats=counters(3, 1, 100))
@@ -1479,7 +1857,7 @@ class Lavapipe(unittest.TestCase):
     def launch(self, mode, workers, stats, *, unsupported=False, rotate=False, areas=False, ordinals=None,
                unavailable_span=False, sampling=False, sample_budget=None, backpressure=False, cancel=False,
                sealed_present=False, last_closed=False, shutdown_inflight=False, shutdown_timeout=False,
-               pipeline_budget=None, pipeline_groups=False, pipeline_overflow=False):
+               pipeline_budget=None, pipeline_groups=False, pipeline_overflow=False, pipeline_raw=None):
         binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
         self.assertTrue(binary.is_file(), f'no fixture binary: {binary}')
         seed = Path(os.environ.get('TOTK_SHADER_SEED_DIR', binary.parent / 'vkdraw-seed')).resolve()
@@ -1498,8 +1876,11 @@ class Lavapipe(unittest.TestCase):
             env.pop('TOTK_VK_GPU_PROFILE_ORDINALS', None)
             env.pop('TOTK_VK_GPU_PROFILE_SAMPLE', None)
             env.pop('TOTK_VK_GPU_PROFILE_PIPELINES', None)
+            env.pop('TOTK_VK_GPU_PROFILE_PIPELINES_RAW', None)
             if pipeline_budget is not None:
                 env['TOTK_VK_GPU_PROFILE_PIPELINES'] = str(pipeline_budget)
+            if pipeline_raw is not None:
+                env['TOTK_VK_GPU_PROFILE_PIPELINES_RAW'] = str(int(pipeline_raw))
             if sample_budget is not None:
                 env['TOTK_VK_GPU_PROFILE_SAMPLE'] = str(sample_budget)
             if ordinals is not None:
@@ -1658,6 +2039,9 @@ class Lavapipe(unittest.TestCase):
             self.assertEqual(report['coverage']['background_dropped_slots'], 0, report['issues'])
             self.assertEqual(report['coverage']['background_dropped_closures'], 0, report['issues'])
             self.assertEqual(report['sessions'][0]['end']['pending_frame_closures'], 0)
+            if 'pipelines' in report and observations[0]['row'].get('pipeline_output') == 'compact':
+                self.check_compact_pipeline(report, frames, draws)
+                return report
             if sealed_present or last_closed or shutdown_inflight:
                 self.assertEqual(frames, 1 if last_closed or shutdown_inflight else 302)
                 self.assertEqual(bool(enabled), bool(stats and supported and not unsupported))
@@ -1744,7 +2128,7 @@ class Lavapipe(unittest.TestCase):
     def test_pipeline_groups_direct_and_deferred(self):
         for workers in (0, 2):
             with self.subTest(workers=workers):
-                report = self.launch(1, workers, 0, pipeline_budget=16, pipeline_groups=True)
+                report = self.launch(1, workers, 0, pipeline_budget=16, pipeline_groups=True, pipeline_raw=True)
                 rows = [r for r in report['_fixture_rows'] if r['type'] == 'pipeline']
                 first = [r for r in rows if r['frame'] == 1 and r['kind'] == 'render']
                 self.assertEqual([r['draws'] for r in first], [3, 2, 4])
@@ -1769,7 +2153,7 @@ class Lavapipe(unittest.TestCase):
                                  sum(g['draws'] for g in report['passes'] if g['kind'] == 'render'))
 
     def test_pipeline_sealed_deferred_ownership(self):
-        report = self.launch(1, 2, 0, pipeline_budget=16, sealed_present=True)
+        report = self.launch(1, 2, 0, pipeline_budget=16, sealed_present=True, pipeline_raw=True)
         rows = [r for r in report['_fixture_rows'] if r['type'] == 'pipeline']
         self.assertTrue(rows)
         self.assertEqual(report['pipelines']['coverage']['invalid_coverage'], 0)
@@ -1777,13 +2161,49 @@ class Lavapipe(unittest.TestCase):
         self.assertTrue(all(r['status'] == ('ok' if r['selected'] else 'not-selected') for r in rows))
 
     def test_pipeline_metadata_bound_is_explicit(self):
-        report = self.launch(1, 2, 0, pipeline_budget=16, pipeline_overflow=True)
+        report = self.launch(1, 2, 0, pipeline_budget=16, pipeline_overflow=True, pipeline_raw=True)
         self.assertGreater(report['pipelines']['coverage']['unretained_groups'], 0)
         self.assertEqual(report['pipelines']['coverage']['dropped_groups'], 0)
         self.assertEqual(report['pipelines']['coverage']['invalid_coverage'], 0)
         coverage = [r for r in report['_fixture_rows'] if r['type'] == 'pipeline_coverage']
         self.assertTrue(any(r['frame'] == 2 and r['population'] == 4096 for r in coverage))
         self.assertTrue(all(g['estimated_gpu_ms'] is None for g in report['pipelines']['shader_pairs']))
+
+    def check_compact_pipeline(self, report, frames, draws):
+        rows = report['_fixture_rows']
+        self.assertFalse(any(r['type'] in ('pipeline', 'pipeline_coverage', 'frame') for r in rows),
+                         'default pipeline compact mode suppresses per-group and global per-frame output')
+        headers = [r for r in rows if r['type'] == 'header']
+        self.assertTrue(all(r['pipeline_output'] == 'compact' and r['pipeline_compact_version'] == 1 for r in headers))
+        self.assertTrue(all(r['pipeline_window_columns'] == list(gpuprof.PIPELINE_WINDOW_COLUMNS) for r in headers))
+        coverage = [r for r in rows if r['type'] == 'pipeline_window_coverage']
+        self.assertEqual(sum(r['frames'] for r in coverage), frames)
+        self.assertEqual(len(coverage), (frames + 299) // 300)
+        self.assertEqual(report['coverage']['frame_rows'], 0)
+        self.assertEqual(report['coverage']['missing_frame_ids'], 0)
+        self.assertEqual(report['coverage']['window_sum_mismatches'], 0, report['issues'])
+        for key in ('invalid_coverage', 'missing_dictionary', 'missing_headers', 'missing_compact_windows',
+                    'missing_compact_frames', 'dropped_groups', 'missing_selected'):
+            self.assertEqual(report['pipelines']['coverage'][key], 0, key)
+        self.assertTrue(any(r['type'] == 'pipeline_key' for r in rows))
+        self.assertTrue(any(r['type'] == 'pipeline_window' for r in rows))
+        self.assertGreater(sum(g['samples'] for g in report['pipelines']['pipelines']), 0)
+        self.assertLessEqual(sum(g['draws'] for g in report['pipelines']['pipelines']), draws)
+        for g in report['pipelines']['pipelines']:
+            self.assertIsNone(g['pass_keys'])
+            self.assertEqual(g['thin'], g['eligible_samples'] < 10)
+        self.assertIsNone(report['pipelines']['domain_excluded_frames'])
+        self.assertTrue(all(r[k] == 0 for r in coverage for k in gpuprof.PIPELINE_COMPACT_LOSS))
+
+    def test_pipeline_default_compact_real_vulkan_groups(self):
+        for workers in (0, 2):
+            with self.subTest(workers=workers):
+                compact = self.launch(1, workers, 0, pipeline_budget=16, pipeline_groups=True)
+                raw = self.launch(1, workers, 0, pipeline_budget=16, pipeline_groups=True, pipeline_raw=True)
+                self.assertLess(compact['_fixture_output_bytes'], raw['_fixture_output_bytes'])
+                for field in ('count', 'draws'):
+                    self.assertEqual(sum(g[field] for g in compact['passes']), sum(g[field] for g in raw['passes']))
+
 
     def test_pipeline_default_off_and_invalid_budgets(self):
         for value in (None, 0, -1, 17, 'invalid'):

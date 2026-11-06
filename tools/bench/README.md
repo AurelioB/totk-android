@@ -261,15 +261,42 @@ starting capture: `TOTK_VK_GPU_PROFILE=1 TOTK_VK_GPU_PROFILE_SAMPLE=2
 TOTK_VK_GPU_PROFILE_PIPELINES=4 TOTK_VK_GPU_PROFILE_STATS=0`. Do not infer shader work from old pass rows:
 `shader` is only the pass's first draw signature; `draws` belongs to the entire pass.
 
-The existing analyzer automatically adds `pipelines` to its JSON result and a shader-pair text table:
-`pipelines.pipelines` keeps stream-scoped actual Vulkan handle identities, and `pipelines.shader_pairs`
-merges exact full variant names across streams. Raw additive schema-3 `pipeline` rows identify
-`frame/group`, `pass_key/pass_ordinal`, actual `pipeline`, `vs/fs/cs`, `draws/dispatches`, nullable total
-`primitives`, `known_primitives/unknown_primitive_draws/primitive_reason`, `selected/status`,
-nullable `gpu_ms`, `timestamp_count` and `selection_numerator/selection_denominator`.
-`pipeline_coverage` rows identify each lease/frame, observed/dropped/selected groups, recorded timestamp
-count, domain population/phase, optional `unretained_groups`, `out_of_range_groups` and discard state.
-Pass frame/window timestamp counts exclude this separate pool.
+When pipeline profiling is enabled, output now defaults to **worker-aggregated compact windows**.
+`TOTK_VK_GPU_PROFILE_PIPELINES_RAW=1` explicitly restores per-group `pipeline`,
+per-lease/frame `pipeline_coverage` and global `frame` rows; unset/`0` uses compact output.
+This switch does not change the parent profiler when pipeline profiling is off. Raw schema-3 captures
+remain readable, including older headers without the additive compact declaration.
+
+The analyzer automatically adds `pipelines` to its JSON result and a shader-pair text table:
+`pipelines.pipelines` keeps launch/stream-scoped actual Vulkan handles, and `pipelines.shader_pairs`
+merges exact full `kind/vs/fs/cs` tuples across streams. Compact headers declare `pipeline_output`,
+`pipeline_compact_version:1` and the exact ordered `pipeline_window_columns`. `pipeline_key` dictionaries
+map positive launch-local IDs to handle + kind + complete shader tuple, never a truncated shader hash or pass
+ordinal. `pipeline_window` numeric arrays carry retained counts, valid/missing/discarded sample counts,
+measured moments and eligible inverse-probability-weighted moments for a canonical 300-frame window;
+orderly close also emits the final partial window. Only keys with selected observations are emitted.
+Keys absent from a window are **unknown/not selected**, not zero-cost entries.
+`pipeline_window_coverage` retains completed/eligible/excluded frame counts, population/budget exposure
+tuples, selected/query counters, optional detail omissions, true losses and aggregation/performance facts.
+The analyzer preserves these original summaries in `pipelines.compact_windows`, including thread CPU
+time, serialized bytes, peak worker backlog and bounded aggregation memory.
+
+Dictionary records must precede their references in the **same retained file**, including after rotation.
+Conflicting/missing dictionaries, unsupported column dimensions/order, nonfinite/inconsistent moments,
+impossible count/probability relationships, missing parent/compact window pairs and incomplete frame
+coverage withhold estimates. Never join a handle or dictionary ID across launches.
+Compact data cannot recover exact per-frame exclusions, per-pass keys, frame percentiles or raw query
+statuses: `domain_excluded_frames` and group `pass_keys` are null; `domain_excluded_windows` supplies
+only the known count per window. Advertised suppression of global frame rows is not itself a capture
+gap; parent window and compact coverage authority replace it for supported aggregate estimates only.
+Do not fabricate frame rows or infer frame-latency percentiles from a sum or sum-of-squares.
+
+In explicit raw mode, `pipeline` rows retain `frame/group`, `pass_key/pass_ordinal`, actual `pipeline`,
+full `vs/fs/cs`, `draws/dispatches`, nullable `primitives`, known/unknown primitive counts/reason,
+`selected/status`, nullable `gpu_ms`, timestamp count and each sample's selection numerator/denominator.
+Raw `pipeline_coverage` rows retain lease/frame, observed/dropped/selected groups, timestamps, population/
+phase, optional unretained detail, out-of-domain groups and discard state.
+Pass frame/window timestamp counts exclude this separate query pool.
 
 Uniform 32-bit launch bits plus rotating phase give every in-domain ordinal probability `budget/N`.
 Population `N` starts at 2048 and grows to the next power of two after larger observed frames; it never
@@ -280,14 +307,21 @@ ordinal across passes AND groups within `ceil(N/budget)` frames. There is no per
 At most `2*budget` extra writes/frame; 2048 metadata records and 1024 timestamp pairs/lease bound storage.
 ALL selected groups have reserved metadata space; at most 1024 additional unselected groups/lease retain
 optional detail. Excess unselected detail is explicitly `unretained`, not a timing loss or zero-cost shader.
-Observed counters in aggregate rows are retained subtotals when `counts_complete:false`.
-`weighted_gpu_ms` is `sum(valid group ms * N/budget)`, NOT equal draw work or observed/sample scaling.
-`estimated_gpu_ms` estimates the whole captured group population only with complete domain/selection
-authority and no selected query loss. Growing-frame tails withhold that estimate. The separately named
-`eligible_estimated_gpu_ms` ranks only the domain-covered frames, explicitly reporting
-`domain_excluded_frames` and `eligible_frames`; it is never a whole-capture total when exclusions exist.
-True dropped selected metadata/results or capture/authority loss withholds both estimates; optional
-unselected detail omission does not bias timing. The valid-sample weighted subtotal is NOT loss correction.
+Observed counters are retained subtotals when `counts_complete:false`: optional metadata can be omitted
+at ingest, and compact output also omits unselected-only key/windows. Neither kind of omission may be
+reinterpreted as zero draws or used to scale timings by observed/sample frequencies.
+`weighted_gpu_ms` is `sum(valid group ms * actual N/budget)`, NOT equal draw work. Each sample retains
+its own weight even when population grows mid-window; multiplying the final sample sum by the final
+population is wrong. `estimated_gpu_ms` estimates the whole captured group population only with complete
+domain/selection authority and no true loss. Growing-frame tails withhold that estimate.
+`eligible_estimated_gpu_ms` ranks only completed domain-covered frames, explicitly reporting exclusion
+counts and `eligible_frames`; it is not a whole-capture total when exclusions exist.
+Discarded frames and true dropped groups are excluded from that domain, and true query/data losses still
+withhold **both** estimates. Missing/invalid selected samples, unavailable queries, worker lease/closure
+drops, unfinished closures, aggregation/key/frame overflow, missing dictionaries and rotation/capture
+loss cannot silently become successful estimates. Optional unselected detail omissions do not censor
+selected timing. Descriptive moments and valid-sample weighted subtotals are not loss correction,
+IID standard errors or confidence intervals.
 No samples mean null estimate, not zero shader cost. `thin` warns below ten eligible group samples.
 Selection is correlated, not IID: periodic work may alias; repeat launches for independent phases.
 Input primitive counts include instances and quad-to-triangle conversion, not clipping/rasterization.
@@ -300,6 +334,20 @@ may serialize work, and metadata/output still costs CPU/IO. First calibrate off/
 then keep pass sampling fixed and ABBA PIPELINES=0/4. Match driver, exact seed manifest/module hashes,
 save/route, render size/FPS cap and thermals; inspect CPU p50/p95, GPU span, clocks, query counts and loss.
 Uniform phase alone cannot remove instrumentation-driven workload changes or prove statistical confidence.
+
+Aggregation is bounded (8192 dictionary/window keys and 64 population exposures); capacity exhaustion
+is explicit overflow, never unbounded allocation or silent eviction of estimator authority. Inactive
+dictionary entries can be retired internally, but IDs are never reused and referenced mappings must
+still be emitted before use after file rotation. Storage remains four bounded files; default compact
+output aims at **at most roughly 50 MB per ten logical minutes**, including retained parent pass/window
+output, for the realistic 4096-key churn fixture—not a guarantee for arbitrary shader/pass churn.
+Default rotation size alone cannot fix an unsustainable producer, and retaining only the latest files
+does not preserve earlier whole-capture estimates. Capture all `.jsonl*` rotations and keep loss warnings.
+Report actual bytes/window and total bytes, aggregation/flush **thread CPU** per window, peak memory/
+backlog, producer pacing waits, true drops and close-time flush separately. Fast synthetic producer
+waiting must not be mislabeled as a real-time throughput result. Host throughput or zero host drops is
+**not proof** that Duo no longer drops slots; only a later matched device run can establish that.
+
 
 ### Sampled queries and interpretation
 
@@ -549,6 +597,52 @@ one-draw secondary chunks and executes a real seeded compute dispatch. A continu
 pre-upload scope must remain in the exact main parent group; ending the child cannot close the parent's
 pipeline query. `--pipeline-overflow` exercises 2049 alternating groups and domain growth. The existing
 mode/default-off and sealed-present fixtures also cover this switch.
+The raw Vulkan assertions explicitly request `PIPELINES_RAW=1`; separate real `--pipeline-groups`
+assertions leave it unset and require compact dictionary/window/coverage rows with no global frame rows.
+Pure fixtures serialize **one** logical 4096-key dataset into both encodings, retaining explicit optional
+unselected omissions rather than generating a second handmatched expected dataset. They compare estimates,
+moments, count subtotals and thin/missing/censor flags with `1e-9` relative/absolute tolerance, including
+20–60 logical fps, mid-window population growth, partial close, missing/invalid queries, true drops,
+discard, missing/late/conflicting dictionaries, rotation loss and unfinished groups.
+A separate fixed-cost ground-truth run activates each 2048-key set for a full 512-frame rotation block,
+then churns to the other half of its 4096-key pool. The block boundary crosses 300-frame windows; four
+retained rotated files and a partial final window must recover each key's known GPU-ms and exact shader
+tuple totals within `1e-10` relative/absolute tolerance. This demonstrates estimator recovery, not merely
+agreement between encodings. It does **not** claim exact finite-sample recovery for arbitrary phase-correlated
+churn. A P1-shaped regression retains 63/70 leading optional lease rows plus intact 86+11 rows: the seven
+missing rows must produce an explicit `retained-row-count-mismatch`, while 137 valid samples remain
+unestimable under independent rotation/missing-window/background-drop authority.
+
+For parent-owned host execution, `vkgpuprofcompacttest` builds the production-worker fixture without
+shader seeds or a Vulkan instance. Set `OUT` to an absolute host output directory:
+
+```sh
+LOCK=/home/agent/Projects/totk-android/.scratch/hosttest.lock
+flock "$LOCK" taskset -c 0-3 nice -n 10 make -C games/totk/android TARGET=linux CC=cc OUT="$OUT" vkgpuprofcompacttest
+flock "$LOCK" taskset -c 0-3 nice -n 10 "$OUT/vkgpuproftest" --compact-contract
+```
+
+Run each capture invocation below in its **own empty working directory** so launch files do not mix:
+
+```sh
+# Ten logical minutes, 4096-key churn, fps cycles20/30/40/50/60.
+flock "$LOCK" taskset -c 0-3 nice -n 10 env TOTK_VK_GPU_PROFILE_PIPELINES_RAW=0 "$OUT/vkgpuproftest" --compact-fixture --seconds 600 --fps 0 --pace 0 --loss 0
+# Same seeded logical data, bounded raw-vs-compact partial-close comparison.
+flock "$LOCK" taskset -c 0-3 nice -n 10 env TOTK_VK_GPU_PROFILE_PIPELINES_RAW=0 "$OUT/vkgpuproftest" --compact-fixture --frames 302 --fps 0 --pace 0 --loss 0
+flock "$LOCK" taskset -c 0-3 nice -n 10 env TOTK_VK_GPU_PROFILE_PIPELINES_RAW=1 "$OUT/vkgpuproftest" --compact-fixture --frames 302 --fps 0 --pace 0 --loss 0
+# True missing/invalid/drop cases must remain unknown.
+flock "$LOCK" taskset -c 0-3 nice -n 10 env TOTK_VK_GPU_PROFILE_PIPELINES_RAW=0 "$OUT/vkgpuproftest" --compact-fixture --frames 302 --fps 0 --pace 0 --loss 1
+```
+
+Also exercise fixed `--fps 20` and `--fps 60`, bounded rotation with `TOTK_VK_GPU_PROFILE_MAX_BYTES=4096`,
+and `--pace 1` when measuring wall-paced host behavior. `--frames` overrides seconds. Both pacing modes
+may wait for synthetic producer capacity; report `producer_wait_ms` rather than treating zero dropped
+synthetic slots as proof the host—or Duo—keeps up without backpressure. Keep raw runs bounded: their
+per-group bytes are intentionally large. Analyze all retained `.jsonl*` files with `gpuprof.py`.
+The C fixture retains optional metadata that compact may suppress for never-selected key/windows:
+compare count subtotals only for the same retained/emitted population, never assert identical never-sampled
+inventories. The pure fixture above supplies exact subtotal-equivalence and independent known-truth assertions.
+
 The optional `GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs for
 modes 0/1/2/3, recorder workers 0/2, statistics on/off/unsupported, ordinal windows off/on, split-frame and
 unsent multi-frame reconciliation, direct pre uploads while main rendering is open, default row/byte reduction
