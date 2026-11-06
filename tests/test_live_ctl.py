@@ -8,12 +8,14 @@ counts after unrelated creates/deletes/moves, EINTR, late creation and repeated 
 
 CC accepts a shell-quoted compiler command; TMPDIR selects scratch output.
 """
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -121,6 +123,103 @@ class LiveCtl(unittest.TestCase):
         self.assertIn('ok: idle recreated IN_IGNORED', out)
         self.assertIn('ok: absent-file control reader: unrelated creates/deletes/moves, EINTR, late creation, '
                       '4 delete/recreate cycles', out)
+
+    @contextmanager
+    def late_reader(self):
+        work = Path(tempfile.mkdtemp(dir=self.dir))
+        trace = self.dir / f'{work.name}.trace'
+        with trace.open('w') as out:
+            proc = subprocess.Popen([str(self.probe), 'late', str(work)], stdout=out, stderr=subprocess.STDOUT)
+            def wait(text, count=1):
+                end = time.monotonic() + 4
+                while time.monotonic() < end:
+                    if trace.read_text().count(text) >= count:
+                        return
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.fail(f'waiting for {text!r}: {trace.read_text()}')
+            try:
+                wait('ready\n')
+                yield work / 'totk.ctl', wait
+                proc.wait(timeout=7)
+                self.assertEqual(proc.returncode, 0, trace.read_text())
+                self.assertIn('mark late ordering', trace.read_text())
+                self.assertIn('ok: live switch channel', trace.read_text())
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+
+    def test_late_create_then_write_later(self):
+        with self.late_reader() as (ctl, wait):
+            with ctl.open('w') as writer:
+                wait('open ok\n')  # IN_CREATE was handled while the file was still empty.
+                writer.write('mark late ordering\n')
+                writer.flush()
+
+    def test_late_permission_denied_then_chmod(self):
+        if os.geteuid() == 0:
+            self.skipTest('requires an unprivileged reader')
+        with self.late_reader() as (ctl, wait):
+            fd = os.open(ctl, os.O_WRONLY | os.O_CREAT, 0)
+            with os.fdopen(fd, 'w') as writer:
+                writer.write('mark late ordering\n')
+            wait('open denied\n')  # CREATE/CLOSE_WRITE precede the readable IN_ATTRIB.
+            ctl.chmod(0o600)
+
+    def test_late_close_write_after_denied_create(self):
+        if os.geteuid() == 0:
+            self.skipTest('requires an unprivileged reader')
+        with self.late_reader() as (ctl, wait):
+            fd = os.open(ctl, os.O_WRONLY | os.O_CREAT, 0)
+            with os.fdopen(fd, 'w') as writer:
+                wait('open denied\n')
+                ctl.chmod(0o600)
+                wait('open ok\n')
+                writer.write('mark late ordering\n')
+
+    def test_late_atomic_rename(self):
+        with self.late_reader() as (ctl, _):
+            temp = ctl.with_suffix('.tmp')
+            temp.write_text('mark late ordering\n')
+            temp.chmod(0o600)
+            os.setxattr(temp, 'user.totk_test', b'prepared')
+            temp.replace(ctl)  # Only MOVED_TO exposes the fully prepared batch.
+
+    def test_late_other_user_chown_then_xattr(self):
+        if os.geteuid() == 0 or not shutil.which('sudo') or subprocess.run(
+                ['sudo', '-n', 'true'], capture_output=True).returncode:
+            self.skipTest('requires unprivileged reader and passwordless sudo for another-user writer')
+        with self.late_reader() as (ctl, wait):
+            code = ("import os,sys; p=sys.argv[1]; "
+                    "fd=os.open(p,os.O_WRONLY|os.O_CREAT,0o600); "
+                    "os.write(fd,b'mark late ordering\\n'); os.close(fd)")
+            subprocess.run(['sudo', '-n', 'python3', '-c', code, str(ctl)], check=True)
+            try:
+                wait('open denied\n')
+                subprocess.run(['sudo', '-n', 'chown', f'{os.getuid()}:{os.getgid()}', str(ctl)], check=True)
+                os.setxattr(ctl, 'user.totk_test', b'context-step')
+            finally:
+                subprocess.run(['sudo', '-n', 'chown', f'{os.getuid()}:{os.getgid()}', str(ctl)], check=True)
+
+    def test_late_retry_without_target_event(self):
+        if os.geteuid() == 0:
+            self.skipTest('requires an unprivileged reader')
+        with self.late_reader() as (ctl, wait):
+            fd = os.open(ctl, os.O_WRONLY | os.O_CREAT, 0)
+            try:
+                os.write(fd, b'mark late ordering\n')
+                wait('open denied\n')
+                ctl.parent.chmod(0)
+                os.fchmod(fd, 0o600)
+                # The target's ATTRIB still cannot be opened through its unsearchable parent.
+                wait('open denied\n', 2)
+                # Restoring parent access generates no named target event: the bounded retry must recover.
+                ctl.parent.chmod(0o700)
+            finally:
+                ctl.parent.chmod(0o700)
+                os.close(fd)
 
     def test_core_thread_sanitizer(self):
         self.run_mode(self.tsan_probe(), 'core', env=os.environ | {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66'})

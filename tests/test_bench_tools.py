@@ -574,10 +574,14 @@ class InSessionAB(unittest.TestCase):
         self.assertIn('mark text', r.stderr)
 
     def test_live_write(self):
-        """live.sh ends its batch with a newline (the game stages complete lines only), reports refusals, and all its
-        root commands share one root shell."""
+        """live.sh atomically publishes only its newline-terminated batch, with permissions/context prepared before
+        appearance; old commands are not replayed, refusals are reported, and all commands share one root shell."""
         with fake_device() as dev:
             log, ctl = dev.game / 'totk.log', dev.game / 'totk.ctl'
+            # chcon must see a nonempty, mode-correct temp, never the published path.
+            (dev.dir / 'bin/chcon').write_text(
+                '#!/bin/sh\nfor arg do file=$arg; done\n'
+                f'[ "$file" != "{ctl}" ] && [ -s "$file" ] && [ "$(stat -c %a "$file")" = 600 ]\n')
             log.write_text('[totk-ctl] following\n')
             stop = threading.Event()
             game = threading.Thread(target=fake_game, args=(ctl, log, stop), daemon=True)
@@ -589,11 +593,14 @@ class InSessionAB(unittest.TestCase):
                 r = live('set', 'TOTK_VK_PIPE_BOOST=1', 'mark', 'a', 'b')
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertIn('gen=1 frame=10 mark a b', r.stdout)
+                first_inode = ctl.stat().st_ino
                 self.assertEqual(ctl.read_text(), 'set TOTK_VK_PIPE_BOOST=1\nmark a b\n')
                 r = live('unset TOTK_VK_PIPE_BOOST', 'mark ok')
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertIn('gen=2 frame=20 mark ok', r.stdout)
-                self.assertEqual(ctl.read_text(), 'set TOTK_VK_PIPE_BOOST=1\nmark a b\nunset TOTK_VK_PIPE_BOOST\nmark ok\n')
+                self.assertEqual(ctl.read_text(), 'unset TOTK_VK_PIPE_BOOST\nmark ok\n')
+                self.assertNotEqual(ctl.stat().st_ino, first_inode)
+                self.assertFalse(list(dev.game.glob('.totk.ctl.*')))
                 self.assertEqual(oct(ctl.stat().st_mode & 0o777), '0o600')
                 r = live('set', 'TOTK_X=1', 'mark', 'r')
                 self.assertEqual(r.returncode, 4, r.stderr)
@@ -601,6 +608,19 @@ class InSessionAB(unittest.TestCase):
             finally:
                 stop.set()
             self.assertEqual(dev.root_shells(), 1)
+
+    def test_live_prepare_failure_keeps_previous_batch(self):
+        with fake_device() as dev:
+            ctl = dev.game / 'totk.ctl'
+            ctl.write_text('mark previous\n')
+            (dev.game / 'totk.log').write_text('')
+            (dev.dir / 'bin/chcon').write_text('#!/bin/sh\nexit 1\n')
+            r = subprocess.run(['sh', str(BENCH / 'live.sh'), '-s', 'x', '--game-dir', str(dev.game),
+                                'mark next'], capture_output=True, text=True, env=dev.env)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn('could not write', r.stderr)
+            self.assertEqual(ctl.read_text(), 'mark previous\n')
+            self.assertFalse(list(dev.game.glob('.totk.ctl.*')))
 
 
 FAKE_ADB = r'''#!/bin/sh
@@ -643,9 +663,16 @@ class fake_device:
 
 def fake_game(ctl, log, stop):
     """The game's side of totk.ctl: each poll that finds new complete lines is one generation."""
-    seen, gen = 0, 0
+    seen, gen, inode = 0, 0, None
     while not stop.is_set():
-        data = ctl.read_bytes() if ctl.exists() else b''
+        try:
+            with ctl.open('rb') as f:
+                current = os.fstat(f.fileno()).st_ino
+                data = f.read()
+            if current != inode:
+                seen, inode = 0, current
+        except FileNotFoundError:
+            data = b''
         end = data.rfind(b'\n') + 1
         if end > seen:
             gen += 1

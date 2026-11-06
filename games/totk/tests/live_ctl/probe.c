@@ -59,10 +59,15 @@ static int observed_rm_watch(int fd, int watch);
 enum { CTL_OPEN, CTL_READ, CTL_PREAD, CTL_STAT, CTL_FSTAT, CTL_CLOSE, CTL_ADD, CTL_REMOVE, CTL_CALLS };
 static _Thread_local int observe_control;
 static _Atomic unsigned long ctl_calls[CTL_CALLS], ctl_event_reads, ctl_interrupts, ctl_ignored, ctl_directory_watches;
+static int trace_open;
 static void observed_call(unsigned which) { if (observe_control) atomic_fetch_add(&ctl_calls[which], 1); }
 static int observed_open(const char *path, int flags, ...) {
     observed_call(CTL_OPEN);
-    if (!(flags & O_CREAT)) return open(path, flags);
+    if (!(flags & O_CREAT)) {
+        int fd = open(path, flags), saved = errno;
+        if (observe_control && trace_open) printf("open %s\n", fd >= 0 ? "ok" : saved == EACCES ? "denied" : "missing");
+        errno = saved; return fd;
+    }
     va_list args; va_start(args, flags); mode_t mode = va_arg(args, mode_t); va_end(args);
     return open(path, flags, mode);
 }
@@ -377,6 +382,21 @@ static void missing(const char *dir) {
     printf("ok: absent-file control reader: unrelated creates/deletes/moves, EINTR, late creation, 4 delete/recreate cycles\n");
 }
 
+/* The Python fixture supplies deliberately separated creates, writes and permission changes. */
+static void late(const char *dir) {
+    static char path[1024];
+    snprintf(path, sizeof path, "%s/totk.ctl", dir);
+    rd.path = path; rd.skip_existing = 1; trace_open = 1;
+    pthread_t thread;
+    int error = pthread_create(&thread, NULL, observed_control, &rd);
+    CHECK(!error, "start late-create control worker"); if (error) return;
+    pthread_detach(thread);
+    CHECK(control_until(&ctl_calls[CTL_READ], 1), "absent target: reader waiting on directory watch");
+    printf("ready\n");
+    CHECK(frames_until(0) == 1, "late-created file acknowledged without a rename rescue");
+    char log[4096]; log_take(log, sizeof log); printf("%s", log);
+}
+
 /* ---------- every live switch toggled ---------- */
 enum { RENDER = 4, SLACKERS = 4, TOGGLES = 300 };
 static _Atomic int render_tid[RENDER + 1], render_nice[RENDER + 1], render_started, stop_all;
@@ -483,14 +503,15 @@ static void switches(void) {
 
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "parse")) return parse_mode();
-    if (argc != 3 || (strcmp(argv[1], "core") && strcmp(argv[1], "switches") && strcmp(argv[1], "missing"))) {
-        fprintf(stderr, "usage: probe parse | probe core <dir> | probe switches <dir> | probe missing <dir>\n"); return 2;
+    if (argc != 3 || (strcmp(argv[1], "core") && strcmp(argv[1], "switches") && strcmp(argv[1], "missing") && strcmp(argv[1], "late"))) {
+        fprintf(stderr, "usage: probe parse | probe {core|switches|missing|late} <dir>\n"); return 2;
     }
     static char stderr_path[1100]; snprintf(stderr_path, sizeof stderr_path, "%s/stderr.txt", argv[2]);
     if (!freopen(stderr_path, "w", stderr)) return 3;
     setvbuf(stderr, NULL, _IONBF, 0); setvbuf(stdout, NULL, _IOLBF, 0);
     log_path = stderr_path;
-    if (!strcmp(argv[1], "core")) core(argv[2]); else if (!strcmp(argv[1], "missing")) missing(argv[2]); else switches();
+    if (!strcmp(argv[1], "core")) core(argv[2]); else if (!strcmp(argv[1], "missing")) missing(argv[2]);
+    else if (!strcmp(argv[1], "late")) late(argv[2]); else switches();
     printf("%s: live switch channel\n", failures ? "FAIL" : "ok");
     return failures != 0;
 }
