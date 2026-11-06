@@ -5,10 +5,91 @@
  * without WSI) and flush a terminal partial window AFTER real fence retirement. */
 #include "vk_int.h"
 #include "vk_record.h"
+#include "vk_gpuprof_time.h"
 #include <sys/mman.h>
 
 static unsigned checks, failures;
 #define CHECK(c, label) do { checks++; if (!(c)) { failures++; fprintf(stderr, "FAIL: %s\n", label); } } while (0)
+static void timestamp_contract(void) {
+    vk_gpuprof_time_domain domain = {1, 2, 0, 48, 1};
+    vk_gpuprof_timestamp first = {100, 1}, last = {200, 1};
+    vk_gpuprof_interval value = vk_gpuprof_interval_check(first, last, domain, domain);
+    CHECK(value.status == GP_TIME_OK && !value.wrapped && fabs(value.ms - 0.0001) < 1e-12,
+        "same-domain available timestamp interval uses advertised units");
+    first.available = 0; first.ticks = UINT64_MAX;
+    value = vk_gpuprof_interval_check(first, last, domain, domain);
+    CHECK(value.status == GP_TIME_UNAVAILABLE && !value.has_value, "unavailable timestamp cannot reuse stale value");
+    first = (vk_gpuprof_timestamp){0, 1}; last = first;
+    value = vk_gpuprof_interval_check(first, last, domain, domain);
+    CHECK(value.status == GP_TIME_OK && value.ms == 0, "available zero counter is legal");
+    uint64_t mask = vk_gpuprof_tick_mask(48);
+    first.ticks = mask - 9; last.ticks = 10;
+    value = vk_gpuprof_interval_check(first, last, domain, domain);
+    CHECK(value.status == GP_TIME_OK && value.wrapped && fabs(value.ms - 0.00002) < 1e-12,
+        "real 48-bit wrap remains a bounded valid interval");
+    first.ticks = mask - 3; last.ticks = 0;
+    value = vk_gpuprof_interval_check(first, last, domain, domain);
+    CHECK(value.status == GP_TIME_OK && value.wrapped && value.ms == 0.000004,
+        "zero end timestamp at a real wrap is not fabricated unavailability");
+    first.ticks = (UINT64_C(1) << 60) | 100; last.ticks = (UINT64_C(2) << 60) | 200;
+    value = vk_gpuprof_interval_check(first, last, domain, domain);
+    CHECK(value.status == GP_TIME_OK && !value.wrapped && fabs(value.ms - 0.0001) < 1e-12,
+        "only timestampValidBits participate in interval math");
+    first.ticks = 100000000; last.ticks = 99999900; domain.period_ns = (double)(float)52.0833321;
+    value = vk_gpuprof_interval_check(first, last, domain, domain);
+    CHECK(value.status == GP_TIME_IMPLAUSIBLE && value.has_value && value.ms > 1e10,
+        "Thor-style backwards endpoint is flagged, not accepted as a 169-day wrap");
+    domain.period_ns = 1; domain.valid_bits = 64;
+    first.ticks = UINT64_MAX - 3; last.ticks = 5;
+    value = vk_gpuprof_interval_check(first, last, domain, domain);
+    CHECK(value.status == GP_TIME_OK && value.wrapped && value.ms == 0.000009,
+        "64-bit wrap avoids undefined shift and preserves exact delta");
+    first.ticks = 0; last.ticks = UINT64_C(10000000000);
+    value = vk_gpuprof_interval_check(first, last, domain, domain);
+    CHECK(value.status == GP_TIME_OK && value.ms == VK_GPUPROF_MAX_FRAME_MS, "sanity limit is inclusive");
+    last.ticks++;
+    CHECK(vk_gpuprof_interval_check(first, last, domain, domain).status == GP_TIME_IMPLAUSIBLE,
+        "positive implausible duration is rejected too");
+    vk_gpuprof_time_domain other = domain; other.queue++;
+    CHECK(vk_gpuprof_interval_check(first, last, domain, other).status == GP_TIME_DOMAIN,
+        "different queues cannot feed one span");
+    other = domain; other.queue_family++;
+    CHECK(vk_gpuprof_interval_check(first, last, domain, other).status == GP_TIME_DOMAIN,
+        "queue families are explicit timestamp domains");
+    other = domain; other.device++;
+    CHECK(vk_gpuprof_interval_check(first, last, domain, other).status == GP_TIME_DOMAIN,
+        "different devices cannot feed one span");
+    other = domain; other.period_ns = 2;
+    CHECK(vk_gpuprof_interval_check(first, last, domain, other).status == GP_TIME_DOMAIN,
+        "different timestamp units cannot feed one span");
+    domain.valid_bits = 0;
+    CHECK(vk_gpuprof_interval_check(first, last, domain, domain).status == GP_TIME_DOMAIN,
+        "zero timestamp precision is unavailable");
+    domain.valid_bits = 65;
+    CHECK(vk_gpuprof_interval_check(first, last, domain, domain).status == GP_TIME_DOMAIN,
+        "invalid timestamp precision never reaches a shift");
+    domain.valid_bits = 48; domain.period_ns = NAN;
+    CHECK(vk_gpuprof_interval_check(first, last, domain, domain).status == GP_TIME_DOMAIN,
+        "invalid timestamp period is rejected");
+}
+static void unavailable_query_contract(void) {
+    if (!V.has_host_query_reset) return;
+    VkQueryPool pool;
+    VkQueryPoolCreateInfo info = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2};
+    VKCHECK(vkCreateQueryPool(V.dev, &info, NULL, &pool));
+    vkResetQueryPool(V.dev, pool, 0, 2);
+    vk_gpuprof_timestamp data[2] = {{UINT64_MAX, UINT64_MAX}, {UINT64_MAX, UINT64_MAX}};
+    VkResult result = vkGetQueryPoolResults(V.dev, pool, 0, 2, sizeof data, data, sizeof data[0],
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    CHECK(result == VK_NOT_READY && !data[0].available && !data[1].available,
+        "real reset-but-unwritten Vulkan queries return availability zero without waiting");
+    vk_gpuprof_time_domain domain = {(uintptr_t)V.dev, (uintptr_t)V.queue, V.qfam,
+        V.timestamp_bits, V.props.limits.timestampPeriod};
+    CHECK(vk_gpuprof_interval_check(data[0], data[1], domain, domain).status == GP_TIME_UNAVAILABLE,
+        "real unavailable query payload cannot form a valid span");
+    vkDestroyQueryPool(V.dev, pool, NULL);
+}
 static uint8_t recording[16384];
 static size_t used;
 static void op(uint32_t code, const void *payload, uint32_t bytes) {
@@ -88,6 +169,9 @@ static int finish_fixture(unsigned frames, unsigned passes, unsigned draws, int 
         CHECK(leases[1] && leases[2], "parallel recorder secondary leases are actually used and returned");
     }
     vk_rec_lock(); vk_gpuprof_test_flush(); vk_rec_unlock();
+    vk_gpuprof_shutdown();
+    vk_gpuprof_shutdown(); /* normal teardown is idempotent */
+    vk_rec_lock(); vk_gpuprof_test_flush(); vk_rec_unlock(); /* late rows cannot follow session_end */
     printf("gpuprof-fixture frames=%u passes=%u draws=%u mode=%d workers=%d stats_supported=%d stats_enabled=%d checks=%u failures=%u\n",
         frames, passes, draws, mode, workers, supported,
         !!vk_gpuprof_stats_mask(), checks, failures);
@@ -172,14 +256,47 @@ static int run_areas(uint8_t *memory, pool_t *gpu, int supported) {
     printf("gpuprof-areas frames=3 passes=11 draws=0 exact_keys=6 families=5 transfers=17\n");
     return finish_fixture(3, 11, 0, supported);
 }
+static int run_unavailable_span(int supported) {
+    /* Both command buffers are real. Only the first is submitted, so the
+     * reserved frame/slot end queries must remain unavailable after its fence. */
+    VkCommandPool pool;
+    VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = V.qfam};
+    VKCHECK(vkCreateCommandPool(V.dev, &pi, NULL, &pool));
+    VkCommandBuffer cb[2];
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 2};
+    VKCHECK(vkAllocateCommandBuffers(V.dev, &ai, cb));
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VKCHECK(vkBeginCommandBuffer(cb[0], &bi)); VKCHECK(vkBeginCommandBuffer(cb[1], &bi));
+    vk_gpuprof_slot *slot = NULL;
+    vk_rec_lock();
+    vk_gpuprof_slot_begin(&slot, cb[0]);
+    vk_gpuprof_test_frame(cb[1]); vk_gpuprof_slot_end(slot, cb[1]); vk_gpuprof_slot_seal(slot);
+    vk_rec_unlock();
+    VKCHECK(vkEndCommandBuffer(cb[0])); VKCHECK(vkEndCommandBuffer(cb[1]));
+    VkFence fence; VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VKCHECK(vkCreateFence(V.dev, &fi, NULL, &fence));
+    VkCommandBufferSubmitInfo command = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb[0]};
+    VkSubmitInfo2 submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .commandBufferInfoCount = 1, .pCommandBufferInfos = &command};
+    VKCHECK(vkQueueSubmit2(V.queue, 1, &submit, fence));
+    VKCHECK(vkWaitForFences(V.dev, 1, &fence, VK_TRUE, UINT64_C(5000000000)));
+    vk_rec_lock(); vk_gpuprof_slot_complete(slot); vk_rec_unlock();
+    vkDestroyFence(V.dev, fence, NULL); vkDestroyCommandPool(V.dev, pool, NULL);
+    printf("gpuprof-unavailable expected_frames=1 expected_invalid_spans=1\n");
+    return finish_fixture(1, 0, 0, supported);
+}
 int main(int argc, char **argv) {
+    timestamp_contract();
     unsigned frames = 302;
     int areas = argc == 2 && !strcmp(argv[1], "--areas");
+    int unavailable_span = argc == 2 && !strcmp(argv[1], "--unavailable-span");
     if (argc == 3 && !strcmp(argv[1], "--frames")) {
         char *end; unsigned long value = strtoul(argv[2], &end, 10);
         if (!*argv[2] || *end || !value || value > 10000) return 2;
         frames = (unsigned)value;
-    } else if (argc != 1 && !areas) return 2;
+    } else if (argc != 1 && !areas && !unavailable_span) return 2;
     /* Force short secondary chunks so workers=2 tests a real parallel pass,
      * rather than merely checking an enabled worker setting on inline draws. */
     setenv("TOTK_VK_REC_CHUNK_DRAWS", "1", 1); setenv("TOTK_VK_REC_LEAD_DRAWS", "1", 1);
@@ -189,8 +306,10 @@ int main(int argc, char **argv) {
     uint8_t *memory = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (memory == MAP_FAILED) { perror("gpuprof fixture mmap"); return 1; }
     mtl_init();
+    unavailable_query_contract();
     int supported = V.has_pipeline_statistics;
     if (getenv("GPUPROF_TEST_UNSUPPORTED")) V.has_pipeline_statistics = 0;
+    if (unavailable_span) return run_unavailable_span(supported);
     mtl_pool_add(memory, bytes);
     pool_t pool = {.mem = memory, .size = bytes,
         .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};

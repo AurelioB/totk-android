@@ -1777,12 +1777,39 @@ observed (otherwise the game's handheld 1280×720/docked 1600×900 mode default)
 fractions are exact reduced absolute/reference ratios, **never** divided by their own pass area.
 Completed-frame observations are retained until that reference is known, even across retired slots.
 
+Window aggregation defaults to exact key + reference extent + `scene_relative`, not frame ordinal.
+Schema-3 `pass` ordinal **0** means **all frame ordinals**; `TOTK_VK_GPU_PROFILE_ORDINALS=1`
+restores per-ordinal windows. This launch-only switch defaults to `0` (all values except exact `1`
+are off), logged once as `[gpu-profile] window ordinals=0/1`. Mode-2 `[gpu-split]` and mode-3
+`long_frame` rows always preserve positive actual ordinals; compacting window rows does not change
+absolute areas, sample counts, counters or the statistics-matched time/draw denominators.
+
+Default retention is **128 MiB × four files**, including `.1`/`.2`/`.3`; override per-file size with
+`TOTK_VK_GPU_PROFILE_MAX_BYTES`. Compact windows target a 6–8-minute pan without rotation, but
+raw logs, pass-key churn and mode-3 dumps can still fill it sooner. Each physical file starts with
+a `header`: launch ID, APK `assets/build.txt` commit/build text, package/versionCode where available,
+effective profiling settings, whitelisted requested launch environment and actual Vulkan device/driver
+IDs/name/version. Exact APK SHA-256 is unavailable in process; join the separately captured APK hash.
+Header rotation indices and window `sequence` identify missing complete windows/evicted files, even
+when no surviving frame reveals the gap. Keep all four files when collecting a launch.
+
+Normal Android close/activity destruction writes `session_end` under the output writer mutex, then
+rejects late writes. `clean_end=true` means orderly **writer** closure only; `all_queries_retired=null`
+does not claim the completion thread was joined. Crash/kill/missing-marker captures remain incomplete.
+Invalid/unavailable timestamps or implausible (>10,000 ms/frame) spans produce `span_valid=false`,
+null span/gap and explicit reasons/counters; measured pass sums are not replaced. The analyzer keeps
+valid-span subtotals and forensic raw spans separate, never sums absurd positive spans as real GPU time.
+For historical schema-2 captures, `gpuprof.py --legacy-span-replay` reads only frame/window timing:
+it flags implausible spans and propagates invalid frame authority to windows without claiming to
+reconstruct query availability/endpoints or schema-3 attachment areas.
+
 Analyzer families normalize depth+MRT layouts and scene-sized depth-only prepasses against this
 reference (`scene_relative=true`). Thus a G-buffer and its depth prepass remain one family each
 through dynamic-resolution changes. Other passes retain absolute family dimensions: fixed 360²
 shadows stay one shadow family as the scene changes, and 360² versus 720² depth targets remain
 distinct. Exact pass tables retain every absolute key/area/reference variant, independent of family
-grouping. Schema 2 is rejected rather than silently reinterpreting its old self-normalized ratios.
+grouping. Normal analysis rejects schema 2 rather than reinterpreting its old self-normalized ratios;
+the explicit legacy timing-only replay above does not admit its pass rows.
 
 Traffic is an **uncompressed logical estimate**, render area × bytes/texel × samples per
 LOAD/STORE, not an Adreno hardware counter. It excludes metadata, resolves, compression,
@@ -1790,8 +1817,8 @@ alignment and driver decisions such as sysmem rendering. Depth and stencil opera
 counted separately, splitting packed D24S8 into 3+1 bytes and D32S8 into 4+1. Unsupported or
 block-compressed view byte sizes are excluded and counted in `unknown-byte attachments`.
 Capacity is 2,048 timed records and statistics queries and 64 frame segments per submission,
-and 16,384 retained observations per frame/key+ordinal+reference aggregates per window;
-nonzero drops/query failures mean incomplete coverage.
+and 16,384 retained observations per frame / exact-key+reference+scene-role aggregates per window
+(also per ordinal when requested); nonzero drops/query failures mean incomplete coverage.
 When off, there are no profiling query pools, allocations, timestamps or audit scans;
 draw/access hooks are a single disabled branch. Diagnostic-on CPU cost is not negligible.
 

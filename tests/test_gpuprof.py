@@ -57,8 +57,9 @@ def scene_row(width, height, reference_width=None, reference_height=None, depth_
     attachments = [attachment(width, height, reference_width, reference_height, slot=slot,
                               format=126 if slot == 8 else 37)
                    for slot in ((8,) if depth_only else (0, 1, 8))]
+    changes.setdefault('scene_relative', True)
     return pass_row(render_width=width, render_height=height, reference_width=reference_width,
-                    reference_height=reference_height, scene_relative=True, attachments=attachments, **changes)
+                    reference_height=reference_height, attachments=attachments, **changes)
 
 
 def window(**changes):
@@ -71,6 +72,21 @@ def window(**changes):
 def frame(**changes):
     row = dict(schema=3, type='frame', frame=1, span_ms=12.0, measured_ms=10.0, gap_ms=2.0,
                dropped=0, reconciliation_failed=False, scene_width=0, scene_height=0)
+    row.update(changes)
+    return row
+
+
+def header(**changes):
+    row = dict(schema=3, type='header', launch_id='fixture', rotation=0, profile=1, stats=False,
+               ordinals=False, max_bytes=134217728, retained_files=4, window_frames=300, span_limit_ms=10000,
+               build_commit=None, package=None, version_code=None, driver={}, env={})
+    row.update(changes)
+    return row
+
+
+def session_end(**changes):
+    row = dict(schema=3, type='session_end', launch_id='fixture', clean_end=True, all_queries_retired=None,
+               last_frame=300, last_window_sequence=1, last_window_end=300, output_failures=0)
     row.update(changes)
     return row
 
@@ -104,6 +120,168 @@ class Analyzer(unittest.TestCase):
         self.assertAlmostEqual(group['ratios']['ns_per_vertex'], 20e6 / 93)
         self.assertAlmostEqual(group['ratios']['ns_per_primitive'], 20e6 / 31)
         self.assertEqual(report['coverage']['window_sum_mismatches'], 0)
+
+    def test_compact_ordinals_reduce_rows_without_changing_sums_or_matched_stats(self):
+        detailed = [pass_row(ordinal=n, count=1, stats_valid=1, draws=2, gpu_ms=1,
+                             stats=counters(6, 2, 20)) for n in range(1, 9)]
+        compact = pass_row(ordinal=0, count=8, stats_valid=8, draws=16, gpu_ms=8,
+                           stats=counters(48, 16, 160), stats_gpu_ms=8, stats_draws=16)
+        a = self.analyze([window(ordinals=True, measured_ms=8, span_ms=10), *detailed])
+        b = self.analyze([window(ordinals=False, measured_ms=8, span_ms=10), compact])
+        self.assertEqual(a['coverage']['pass_rows'], 8)
+        self.assertEqual(b['coverage']['pass_rows'], 1)
+        for key in ('gpu_ms', 'count', 'draws', 'stats', 'ratios', 'ratio_gpu_ms', 'ratio_draws'):
+            self.assertEqual(a['families'][0][key], b['families'][0][key], key)
+        self.assertLess(len(json.dumps(compact)), len(json.dumps(detailed)))
+        self.assertEqual(b['passes'][0]['ordinals'], [0])
+        self.assertEqual(b['coverage']['ordinal_metadata_mismatches'], 0)
+        text = io.StringIO()
+        gpuprof.render(b, text)
+        self.assertIn('all (0)', text.getvalue())
+
+    def test_zero_ordinal_is_only_valid_for_window_pass_aggregates(self):
+        self.assertEqual(gpuprof.validate(pass_row(ordinal=0))['ordinal'], 0)
+        for value in (0, -1, True, 1.5):
+            with self.subTest(ordinal=value), self.assertRaises(ValueError):
+                gpuprof.validate(pass_row(type='long_frame', frame=1, ordinal=value))
+        self.assertEqual(gpuprof.validate(pass_row(type='long_frame', frame=1, ordinal=7))['ordinal'], 7)
+        for value in (-1, True, 1.5):
+            with self.subTest(ordinal=value), self.assertRaises(ValueError):
+                gpuprof.validate(pass_row(ordinal=value))
+
+    def test_compact_dedup_keeps_reference_and_scene_role(self):
+        rows = [scene_row(64, 36, ordinal=0), scene_row(64, 36, 128, 72, ordinal=0),
+                scene_row(64, 36, ordinal=0, scene_relative=False)]
+        self.file('gpuprof-compact.jsonl.1', rows)
+        self.file('gpuprof-compact.jsonl', [rows[0]])
+        report = gpuprof.analyze([str(self.root / 'gpuprof-compact.jsonl*')])
+        self.assertEqual(report['coverage']['duplicate_rows'], 1)
+        self.assertEqual(report['coverage']['conflicting_rows'], 0)
+        self.assertEqual(report['coverage']['pass_rows'], 3)
+        self.assertEqual(len(report['passes'][0]['areas']), 3)
+        self.assertEqual(report['passes'][0]['gpu_ms'], 30)
+
+    def test_window_ordinal_metadata_is_optional_boolean_and_checked(self):
+        for value in (0, 1, 'false', None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                gpuprof.validate(window(ordinals=value))
+        report = self.analyze([window(ordinals=False), pass_row(ordinal=1)])
+        self.assertEqual(report['coverage']['ordinal_metadata_mismatches'], 1)
+        self.assertEqual(self.analyze([window(), pass_row()])['coverage']['malformed_rows'], 0)
+
+    def test_partial_compact_statistics_retain_explicitly_matched_denominators(self):
+        row = pass_row(ordinal=0, count=10, stats_valid=2, draws=100, gpu_ms=100,
+                       stats_gpu_ms=2, stats_draws=10)
+        group = self.analyze([row])['passes'][0]
+        self.assertEqual(group['stats_missing'], 8)
+        self.assertEqual(group['ratio_draws'], 10)
+        self.assertEqual(group['ratio_gpu_ms'], 2)
+        self.assertEqual(group['ratios']['verts_per_draw'], 3)
+        self.assertAlmostEqual(group['ratios']['ns_per_vertex'], 2e6 / 30)
+        for changes in ({'stats_gpu_ms': -1}, {'stats_draws': 101}, {'stats_gpu_ms': 101}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                gpuprof.validate({**row, **changes})
+
+    def test_headers_rotation_sequences_and_writer_end_expose_capture_loss(self):
+        self.file('gpuprof-loss.jsonl.1', [header(rotation=4),
+                  window(window_start=301, window_end=600, sequence=2)])
+        self.file('gpuprof-loss.jsonl', [header(rotation=5),
+                  window(window_start=901, window_end=1200, sequence=4),
+                  session_end(last_frame=1200, last_window_sequence=4, last_window_end=1200)])
+        report = gpuprof.analyze([str(self.root / 'gpuprof-loss.jsonl*')])
+        self.assertEqual(report['coverage']['malformed_rows'], 0)
+        self.assertEqual(report['coverage']['missing_windows'], 2)
+        self.assertEqual(report['coverage']['rotation_evictions'], 2)
+        self.assertEqual(report['coverage']['missing_rotation_files'], 4)
+        self.assertEqual(report['coverage']['streams_without_end'], 0)
+        self.assertTrue(report['sessions'][0]['clean_end'])
+        self.assertIsNone(report['sessions'][0]['all_queries_retired'])
+        self.assertEqual(len(report['sessions'][0]['headers']), 2)
+
+    def test_unmarked_session_is_not_a_clean_exit_and_old_capture_only_proves_interior_holes(self):
+        report = self.analyze([header(), window(), pass_row(ordinal=0)])
+        self.assertFalse(report['sessions'][0]['clean_end'])
+        self.assertEqual(report['coverage']['streams_without_end'], 1)
+        self.assertTrue(any('no session_end' in issue for issue in report['issues']))
+        old = self.analyze([window(window_start=301, window_end=600),
+                            window(window_start=901, window_end=1200)])
+        self.assertEqual(old['coverage']['missing_windows'], 1)
+        self.assertFalse(old['sessions'][0]['leading_coverage_known'])
+        frames_only = self.analyze([header(), frame(frame=601)])
+        self.assertEqual(frames_only['coverage']['missing_windows'], 2)
+
+    def test_header_conflicts_and_invalid_lifecycle_fields_are_explicit(self):
+        report = self.analyze([header(), header(rotation=1, ordinals=True), session_end()])
+        self.assertEqual(report['coverage']['header_conflicts'], 1)
+        self.assertFalse(report['sessions'][0]['clean_end'])
+        for row in (header(rotation=-1), header(ordinals=1), header(driver=None),
+                    window(sequence=2), session_end(clean_end=False)):
+            with self.subTest(row=row), self.assertRaises(ValueError):
+                gpuprof.validate(row)
+
+    def test_invalid_span_fields_require_explicit_nulls_not_missing_or_numeric_time(self):
+        invalid = frame(span_valid=False, span_ms=None, gap_ms=None)
+        for key in ('span_ms', 'gap_ms'):
+            for omit in (False, True):
+                row = dict(invalid)
+                if omit:
+                    del row[key]
+                else:
+                    row[key] = 0
+                with self.subTest(key=key, omit=omit), self.assertRaises(ValueError):
+                    gpuprof.validate(row)
+        with self.assertRaises(ValueError):
+            gpuprof.validate(window(valid_span_ms=None))
+
+    def test_invalid_spans_keep_measured_sums_but_not_fake_span_gap_totals(self):
+        rows = [window(span_valid=False, span_ms=None, gap_ms=None, valid_span_ms=12,
+                       valid_gap_ms=2, invalid_spans=1, unavailable_timestamps=1),
+                pass_row(ordinal=0), frame(),
+                frame(frame=2, span_valid=False, span_ms=None, gap_ms=None, raw_span_ms=5e10,
+                      span_reason='implausible-timestamp', unavailable_timestamps=1, invalid_timestamps=2,
+                      reconciliation_failed=True)]
+        report = self.analyze(rows)
+        self.assertEqual(report['coverage']['malformed_rows'], 0)
+        self.assertEqual(report['coverage']['invalid_frame_spans'], 1)
+        self.assertEqual(report['coverage']['invalid_window_spans'], 1)
+        self.assertEqual(report['coverage']['invalid_timestamps'], 2)
+        self.assertEqual(report['timing']['frame']['measured_ms'], 20)
+        self.assertEqual(report['timing']['frame']['valid_span_ms'], 12)
+        self.assertIsNone(report['timing']['window']['span_ms'])
+        self.assertIsNone(report['timing']['frame']['gap_ms'])
+        self.assertEqual(report['rejected_spans'][0]['raw_span_ms'], 5e10)
+
+    def test_legacy_span_replay_rejects_huge_positive_spans_without_reinterpreting_passes(self):
+        bad = self.file('gpuprof-old.jsonl', [dict(frame(span_ms=58640630904, gap_ms=58640630894), schema=2),
+                        dict(window(span_ms=58640630904, gap_ms=58640630894), schema=2),
+                        dict(pass_row(), schema=2)])
+        report = gpuprof.analyze([bad], legacy_span_replay=True)
+        self.assertEqual(report['coverage']['malformed_rows'], 0)
+        self.assertEqual(report['coverage']['legacy_ignored_rows'], 1)
+        self.assertEqual(report['coverage']['invalid_frame_spans'], 1)
+        self.assertEqual(report['coverage']['invalid_window_spans'], 1)
+        self.assertEqual(report['timing']['frame']['measured_ms'], 10)
+        self.assertEqual(report['passes'], [])
+        self.assertEqual(report['rejected_spans'][0]['source_schema'], 2)
+        self.assertEqual(gpuprof.analyze([bad])['coverage']['malformed_rows'], 3)
+        result = subprocess.run([sys.executable, str(ROOT / 'tools/bench/gpuprof.py'),
+                                 '--legacy-span-replay', str(bad), '--json', '-'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)['legacy_span_replay'])
+        plausible = self.file('gpuprof-b1.jsonl', [
+            dict(frame(span_ms=55, measured_ms=44, gap_ms=11), schema=2),
+            dict(window(frames=600, span_ms=32900, measured_ms=26000, gap_ms=6900), schema=2)])
+        replay = gpuprof.analyze([plausible], legacy_span_replay=True)
+        self.assertEqual(replay['coverage']['invalid_frame_spans'], 0)
+        self.assertEqual(replay['coverage']['invalid_window_spans'], 0)
+        self.assertEqual(replay['timing']['window']['span_ms'], 32900)
+
+    def test_schema_three_old_false_success_still_rejects_implausible_span(self):
+        report = self.analyze([frame(span_ms=5e10, gap_ms=5e10 - 10),
+                               window(span_ms=12, measured_ms=10, gap_ms=2), pass_row()])
+        self.assertEqual(report['coverage']['invalid_frame_spans'], 1)
+        self.assertEqual(report['coverage']['invalid_window_spans'], 1)
+        self.assertIsNone(report['timing']['window']['span_ms'])
 
     def test_family_keeps_structure_ignores_shader_key_and_ordinal(self):
         rows = [pass_row(gpu_ms=1), pass_row(key='b', ordinal=2, shader='shader-b', gpu_ms=2),
@@ -526,7 +704,8 @@ class Analyzer(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('GPUPROF_TEST_BIN'), 'set GPUPROF_TEST_BIN to run the real Vulkan fixture')
 class Lavapipe(unittest.TestCase):
-    def launch(self, mode, workers, stats, *, unsupported=False, rotate=False, areas=False):
+    def launch(self, mode, workers, stats, *, unsupported=False, rotate=False, areas=False, ordinals=None,
+               unavailable_span=False):
         binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
         self.assertTrue(binary.is_file(), f'no fixture binary: {binary}')
         seed = Path(os.environ.get('TOTK_SHADER_SEED_DIR', binary.parent / 'vkdraw-seed')).resolve()
@@ -535,16 +714,21 @@ class Lavapipe(unittest.TestCase):
             env = dict(os.environ, TOTK_SHADER_SEED_DIR=str(seed), TOTK_VK_GPU_PROFILE=str(mode),
                        TOTK_VK_REC_THREADS=str(workers), TOTK_VK_GPU_PROFILE_STATS=str(stats),
                        TOTK_VK_GPU_PROFILE_LONG_MS='0', TOTK_VK_GPU_PROFILE_LONG_FRAMES='2',
-                       TOTK_VK_GPU_PROFILE_MAX_BYTES='4096' if rotate else '16777216',
+                       TOTK_VK_GPU_PROFILE_MAX_BYTES='4096' if rotate else '134217728',
                        TOTK_RENDER_RES='1280x720')
             # Isolate launch policy from a developer's shell diagnostics.
             for key in ('TOTK_VK_OCCLUSION', 'TOTK_VK_PASS_DUMP', 'TOTK_VK_PASS_PROFILE', 'TOTK_VK_PASSPROBE',
                         'TOTK_VK_PASS_MERGE', 'GPUPROF_TEST_UNSUPPORTED', 'TOTK_VK_OFF', 'TOTK_VK_WRITEBACK',
                         'TOTK_FRAME_LAG', 'TOTK_VK_LAG_CAPTURE'):
                 env.pop(key, None)
+            env.pop('TOTK_VK_GPU_PROFILE_ORDINALS', None)
+            if ordinals is not None:
+                env['TOTK_VK_GPU_PROFILE_ORDINALS'] = str(ordinals)
+            if not rotate:
+                env.pop('TOTK_VK_GPU_PROFILE_MAX_BYTES', None)  # exercise the actual 128 MiB default
             if unsupported:
                 env['GPUPROF_TEST_UNSUPPORTED'] = '1'
-            arguments = ['--areas'] if areas else ['--frames', '302']
+            arguments = ['--unavailable-span'] if unavailable_span else ['--areas'] if areas else ['--frames', '302']
             result = subprocess.run([str(binary), *arguments], cwd=temporary, env=env,
                                     capture_output=True, text=True, timeout=180)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -562,10 +746,29 @@ class Lavapipe(unittest.TestCase):
             self.assertEqual(report['coverage']['truncated_rows'], 0, report['issues'])
             self.assertEqual(report['coverage']['conflicting_rows'], 0, report['issues'])
             observations, _, _ = gpuprof.load(gpuprof.inputs(paths))
+            self.assertIn(f'window ordinals={int(bool(ordinals))}', result.stderr)
+            self.assertEqual(report['coverage']['ordinal_metadata_mismatches'], 0)
+            self.assertEqual(report['coverage']['streams_without_end'], 0)
+            self.assertIsNone(report['sessions'][0]['all_queries_retired'])
+            report['_fixture_output_bytes'] = sum(path.stat().st_size for path in paths)
+            for path in paths:
+                first = json.loads(path.read_text(encoding='utf-8').splitlines()[0])
+                self.assertEqual(first['type'], 'header', 'every rotated file must carry its launch identity')
+                self.assertEqual(first['ordinals'], bool(ordinals))
+                self.assertEqual(first['max_bytes'], 4096 if rotate else 134217728)
+                self.assertEqual(first['span_limit_ms'], 10000)
+            if mode == 2:
+                raw_ordinals = re.findall(r'\[gpu-split\] frame=\d+ ordinal=(\d+)', result.stderr)
+                self.assertTrue(raw_ordinals)
+                self.assertTrue(all(int(ordinal) > 0 for ordinal in raw_ordinals))
             for observation in observations:
                 row = observation['row']
                 self.assertEqual(row['schema'], 3)
                 if row['type'] in ('pass', 'long_frame'):
+                    if row['type'] == 'pass':
+                        self.assertEqual(row['ordinal'] > 0, bool(ordinals))
+                    else:
+                        self.assertGreater(row['ordinal'], 0, 'selected raw frames keep their actual ordinals')
                     for axis in ('width', 'height'):
                         self.assertGreater(row[f'reference_{axis}'], 0)
                         self.assertLessEqual(row[f'reference_{axis}'], gpuprof.UINT32_MAX)
@@ -574,6 +777,30 @@ class Lavapipe(unittest.TestCase):
                             self.assertEqual(attachment[f'{axis}_num'] * row[f'reference_{axis}'],
                                              attachment[axis] * attachment[f'{axis}_den'])
                     self.assertIsInstance(row['scene_relative'], bool)
+                elif row['type'] == 'window':
+                    self.assertEqual(row['ordinals'], bool(ordinals))
+                    self.assertEqual(row['sequence'], (row['window_start'] - 1) // 300 + 1)
+            if unavailable_span:
+                self.assertEqual(frames, 1)
+                frame_rows = [o['row'] for o in observations if o['row']['type'] == 'frame']
+                windows = [o['row'] for o in observations if o['row']['type'] == 'window']
+                self.assertEqual(len(frame_rows), 1)
+                self.assertEqual(len(windows), 1)
+                for row in (frame_rows[0], windows[0]):
+                    self.assertFalse(row['span_valid'])
+                    self.assertIsNone(row['span_ms'])
+                    self.assertIsNone(row['gap_ms'])
+                    self.assertGreater(row['unavailable_timestamps'], 0)
+                self.assertIsNone(frame_rows[0]['raw_span_ms'])
+                self.assertEqual(frame_rows[0]['span_reason'], 'unavailable-timestamp')
+                self.assertTrue(frame_rows[0]['reconciliation_failed'])
+                self.assertEqual(windows[0]['invalid_spans'], 1)
+                self.assertGreater(windows[0]['failed_slots'], 0)
+                self.assertEqual(windows[0]['valid_span_ms'], 0)
+                self.assertEqual(report['coverage']['invalid_frame_spans'], 1)
+                self.assertEqual(report['coverage']['invalid_window_spans'], 1)
+                self.assertEqual(report['sessions'][0]['end']['last_frame'], 1)
+                return report
             if areas:
                 self.assertEqual((frames, passes, draws), (3, 11, 0))
                 self.assertEqual(bool(enabled), bool(stats and supported and not unsupported))
@@ -583,6 +810,7 @@ class Lavapipe(unittest.TestCase):
                 self.assertEqual({p.suffix for p in paths}, {'.jsonl', '.1', '.2', '.3'})
                 self.assertTrue(all(p.stat().st_size <= 4096 for p in paths))
                 self.assertLess(report['coverage']['frame_rows'], frames, 'bounded rotation must discard old rows')
+                self.assertGreater(report['coverage']['rotation_evictions'], 0)
                 return report
             self.assertEqual(report['coverage']['frame_rows'], frames)
             self.assertEqual(report['coverage']['windows'], 2)
@@ -719,33 +947,54 @@ class Lavapipe(unittest.TestCase):
         for mode in (1, 2):
             for workers in (0, 2):
                 for stats in (0, 1):
-                    with self.subTest(mode=mode, workers=workers, stats=stats):
-                        report = self.launch(mode, workers, stats, areas=True)
-                        keys = {(g['key'], g['render_width'], g['render_height'])
-                                for g in report['passes'] if g['kind'] == 'render'}
-                        if reference is None:
-                            reference = keys
-                        self.assertEqual(keys, reference)
+                    for ordinals in (0, 1):
+                        with self.subTest(mode=mode, workers=workers, stats=stats, ordinals=ordinals):
+                            report = self.launch(mode, workers, stats, areas=True, ordinals=ordinals)
+                            keys = {(g['key'], g['render_width'], g['render_height'])
+                                    for g in report['passes'] if g['kind'] == 'render'}
+                            if reference is None:
+                                reference = keys
+                            self.assertEqual(keys, reference)
 
     def test_modes_workers_statistics_and_stable_keys(self):
         reference = None
         for mode in range(4):
             for workers in (0, 2):
                 for stats in (0, 1):
-                    with self.subTest(mode=mode, workers=workers, stats=stats):
-                        report = self.launch(mode, workers, stats)
-                        if report:
-                            keys = {(g['key'], g['shader']) for g in report['passes'] if g['kind'] == 'render'}
-                            if reference is None:
-                                reference = keys
-                            self.assertEqual(keys, reference, 'recorder/mode/stats must not change pass keys')
+                    for ordinals in (0, 1):
+                        with self.subTest(mode=mode, workers=workers, stats=stats, ordinals=ordinals):
+                            report = self.launch(mode, workers, stats, ordinals=ordinals)
+                            if report:
+                                keys = {(g['key'], g['shader']) for g in report['passes'] if g['kind'] == 'render'}
+                                if reference is None:
+                                    reference = keys
+                                self.assertEqual(keys, reference, 'recorder/mode/stats/ordinals must not change pass keys')
         for workers in (0, 2):
-            with self.subTest(unsupported=True, workers=workers):
-                report = self.launch(1, workers, 1, unsupported=True)
-                self.assertEqual({(g['key'], g['shader']) for g in report['passes'] if g['kind'] == 'render'}, reference)
+            for ordinals in (0, 1):
+                with self.subTest(unsupported=True, workers=workers, ordinals=ordinals):
+                    report = self.launch(1, workers, 1, unsupported=True, ordinals=ordinals)
+                    self.assertEqual({(g['key'], g['shader']) for g in report['passes'] if g['kind'] == 'render'}, reference)
+
+    def test_default_compact_output_reduces_window_rows_and_bytes(self):
+        compact = self.launch(1, 2, 1)
+        detailed = self.launch(1, 2, 1, ordinals=1)
+        self.assertLess(compact['coverage']['pass_rows'], detailed['coverage']['pass_rows'])
+        self.assertLess(compact['_fixture_output_bytes'], detailed['_fixture_output_bytes'])
+        for report in (compact, detailed):
+            self.assertEqual(report['coverage']['window_sum_mismatches'], 0)
+        def totals(report):
+            rows = [(g['kind'], g['samples'], g['count'], g['draws'], g['stats'], g['stats_missing'],
+                     g['ratio_draws']) for g in report['families']]
+            return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True))
+        self.assertEqual(totals(compact), totals(detailed))
+
+    def test_real_unsubmitted_span_query_is_unavailable_not_zero_time(self):
+        self.launch(1, 0, 0, unavailable_span=True)
 
     def test_bounded_output_rotation_retains_whole_schema_rows(self):
-        self.launch(3, 2, 1, rotate=True)
+        for ordinals in (0, 1):
+            with self.subTest(ordinals=ordinals):
+                self.launch(3, 2, 1, rotate=True, ordinals=ordinals)
 
 
 if __name__ == '__main__':

@@ -52,8 +52,35 @@ python3 tools/bench/ledger.py add $OUT/result.json --commit <sha> --apk <apk> --
 ## GPU pass profile (host-only analysis)
 
 `python3 tools/bench/gpuprof.py 'capture/gpuprof-*.jsonl*' [--json analysis.json]` reads **schema-3 only**
-GPU-profiler rows, including the three `.1`/`.2`/`.3` rotations. Schema 2 is rejected because its attachment
-ratios used different reference semantics. `--json -` emits JSON only on stdout (`totk-gpuprof-analysis/3`).
+GPU-profiler rows, including the three `.1`/`.2`/`.3` rotations. Normal analysis rejects schema 2 because its
+attachment ratios used different reference semantics. `--json -` emits JSON only on stdout (`totk-gpuprof-analysis/3`).
+
+Windows now default to **one row per exact key + reference extent + scene role**, with `ordinal: 0`
+meaning **all frame ordinals**, displayed as `all (0)`. `TOTK_VK_GPU_PROFILE_ORDINALS=1` restores
+per-ordinal windows (default `0`, read once; startup logs `[gpu-profile] window ordinals=0/1`).
+Mode-2 raw `[gpu-split]` logs and mode-3 selected `long_frame` rows always retain their actual positive
+frame ordinals. Window `ordinals` records the selected policy; old schema-3 captures without it remain readable.
+Counts, times, absolute dimensions and statistics counters/explicitly matched time/draws remain unchanged sums.
+
+Default storage is **128 MiB per file × four files**, overridable with `TOTK_VK_GPU_PROFILE_MAX_BYTES`
+(4096–1073741824). Compact mode targets a 6–8-minute pan without rotation, not a duration guarantee.
+Each file begins with a `header` containing launch ID, rotation index, build commit from APK `assets/build.txt`,
+package/versionCode when available, Vulkan device/driver identity, effective profiling switches and a whitelist
+of requested launch environment values (null means unset, not necessarily an effective backend default).
+Host fixtures/missing APK metadata explicitly retain unavailable identity; no environment build string is trusted.
+Exact APK/driver artifact hashes must be joined from capture records, not inferred from version labels.
+Normal Android close/destruction emits `session_end`: `clean_end` proves writer closure, while
+`all_queries_retired: null` explicitly does not prove GPU completion. Crash/kill never fabricates this marker.
+
+Capacity model (not a new device-duration measurement): six original Thor S/D/B1 snapshots
+(`.scratch/bench/rpmode/thor/{S,D,B1}`, initial and `after-hateno`) contain 77 complete windows,
+463,121 per-ordinal pass rows and 11,736 window/key proxies after ordinal coalescing (39.5× fewer).
+The largest observed proxy population is 265/window. Serializing those coalesced legacy templates
+with an extra 256 bytes/row + 128 bytes/attachment for schema-3 metadata gives a peak 334,477 bytes/window.
+At 60 fps for 480 seconds, 700 bytes/new frame × 28,800 frames + 96 peak windows + 64 KiB metadata
+is 52,335,328 bytes (49.91 MiB). Schema 2 cannot recover actual schema-3 absolute/reference variants;
+allowing **2×** the modeled pass bytes gives 84,445,120 bytes (80.53 MiB), hence the 128 MiB default
+rather than a marginal 64 MiB. Arbitrary key/reference churn or raw/long-frame populations can exceed this model.
 
 Pass and selected `long_frame` rows require absolute `render_width`/`render_height`,
 `reference_width`/`reference_height`, and boolean `scene_relative`. Every attachment retains its slot, format,
@@ -84,20 +111,43 @@ Unavailable statistics stay unavailable. Time/draw ratios use only complete-stat
 match; partial-stat rows still contribute their available counters to counter-to-counter ratios.
 
 The report includes measured/span/gap sums, absent frame IDs within the captured range, missing window summaries,
-pass/window sum mismatches, dropped/failed slots, partial windows and malformed/incomplete/duplicate/conflicting
-rows. Separate launch filenames remain separate observations; repeated rotation rows count once, while conflicting
-identities are excluded rather than choosing an arbitrary value. Complete missing leading/trailing windows cannot
-be inferred. `long_frame` tables describe over-threshold frames and retained-history diagnostics; they are never
-added to window totals or treated as an unbiased latency distribution. `TOTK_VK_GPU_PROFILE_LONG_FRAMES` bounds
-the history ring, **not** the number of over-threshold frames that can be dumped; a zero long-frame threshold
-selects every frame. Exit 1 means malformed/conflicting rows; a partial final JSON line is a reported capture
-warning. Exit 2 means an input/output error.
+complete missing window sequences, rotation eviction/absent files, absent end markers, pass/window sum mismatches,
+dropped/failed slots, partial windows and malformed/incomplete/duplicate/conflicting rows. `sessions` retains every
+header/end observation. Separate launch filenames remain separate observations; repeated rotation rows count once,
+while conflicts are excluded rather than choosing an arbitrary value. Dedup retains exact key, ordinal, reference
+dimensions and `scene_relative`, so compact rows do not merge distinct scene roles/references.
+Headers establish sequence 1 as the launch start; older headerless captures only prove interior window gaps.
+Missing trailing work after an unmarked exit cannot be inferred. A clean writer end is not a flush of pending queries.
+
+Invalid frame/window spans have `span_valid: false` and null `span_ms`/`gap_ms`; reasons, unavailable/invalid
+timestamp counters and raw forensic spans remain explicit. The analyzer excludes implausible older positive spans
+above 10,000 ms/frame even if the old producer reported success, and propagates invalid frame authority to its window.
+`timing` preserves measured sums and valid-span/gap subtotals; total span/gap stay null if that population contains
+invalid rows. Invalid timing is not zero GPU time. `rejected_spans` preserves raw values and source locations.
+
+For historical timing-only replay:
+`python3 tools/bench/gpuprof.py --legacy-span-replay 'capture/gpuprof-*.jsonl*' --json replay.json`.
+This explicit mode accepts schema-2/3 **frame/window timing only**, ignoring pass/long-frame rows and disabling
+pass/window sum comparisons. It flags implausible spans without reconstructing query availability/endpoints or
+claiming schema-3 attachment/reference semantics. Valid historical timing values remain unchanged.
+
+`long_frame` tables describe over-threshold frames and retained-history diagnostics; they are never added to window
+totals or treated as an unbiased latency distribution. `TOTK_VK_GPU_PROFILE_LONG_FRAMES` bounds the history ring,
+**not** the number of over-threshold frames dumped; a zero threshold selects every valid frame. Exit 1 means
+malformed/conflicting rows; a partial final JSON line is a reported capture warning. Exit 2 means an I/O error.
 
 `tests/test_gpuprof.py` pins schema-3 dimensions/references, scene-relative and fixed-depth families, ratios,
-optional statistics, rotation and long-frame accounting without Vulkan. The optional
+compact ordinal sentinel/dedup/statistics totals, capture-loss lifecycle metadata, legacy span replay, optional
+statistics, rotation and long-frame accounting without Vulkan. The optional
 `GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs for modes 0/1/2/3,
-recorder workers 0/2, statistics on/off/unsupported, split-frame and unsent multi-frame reconciliation,
-direct pre uploads while main rendering is open, and bounded file rotation. The color-only 64/128 scenario
+recorder workers 0/2, statistics on/off/unsupported, ordinal windows off/on, split-frame and unsent multi-frame
+reconciliation, direct pre uploads while main rendering is open, default row/byte reduction and bounded file rotation.
+Every rotated file must carry its header, and orderly fixture exit must carry its writer-end marker.
+`--unavailable-span` deliberately leaves a real span-end query in an unsubmitted command buffer;
+the existing submitted buffer's fence retires, but the unsubmitted end remains unavailable.
+The matrix requires null invalid frame/window spans, explicit unavailable counters and the orderly writer end,
+not fabricated query values or a zero-duration success.
+The color-only 64/128 scenario
 requires distinct absolute keys and families. Its `--areas` scenario covers changing depth+MRT scenes,
 scene-sized prepasses, a smaller MRT later in the same frame, fixed 360×360/128×128 depth targets, and a frame
 with no observed scene; all contributing absolute keys and reference variants remain available for joins.

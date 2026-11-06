@@ -88,6 +88,8 @@ int vk_overlay_cycle(void);   /* android/gfx/vk_overlay.c */
 extern void runtime_fps_adaptive_lifecycle(int window, int paused) __attribute__((weak));
 extern void runtime_fps_adaptive_pipeline(uint64_t now) __attribute__((weak));
 extern void runtime_fps_adaptive_grace(uint64_t now, uint64_t duration) __attribute__((weak));
+extern void vk_gpuprof_identity(const char *commit, const char *package, uint64_t version, const char *build) __attribute__((weak));
+extern void vk_gpuprof_shutdown(void) __attribute__((weak));
 
 static char g_data[1024];                    /* the game folder (shared storage) */
 static ANativeActivity *g_activity;
@@ -1340,6 +1342,61 @@ static void pipeline_key_asset(const ANativeActivity *a) {
     if (ok && !rename(tmp, path)) env_default("TOTK_PSO_KEYS", "%s", path);
     else { unlink(tmp); fprintf(stderr, "[pso-prewarm] cannot stage APK key list\n"); }
 }
+/* Profile identity comes from this APK, not user-editable launch variables.
+   Missing facts stay unavailable; only collect them for an opted-in launch. */
+static void gpu_profile_identity(const ANativeActivity *a) {
+    const char *mode = getenv("TOTK_VK_GPU_PROFILE");
+    if (!vk_gpuprof_identity || !mode || (strcmp(mode, "1") && strcmp(mode, "2") && strcmp(mode, "3"))) return;
+    char build[256] = {0}, commit[80] = {0}, package[256] = {0};
+    AAsset *asset = AAssetManager_open(a->assetManager, "build.txt", AASSET_MODE_BUFFER);
+    if (asset) {
+        off_t size = AAsset_getLength(asset);
+        if (size > 0 && size < (off_t)sizeof build && AAsset_read(asset, build, (size_t)size) == size) {
+            char candidate[80], extra;
+            if (sscanf(build, "commit %79s %c", candidate, &extra) == 1) {
+                size_t n = strlen(candidate);
+                if ((n == 12 || n == 40 || n == 64) && strspn(candidate, "0123456789abcdef") == n)
+                    snprintf(commit, sizeof commit, "%s", candidate);
+            }
+        } else build[0] = 0;
+        AAsset_close(asset);
+    }
+    JNIEnv *env = NULL; int attached = 0; uint64_t version = 0;
+    if ((*a->vm)->GetEnv(a->vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*a->vm)->AttachCurrentThread(a->vm, &env, NULL) == JNI_OK) attached = 1;
+        else env = NULL;
+    }
+    if (env && (*env)->PushLocalFrame(env, 16) == JNI_OK) {
+        jclass activity = (*env)->GetObjectClass(env, a->clazz);
+        jmethodID name_method = activity ? (*env)->GetMethodID(env, activity, "getPackageName", "()Ljava/lang/String;") : NULL;
+        jstring name = name_method ? (*env)->CallObjectMethod(env, a->clazz, name_method) : NULL;
+        if (!name || (*env)->ExceptionCheck(env)) goto identity_done;
+        const char *text = (*env)->GetStringUTFChars(env, name, NULL);
+        if (!text) goto identity_done;
+        snprintf(package, sizeof package, "%s", text);
+        (*env)->ReleaseStringUTFChars(env, name, text);
+        jmethodID manager_method = (*env)->GetMethodID(env, activity, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+        jobject manager = manager_method ? (*env)->CallObjectMethod(env, a->clazz, manager_method) : NULL;
+        if (!manager || (*env)->ExceptionCheck(env)) goto identity_done;
+        jclass manager_class = (*env)->GetObjectClass(env, manager);
+        jmethodID info_method = manager_class ? (*env)->GetMethodID(env, manager_class, "getPackageInfo",
+            "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;") : NULL;
+        jobject info = info_method ? (*env)->CallObjectMethod(env, manager, info_method, name, 0) : NULL;
+        if (!info || (*env)->ExceptionCheck(env)) goto identity_done;
+        jclass info_class = (*env)->GetObjectClass(env, info);
+        jmethodID version_method = info_class ? (*env)->GetMethodID(env, info_class, "getLongVersionCode", "()J") : NULL;
+        if (version_method && !(*env)->ExceptionCheck(env)) {
+            jlong value = (*env)->CallLongMethod(env, info, version_method);
+            if (!(*env)->ExceptionCheck(env) && value > 0) version = (uint64_t)value;
+        }
+identity_done:
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        (*env)->PopLocalFrame(env, NULL);
+    }
+    if (env && (*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (attached) (*a->vm)->DetachCurrentThread(a->vm);
+    vk_gpuprof_identity(commit, package, version, build);
+}
 static int is_dir(const char *p) { struct stat st; return !stat(p, &st) && S_ISDIR(st.st_mode); }
 static int is_file(const char *p) { struct stat st; return !stat(p, &st) && S_ISREG(st.st_mode); }
 /* copy a folder recursively (dst made); returns the number of files copied, -1 on failure */
@@ -1578,6 +1635,7 @@ static int start_game(const ANativeActivity *a) {
     snprintf(p, sizeof p, "%s/settings.env", a->internalDataPath); settings_file(p);
     snprintf(p, sizeof p, "%s/totk.env", g_data); env_file(p);
     android_driver_env_policy(); /* freeze driver options before any app worker or driver call */
+    gpu_profile_identity(a);
     log_mirror_start();   /* TOTK_LOGCAT is final now */
     live_ctl_start();     /* after totk.env: its values are the launch values a live "unset" returns to */
     thread_sampler_start();
@@ -1802,7 +1860,9 @@ int runtime_front_request_close(void) {
         return 0;
     }
     __android_log_print(ANDROID_LOG_WARN, "TotkSetup", "close game: pid=%d save=idle; native pipeline-cache flush and exit", getpid());
-    fprintf(stderr, "[totk] close requested: flushing pipeline cache and exiting\n"); vk_pcache_shutdown(); _exit(0);
+    fprintf(stderr, "[totk] close requested: flushing pipeline cache and exiting\n"); vk_pcache_shutdown();
+    if (vk_gpuprof_shutdown) vk_gpuprof_shutdown();
+    _exit(0);
 }
 /* One stat per 500 ms on this non-render thread; no activity launch, task-affinity changes or frame-loop I/O. */
 static void *android_close_requests(void *arg) {
@@ -2331,7 +2391,9 @@ static void on_resume(ANativeActivity *a) {
     present_transform_update(a,g_window_epoch);
 }
 static void on_destroy(ANativeActivity *a) {
-    vk_pcache_shutdown(); window_clear(a); fprintf(stderr, "[totk-app] activity destroyed: exiting\n"); _exit(0);
+    vk_pcache_shutdown(); window_clear(a); fprintf(stderr, "[totk-app] activity destroyed: exiting\n");
+    if (vk_gpuprof_shutdown) vk_gpuprof_shutdown();
+    _exit(0);
 }
 
 __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActivity *a, void *saved, size_t saved_size) {

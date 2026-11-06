@@ -2,6 +2,7 @@
    queue. Deferred pass-end tokens retain immutable query coordinates, so recorder
    assembly never touches the walking thread's current pass. */
 #include "vk_int.h"
+#include "vk_gpuprof_time.h"
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -41,9 +42,11 @@ struct vk_gpuprof_slot {
     uint32_t nsegment, has_pre;
     VkCommandBuffer pre_cb;
     gp_segment segment[GP_SEGMENTS];
-    uint64_t span_ticks[GP_SEGMENTS + 1], pre_tick;
+    vk_gpuprof_timestamp span_ticks[GP_SEGMENTS + 1], pre_tick;
+    vk_gpuprof_time_domain domain;
+    uint8_t timestamp_marks[GP_TIMESTAMPS]; /* counted/invalid once per queried endpoint */
     gp_record rec[GP_RECORDS];
-    uint64_t ticks[GP_RECORDS * 2];
+    vk_gpuprof_timestamp ticks[GP_RECORDS * 2];
     uint64_t counters[GP_RECORDS][GP_STATS];
     uint32_t stats_owner[GP_RECORDS];
 };
@@ -79,13 +82,17 @@ static uint64_t audit_overflow;
 /* Timing aggregates below are accessed ONLY by the completion thread. */
 static gp_group groups[GP_GROUPS];
 static struct {
-    uint64_t frame, first, last, dropped;
+    uint64_t frame, dropped, unavailable_timestamps, invalid_timestamps, timestamp_wraps;
+    vk_gpuprof_timestamp first, last;
+    vk_gpuprof_time_domain first_domain, last_domain;
+    vk_gpuprof_time_status status;
     double measured;
     uint32_t scene_w, scene_h;
     int has_ticks, failed;
 } completed;
 static uint64_t last_completed, window_frames;
 static double window_span, window_gap;
+static uint64_t window_unavailable_timestamps, window_invalid_timestamps, window_invalid_spans, window_valid_span_frames;
 static int partial_report;
 typedef struct {
     uint64_t frame, dropped; uint32_t n, capacity;
@@ -96,6 +103,7 @@ static gp_long_frame *long_ring;
 static gp_long_frame frame_pending; /* one reusable completion-owner frame outside long-frame mode */
 static uint32_t game_reference_w, game_reference_h; /* immutable fallback when no scene MRT was observed */
 static uint32_t long_frames;
+static int window_ordinals;
 static double long_ms = 50;
 static uint64_t window, total_records, dropped_records, failed_slots, loads, clears, stores, discards;
 static uint64_t stats_failures;
@@ -108,51 +116,19 @@ static const char *const end_names[] = {
 };
 static FILE *output_file;
 static char output_path[PATH_MAX];
-static uint64_t output_bytes, output_limit = UINT64_C(16) << 20, output_failures;
+static uint64_t output_bytes, output_limit = UINT64_C(128) << 20;
+static _Atomic uint64_t output_failures;
+static pthread_mutex_t output_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t output_rotation, output_last_frame, output_last_window, output_last_window_end;
+static int output_closed;
+static char output_launch[96], output_commit[80], output_package[256], output_build[256];
+static uint64_t output_version;
 static uint64_t report_end;
 static uint64_t env_u64(const char *name, uint64_t fallback, uint64_t minimum, uint64_t maximum) {
     const char *e = getenv(name); char *end = NULL;
     if (!e || !*e || *e == '-') return fallback;
     unsigned long long value = strtoull(e, &end, 10);
     return end && !*end && value >= minimum && value <= maximum ? value : fallback;
-}
-static void output_init(void) {
-    char cwd[PATH_MAX]; struct timespec now;
-    if (!getcwd(cwd, sizeof cwd) || clock_gettime(CLOCK_REALTIME, &now)) {
-        LOGV("[gpu-profile] cannot resolve output game directory"); output_failures++; return;
-    }
-    int n = snprintf(output_path, sizeof output_path, "%s/gpuprof-%llu-%ld-%09ld.jsonl",
-        cwd, (unsigned long long)now.tv_sec, (long)getpid(), now.tv_nsec);
-    if (n < 0 || (size_t)n >= sizeof output_path - 2) { output_failures++; return; }
-    output_limit = env_u64("TOTK_VK_GPU_PROFILE_MAX_BYTES", output_limit, 4096, UINT64_C(1) << 30);
-    output_file = fopen(output_path, "wb");
-    if (!output_file) output_failures++;
-    LOGV("[gpu-profile] JSONL %s path=%s max-bytes=%llu rotations=3 (TOTK_VK_GPU_PROFILE_MAX_BYTES)",
-        output_file ? "enabled" : "unavailable", output_path, (unsigned long long)output_limit);
-}
-static void output_row(const char *text) {
-    if (!output_file) return;
-    size_t n = strlen(text);
-    if (n > output_limit) { output_failures++; return; }
-    if (output_bytes + n > output_limit) {
-        fclose(output_file); output_file = NULL;
-        char from[PATH_MAX], to[PATH_MAX];
-        for (int i = 3; i > 0; i--) {
-            snprintf(to, sizeof to, "%s.%d", output_path, i);
-            if (i == 1) snprintf(from, sizeof from, "%s", output_path);
-            else snprintf(from, sizeof from, "%s.%d", output_path, i - 1);
-            if (rename(from, to) && access(from, F_OK) == 0) {
-                LOGV("[gpu-profile] JSONL rotation failed path=%s", from); output_failures++; return;
-            }
-        }
-        output_file = fopen(output_path, "wb"); output_bytes = 0;
-        if (!output_file) { output_failures++; return; }
-    }
-    if (fwrite(text, 1, n, output_file) != n) {
-        LOGV("[gpu-profile] JSONL write failed path=%s", output_path);
-        fclose(output_file); output_file = NULL; output_failures++; return;
-    }
-    output_bytes += n;
 }
 typedef struct { char data[8192]; size_t used; int failed; } gp_json;
 static void json_add(gp_json *row, const char *format, ...) {
@@ -162,6 +138,149 @@ static void json_add(gp_json *row, const char *format, ...) {
     va_end(args);
     if (n < 0 || (size_t)n >= sizeof row->data - row->used) { row->failed = 1; return; }
     row->used += (size_t)n;
+}
+static gp_json output_header;
+static void json_string(gp_json *row, const char *text) {
+    if (!text) { json_add(row, "null"); return; }
+    json_add(row, "\"");
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (*p == '"' || *p == '\\') json_add(row, "\\%c", *p);
+        else if (*p < 32) json_add(row, "\\u%04x", *p);
+        else json_add(row, "%c", *p);
+    }
+    json_add(row, "\"");
+}
+/* Frontend-provided APK facts, before Vulkan startup; never accept environment
+   text as an authenticated package/build identity. */
+void vk_gpuprof_identity(const char *commit, const char *package, uint64_t version, const char *build) {
+    pthread_mutex_lock(&output_mu);
+    if (!output_launch[0] && !output_closed) {
+        snprintf(output_commit, sizeof output_commit, "%s", commit ? commit : "");
+        snprintf(output_package, sizeof output_package, "%s", package ? package : "");
+        snprintf(output_build, sizeof output_build, "%s", build ? build : "");
+        output_version = version;
+    }
+    pthread_mutex_unlock(&output_mu);
+}
+static int output_write_locked(const char *text, size_t n) {
+    if (fwrite(text, 1, n, output_file) != n) {
+        LOGV("[gpu-profile] JSONL write failed path=%s", output_path);
+        fclose(output_file); output_file = NULL; output_failures++; return 0;
+    }
+    output_bytes += n;
+    return 1;
+}
+static int output_header_locked(void) {
+    gp_json row = output_header;
+    json_add(&row, ",\"rotation\":%llu}\n", (unsigned long long)output_rotation);
+    if (row.failed || row.used >= output_limit) { output_failures++; return 0; }
+    return output_write_locked(row.data, row.used);
+}
+static void output_init(void) {
+    char cwd[PATH_MAX]; struct timespec now;
+    pthread_mutex_lock(&output_mu);
+    if (output_closed) { pthread_mutex_unlock(&output_mu); return; }
+    if (!getcwd(cwd, sizeof cwd) || clock_gettime(CLOCK_REALTIME, &now)) {
+        LOGV("[gpu-profile] cannot resolve output game directory"); output_failures++; goto done;
+    }
+    snprintf(output_launch, sizeof output_launch, "%llu-%ld-%09ld",
+        (unsigned long long)now.tv_sec, (long)getpid(), now.tv_nsec);
+    int n = snprintf(output_path, sizeof output_path, "%s/gpuprof-%s.jsonl", cwd, output_launch);
+    if (n < 0 || (size_t)n >= sizeof output_path - 2) { output_failures++; goto done; }
+    output_limit = env_u64("TOTK_VK_GPU_PROFILE_MAX_BYTES", output_limit, 4096, UINT64_C(1) << 30);
+    gp_json *row = &output_header;
+    json_add(row, "{\"schema\":3,\"type\":\"header\",\"launch_id\":"); json_string(row, output_launch);
+    json_add(row, ",\"build_commit\":"); json_string(row, output_commit[0] ? output_commit : NULL);
+    json_add(row, ",\"build_asset\":"); json_string(row, output_build[0] ? output_build : NULL);
+    json_add(row, ",\"build_identity_source\":"); json_string(row, output_commit[0] ? "apk:assets/build.txt" : "unavailable");
+    json_add(row, ",\"build_identity_reason\":");
+    json_string(row, output_commit[0] ? NULL : "APK build.txt commit unavailable (host fixture or missing asset)");
+    json_add(row, ",\"package\":"); json_string(row, output_package[0] ? output_package : NULL);
+    json_add(row, ",\"version_code\":");
+    if (output_version) json_add(row, "%llu", (unsigned long long)output_version); else json_add(row, "null");
+    json_add(row, ",\"apk_sha256\":null,\"apk_sha256_reason\":\"not computed in process; join capture APK hash\","
+        "\"profile\":%d,\"stats\":%s,\"ordinals\":%s,\"max_bytes\":%llu,\"retained_files\":4,"
+        "\"window_frames\":%d,\"span_limit_ms\":%.0f,\"timestamp_bits\":%u,\"timestamp_period_ns\":%.9f,"
+        "\"driver\":{\"vendor_id\":%u,\"device_id\":%u,\"api_version\":%u,\"driver_version\":%u,\"device_name\":",
+        vk_gpuprof_on, stats_on ? "true" : "false", window_ordinals ? "true" : "false",
+        (unsigned long long)output_limit, GP_WINDOW, VK_GPUPROF_MAX_FRAME_MS, V.timestamp_bits, V.props.limits.timestampPeriod,
+        V.props.vendorID, V.props.deviceID, V.props.apiVersion, V.props.driverVersion);
+    json_string(row, V.props.deviceName);
+    json_add(row, ",\"requested_driver\":"); json_string(row, getenv("TOTK_VK_DRIVER"));
+    json_add(row, ",\"binary_sha256\":null,\"binary_sha256_reason\":\"join captured driver artifact\"},\"env\":{");
+    static const char *const names[] = {
+        "TOTK_VK_DRIVER", "TOTK_VK_GPU_PROFILE", "TOTK_VK_GPU_PROFILE_STATS", "TOTK_VK_GPU_PROFILE_ORDINALS",
+        "TOTK_VK_GPU_PROFILE_LONG_MS", "TOTK_VK_GPU_PROFILE_LONG_FRAMES", "TOTK_VK_GPU_PROFILE_MAX_BYTES",
+        "TOTK_VK_REC_THREADS", "TOTK_VK_REC_CHUNK_DRAWS", "TOTK_VK_REC_INLINE_DRAWS", "TOTK_VK_REC_LEAD_DRAWS",
+        "TOTK_OPERATION_MODE", "TOTK_RENDER_RES", "TOTK_FPS60", "TOTK_SCENE_SCALE", "TOTK_VK_PRESENT",
+        "TU_DEBUG", "TU_PERF"
+    };
+    for (unsigned i = 0; i < sizeof names / sizeof *names; i++) {
+        json_add(row, "%s", i ? "," : ""); json_string(row, names[i]); json_add(row, ":"); json_string(row, getenv(names[i]));
+    }
+    json_add(row, "}");
+    output_file = fopen(output_path, "wb");
+    if (!output_file) output_failures++;
+    else if (!output_header_locked()) { if (output_file) fclose(output_file); output_file = NULL; }
+    LOGV("[gpu-profile] JSONL %s path=%s max-bytes=%llu rotations=3 (TOTK_VK_GPU_PROFILE_MAX_BYTES)",
+        output_file ? "enabled" : "unavailable", output_path, (unsigned long long)output_limit);
+done:
+    pthread_mutex_unlock(&output_mu);
+}
+static int output_row_locked(const char *text) {
+    if (!output_file || output_closed) return 0;
+    size_t n = strlen(text);
+    if (n + output_header.used + 64 > output_limit) { output_failures++; return 0; }
+    if (output_bytes + n > output_limit) {
+        fclose(output_file); output_file = NULL;
+        char from[PATH_MAX], to[PATH_MAX];
+        for (int i = 3; i > 0; i--) {
+            snprintf(to, sizeof to, "%s.%d", output_path, i);
+            if (i == 1) snprintf(from, sizeof from, "%s", output_path);
+            else snprintf(from, sizeof from, "%s.%d", output_path, i - 1);
+            if (rename(from, to) && access(from, F_OK) == 0) {
+                LOGV("[gpu-profile] JSONL rotation failed path=%s", from); output_failures++; return 0;
+            }
+        }
+        output_file = fopen(output_path, "wb"); output_bytes = 0; output_rotation++;
+        if (!output_file) { output_failures++; return 0; }
+        if (!output_header_locked()) return 0;
+    }
+    return output_write_locked(text, n);
+}
+static void output_row(const char *text) {
+    pthread_mutex_lock(&output_mu);
+    output_row_locked(text);
+    pthread_mutex_unlock(&output_mu);
+}
+static void output_frame(const char *text, uint64_t number) {
+    pthread_mutex_lock(&output_mu);
+    if (output_row_locked(text)) output_last_frame = number;
+    if (output_file) fflush(output_file);
+    pthread_mutex_unlock(&output_mu);
+}
+static void output_window(const char *text, uint64_t sequence, uint64_t end) {
+    pthread_mutex_lock(&output_mu);
+    if (output_row_locked(text)) { output_last_window = sequence; output_last_window_end = end; }
+    if (output_file) fflush(output_file);
+    pthread_mutex_unlock(&output_mu);
+}
+/* Orderly writer closure only: the frontend has not joined GPU completion.
+   Do not read completion-owner aggregates or pretend all queries retired. */
+void vk_gpuprof_shutdown(void) {
+    pthread_mutex_lock(&output_mu);
+    if (!output_closed && output_file) {
+        gp_json row = {0};
+        json_add(&row, "{\"schema\":3,\"type\":\"session_end\",\"launch_id\":"); json_string(&row, output_launch);
+        json_add(&row, ",\"clean_end\":true,\"all_queries_retired\":null,\"last_frame\":%llu,"
+            "\"last_window_sequence\":%llu,\"last_window_end\":%llu,\"output_failures\":%llu}\n",
+            (unsigned long long)output_last_frame, (unsigned long long)output_last_window,
+            (unsigned long long)output_last_window_end, (unsigned long long)atomic_load(&output_failures));
+        output_row_locked(row.data);
+        if (output_file) { fflush(output_file); fclose(output_file); output_file = NULL; }
+    }
+    output_closed = 1;
+    pthread_mutex_unlock(&output_mu);
 }
 static const char *kind_name(const gp_key *key) {
     static const char *const kinds[] = {"render", "compute", "upload", "transfer", "post", "upscale", "present", "framegen"};
@@ -295,14 +414,15 @@ static void aggregate_sample(const gp_group *sample) {
         if (a->store == VK_ATTACHMENT_STORE_OP_STORE) { stores++; store_bytes += bytes; } else discards++;
     }
     uint64_t reference = ((uint64_t)sample->reference_w << 32) | sample->reference_h;
-    size_t at = (sample->hash ^ sample->ordinal ^ reference ^ sample->scene_relative) % GP_GROUPS, tries = 0;
-    while (groups[at].count && (groups[at].hash != sample->hash || groups[at].ordinal != sample->ordinal ||
+    uint32_t ordinal = window_ordinals ? sample->ordinal : 0;
+    size_t at = (sample->hash ^ ordinal ^ reference ^ sample->scene_relative) % GP_GROUPS, tries = 0;
+    while (groups[at].count && (groups[at].hash != sample->hash || groups[at].ordinal != ordinal ||
         groups[at].reference_w != sample->reference_w || groups[at].reference_h != sample->reference_h ||
         groups[at].scene_relative != sample->scene_relative || !key_equal(&groups[at].key, key)) &&
         ++tries < GP_GROUPS) at = (at + 1) % GP_GROUPS;
     if (tries == GP_GROUPS) { dropped_records++; completed.dropped++; return; }
     gp_group *g = &groups[at];
-    if (!g->count) { *g = *sample; return; }
+    if (!g->count) { *g = *sample; g->ordinal = ordinal; return; }
     g->count += sample->count; g->draws += sample->draws; g->ms += sample->ms;
     for (unsigned st = 0; st < GP_STATS; st++) g->counters[st] += sample->counters[st];
     g->stats_count += sample->stats_count; g->stats_draws += sample->stats_draws; g->stats_ms += sample->stats_ms;
@@ -357,14 +477,20 @@ static void report(void) {
     for (size_t i = 0; i < n; i++) output_pass(rank[i], "pass", 0);
     gp_json summary = {0};
     json_add(&summary, "{\"schema\":3,\"type\":\"window\",\"window_start\":%llu,\"window_end\":%llu,"
-        "\"frames\":%llu,\"partial\":%s,\"measured_ms\":%.9f,\"span_ms\":%.9f,\"gap_ms\":%.9f,"
-        "\"dropped\":%llu,\"failed_slots\":%llu,\"stats_failed_slots\":%llu,\"output_failures\":%llu}\n",
+        "\"sequence\":%llu,\"ordinals\":%s,\"frames\":%llu,\"partial\":%s,\"measured_ms\":%.9f,"
+        "\"span_valid\":%s,\"valid_span_ms\":%.9f,\"valid_gap_ms\":%.9f,\"span_frames\":%llu,",
         (unsigned long long)(window * GP_WINDOW + 1), (unsigned long long)report_end,
-        (unsigned long long)window_frames, partial_report ? "true" : "false", total_ms, window_span, window_gap,
-        (unsigned long long)dropped_records, (unsigned long long)failed_slots,
-        (unsigned long long)stats_failures, (unsigned long long)output_failures);
-    output_row(summary.data);
-    if (output_file) fflush(output_file);
+        (unsigned long long)(window + 1), window_ordinals ? "true" : "false",
+        (unsigned long long)window_frames, partial_report ? "true" : "false", total_ms,
+        window_invalid_spans ? "false" : "true", window_span, window_gap, (unsigned long long)window_valid_span_frames);
+    if (window_invalid_spans) json_add(&summary, "\"span_ms\":null,\"gap_ms\":null,");
+    else json_add(&summary, "\"span_ms\":%.9f,\"gap_ms\":%.9f,", window_span, window_gap);
+    json_add(&summary, "\"dropped\":%llu,\"failed_slots\":%llu,\"stats_failed_slots\":%llu,"
+        "\"unavailable_timestamps\":%llu,\"invalid_timestamps\":%llu,\"invalid_spans\":%llu,\"output_failures\":%llu}\n",
+        (unsigned long long)dropped_records, (unsigned long long)failed_slots, (unsigned long long)stats_failures,
+        (unsigned long long)window_unavailable_timestamps, (unsigned long long)window_invalid_timestamps,
+        (unsigned long long)window_invalid_spans, (unsigned long long)atomic_load(&output_failures));
+    output_window(summary.data, window + 1, report_end);
     LOGV("[gpu-profile] frames %llu-%llu: measured %.3f ms/frame (render %.3f compute %.3f), %.2f passes+dispatches/frame; LOAD %.2f CLEAR %.2f STORE %.2f DONT_CARE-store %.2f ops/frame; logical attachment estimate load %.3f store %.3f MiB/frame (not actual traffic); unknown-byte attachments %llu; dropped %llu failed-slots %llu",
          (unsigned long long)(window * GP_WINDOW + 1), (unsigned long long)((window + 1) * GP_WINDOW),
          total_ms / GP_WINDOW, render_ms / GP_WINDOW, compute_ms / GP_WINDOW, total_records / (double)GP_WINDOW,
@@ -401,34 +527,87 @@ static void report(void) {
     stats_failures = 0;
     load_bytes = store_bytes = unknown_bytes = 0; total_ms = render_ms = compute_ms = 0;
     window_frames = 0; window_span = window_gap = 0;
+    window_unavailable_timestamps = window_invalid_timestamps = window_invalid_spans = window_valid_span_frames = 0;
 }
 static void advance(uint64_t target) { while (window < target) { report(); window++; } }
-static uint64_t tick_delta(uint64_t end, uint64_t start) {
-    uint64_t delta = end - start;
-    return V.timestamp_bits < 64 ? delta & ((UINT64_C(1) << V.timestamp_bits) - 1) : delta;
+static vk_gpuprof_time_domain current_time_domain(void) {
+    return (vk_gpuprof_time_domain){(uintptr_t)V.dev, (uintptr_t)V.queue, V.qfam,
+        V.timestamp_bits, V.props.limits.timestampPeriod};
 }
-static double tick_ms(uint64_t end, uint64_t start) {
-    return (double)tick_delta(end, start) * V.props.limits.timestampPeriod / 1e6;
+static void frame_time_failure(vk_gpuprof_time_status status) {
+    completed.failed = 1;
+    if (completed.status == GP_TIME_OK) completed.status = status;
+}
+static int query_readable(VkResult result) { return result == VK_SUCCESS || result == VK_NOT_READY; }
+static void invalid_timestamp(vk_gpuprof_slot *slot, uint32_t query, vk_gpuprof_time_status status) {
+    if (!(slot->timestamp_marks[query] & 2)) {
+        slot->timestamp_marks[query] |= 2;
+        completed.invalid_timestamps++; window_invalid_timestamps++;
+    }
+    frame_time_failure(status);
+}
+static void count_timestamp(vk_gpuprof_slot *slot, uint32_t query, vk_gpuprof_timestamp stamp, VkResult result) {
+    if (!(slot->timestamp_marks[query] & 1)) {
+        slot->timestamp_marks[query] |= 1;
+        if (!query_readable(result)) invalid_timestamp(slot, query, GP_TIME_QUERY_FAILED);
+        else if (!stamp.available) { completed.unavailable_timestamps++; window_unavailable_timestamps++; }
+    }
+    if (!query_readable(result)) frame_time_failure(GP_TIME_QUERY_FAILED);
+    else if (!stamp.available) frame_time_failure(GP_TIME_UNAVAILABLE);
+}
+static void check_interval(vk_gpuprof_slot *slot, uint32_t last_query, vk_gpuprof_interval interval) {
+    if (interval.status == GP_TIME_OK) { completed.timestamp_wraps += interval.wrapped; return; }
+    if (interval.status == GP_TIME_UNAVAILABLE) frame_time_failure(interval.status);
+    else invalid_timestamp(slot, last_query, interval.status);
 }
 static void finish_frame(void) {
     if (!completed.frame) return;
     finalize_passes();
-    double span = completed.has_ticks ? tick_ms(completed.last, completed.first) : 0;
-    double gap = span - completed.measured;
+    vk_gpuprof_interval interval = {.status = GP_TIME_MISSING};
+    if (completed.has_ticks) interval = vk_gpuprof_interval_check(completed.first, completed.last,
+        completed.first_domain, completed.last_domain);
+    if (interval.status != GP_TIME_OK && completed.status == GP_TIME_OK) {
+        frame_time_failure(interval.status);
+        if (interval.status != GP_TIME_UNAVAILABLE && interval.status != GP_TIME_MISSING) {
+            completed.invalid_timestamps++; window_invalid_timestamps++;
+        }
+    }
+    double gap = interval.ms - completed.measured;
     double epsilon = V.props.limits.timestampPeriod * (GP_RECORDS * 2.0 + 2) / 1e6;
-    int failed = completed.failed || completed.dropped || !completed.has_ticks || gap < -epsilon;
-    uint64_t long_dropped = long_finish(completed.frame, span, completed.measured, gap);
+    if (completed.status == GP_TIME_OK && (completed.failed || completed.dropped)) frame_time_failure(GP_TIME_INCOMPLETE);
+    if (completed.status == GP_TIME_OK && gap < -epsilon) frame_time_failure(GP_TIME_NEGATIVE_GAP);
+    int valid = completed.status == GP_TIME_OK;
+    char span_text[64] = "null", gap_text[64] = "null", raw_text[64] = "null", first_text[32] = "null", last_text[32] = "null";
+    if (interval.has_value) snprintf(raw_text, sizeof raw_text, "%.9f", interval.ms);
+    if (valid) {
+        snprintf(span_text, sizeof span_text, "%.9f", interval.ms); snprintf(gap_text, sizeof gap_text, "%.9f", gap);
+        window_span += interval.ms; window_gap += gap; window_valid_span_frames++;
+    } else {
+        window_invalid_spans++;
+        LOGV("[gpu-profile invalid] frame=%llu reason=%s raw-span-ms=%s first=%llu/%llu last=%llu/%llu queue-family=%u bits=%u",
+            (unsigned long long)completed.frame, vk_gpuprof_time_reason(completed.status), raw_text,
+            (unsigned long long)completed.first.ticks, (unsigned long long)completed.first.available,
+            (unsigned long long)completed.last.ticks, (unsigned long long)completed.last.available,
+            completed.first_domain.queue_family, completed.first_domain.valid_bits);
+    }
+    if (completed.has_ticks && completed.first.available) snprintf(first_text, sizeof first_text, "%llu", (unsigned long long)completed.first.ticks);
+    if (completed.has_ticks && completed.last.available) snprintf(last_text, sizeof last_text, "%llu", (unsigned long long)completed.last.ticks);
+    uint64_t long_dropped = valid ? long_finish(completed.frame, interval.ms, completed.measured, gap) : 0;
     gp_json row = {0};
-    json_add(&row, "{\"schema\":3,\"type\":\"frame\",\"frame\":%llu,\"span_ms\":%.9f,"
-        "\"measured_ms\":%.9f,\"gap_ms\":%.9f,\"dropped\":%llu,\"reconciliation_failed\":%s,\"long_dropped\":%llu,"
-        "\"scene_width\":%u,\"scene_height\":%u}\n",
-        (unsigned long long)completed.frame, span, completed.measured, gap,
-        (unsigned long long)completed.dropped, failed ? "true" : "false", (unsigned long long)long_dropped,
+    json_add(&row, "{\"schema\":3,\"type\":\"frame\",\"frame\":%llu,\"span_ms\":%s,"
+        "\"measured_ms\":%.9f,\"gap_ms\":%s,\"raw_span_ms\":%s,\"span_valid\":%s,\"span_reason\":\"%s\","
+        "\"unavailable_timestamps\":%llu,\"invalid_timestamps\":%llu,\"timestamp_wraps\":%llu,"
+        "\"first_tick\":%s,\"last_tick\":%s,\"timestamp_bits\":%u,\"timestamp_period\":%.12g,\"queue_family\":%u,"
+        "\"dropped\":%llu,\"reconciliation_failed\":%s,\"long_dropped\":%llu,\"scene_width\":%u,\"scene_height\":%u}\n",
+        (unsigned long long)completed.frame, span_text, completed.measured, gap_text, raw_text,
+        valid ? "true" : "false", vk_gpuprof_time_reason(completed.status),
+        (unsigned long long)completed.unavailable_timestamps, (unsigned long long)completed.invalid_timestamps,
+        (unsigned long long)completed.timestamp_wraps, first_text, last_text,
+        completed.first_domain.valid_bits, completed.first_domain.period_ns, completed.first_domain.queue_family,
+        (unsigned long long)completed.dropped, valid ? "false" : "true", (unsigned long long)long_dropped,
         completed.scene_w, completed.scene_h);
-    output_row(row.data);
-    if (output_file) fflush(output_file);
-    window_span += span; window_gap += gap; window_frames++;
-    last_completed = completed.frame;
+    output_frame(row.data, completed.frame);
+    window_frames++; last_completed = completed.frame;
     memset(&completed, 0, sizeof completed);
 }
 
@@ -445,6 +624,10 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
             int requested = se && !strcmp(se, "1");
             stats_on = vk_gpuprof_on && requested && V.has_pipeline_statistics;
             if (requested) LOGV("[gpu-profile] geometry+fragment statistics %s (pipelineStatisticsQuery=%d; TOTK_VK_GPU_PROFILE_STATS=1)", stats_on ? "on" : "unavailable", V.has_pipeline_statistics);
+            const char *oe = getenv("TOTK_VK_GPU_PROFILE_ORDINALS");
+            window_ordinals = oe && !strcmp(oe, "1");
+            LOGV("[gpu-profile] window ordinals=%d (TOTK_VK_GPU_PROFILE_ORDINALS=%s; default=0; ordinal=0 means all frame ordinals)",
+                window_ordinals, oe ? oe : "unset");
             if (vk_gpuprof_on) {
                 const char *mode = getenv("TOTK_OPERATION_MODE"), *resolution = getenv("TOTK_RENDER_RES");
                 int handheld = mode && !strcmp(mode, "handheld");
@@ -486,6 +669,8 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
     current = *slot; current->n = current->dropped = 0; current->sealed = 0;
     current->ns = 0; current->has_pre = 0; current->pre_cb = VK_NULL_HANDLE;
     current->nsegment = 1; current->segment[0] = (gp_segment){frame, 0, 0};
+    current->domain = current_time_domain();
+    memset(current->timestamp_marks, 0, sizeof current->timestamp_marks);
     vkResetQueryPool(V.dev, current->pool, 0, GP_TIMESTAMPS);
     if (stats_on) vkResetQueryPool(V.dev, current->stats, 0, GP_RECORDS);
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE);
@@ -532,17 +717,20 @@ static void ingest_record(gp_record *r, double ms, int stats_valid) {
 }
 void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
     if (!slot) return;
+    const VkQueryResultFlags flags = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
     VkResult result = slot->n ? vkGetQueryPoolResults(V.dev, slot->pool, 0, slot->n * 2,
-        slot->n * 2 * sizeof(uint64_t), slot->ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) : VK_SUCCESS;
+        slot->n * 2 * sizeof slot->ticks[0], slot->ticks, sizeof slot->ticks[0], flags) : VK_SUCCESS;
     VkResult span_result = vkGetQueryPoolResults(V.dev, slot->pool, GP_SPAN_BASE, slot->nsegment + 1,
-        (slot->nsegment + 1) * sizeof(uint64_t), slot->span_ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
-    if (slot->has_pre && vkGetQueryPoolResults(V.dev, slot->pool, GP_PRE_QUERY, 1,
-        sizeof slot->pre_tick, &slot->pre_tick, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT)) span_result = VK_NOT_READY;
+        (slot->nsegment + 1) * sizeof slot->span_ticks[0], slot->span_ticks, sizeof slot->span_ticks[0], flags);
+    VkResult pre_result = slot->has_pre ? vkGetQueryPoolResults(V.dev, slot->pool, GP_PRE_QUERY, 1,
+        sizeof slot->pre_tick, &slot->pre_tick, sizeof slot->pre_tick, flags) : VK_SUCCESS;
     VkResult sr = stats_on && slot->ns ? vkGetQueryPoolResults(V.dev, slot->stats, 0, slot->ns,
         slot->ns * sizeof slot->counters[0], slot->counters, sizeof slot->counters[0], VK_QUERY_RESULT_64_BIT) : VK_SUCCESS;
     for (uint32_t q = 0; sr == VK_SUCCESS && q < slot->ns; q++)
         for (unsigned st = 0; st < GP_STATS; st++)
             slot->rec[slot->stats_owner[q]].counters[st] += slot->counters[q][st];
+    int slot_failed = result != VK_SUCCESS || span_result != VK_SUCCESS || pre_result != VK_SUCCESS;
+    int slot_reported = 0;
     for (uint32_t s = 0; s < slot->nsegment; s++) {
         const gp_segment *segment = &slot->segment[s];
         if (completed.frame && completed.frame != segment->frame) finish_frame();
@@ -550,21 +738,34 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
         completed.frame = segment->frame;
         if (!s) {
             completed.dropped += slot->dropped; dropped_records += slot->dropped;
-            failed_slots += result != VK_SUCCESS || span_result != VK_SUCCESS;
             stats_failures += sr != VK_SUCCESS;
         }
-        completed.failed |= result != VK_SUCCESS || span_result != VK_SUCCESS;
-        if (span_result == VK_SUCCESS) {
-            uint64_t first = !s && slot->has_pre ? slot->pre_tick : slot->span_ticks[segment->first];
-            if (!completed.has_ticks) completed.first = first;
-            completed.last = slot->span_ticks[segment->last]; completed.has_ticks = 1;
-        }
+        uint32_t first_query = !s && slot->has_pre ? GP_PRE_QUERY : GP_SPAN_BASE + segment->first;
+        VkResult first_result = !s && slot->has_pre ? pre_result : span_result;
+        vk_gpuprof_timestamp first = query_readable(first_result) ?
+            (!s && slot->has_pre ? slot->pre_tick : slot->span_ticks[segment->first]) : (vk_gpuprof_timestamp){0};
+        vk_gpuprof_timestamp last = query_readable(span_result) ? slot->span_ticks[segment->last] : (vk_gpuprof_timestamp){0};
+        count_timestamp(slot, first_query, first, first_result);
+        count_timestamp(slot, GP_SPAN_BASE + segment->last, last, span_result);
+        vk_gpuprof_interval segment_time = vk_gpuprof_interval_check(first, last, slot->domain, slot->domain);
+        check_interval(slot, GP_SPAN_BASE + segment->last, segment_time);
+        if (completed.has_ticks) check_interval(slot, first_query,
+            vk_gpuprof_interval_check(completed.last, first, completed.last_domain, slot->domain));
+        else { completed.first = first; completed.first_domain = slot->domain; }
+        completed.last = last; completed.last_domain = slot->domain; completed.has_ticks = 1;
+        if (segment_time.status != GP_TIME_OK || completed.status != GP_TIME_OK) slot_failed = 1;
         for (uint32_t i = 0; i < slot->n; i++) {
             gp_record *r = &slot->rec[i];
-            if (r->frame != segment->frame || result != VK_SUCCESS) continue;
-            ingest_record(r, tick_ms(slot->ticks[2 * i + 1], slot->ticks[2 * i]),
-                r->stats_count && !r->stats_invalid && sr == VK_SUCCESS);
+            if (r->frame != segment->frame) continue;
+            vk_gpuprof_timestamp start = query_readable(result) ? slot->ticks[2 * i] : (vk_gpuprof_timestamp){0};
+            vk_gpuprof_timestamp end = query_readable(result) ? slot->ticks[2 * i + 1] : (vk_gpuprof_timestamp){0};
+            count_timestamp(slot, 2 * i, start, result); count_timestamp(slot, 2 * i + 1, end, result);
+            vk_gpuprof_interval pass_time = vk_gpuprof_interval_check(start, end, slot->domain, slot->domain);
+            check_interval(slot, 2 * i + 1, pass_time);
+            if (pass_time.status != GP_TIME_OK) { slot_failed = 1; continue; }
+            ingest_record(r, pass_time.ms, r->stats_count && !r->stats_invalid && sr == VK_SUCCESS);
         }
+        if (slot_failed && !slot_reported) { failed_slots++; slot_reported = 1; }
         if (segment->frame <= slot->sealed) finish_frame();
     }
     if (slot->sealed) advance(slot->sealed / GP_WINDOW);

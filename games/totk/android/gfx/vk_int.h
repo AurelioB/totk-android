@@ -605,6 +605,8 @@ typedef enum {
     VK_PASS_END_MERGE_HAZARD, VK_PASS_END_SPLIT
 } vk_pass_end_kind;
 extern int vk_gpuprof_on;   /* initialized once at first slot; off hot paths are a single branch */
+void vk_gpuprof_identity(const char *commit, const char *package, uint64_t version, const char *build);
+void vk_gpuprof_shutdown(void); /* writer-only orderly end; no GPU retirement/join implied */
 void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb);
 void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot);
 void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot);   /* completion thread, AFTER the existing fence */

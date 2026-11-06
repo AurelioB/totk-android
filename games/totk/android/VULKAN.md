@@ -1463,6 +1463,57 @@ measurements, the ownership contract is:
   fractions use that common reference, with the game resolution as an explicit no-scene fallback, not the pass area.
   Analyzer families merge scene-relative MRTs and scene-sized depth prepasses through DRS; fixed depth targets
   keep absolute families. Window rows preserve separate reference variants of the same absolute key.
+- **Compact profiler windows:** `TOTK_VK_GPU_PROFILE_ORDINALS=0` (default; only exact `1` enables it)
+  aggregates across frame ordinals by exact key + reference dimensions + `scene_relative`; ordinal `0`
+  is the all-ordinals sentinel, not a pass position. `=1` restores positive-ordinal window rows.
+  `[gpu-profile] window ordinals=0/1` proves the launch policy. Mode-2 raw split logs and mode-3
+  selected `long_frame` rows retain actual positive ordinals in either setting. Times, counts, absolute
+  areas and explicitly statistics-matched draws/time are still sums, not averages or synthetic zeros.
+- **Profiler capture lifecycle:** the default is 128 MiB per JSONL file × four files; compact windows
+  target a 6–8-minute pan without rotation, not a guaranteed duration for arbitrary pass counts/raw modes.
+  Each rotation repeats a schema-3 header with launch ID, APK `assets/build.txt` commit, package/versionCode
+  when available, whitelisted launch environment, effective profiling switches and Vulkan driver identity.
+  Exact APK/driver hashes must be joined from the capture artifacts; they are not invented in process.
+  Monotonic window sequences and rotation indices let the analyzer flag complete missing windows and
+  retention eviction. Normal Android close/destruction writes `session_end` under the writer lock;
+  crash/kill has no fabricated end marker. A clean writer end does **not** claim all GPU queries retired.
+- **Invalid span authority:** timestamp reads request 64-bit values **and availability**, without WAIT;
+  an unavailable endpoint is never a zero-duration sample or silently replaced by a later endpoint.
+  Each retired slot captures its immutable device, queue, queue family, `timestampValidBits` and period.
+  Both endpoints and cross-slot adjacency must have the same domain. The renderer uses queue index zero
+  of its one graphics+compute family (`V.queue`) for pre/main/framegen command buffers; worker secondaries
+  inherit that submission, not a separate worker queue. Device/queue/domain changes invalidate a span.
+  Counters are masked to the family's valid bits before modular subtraction; a genuine short counter wrap
+  is accepted and counted. Modular arithmetic alone cannot distinguish a wrap from a backwards/stale
+  endpoint: every individual interval and whole frame must also be at most 10,000 ms.
+  This bound is a conservative corruption guard, **not** proof that available values have no driver fault.
+  Thor's 48-bit/52.0833320618-ns counter wraps after roughly 169.7 days; the old huge positive spans
+  were backwards endpoints misread as that wrap. Old files lack ticks/availability, so their original
+  driver/query failure cannot be reconstructed.
+  Frame/window `span_valid=false` makes `span_ms`/`gap_ms` null, with per-window unavailable/invalid
+  timestamp and invalid-span counts plus raw forensic endpoint fields retained. A valid span requires
+  every contributing endpoint/interval, complete records and nonnegative reconciliation within timestamp
+  quantization tolerance; windows retain `valid_span_ms`/`span_frames` separately if any frame is invalid.
+  The analyzer also rejects implausibly huge older positive spans despite an old success flag.
+  Explicit `--legacy-span-replay` accepts schema-2 frame/window timing only; it cannot recover missing
+  query availability or reinterpret old pass-area semantics. No mobile overhead benefit is claimed.
+- **Profiler cost is not passive:** in the inspected Turnip source
+  (`turnip/wt-rpmode/mesa/src/freedreno/vulkan/tu_query_pool.cc:2100–2144`), every
+  `ALL_COMMANDS` timestamp issues a WFI before reading the always-on counter; its comment explicitly
+  calls out CP stalling. All enabled modes add two such timestamps per timed pass/scope plus frame/slot
+  boundaries. Modes 2/3 do not reduce that GPU cost: mode 2 adds raw CPU logs, and mode 3 adds history
+  memory/output for selected frames. Statistics add query start/stop barriers per secondary chunk (or
+  inline primary), not merely once per aggregate pass. Turnip's `emit_begin_stat_query`/`emit_end_stat_query`
+  (`tu_query_pool.cc:1157–1222,1674–1733`) start/stop counters, WFI, snapshot all statistic registers,
+  then subtract/accumulate results with memory-write waits. In a tiled pass that draw stream can execute
+  repeatedly. Vertex-stage statistics explicitly disable concurrent binning for GMEM passes
+  (`tu_cmd_buffer.cc:3479–3486`); secondary draw streams replay per tile (`:3817,6524`).
+  This is a plausible large GPU perturbation,
+  not a measured decomposition of the Odin slowdown. Host query resets are CPU memory writes; retired
+  result reads use no WAIT flag (`tu_query_pool.cc:678–789,1075–1086`), so they do not intentionally add
+  a new queue/fence wait. Lower-volume JSONL saves CPU/I/O only, not these GPU barriers.
+  Always isolate profile-off, timestamps-only, then statistics under identical driver/TU_DEBUG settings;
+  do not interpret instrumented frame spans as uninstrumented game performance.
 
 Pipeline handle selection deliberately remains on the walking thread in this cutover. `pipe_get`'s cold asynchronous
 misses skip draws; emitted draws immediately update cumulative synthetic samples, used by later reports and conditions.
