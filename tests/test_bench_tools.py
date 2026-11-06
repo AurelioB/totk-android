@@ -288,6 +288,18 @@ def ab_log(windows, ctl):
 
 
 class Pacing(unittest.TestCase):
+    def test_cumulative_draw_counter_differences_and_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'totk.log'
+            p.write_text(''.join(f'[nvn-vk] frame {f}: 57.0 fps over the last 300, {d} draws\n'
+                                 for f, d in ((300, 1200000), (600, 2700000), (900, 100),
+                                              (1200, 1500100), (1800, 4500100), (2100, 6000100))))
+            rates = analyze.parse_log(p)[5]['draw_rates']
+        self.assertEqual(rates, {600: 5000, 1200: 5000, 2100: 5000})
+        self.assertNotIn(300, rates)  # no assumed zero origin
+        self.assertNotIn(900, rates)  # reset
+        self.assertNotIn(1800, rates)  # missing intermediate 300-frame sample
+
     def test_steady_and_dip_report_separate_time_weighted_states(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)

@@ -56,6 +56,11 @@ points) says **verdict confounded by dips** rather than declaring a speed win fr
 steady-fps estimate. Historical JSON without pacing data is labelled unavailable and retains legacy comparisons;
 re-analyze its original logs with the preset target to obtain a pacing-aware comparison.
 
+Draws are a **cumulative** backend counter: `draws_per_frame` uses consecutive 300-frame sample differences,
+`(D_now - D_previous)/(frame_now - frame_previous)`, never `D_now/300`. First samples, counter/frame resets and
+missing intermediate samples have no rate (null); the next complete monotonic pair resumes measurement.
+`draws_per_frame_mean` and `draws_windows` report the mean and coverage over usable windows.
+
 Example (one device, one scene; placeholders in `<>`):
 
 ```sh

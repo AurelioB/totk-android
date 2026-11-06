@@ -62,7 +62,7 @@ AB_METRICS = ('fps_steady', 'dip_time_fraction', 'fps_mean', 'fps_min', 'p50_ms_
 
 def parse_log(path):
     timing, gpu, fps, stut, longf, info = {}, {}, {}, {}, [], {}
-    frame_ms, near33 = {}, {}
+    frame_ms, near33, draw_samples = {}, {}, []
     last_window = None
     for line in open(path, encoding='utf-8', errors='replace'):
         if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):
@@ -72,6 +72,8 @@ def parse_log(path):
         if m := re.search(r'\[nvn-vk\] frame (\d+): ([\d.]+) fps over the last 300', line):
             fps[int(m[1])] = float(m[2])
             last_window = int(m[1])
+            if d := re.search(r'over the last 300, (\d+) draws\b', line):
+                draw_samples.append((last_window, int(d[1])))
         if m := re.search(r'\[nvn-vk\] frame (\d+), stutter: longest frame ([\d.]+) ms, (\d+) frames over (\d+) ms, (\d+) over (\d+) ms', line):
             stut[int(m[1])] = (int(m[3]), int(m[4]), int(m[5]), int(m[6]))
         if m := re.search(r'\[长帧\] 帧 (\d+)（([\d.]+) s）整帧 ([\d.]+) ms', line):
@@ -93,9 +95,21 @@ def parse_log(path):
         if 'device lost' in line.lower():
             info['device_lost'] = info.get('device_lost', 0) + 1
     info['frame_ms'], info['near33'] = frame_ms, near33
+    info['draw_rates'] = cumulative_draw_rates(draw_samples)
     return timing, gpu, fps, stut, longf, info
 
 
+
+def cumulative_draw_rates(samples):
+    """Consecutive cumulative samples only: no invented zero origin, reset or missing-window interpolation."""
+    rates, previous = {}, None
+    for frame, draws in samples:
+        if previous:
+            pf, pd = previous
+            if frame - pf == 300 and draws >= pd:
+                rates[frame] = (draws - pd) / (frame - pf)
+        previous = frame, draws
+    return rates
 
 def pacing_of(end, fps, target, info):
     """Classify >=20% half-rate frames as a dip; otherwise use fps < 5/6 target when frame coverage is incomplete.
@@ -198,6 +212,9 @@ def summarize(windows, thermal=()):
         **pacing,
         'fps_min': min(vals('fps'), default=None), 'fps_max': max(vals('fps'), default=None),
         'fps_mean': round(sum(vals('fps')) / len(vals('fps')), 2) if vals('fps') else None,
+        'draws_per_frame_mean': round(sum(vals('draws_per_frame')) / len(vals('draws_per_frame')), 2)
+                                if vals('draws_per_frame') else None,
+        'draws_windows': len(vals('draws_per_frame')),
         'p50_ms_median': p50s[len(p50s) // 2] if p50s else None,
         'p95_ms_max': max(vals('p95_ms'), default=None), 'max_ms': max(vals('max_ms'), default=None),
         'gpu_ms_mean': round(sum(vals('gpu_ms')) / len(vals('gpu_ms')), 2) if vals('gpu_ms') else None,
@@ -525,14 +542,15 @@ def main():
                     w = {'frames': [f - 299, f], 'fps': fps.get(f), 'p50_ms': timing[f][0], 'p95_ms': timing[f][1],
                          'max_ms': round(timing[f][2], 1), 'gpu_ms': gpu.get(f), 'long_ge25': sum(x[1] >= 25 for x in lf),
                          'long_ge45': sum(x[1] >= 45 for x in lf), 'over33': st[0] if st else None,
-                         'over50': st[2] if st else None}
+                         'over50': st[2] if st else None, 'draws_per_frame': info['draw_rates'].get(f)}
                     w.update(pacing_of(f, w['fps'], target, info))
                     windows.append(w)
                     print(f'{f-299:>6}-{f:<6} {w["fps"] or 0:5.1f} {w["p50_ms"]:6.2f} {w["p95_ms"]:6.2f} {w["max_ms"]:6.1f} '
                           f'{w["gpu_ms"] if w["gpu_ms"] is not None else float("nan"):7.1f}  {w["long_ge25"]:>6}    '
                           f'{w["long_ge45"]:>6}    {st[0] if st else "-"}/{st[2] if st else "-"} '
                           f'(>{st[1] if st else "-"}/>{st[3] if st else "-"}) {w["pacing_state"]} '
-                          f'near33={w["frames_near33"]} ({w["pacing_source"]})')
+                          f'near33={w["frames_near33"]} ({w["pacing_source"]}) '
+                          f'draws/frame={w["draws_per_frame"] if w["draws_per_frame"] is not None else "-"}')
                 rows = parse_samples(None, kv['T0'], kv['T1'], samples)
                 all_rows += rows
                 if rows:
