@@ -5,9 +5,10 @@ and comparing against the recorded baselines. The full procedure is the `totk-be
 (`.omp/skills/totk-benchmark/SKILL.md`); this is the quick reference.
 
 Device side: `su` root (for `sendevent`, the app's private `totk.log` and `settings.env`, `dmesg`, and the thermal /
-cpufreq / kgsl sysfs files). Nothing is pushed to the device; the device writes are the dmesg marker of
-`collect.sh --mark` and the live-switch control file of `live.sh` / `ab.sh` (`<game>/totk.ctl`, written with the game
-folder's owner and explicit SELinux context from `ls -Zd <game dir>`). Everything is read from `totk.log` and sysfs / procfs, never from
+cpufreq / kgsl sysfs files). Ordinary benchmark tools write only the dmesg marker and live-control file
+(`<game>/totk.ctl`, atomically published with the game folder's owner and explicit SELinux context from `ls -Zd`).
+The explicit CPU profiler below also stages its NDK binary in `/data/local/tmp` and temporarily changes
+recorded perf access controls. Everything is read from `totk.log` and sysfs / procfs, never from
 logcat (some devices' logd drops the game's lines). `bench_input.sh`, `pan.sh` and `live.sh` run every root command
 through one persistent root shell per device (`rootsh.py`; `sampler.py` holds its own), pinned to the slowest cpufreq
 cluster: a `su -c` per command costs the device a su session and, with Magisk, a su-notify `app_process` on any core.
@@ -133,8 +134,9 @@ percent. Historical rows derive external_power from available raw ac/usb fields;
 Pan JSON retains timestamped fields rather than inferring charger state from temperatures.
 
 Android toybox `chcon` does not support GNU `--reference`. `live.sh` reads `CTX=$(ls -Zd "$GAME")`,
-extracts its first field (including the full `s0:c...` MLS categories), then runs `chcon "$CTX" "$GAME/totk.ctl"`
-before appending. Missing context or failed chcon aborts the write. There is no totk.env writer in these tools;
+extracts its first field (including the full `s0:c...` MLS categories), then runs `chcon "$CTX"` on the fully
+written temporary control file before atomic rename to `"$GAME/totk.ctl"`. Missing context or failed chcon
+aborts publication without replacing the previous batch. There is no totk.env writer in these tools;
 when writing one manually, apply the same game-directory owner/mode/context procedure to `"$GAME/totk.env"`,
 not a generic `app_data_file:s0` label that discards its categories.
 
@@ -405,3 +407,50 @@ Set `TOTK_SHADER_SEED_DIR` to that seed's absolute directory and select the host
 The fixture verifies actual pixels and secondary recorder use; it does not establish Android overhead or speedup.
 Run host builds/matrices under `flock /home/agent/Projects/totk-android/.scratch/hosttest.lock`
 and `taskset -c 0-3 nice -n 10`; no Android device is needed.
+
+## Per-thread CPU profiling (rooted device, explicit opt-in)
+
+`cpuprof.sh` records `cpu-clock` at 750 Hz per running thread (500–1000 configurable),
+with frame-pointer call chains. It does not install an APK, change a game setting,
+launch the game, or drive the camera. Reserve exclusive profiling access first;
+no other tool may change perf sysctls/properties during its capture/recovery.
+
+```sh
+taskset -c 0-3 nice -n 10 tools/bench/cpuprof.sh -s <serial> \
+  --symbols <release-work>/symbols --commit 3421073 --seconds 60 --hz 750 \
+  --out <new-capture-directory>
+# After capture.ready appears, wait 5 seconds, then run pan.sh --seconds 48 --no-shot
+# in another controller. The profiler uses a separate persistent root broker so
+# its bounded record command does not block camera input on the benchmark broker.
+```
+
+`build_release.py:138–155` keeps unstripped libraries in its `--work` directory's
+`symbols/`; RC8 is commit `34210734b46ffc340ff61f1304f355bf32271bca`.
+The capture authenticates installed `assets/build.txt` and the APK library's GNU
+build ID against the supplied DWARF/symbol-bearing `libtotk.so` before changing
+perf controls. A rebuild with the same source commit is not sufficient unless
+its build ID matches. The Android arm64 binary comes from NDK
+`28.2.13676358/simpleperf/bin/android/arm64/simpleperf` by default.
+Deployment pushes to a unique shell-accessible flat `/data/local/tmp` pathname,
+then root-copies/chmods into its private capture directory; it never asks the
+non-root adb shell user to push inside a mode-0700 root directory.
+
+The device EXIT/signal trap restores recorded perf sysctls and the four
+property-backed simpleperf controls (including initially empty properties),
+then compares a full readback with the durable `controls.before`. The host
+independently recovers/verifies before removing its owned directory and lock.
+On connection/power loss, retain the host output directory and run
+`cpuprof.sh -s <same-serial> --out <capture-directory> --recover`; do not start
+another profiler first. A changed boot ID refuses stale writes. Recovery never
+removes a different session's lock. `capture.json` records restoration/cleanup;
+failed recordings are not successful profiles.
+
+`cpuprof_report.py <perf.data> --symbols <release-work>/symbols --out <report.json>`
+re-symbolizes offline using the NDK ReportLib API and rejects mismatched recorded
+libtotk build IDs. Rankings retain each TID and group walker, recorders, submit,
+game (`g-*`) and other threads. CPU milliseconds use event periods, not sample
+counts. Inclusive stacks count a recursive symbol once per sample; they overlap
+and are not additive wall-time/critical-path measurements. Frame-pointer gaps,
+unknown/JIT guest symbols, sampling overhead and unsymbolized driver code limit
+attribution. Do not divide whole-capture CPU by pan-only frame counts.
+See [candidate ranking](cpuprof-candidates.md) for the host design gate.

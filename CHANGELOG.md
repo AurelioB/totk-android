@@ -5,6 +5,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 
 ## Unreleased
 
+### Developer tools
+- Add opt-in rooted-device CPU profiling with NDK simpleperf frame-pointer stacks,
+  exact-build symbol checks, shell-accessible staging, and verified perf-control restoration.
+  Per-thread period-weighted self/inclusive reports separate walker, recorder, submit and game CPU.
+
 ### Runtime
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
   Normal launches no longer start its tail thread or wake logd for every frame log. Crash reports remain enabled.
