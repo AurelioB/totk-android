@@ -610,6 +610,15 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot);   /* completion thread, AF
 void vk_gpuprof_begin(VkCommandBuffer cb, const VkRenderingInfo *ri, const VkFormat formats[10],
                      const tex_t *const textures[10], const uint32_t widths[10], const uint32_t heights[10], uint32_t samples);
 void vk_gpuprof_end(VkCommandBuffer cb, vk_pass_end_kind reason, uint32_t detail);
+typedef struct {
+    VkQueryPool pool, stats;
+    uint32_t timestamp, stats_query1;
+} vk_gpuprof_end_token;
+void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpuprof_end_token *token);
+void vk_gpuprof_end_emit(VkCommandBuffer cb, const vk_gpuprof_end_token *token);
+VkQueryPipelineStatisticFlags vk_gpuprof_stats_mask(void);
+void vk_gpuprof_secondary(int enabled);
+int vk_gpuprof_chunk_query(VkQueryPool *pool, uint32_t *query);
 void vk_gpuprof_draw(vk_shader *const shaders[6], int compute);
 void vk_gpuprof_dispatch_begin(VkCommandBuffer cb);
 void vk_gpuprof_clear(uint32_t mask);   /* proven full attachment clear, before any draw */

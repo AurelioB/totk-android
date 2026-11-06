@@ -1745,11 +1745,10 @@ make -C wt-frametl/games/totk/android TARGET=linux CC=cc \
 ## Per-pass GPU time and tile-traffic audit (2026-10-22)
 
 `TOTK_VK_GPU_PROFILE=1` enables the isolated `gfx/vk_gpuprof.c` diagnostic; default is off.
-Use `TOTK_VK_REC_THREADS=0`. The threaded recorder must force its inline path when this
-switch is set: its parked secondary passes finish in a different primary section, and
-timestamps on the walking primary would otherwise measure the wrong work. This diagnostic
-does **not** measure worker-mode performance. Do not combine it with `TOTK_VK_PASS_PROFILE`,
-pass dumps, screenshots or the pass probe for performance measurements.
+The threaded recorder remains enabled. Each pass part retains its original primary's
+query coordinates; assembly closes the bracket after executing its secondary chunks,
+on that same primary. `TOTK_VK_REC_THREADS=0` is also supported. Do not combine it with
+`TOTK_VK_PASS_PROFILE`, pass dumps, screenshots or the pass probe for performance measurements.
 
 Each existing submission slot owns a timestamp query pool, reset when that slot is reused.
 `vkCmdWriteTimestamp2(ALL_COMMANDS)` brackets primary rendering instances (including attachment
@@ -1844,9 +1843,9 @@ pass setup/teardown and synchronization overhead, against extra CPU hazard check
 
 `TOTK_VK_GPU_PROFILE=2` retains the normal 300-frame aggregates and adds `[gpu-split]` for
 **every completed instance**, with recording-frame number, instance ordinal, stable signature,
-draw count, GPU ms, end reason and detail. `=1` remains the compact mode. Both require the
-recorder's inline path. Detailed logging can be voluminous; use short diagnostic runs, not
-their fps as the final performance comparison.
+draw count, GPU ms, end reason and detail. `=1` remains the compact mode. Both support
+the normal recorder workers. Detailed logging can be voluminous; use short diagnostic
+runs, not their fps as the final performance comparison.
 
 Reasons distinguish NVN barriers, texture invalidation barriers, attachment changes, clears,
 copies/blits, compute dispatches, CPU waits/readbacks, submission ends, uniform flushes,

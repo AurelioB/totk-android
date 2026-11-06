@@ -54,6 +54,7 @@ typedef struct rec_job {
     vk_record_draw *draw; vk_record_descriptor *info;
     uint32_t count, limit, capdraw, ninfo, capinfo, info_mark, slot, ncolor;
     VkFormat color[8], depth, stencil; VkSampleCountFlagBits samples;
+    VkQueryPool profile_pool; uint32_t profile_query; /* this secondary's own immutable stats query */
     VkCommandBuffer cb; atomic_int done; int parallel;
     rec_event *event; uint32_t nevent, capevent;
     uint64_t generation, reset_time, id, ready_ns;
@@ -67,6 +68,7 @@ typedef struct rec_job {
 typedef struct rec_pass {
     struct rec_pass *all_next, *next; rec_job *jobs; VkCommandBuffer primary;
     uint32_t draws;
+    vk_gpuprof_end_token profile_end; /* immutable handles/indices; assembler never reads the walking profiler */
 } rec_pass;
 typedef struct rec_context {
     uint32_t lease_head, lease_tail, ncb;
@@ -137,7 +139,9 @@ static rec_job *guard_building;
 static uint32_t current_slot, chunk_draws = 128, lead_draws = 32, inline_draws, pass_draws;
 static int threads = -1, ds_off, dyn_off, vma_names, descriptor_stock;
 static uint32_t descriptor_stock_max;   /* TOTK_VK_DESC_STOCK_MAX_SETS launch value, 0: no ceiling */
-static struct { uint32_t ncolor; VkFormat color[8], depth, stencil; VkSampleCountFlagBits samples; } pass;
+static struct {
+    uint32_t ncolor; VkFormat color[8], depth, stencil; VkSampleCountFlagBits samples;
+} pass;
 static uint64_t busy_ns[REC_WORKERS], chunks_parallel, chunks_inline, passes_parallel, passes_inline;
 static uint64_t next_chunk_id;
 static uint64_t wait_ns, walk_ns, walk_wait_mark, inline_ns, execute_ns, reset_ns, worker_reset_ns, job_ns;
@@ -1040,6 +1044,7 @@ static void record_job(rec_job *j, unsigned worker) {
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT, .pInheritanceInfo = &ii};
     VKCHECK(vkBeginCommandBuffer(j->cb, &bi));
+    if (j->profile_pool) vkCmdBeginQuery(j->cb, j->profile_pool, j->profile_query, 0);
     VkPipeline pipeline = VK_NULL_HANDLE; vk_record_dynamic dynamic = {0};
     VkPipelineLayout bound_layout = VK_NULL_HANDLE; VkDescriptorSet bound_set[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkBuffer vertices[17], index_buffer = VK_NULL_HANDLE;
@@ -1113,6 +1118,7 @@ static void record_job(rec_job *j, unsigned worker) {
             draws++;
         } else if (d->count) { vkCmdDraw(j->cb, d->count, d->instances, d->first, d->base_instance); draws++; }
     }
+    if (j->profile_pool) vkCmdEndQuery(j->cb, j->profile_pool, j->profile_query);
     VKCHECK(vkEndCommandBuffer(j->cb));
     project_guards(j);   /* freeze every owner/view/alias VA while this recording job still owns its inputs */
     /* Publish once per completed chunk, never a ring lock for each draw or descriptor update. */
@@ -1236,7 +1242,7 @@ int vk_record_enabled(void) {
     else LOGV("descriptor stock ceiling: none (TOTK_VK_DESC_STOCK_MAX_SETS unset or 0)");
     e = getenv("TOTK_VK_REC_THREADS"); threads = e ? atoi(e) : default_threads;
     if (threads < 0) threads = 0; if (threads > REC_WORKERS) threads = REC_WORKERS;
-    const char *diagnostics[] = {"TOTK_VK_OCCLUSION", "TOTK_VK_PASS_DUMP", "TOTK_VK_PASS_PROFILE", "TOTK_VK_PASSPROBE", "TOTK_VK_GPU_PROFILE", "TOTK_VK_PASS_MERGE"};
+    const char *diagnostics[] = {"TOTK_VK_OCCLUSION", "TOTK_VK_PASS_DUMP", "TOTK_VK_PASS_PROFILE", "TOTK_VK_PASSPROBE", "TOTK_VK_PASS_MERGE"};
     for (size_t i = 0; threads && i < sizeof diagnostics / sizeof *diagnostics; i++) {
         e = getenv(diagnostics[i]); if (e && *e && strcmp(e, "0")) { LOGV("recorder: threads disabled by %s", diagnostics[i]); threads = 0; }
     }
@@ -1405,6 +1411,8 @@ static void dispatch_building(void) {
     else j->small_info_uses = 0;
     uint32_t operations = j->count + j->nevent;
     if (!operations) { j->done = 1; return; }
+    j->profile_pool = VK_NULL_HANDLE; j->profile_query = 0;
+    if (vk_gpuprof_on) (void)vk_gpuprof_chunk_query(&j->profile_pool, &j->profile_query);
     if (inline_draws && operations < inline_draws) { uint64_t t0 = host_now_ns(); record_job(j, 0); inline_ns += host_now_ns() - t0; reset_ns += j->reset_time; j->done = 1; chunks_inline++; return; }
     j->parallel = pass_parallel = 1; j->batch_next = NULL; chunks_parallel++;
     j->ready_ns = host_now_ns();
@@ -1414,6 +1422,7 @@ static void dispatch_building(void) {
         if (small_jobs == 4 || small_draws >= 32) flush_small();
     } else { flush_small(); enqueue_batch(j); }
 }
+void vk_record_pass_flush(void) { dispatch_building(); }
 void vk_record_draw_commit(void) { pass_draws++; if (++building->count == building->limit) dispatch_building(); }
 void vk_record_draw_abort(void) { if (building) { building->ninfo = building->info_mark; building->id = ++next_chunk_id; } }
 static rec_event *event_begin(void) {
@@ -1427,13 +1436,18 @@ void vk_record_clear(const VkClearAttachment *attachment, const VkClearRect *rec
 void vk_record_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2 stage) {
     rec_event *e = event_begin(); e->kind = REC_TIMESTAMP; e->timestamp.pool = pool; e->timestamp.query = query; e->timestamp.stage = stage;
 }
-int vk_record_pass_end(VkCommandBuffer primary) {
+int vk_record_pass_end(VkCommandBuffer primary, const vk_gpuprof_end_token *profile_end) {
     dispatch_building();
-    if (!pass_head) { vkCmdEndRendering(primary); passes_inline++; return 0; }
+    if (!pass_head) {
+        vkCmdEndRendering(primary);
+        if (profile_end && profile_end->pool) vk_gpuprof_end_emit(primary, profile_end);
+        passes_inline++; return 0;
+    }
     rec_pass *p = slots[current_slot].pass_cursor;
     if (p) slots[current_slot].pass_cursor = p->all_next;
     else { p = VK_CALLOC(1, sizeof *p); p->all_next = slots[current_slot].passes; slots[current_slot].passes = p; }
     p->primary = primary; p->jobs = pass_head; p->next = NULL; p->draws = pass_draws;
+    p->profile_end = profile_end ? *profile_end : (vk_gpuprof_end_token){0};
     if (pending_tail) pending_tail->next = p; else pending_head = p; pending_tail = p;
     if (pass_parallel) passes_parallel++; else passes_inline++;
     pass_head = pass_tail = building = NULL;
@@ -1474,7 +1488,9 @@ static void record_assemble_inner(unsigned slot, int background) {
                 if (count == 64) { vkCmdExecuteCommands(p->primary, count, commands); count = 0; }
             }
             if (count) vkCmdExecuteCommands(p->primary, count, commands);
-            vkCmdEndRendering(p->primary); VKCHECK(vkEndCommandBuffer(p->primary)));
+            vkCmdEndRendering(p->primary);
+            if (p->profile_end.pool) vk_gpuprof_end_emit(p->primary, &p->profile_end);
+            VKCHECK(vkEndCommandBuffer(p->primary)));
         execute += host_now_ns() - t0;
     }
     slots[slot].pending = NULL;

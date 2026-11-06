@@ -1,6 +1,6 @@
-/* Opt-in primary-command-buffer timestamps. Slot lifetime/publication is supplied by nvn_vk.c's
-   existing fence queue; only the completion thread owns timing aggregates. No additional waits,
-   barriers or submissions. CPU audit state belongs exclusively to the recording lock. */
+/* Opt-in GPU timestamps. Slot lifetime/publication is supplied by nvn_vk.c's fence
+   queue. Deferred pass-end tokens retain immutable query coordinates, so recorder
+   assembly never touches the walking thread's current pass. */
 #include "vk_int.h"
 
 #define GP_RECORDS 2048
@@ -13,7 +13,10 @@ typedef struct {
     uint64_t shader;
     uint32_t w, h, samples, colors, bucket, compute;
 } gp_key;
-typedef struct { gp_key key; uint64_t frame; uint32_t draws, instance, reason, detail, stats_q1; } gp_record;
+typedef struct {
+    gp_key key; uint64_t frame, fragments;
+    uint32_t draws, instance, reason, detail, stats_q1, stats_count, stats_invalid;
+} gp_record;
 struct vk_gpuprof_slot {
     VkQueryPool pool, stats;
     uint32_t n, dropped, ns;
@@ -21,6 +24,7 @@ struct vk_gpuprof_slot {
     gp_record rec[GP_RECORDS];
     uint64_t ticks[GP_RECORDS * 2];
     uint64_t fragments[GP_RECORDS];
+    uint32_t stats_owner[GP_RECORDS];
 };
 typedef struct { gp_key key; uint64_t hash, count, draws, fragments, stats_count; double ms; } gp_group;
 typedef struct {
@@ -30,7 +34,7 @@ typedef struct {
 } gp_audit;
 
 int vk_gpuprof_on;
-static int stats_on;
+static int stats_on, secondary_pass;
 static vk_gpuprof_slot *current;
 static gp_record *open_record;
 static gp_audit open_audit;
@@ -128,7 +132,7 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
         const char *e = getenv("TOTK_VK_GPU_PROFILE");
         if (e && (!strcmp(e, "1") || !strcmp(e, "2"))) {
             vk_gpuprof_on = V.timestamp_bits && V.props.limits.timestampComputeAndGraphics && V.props.limits.timestampPeriod > 0 ? atoi(e) : 0;
-            LOGV("[gpu-profile] %s (TOTK_VK_GPU_PROFILE=%s); 300-frame windows, primary passes only; recorder workers must be disabled",
+            LOGV("[gpu-profile] %s (TOTK_VK_GPU_PROFILE=%s); 300-frame windows, exact primary pass parts; recorder workers supported",
                  vk_gpuprof_on ? "enabled" : "unavailable: queue/device lacks graphics+compute timestamps", e);
             const char *se = getenv("TOTK_VK_GPU_PROFILE_STATS");
             int requested = se && !strcmp(se, "1");
@@ -163,6 +167,8 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
     VkResult sr = stats_on && slot->ns ? vkGetQueryPoolResults(V.dev, slot->stats, 0, slot->ns,
         slot->ns * sizeof(uint64_t), slot->fragments, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) : VK_SUCCESS;
     stats_failures += sr != VK_SUCCESS;
+    for (uint32_t q = 0; sr == VK_SUCCESS && q < slot->ns; q++)
+        slot->rec[slot->stats_owner[q]].fragments += slot->fragments[q];
     for (uint32_t i = 0; i < slot->n; i++) {
         gp_record *r = &slot->rec[i]; advance((r->frame - 1) / GP_WINDOW);
         if (result) continue;
@@ -192,8 +198,8 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
         if (tries == GP_GROUPS) { dropped_records++; continue; }
         gp_group *g = &groups[at]; if (!g->count) { g->key = r->key; g->hash = hash; }
         g->count++; g->draws += r->draws; g->ms += ms;
-        if (r->stats_q1 && sr == VK_SUCCESS) {
-            g->fragments += slot->fragments[r->stats_q1 - 1]; g->stats_count++;
+        if (r->stats_count && !r->stats_invalid && sr == VK_SUCCESS) {
+            g->fragments += r->fragments; g->stats_count++;
         }
     }
     dropped_records += slot->dropped; failed_slots += result != VK_SUCCESS;
@@ -206,8 +212,9 @@ static void begin_record(VkCommandBuffer cb, int compute) {
     open_record->frame = frame; open_record->key.compute = (uint32_t)compute;
     open_record->instance = ++frame_instance;
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, current->n * 2);
-    if (!compute && stats_on) {
-        open_record->stats_q1 = ++current->ns;
+    if (!compute && stats_on && !secondary_pass && current->ns < GP_RECORDS) {
+        open_record->stats_q1 = ++current->ns; open_record->stats_count++;
+        current->stats_owner[current->ns - 1] = current->n;
         vkCmdBeginQuery(cb, current->stats, open_record->stats_q1 - 1, 0);
     }
 }
@@ -265,17 +272,39 @@ void vk_gpuprof_clear(uint32_t mask) {
     if (!open_record || open_record->draws) return;
     for (int j = 0; j < 10; j++) if ((mask >> j & 1) && open_record->key.a[j].format && open_record->key.a[j].load == VK_ATTACHMENT_LOAD_OP_LOAD) open_audit.load_dead |= 1u << j;
 }
-void vk_gpuprof_end(VkCommandBuffer cb, vk_pass_end_kind reason, uint32_t detail) {
+void vk_gpuprof_secondary(int enabled) { secondary_pass = enabled; }
+int vk_gpuprof_chunk_query(VkQueryPool *pool, uint32_t *query) {
+    if (!stats_on || !current || !open_record) return 0;
+    if (current->ns == GP_RECORDS) { open_record->stats_invalid = 1; return 0; }
+    *pool = current->stats; *query = current->ns++;
+    current->stats_owner[*query] = (uint32_t)(open_record - current->rec);
+    open_record->stats_count++;
+    return 1;
+}
+VkQueryPipelineStatisticFlags vk_gpuprof_stats_mask(void) {
+    return stats_on ? VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT : 0;
+}
+void vk_gpuprof_end_emit(VkCommandBuffer cb, const vk_gpuprof_end_token *token) {
+    if (!token->pool) return;
+    if (token->stats_query1) vkCmdEndQuery(cb, token->stats, token->stats_query1 - 1);
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, token->pool, token->timestamp);
+}
+void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpuprof_end_token *token) {
+    memset(token, 0, sizeof *token);
     if (!open_record) return;
     open_record->reason = (uint32_t)reason; open_record->detail = detail;
-    if (open_record->stats_q1) vkCmdEndQuery(cb, current->stats, open_record->stats_q1 - 1);
-    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, current->n * 2 + 1);
+    *token = (vk_gpuprof_end_token){current->pool, current->stats, current->n * 2 + 1, open_record->stats_q1};
     if (!open_record->key.compute) {
         if (audit_n == audit_cap) { audit_cap = audit_cap ? 2 * audit_cap : 256; audit = realloc(audit, audit_cap * sizeof *audit); if (!audit) DIE("GPU profiler audit allocation"); }
         open_audit.key = open_record->key; open_audit.key.bucket = bucket(open_record->draws);
         audit[audit_n++] = open_audit;
     }
     current->n++; open_record = NULL;
+}
+void vk_gpuprof_end(VkCommandBuffer cb, vk_pass_end_kind reason, uint32_t detail) {
+    vk_gpuprof_end_token token;
+    vk_gpuprof_end_deferred(reason, detail, &token);
+    vk_gpuprof_end_emit(cb, &token);
 }
 void vk_gpuprof_present(void) {
     for (size_t i = 0; i < audit_n; i++) {

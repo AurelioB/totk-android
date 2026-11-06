@@ -1068,17 +1068,22 @@ static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
     g_feedback_avoided += R.feedback_continued - (uint32_t)R.feedback_restore;
     VkCommandBuffer cb = vk_cb();
     if (R.secondary) {
-        if (VK_REC_VALUE(VK_REC_O_ASSEMBLE, vk_record_pass_end(cb))) cb = vk_record_next_primary();
+        vk_gpuprof_end_token profile_end = {0};
+        if (vk_gpuprof_on) {
+            vk_record_pass_flush(); /* final chunk still belongs to the profiler's current open pass */
+            vk_gpuprof_end_deferred(reason, detail, &profile_end);
+        }
+        if (VK_REC_VALUE(VK_REC_O_ASSEMBLE, vk_record_pass_end(cb, &profile_end))) cb = vk_record_next_primary();
         descriptor_unbind();
     } else {
         vk_occlusion_end(cb);   /* precise queries remain on the original inline diagnostic path */
         vkCmdEndRendering(cb);
+        if (vk_gpuprof_on) vk_gpuprof_end(cb, reason, detail);
     }
     vk_barrier_all(cb);
     /* This full barrier also issues every deferred texture invalidation before
        the next pass's reads. No deferred dependency survives an ownership end. */
     R.feedback_pending=0;
-    if (vk_gpuprof_on) vk_gpuprof_end(cb, reason, detail);
     if (PP.open >= 0) { PP.rec[PP.open].draws = (uint32_t)(g_stat_draws - PP.draws0); pp_end(cb, PP.open); PP.open = -1; }
     pso_life_pass_write(0);
     R.open = 0; g_bound_pipe = VK_NULL_HANDLE;
@@ -1289,11 +1294,13 @@ static void split_depth_begin(VkCommandBuffer cb, VkAttachmentLoadOp load) {
         (void)vk_transient(4, 4, &buffer, &offset);
         VkBufferImageCopy copy = {.bufferOffset = offset,
             .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, R.dlevel, R.dlayer, 1}, .imageExtent = {1, 1, 1}};
+        if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
         vk_barrier_all(cb);
         vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &copy);
         vk_barrier_all(cb);
         vkCmdCopyBufferToImage(cb, buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
         vk_barrier_all(cb);
+        if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
         g_split_touches++;
     }
     g_split_depth[i].image = image; g_split_depth[i].game = game; g_split_depth[i].seal = seal;
@@ -1580,7 +1587,10 @@ static int begin_rendering_inner(int draw_tail) {
       if (i >= 0) { pp_rec *r = &PP.rec[i]; r->w = R.host_w; r->h = R.host_h; r->f0 = R.cfmt[0]; r->df = R.dfmt != VK_FORMAT_UNDEFINED ? R.dfmt : R.sfmt; r->ncolor = (uint8_t)nc; PP.draws0 = g_stat_draws;
           if (R.native) r->native_op=(uint8_t)(1+(vk_tex_native_window(R.ctex[0]) ? VK_NUI_WINDOW_PASS : VK_NUI_UI_PASS)); } }
     if (R.native) native_count[vk_tex_native_window(R.ctex[0]) ? VK_NUI_WINDOW_PASS : VK_NUI_UI_PASS]++;
+    R.secondary = vk_record_enabled() && !PD.active && !PP.active && !probe_on() &&
+        !(vk_fg_extract_active && fg_extract_inline());
     if (vk_gpuprof_on) {
+        vk_gpuprof_secondary(R.secondary); /* stats stay inside secondaries; no inheritedQueries requirement */
         VkFormat fmt[10]; const tex_t *tex[10]; uint32_t widths[10], heights[10];
         for (int j = 0; j < 10; j++) {
             vk_tex *x = j < 8 ? R.ctex[j] : R.dtex;
@@ -1599,8 +1609,6 @@ static int begin_rendering_inner(int draw_tail) {
         vk_gpuprof_begin(cb, &ri, fmt, tex, widths, heights, R.samples);
     }
     PD.draws0 = g_stat_draws;
-    R.secondary = vk_record_enabled() && !PD.active && !PP.active && !probe_on() &&
-        !(vk_fg_extract_active && fg_extract_inline());
     if (R.secondary) { ri.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT; vk_record_pass_begin(nc, R.cfmt, R.dfmt, R.sfmt, R.samples); }
     R.merge_pending = R.merge_armed = R.merge_storage = R.merge_continued = 0;
     R.feedback_on=totk_live_cached(&g_feedback_narrow_live,"TOTK_VK_FEEDBACK_NARROW",g_feedback_narrow_launch);

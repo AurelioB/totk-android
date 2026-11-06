@@ -1436,10 +1436,18 @@ measurements, the ownership contract is:
   and secondary [WriteTimestamp2](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdWriteTimestamp2.html).
   The saved Thor probe and current device extension setup do not enumerate/enable maintenance7 or nested-command-buffer
   support; their availability is not inferred and the recorder does not depend on either extension.
-- **Diagnostics:** occlusion queries, pass dumps, pass profiling (including `TOTK_VK_GPU_PROFILE=1/2`),
-  `TOTK_VK_PASS_MERGE=1` and pass probes force the original single-thread path with a diagnostic log.
-  CPU split profiling continues to measure the walking thread; worker busy time and waits are reported
-  separately, not spuriously added into its exclusive categories.
+- **Diagnostics:** occlusion queries, pass dumps, `TOTK_VK_PASS_PROFILE`, `TOTK_VK_PASS_MERGE=1`
+  and pass probes force the original single-thread path with a diagnostic log. `TOTK_VK_GPU_PROFILE`
+  (default off) retains recorder workers and asynchronous assembly: timestamps bracket the full rendering pass
+  part on its original primary, from before BeginRendering to after EndRendering. All secondary chunks contribute
+  to that one exact bracket, not separately timed chunk approximations; an explicit pass split creates another
+  pass part. Empty passes and `REC_THREADS=0` use the same timing bracket. Optional pipeline statistics use
+  independent begin/end queries inside each secondary and sum into the pass; no primary statistics query remains
+  active across ExecuteCommands, so recorder profiling does not require `inheritedQueries`. Inline passes keep
+  their primary statistics query. The walker allocates chunk queries before queueing, and the assembler uses
+  captured end handles/indices without consulting or waiting for the walking profiler.
+  Keep profiler mode fixed for worker-count A/Bs; CPU split profiling still measures only the walking thread,
+  with worker busy time and waits reported separately rather than added into its exclusive categories.
 
 Pipeline handle selection deliberately remains on the walking thread in this cutover. `pipe_get`'s cold asynchronous
 misses skip draws; emitted draws immediately update cumulative synthetic samples, used by later reports and conditions.
