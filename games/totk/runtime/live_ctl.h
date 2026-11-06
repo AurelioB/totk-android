@@ -349,9 +349,9 @@ static inline void totk_live_slack_tick(void) {
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <time.h>
-/* Follows path: keep the directory watch until open succeeds, including close/attribute changes that can make a
-   root-created file readable. Then watch only the file (the game folder's log changes constantly). Failed opens
-   other than ENOENT and failed reads also retry every 250 ms; absent files block without polling or watch churn.
+/* Follows path: keep a create/move-only directory watch until open succeeds, so unrelated log writes/closes and
+   attribute changes do not wake the absent-file reader. Failed opens other than ENOENT and failed reads retry
+   every 250 ms, including ownership/context repair after creation. Then watch only the file.
    Without inotify it polls every 250 ms. A truncated or replaced file is read again from its beginning. Never returns. */
 typedef struct { const char *path; int skip_existing; unsigned long wakeups; } totk_live_reader;
 static inline void live_ctl_run(totk_live_reader *rd) {
@@ -367,7 +367,7 @@ static inline void live_ctl_run(totk_live_reader *rd) {
                unrelated folder events would wake this thread forever, even with no control-file changes. */
             if (in >= 0 && !directory) {
                 if (watch >= 0) inotify_rm_watch(in, watch);
-                watch = inotify_add_watch(in, dir, IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE | IN_ATTRIB);
+                watch = inotify_add_watch(in, dir, IN_CREATE | IN_MOVED_TO);
                 directory = watch >= 0;
             }
             fd = open(rd->path, O_RDONLY | O_CLOEXEC);
