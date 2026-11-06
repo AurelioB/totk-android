@@ -1458,6 +1458,12 @@ measurements, the ownership contract is:
   not hidden behind sampling; static attachment operations and logical byte summaries remain,
   computed from pass keys off the walker. Nested timing scopes preserve only their timing parent,
   command buffer and secondary-query state.
+  With profiling unset/off, secondary pass closes do not initialize/copy an end token and chunks
+  never store/read profiler query metadata. `rec_job`/`rec_pass` retain their non-profiler sizes
+  and member offsets: only enabled runs allocate enclosing cold metadata tails. The parked-pass
+  close keeps its original one-argument ordinary entry; the enabled token copy has a separate
+  profiled entry selected by the draw-side guard, not a token-preserving wrapper around ordinary work.
+  Cached `vk_gpuprof_on` guards remain predictable branches, not a claim of zero instructions.
   One opt-in startup preparation creates sixteen query-slot leases on the dedicated `totk-gpuprof`
   worker; startup may wait for readiness once. Thereafter the walker takes a prepared lease with
   a short private O(1) mutex operation, without query resets, result reads, formatting or I/O.

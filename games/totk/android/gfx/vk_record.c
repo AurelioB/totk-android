@@ -54,7 +54,6 @@ typedef struct rec_job {
     vk_record_draw *draw; vk_record_descriptor *info;
     uint32_t count, limit, capdraw, ninfo, capinfo, info_mark, slot, ncolor;
     VkFormat color[8], depth, stencil; VkSampleCountFlagBits samples;
-    VkQueryPool profile_pool; uint32_t profile_query; /* this secondary's own immutable stats query */
     VkCommandBuffer cb; atomic_int done; int parallel;
     rec_event *event; uint32_t nevent, capevent;
     uint64_t generation, reset_time, id, ready_ns;
@@ -68,8 +67,18 @@ typedef struct rec_job {
 typedef struct rec_pass {
     struct rec_pass *all_next, *next; rec_job *jobs; VkCommandBuffer primary;
     uint32_t draws;
-    vk_gpuprof_end_token profile_end; /* immutable handles/indices; assembler never reads the walking profiler */
 } rec_pass;
+/* The launch-time profiler switch is immutable before any job/pass allocation.
+   Only enabled runs allocate these tails; disabled objects retain the original
+   sizes/member offsets, including the inline registrar array and slot stride. */
+typedef struct {
+    rec_job job;
+    VkQueryPool pool; uint32_t query; /* this secondary's own immutable stats query */
+} rec_profile_job;
+typedef struct {
+    rec_pass pass;
+    vk_gpuprof_end_token end; /* assembler never reads the walking profiler */
+} rec_profile_pass;
 typedef struct rec_context {
     uint32_t lease_head, lease_tail, ncb;
     struct rec_context *retired_next; int retired; /* rec_mu: return-list publication */
@@ -1044,7 +1053,10 @@ static void record_job(rec_job *j, unsigned worker) {
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT, .pInheritanceInfo = &ii};
     VKCHECK(vkBeginCommandBuffer(j->cb, &bi));
-    if (j->profile_pool) vkCmdBeginQuery(j->cb, j->profile_pool, j->profile_query, 0);
+    if (__builtin_expect(vk_gpuprof_on, 0)) {
+        const rec_profile_job *profile = (const rec_profile_job *)j;
+        if (profile->pool) vkCmdBeginQuery(j->cb, profile->pool, profile->query, 0);
+    }
     VkPipeline pipeline = VK_NULL_HANDLE; vk_record_dynamic dynamic = {0};
     VkPipelineLayout bound_layout = VK_NULL_HANDLE; VkDescriptorSet bound_set[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkBuffer vertices[17], index_buffer = VK_NULL_HANDLE;
@@ -1118,7 +1130,10 @@ static void record_job(rec_job *j, unsigned worker) {
             draws++;
         } else if (d->count) { vkCmdDraw(j->cb, d->count, d->instances, d->first, d->base_instance); draws++; }
     }
-    if (j->profile_pool) vkCmdEndQuery(j->cb, j->profile_pool, j->profile_query);
+    if (__builtin_expect(vk_gpuprof_on, 0)) {
+        const rec_profile_job *profile = (const rec_profile_job *)j;
+        if (profile->pool) vkCmdEndQuery(j->cb, profile->pool, profile->query);
+    }
     VKCHECK(vkEndCommandBuffer(j->cb));
     project_guards(j);   /* freeze every owner/view/alias VA while this recording job still owns its inputs */
     /* Publish once per completed chunk, never a ring lock for each draw or descriptor update. */
@@ -1305,7 +1320,10 @@ void vk_record_pass_begin(uint32_t ncolor, const VkFormat *color, VkFormat depth
 static rec_job *job_allocate(void) {
     rec_job *j = slots[current_slot].cursor;
     if (j) slots[current_slot].cursor = j->all_next;
-    else { j = VK_CALLOC(1, sizeof *j); j->all_next = slots[current_slot].jobs; slots[current_slot].jobs = j; }
+    else {
+        j = VK_CALLOC(1, vk_gpuprof_on ? sizeof(rec_profile_job) : sizeof *j);
+        j->all_next = slots[current_slot].jobs; slots[current_slot].jobs = j;
+    }
     j->generation = slots[current_slot].generation; j->slot = current_slot;
     j->frame = totk_ft_work_frame();
     j->done = j->parallel = j->count = 0; j->pass_next = j->queue_next = j->batch_next = NULL;
@@ -1411,8 +1429,11 @@ static void dispatch_building(void) {
     else j->small_info_uses = 0;
     uint32_t operations = j->count + j->nevent;
     if (!operations) { j->done = 1; return; }
-    j->profile_pool = VK_NULL_HANDLE; j->profile_query = 0;
-    if (vk_gpuprof_on) (void)vk_gpuprof_chunk_query(&j->profile_pool, &j->profile_query);
+    if (__builtin_expect(vk_gpuprof_on, 0)) {
+        rec_profile_job *profile = (rec_profile_job *)j;
+        profile->pool = VK_NULL_HANDLE;
+        (void)vk_gpuprof_chunk_query(&profile->pool, &profile->query);
+    }
     if (inline_draws && operations < inline_draws) { uint64_t t0 = host_now_ns(); record_job(j, 0); inline_ns += host_now_ns() - t0; reset_ns += j->reset_time; j->done = 1; chunks_inline++; return; }
     j->parallel = pass_parallel = 1; j->batch_next = NULL; chunks_parallel++;
     j->ready_ns = host_now_ns();
@@ -1436,22 +1457,39 @@ void vk_record_clear(const VkClearAttachment *attachment, const VkClearRect *rec
 void vk_record_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2 stage) {
     rec_event *e = event_begin(); e->kind = REC_TIMESTAMP; e->timestamp.pool = pool; e->timestamp.query = query; e->timestamp.stage = stage;
 }
-int vk_record_pass_end(VkCommandBuffer primary, const vk_gpuprof_end_token *profile_end) {
+/* Constant specialization keeps token lifetimes, copy temporaries and variable
+   allocation sizes out of the disabled entry point, not just their stores. */
+static inline __attribute__((always_inline)) int record_pass_end_impl(VkCommandBuffer primary,
+        const vk_gpuprof_end_token *profile_end, int profiling) {
     dispatch_building();
     if (!pass_head) {
         vkCmdEndRendering(primary);
-        if (profile_end && profile_end->pool) vk_gpuprof_end_emit(primary, profile_end);
+        if (profiling && profile_end) vk_gpuprof_end_emit(primary, profile_end);
         passes_inline++; return 0;
     }
     rec_pass *p = slots[current_slot].pass_cursor;
     if (p) slots[current_slot].pass_cursor = p->all_next;
-    else { p = VK_CALLOC(1, sizeof *p); p->all_next = slots[current_slot].passes; slots[current_slot].passes = p; }
+    else {
+        p = VK_CALLOC(1, profiling ? sizeof(rec_profile_pass) : sizeof *p);
+        p->all_next = slots[current_slot].passes; slots[current_slot].passes = p;
+    }
     p->primary = primary; p->jobs = pass_head; p->next = NULL; p->draws = pass_draws;
-    p->profile_end = profile_end ? *profile_end : (vk_gpuprof_end_token){0};
+    if (profiling) {
+        rec_profile_pass *profile = (rec_profile_pass *)p;
+        profile->end = profile_end ? *profile_end : (vk_gpuprof_end_token){0};
+    }
     if (pending_tail) pending_tail->next = p; else pending_head = p; pending_tail = p;
     if (pass_parallel) passes_parallel++; else passes_inline++;
     pass_head = pass_tail = building = NULL;
     return 1;
+}
+/* The draw-side cached branch chooses distinct entries so the disabled core
+   carries neither a token argument nor a switch value across dispatch. */
+int vk_record_pass_end(VkCommandBuffer primary) {
+    return record_pass_end_impl(primary, NULL, 0);
+}
+int vk_record_pass_end_profiled(VkCommandBuffer primary, const vk_gpuprof_end_token *profile_end) {
+    return record_pass_end_impl(primary, profile_end, 1);
 }
 void vk_record_slot_seal(unsigned slot) {
     flush_small();
@@ -1489,7 +1527,7 @@ static void record_assemble_inner(unsigned slot, int background) {
             }
             if (count) vkCmdExecuteCommands(p->primary, count, commands);
             vkCmdEndRendering(p->primary);
-            if (p->profile_end.pool) vk_gpuprof_end_emit(p->primary, &p->profile_end);
+            if (__builtin_expect(vk_gpuprof_on, 0)) vk_gpuprof_end_emit(p->primary, &((const rec_profile_pass *)p)->end);
             VKCHECK(vkEndCommandBuffer(p->primary)));
         execute += host_now_ns() - t0;
     }

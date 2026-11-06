@@ -1088,12 +1088,16 @@ static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
     g_feedback_avoided += R.feedback_continued - (uint32_t)R.feedback_restore;
     VkCommandBuffer cb = vk_cb();
     if (R.secondary) {
-        vk_gpuprof_end_token profile_end = {0};
-        if (vk_gpuprof_on) {
+        int parked;
+        if (__builtin_expect(vk_gpuprof_on, 0)) {
+            vk_gpuprof_end_token profile_end;
             vk_record_pass_flush(); /* final chunk still belongs to the profiler's current open pass */
             vk_gpuprof_end_deferred(reason, detail, &profile_end);
+            parked = VK_REC_VALUE(VK_REC_O_ASSEMBLE, vk_record_pass_end_profiled(cb, &profile_end));
+        } else {
+            parked = VK_REC_VALUE(VK_REC_O_ASSEMBLE, vk_record_pass_end(cb));
         }
-        if (VK_REC_VALUE(VK_REC_O_ASSEMBLE, vk_record_pass_end(cb, &profile_end))) cb = vk_record_next_primary();
+        if (parked) cb = vk_record_next_primary();
         descriptor_unbind();
     } else {
         vk_occlusion_end(cb);   /* precise queries remain on the original inline diagnostic path */
