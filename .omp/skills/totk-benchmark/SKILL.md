@@ -19,8 +19,10 @@ All scripts are in `tools/bench/` (paths below are relative to the repository ro
     `settings.env`, both in `/data/user/0/com.aure.totk/files` (readable only by the app or root). Never rely on logcat:
     some devices' logd drops the game's lines (the Pocket Duo showed none). A file root **writes** there (the live
     switches' `totk.ctl`) needs the game folder's owner and SELinux context, MLS categories included:
-    `chown $(stat -c %u:%g <game dir>)` and `chcon --reference=<game dir>`, else the app cannot read it (`live.sh` does
-    both).
+    `chown $(stat -c %u:%g <game dir>)`, mode0600 and an explicit `chcon "$CTX" <file>`, where
+    `CTX=$(ls -Zd <game dir>); CTX=${CTX%% *}` preserves the whole MLS context. Android toybox lacks GNU
+    `chcon --reference`. `live.sh` applies this to totk.ctl; use the same procedure for any manual totk.env write.
+    Abort on missing context or chcon failure rather than dropping the MLS categories.
   - **Kernel log and sysfs**: the dmesg marker and the GPU/SMMU fault check read the kernel log; the sampler and the
     frequency snapshots read thermal zones, cooling devices, cpufreq policies and `/sys/class/kgsl` (several of them
     root-only on production builds).
@@ -176,8 +178,13 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
   Exact per-pan GPU residency comes from boundary differences of `trans_stat`'s final time column, never its
   transition matrix or an instantaneous-clock histogram. The KGSL `gpu_clock_stats` alternative counts active time
   in available-frequency order, so is labelled active-clock distribution, not full wall residency. Counter units
-  and raw snapshots are retained; absent/failed/reset/mismatched counters are unavailable, not zero.
-  Sampler `ac`, `usb`, `level` fields (online 0/1, battery percent) are retained per pan with timestamps.
+  and raw snapshots are retained; absent/failed/identity-mismatched or regressing counters are unavailable, not zero.
+  KGSL `reset_count` tracks GPU boots/wakes as well as recovery, not devfreq statistics resets; its delta is reported
+  separately and does not veto monotonic counters. Declared time units must pass the elapsed upper-bound check
+  (device uptime plus max(1s,5%) tolerance); unknown units explicitly have no time-sanity check. See README sources.
+  Sampler `external_power` is any online non-battery kernel supply, not Android's AC/USB charger enum; it is null
+  without readable online state. Keep `power_supplies` raw type/online observations, raw legacy `ac`/`usb`, battery
+  `level` and timestamps. Sysfs USB online can correspond to dumpsys AC=true on Odin; never rename one into the other.
 - Read **steady fps, dip-window count, dip time fraction, ~33 ms frame count, and mean fps separately**. At a 60 target,
   >=60/300 frames in 29–37.5 ms makes a dip window (complete durations, else complete fence histogram); without full
   frame evidence the fallback is fps <50. At 30 target the fallback is <25; normal ~33 ms pacing is not a dip.

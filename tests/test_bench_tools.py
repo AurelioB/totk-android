@@ -754,9 +754,21 @@ class InSessionAB(unittest.TestCase):
                 r = live('set', 'TOTK_X=1', 'mark', 'r')
                 self.assertEqual(r.returncode, 4, r.stderr)
                 self.assertIn('refused "set TOTK_X=1"', r.stdout)
+                attempts = (dev.dir / 'chcon-calls').read_text().splitlines()
+                self.assertEqual(attempts, [f'{dev.env["FAKE_CONTEXT"]} {ctl}'] * 3)
             finally:
                 stop.set()
             self.assertEqual(dev.root_shells(), 1)
+
+    def test_live_context_failure_stops_before_appending(self):
+        with fake_device() as dev:
+            dev.env['FAKE_CONTEXT'] = '?'
+            result = subprocess.run(['sh', str(BENCH / 'live.sh'), '-s', 'x', '--game-dir', str(dev.game),
+                                     '--wait', '0', 'set', 'TOTK_VK_PIPE_BOOST=1'],
+                                    capture_output=True, text=True, env=dev.env)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual((dev.game / 'totk.ctl').read_text(), '')
+            self.assertFalse((dev.dir / 'chcon-calls').exists())
 
 
 FAKE_ADB = r'''#!/bin/sh
@@ -778,11 +790,17 @@ class fake_device:
         self.tmp = tempfile.TemporaryDirectory()
         d = self.dir = Path(self.tmp.name)
         (d / 'bin').mkdir(); (d / 'game').mkdir()
-        for name, text in (('adb', FAKE_ADB), ('chcon', '#!/bin/sh\nexit 0\n')):
+        for name, text in (
+                ('adb', FAKE_ADB),
+                ('ls', '#!/bin/sh\nif [ "$1" = "-Zd" ]; then printf "%s %s\\n" "$FAKE_CONTEXT" "$2"; '
+                       'else exec /bin/ls "$@"; fi\n'),
+                ('chcon', '#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_CHCON"\n'
+                          '[ "$#" -eq 2 ] && [ "$1" = "$FAKE_CONTEXT" ] || exit 2\n')):
             (d / 'bin' / name).write_text(text); (d / 'bin' / name).chmod(0o755)
         self.game, self.calls = d / 'game', d / 'calls'
         self.env = dict(os.environ, PATH=f"{d / 'bin'}:{os.environ['PATH']}", FAKE_CALLS=str(self.calls),
-                        XDG_RUNTIME_DIR=str(d))
+                        XDG_RUNTIME_DIR=str(d), FAKE_CONTEXT='u:object_r:app_data_file:s0:c123,c456',
+                        FAKE_CHCON=str(d / 'chcon-calls'))
         return self
 
     def rootsh(self, *args, stdin=None):
@@ -913,12 +931,29 @@ class GpuResidency(unittest.TestCase):
         self.assertEqual(delta['fractions'], {1100000000: 0.75, 1050000000: 0.25})
         self.assertEqual(delta['counter_kind'], 'residency')
         for broken in (dict(b, raw=self.trans_stat(999, 2100)), dict(b, boot_id='reboot'),
-                       dict(b, reset_count='1'), dict(b, uptime_start=0), dict(b, status='error')):
+                       dict(b, uptime_start=0), dict(b, status='error')):
             with self.subTest(broken=broken):
                 with self.assertRaises(ValueError):
                     sampler.gpu_residency_delta(a, broken)
         with self.assertRaises(ValueError):
             sampler.gpu_residency_delta(None, b)
+
+    def test_gpu_start_count_change_keeps_monotonic_sane_residency(self):
+        a = dict(self.record('start', 1000, 2000), reset_count='73936', uptime_start=100, uptime_end=100.01)
+        b = dict(self.record('end', 21000, 126700), reset_count='73937', uptime_start=244.70, uptime_end=244.71)
+        delta = sampler.gpu_residency_delta(a, b)
+        self.assertEqual(delta['reset_count_delta'], 1)
+        self.assertEqual(delta['total_delta'], 144700)
+        self.assertAlmostEqual(delta['time_sanity']['counter_seconds'], 144.7)
+        self.assertEqual(delta['time_sanity']['status'], 'passed')
+        # Actual counter regression remains invalid independently of GPU-start count.
+        with self.assertRaisesRegex(ValueError, 'counter reset'):
+            sampler.gpu_residency_delta(a, dict(b, raw=self.trans_stat(999, 126700)))
+        with self.assertRaisesRegex(ValueError, 'exceeds elapsed'):
+            sampler.gpu_residency_delta(a, dict(b, raw=self.trans_stat(1000000, 126700)))
+        unknown = dict(b, raw=b['raw'].replace('time(ms)', 'time(jiffies)'))
+        old_unknown = dict(a, raw=a['raw'].replace('time(ms)', 'time(jiffies)'))
+        self.assertEqual(sampler.gpu_residency_delta(old_unknown, unknown)['time_sanity']['status'], 'unavailable')
 
     def test_clock_stats_vector_is_active_time_not_wall_residency(self):
         parsed = sampler.parse_gpu_time_in_state('100 300\n', '/sys/class/kgsl/kgsl-3d0/gpu_clock_stats',
@@ -935,7 +970,8 @@ class GpuResidency(unittest.TestCase):
             (d / 'logs').mkdir()
             (d / 'logs/odin.log').write_text(ab_log({600: (57, 20, 10, 0)}, []))
             (d / 'pans.txt').write_text('odin hateno F0=0 F1=600 T0=100 T1=120 V=16000 TARGET_FPS=60\n')
-            (d / 'samples-odin.txt').write_text('101 f=300 ac=0 usb=1 level=82 caps= 1/1\n')
+            (d / 'samples-odin.txt').write_text('101 f=300 ac= usb=1 level=82 '
+                                              'supply.usb.type=USB supply.usb.online=1 caps= 1/1\n')
             path = d / sampler.GPU_SNAPSHOT_FILE
             records = [self.record('start', 1000, 2000), self.record('end', 1300, 2100)]
             path.write_text(''.join(json.dumps(r) + '\n' for r in records))
@@ -947,12 +983,30 @@ class GpuResidency(unittest.TestCase):
             with self.assertRaises(ValueError):
                 sampler.parse_gpu_snapshots(path)
         self.assertEqual(record['pans'][0]['gpu_residency']['fractions']['1100000000'], 0.75)
-        self.assertEqual(record['pans'][0]['battery'], [{'epoch': 101, 'ac': 0, 'usb': 1, 'level': 82}])
+        self.assertEqual(record['pans'][0]['battery'], [{'epoch': 101, 'ac': None, 'usb': 1, 'level': 82,
+                         'external_power': True, 'power_supplies': {'usb': {'type': 'USB', 'online': 1}}}])
         self.assertIn('1100 MHz 75.00%', result.stdout)
         self.assertIn('only 1 complete windows', result.stdout)
 
 
 class MemorySampling(unittest.TestCase):
+    def test_external_power_is_any_kernel_supply_not_android_charger_category(self):
+        cases = [
+            ({'ac': '', 'usb': '1', 'supply.usb.type': 'USB', 'supply.usb.online': '1'}, True),
+            ({'supply.dc.type': 'Mains', 'supply.dc.online': '0',
+              'supply.wireless.type': 'Wireless', 'supply.wireless.online': '1'}, True),
+            ({'supply.dc.type': 'Mains', 'supply.dc.online': '0'}, False),
+            ({'supply.usb.type': 'USB', 'supply.usb.online': ''}, None),
+            ({'supply.battery.type': 'Battery', 'supply.battery.online': '1'}, None),
+            ({'ac': '', 'usb': '1'}, True),  # historical rows
+            ({}, None)]
+        for tokens, expected in cases:
+            with self.subTest(tokens=tokens):
+                self.assertIs(sampler.power_of_tokens(tokens)['external_power'], expected)
+        line = sampler.add_power('f=300 ac= usb=1 supply.usb.type=USB supply.usb.online=1 caps= 1/1')
+        self.assertIn('external_power=1 caps=', line)
+        self.assertIn('supply.usb.type=USB supply.usb.online=1', line)
+
     LINE = ('f={f} cpu=55000 gpu=60000 cool=0 tpl=0 gclk=1 gcap=2 mav={mav} rss=2000000 swp={swp} shm=1000 kgk=1048576 '
             'kgm= kgi=2097152 pcs=1.50 pcf=0.00 pms={pms} pmf=3.25 kst={kst} caps= 2016000/2016000')
 

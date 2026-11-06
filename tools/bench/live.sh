@@ -6,7 +6,7 @@
 #
 # Appends the lines to the running game's control file <game>/totk.ctl (runtime/live_ctl.h) in ONE write, so they apply
 # at the same frame boundary (one generation). Root (the serial's persistent root shell, rootsh.py) writes it with the
-# game folder's owner, mode 0600 and SELinux context (chcon --reference=<game dir>: a root-made file lacks the app's MLS
+# game folder's owner, mode 0600 and explicit SELinux context (from ls -Zd: a root-made file lacks the app's MLS
 # categories and the app could not read it). Then waits up to --wait seconds (default 10) for the game's [totk-ctl]
 # lines in totk.log and prints them: the mark's line when there is a mark, refusals always. Exit 3 when a mark was not
 # acknowledged in time, 4 when the game refused a line (the other lines of the write still apply).
@@ -58,7 +58,10 @@ case $N0 in ""|*[!0-9]*) N0=0 ;; esac
 REMOTE="umask 077
 [ -e $CTL ] || : > $CTL || exit 1
 chown \$(stat -c %u:%g $GAME) $CTL && chmod 0600 $CTL || exit 1
-chcon --reference=$GAME $CTL 2>/dev/null || chcon \$(ls -Zd $GAME | cut -d' ' -f1) $CTL || exit 1
+CTX=\$(ls -Zd $GAME) || exit 1
+CTX=\${CTX%% *}
+case \$CTX in *:*:*:*) ;; *) echo 'cannot read game SELinux context' >&2; exit 1 ;; esac
+chcon \"\$CTX\" $CTL || exit 1
 cat >> $CTL <<'TOTK_CTL_END'
 ${LINES}TOTK_CTL_END"
 root "$REMOTE" || die "could not write $CTL (root, owner or SELinux context)"

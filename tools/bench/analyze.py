@@ -33,7 +33,7 @@ import argparse, collections, datetime, json, os, re, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchlib import SCHEMA, caps_of_limits, device_signature, guard_output, parse_freq_tokens, sig_caps_text  # noqa: E402
-from sampler import GPU_SNAPSHOT_FILE, gpu_residency_delta, parse_gpu_snapshots  # noqa: E402
+from sampler import GPU_SNAPSHOT_FILE, gpu_residency_delta, parse_gpu_snapshots, power_of_tokens  # noqa: E402
 
 METHOD_SUMMARY = ('Default profile per device (no totk.env). Save loaded from the in-game Load list, ~55 s settle, then the '
                   'right stick held at {stick} (right, then left) via sendevent on the controller node. Only the runtime\'s own '
@@ -414,6 +414,7 @@ def parse_sample_rows(path):
                 caps.append((int(s), int(m)))
         row = {'t': t, 'f': num('f'), 'cpu': num('cpu'), 'gpu': num('gpu'), 'cool': num('cool'), 'tpl': num('tpl'),
                'gcap': num('gcap'), 'caps': caps, 'ac': num('ac'), 'usb': num('usb'), 'level': num('level')}
+        row.update(power_of_tokens(d))
         for key, *_ in MEMORY_FIELDS:
             row[key] = real(key) if key in d else None
         parts = [row[k] for k in ('kgk', 'kgm', 'kgi') if row[k] is not None]
@@ -652,7 +653,8 @@ def main():
                           f' (counter unit {residency["counter_unit"]}; source {residency["source"]})')
                 else:
                     print(f'  GPU residency unavailable: {residency["reason"]}')
-                batteries.append([{'epoch': r['t'], **{k: r[k] for k in ('ac', 'usb', 'level')}} for r in rows])
+                batteries.append([{'epoch': r['t'], **{k: r[k] for k in
+                                  ('external_power', 'power_supplies', 'ac', 'usb', 'level')}} for r in rows])
                 all_rows += rows
                 if rows:
                     capped = sorted({c for r in rows for c in r['caps'] if c[0] != c[1]})

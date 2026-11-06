@@ -9,12 +9,15 @@ RssShmem (kB), its kgsl memory /sys/class/kgsl/kgsl/proc/<pid>/{kernel,gpumem_ma
 exist), PSI cpu / memory some / full avg10 (/proc/pressure), and the kswapd threads' CPU ticks, from which the host adds
 kswapd's CPU % over the interval. Lines are host-timestamped (epoch seconds) and appended to <out>/samples-<label>.txt:
 
-  <epoch> f=<frame> cpu=<mC> gpu=<mC> cool=<sum> tpl=<level> gclk=<Hz> gcap=<Hz> ac=<0|1> usb=<0|1> level=<%>
+  <epoch> f=<frame> cpu=<mC> gpu=<mC> cool=<sum> tpl=<level> gclk=<Hz> gcap=<Hz> external_power=<0|1> level=<%>
           mav=<kB> rss=<kB> swp=<kB> shm=<kB> kgk=<B> kgm=<B> kgi=<B> pcs=<avg10> pcf=<avg10> pms=<avg10> pmf=<avg10>
+          ac=<raw Mains online> usb=<raw USB online> supply.<name>.type=<kernel type> supply.<name>.online=<0|1> ...
           kst=<ticks> ksw=<%> caps= <scaling>/<cpuinfo> ...
 
 A value the device does not expose (no matching thermal zone / cooling device, no kgsl, no PSI, the game not running)
 is left empty and becomes null.
+external_power is any readable online non-battery supply, not Android BatteryService's AC/USB classification;
+raw kernel supply observations are retained. Old rows without named supplies derive it from raw ac/usb.
 
 Runs until --duration elapses, or SIGINT / SIGTERM; then the device loop and its sleep are killed, so no process is left
 on the device. As a safety net the device loop also ends by itself after --max-seconds (default 3 h, or --duration + 60).
@@ -37,10 +40,11 @@ CZ=""; GZ=""; CD=""
 for z in thermal_zone*; do t=$(cat $z/type 2>/dev/null); case $t in cpu*) CZ="$CZ $z/temp";; gpuss*) GZ="$GZ $z/temp";; esac; done
 for c in cooling_device*; do t=$(cat $c/type 2>/dev/null); case $t in cpufreq-*|cpu-cluster*|thermal-cluster*|kgsl|gpu|devfreq-*kgsl*) CD="$CD $c/cur_state";; esac; done
 L=@LOG@
-AC=""; USB=""; BAT=""
+AC=""; USB=""; BAT=""; SUPPLIES=""
 for p in /sys/class/power_supply/*; do
   t=$(cat "$p/type" 2>/dev/null)
   case $t in Mains) AC="$AC $p/online" ;; USB|USB_*) USB="$USB $p/online" ;; Battery) [ -n "$BAT" ] || BAT=$p/capacity ;; esac
+  case $t in Battery|BMS) ;; *) SUPPLIES="$SUPPLIES $p" ;; esac
 done
 online() { [ -z "$1" ] || cat $1 2>/dev/null </dev/null | sort -n | tail -n1; }
 PSI() { sed -n "s/^$1 avg10=\([0-9.]*\).*/\1/p" $2 2>/dev/null </dev/null; }
@@ -56,7 +60,8 @@ while true; do
   ks=""; for k in $(pgrep kswapd 2>/dev/null); do t=$(cut -d' ' -f14,15 /proc/$k/stat 2>/dev/null </dev/null); [ -n "$t" ] && ks=$(( ${ks:-0} + ${t% *} + ${t#* } )); done
   mem="mav=$(grep -m1 '^MemAvailable:' /proc/meminfo </dev/null | tr -s ' ' | cut -d' ' -f2) rss=$(st VmRSS) swp=$(st VmSwap) shm=$(st RssShmem) kgk=$(kv kernel) kgm=$(kv gpumem_mapped) kgi=$(kv imported)"
   psi="pcs=$(PSI some /proc/pressure/cpu) pcf=$(PSI full /proc/pressure/cpu) pms=$(PSI some /proc/pressure/memory) pmf=$(PSI full /proc/pressure/memory) kst=$ks"
-  echo "f=${f:-0} cpu=$ct gpu=$gt cool=$cs tpl=$(cat /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel 2>/dev/null) gclk=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null) gcap=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null) ac=$(online "$AC") usb=$(online "$USB") level=$(cat $BAT 2>/dev/null </dev/null) $mem $psi caps=$caps"
+  power=""; for p in $SUPPLIES; do n=${p##*/}; power="$power supply.$n.type=$(cat "$p/type" 2>/dev/null) supply.$n.online=$(cat "$p/online" 2>/dev/null)"; done
+  echo "f=${f:-0} cpu=$ct gpu=$gt cool=$cs tpl=$(cat /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel 2>/dev/null) gclk=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null) gcap=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null) ac=$(online "$AC") usb=$(online "$USB") level=$(cat $BAT 2>/dev/null </dev/null) $power $mem $psi caps=$caps"
   [ $(date +%s) -lt $END ] || exit 0
   sleep @INTERVAL@
 done
@@ -86,6 +91,29 @@ done
 echo 'no readable GPU cumulative time-in-state source' >&2
 exit 3
 '''
+
+
+def power_of_tokens(tokens):
+    """Kernel supply observations, not Android BatteryService AC/USB categories; no readable online => unknown."""
+    supplies = {}
+    for key, value in tokens.items():
+        if key.startswith('supply.') and key.endswith(('.type', '.online')):
+            name, field = key[7:].rsplit('.', 1)
+            supplies.setdefault(name, {})[field] = value if field == 'type' else int(value) if value in ('0', '1') else None
+    online = [s['online'] for s in supplies.values() if s.get('type') not in ('Battery', 'BMS')
+              and s.get('online') in (0, 1)]
+    if not online:
+        online = [int(tokens[k]) for k in ('ac', 'usb') if tokens.get(k) in ('0', '1')]
+    if not online and tokens.get('external_power') in ('0', '1'):
+        online = [int(tokens['external_power'])]
+    return {'external_power': any(online) if online else None, 'power_supplies': supplies}
+
+
+def add_power(line):
+    head, sep, tail = line.partition(' caps=')
+    tokens = dict(t.split('=', 1) for t in head.split() if '=' in t)
+    value = power_of_tokens(tokens)['external_power']
+    return f'{head} external_power={"" if value is None else int(value)}{sep}{tail}'
 
 
 def parse_gpu_time_in_state(text, source, frequencies=None):
@@ -190,11 +218,12 @@ def parse_gpu_snapshots(path):
 
 
 def gpu_residency_delta(start, end):
-    """Delta two raw records; raises ValueError for missing, reset or mismatched snapshots.
+    """Delta two raw records; reject counter regressions, identity changes and impossible unit-aware total times.
 
     Returns source/counter_unit/frequency_unit/counter_kind, integer deltas,
     total_delta and fractions keyed by frequency in Hz. Fractions describe only
     the counter's coverage (active time for gpu_clock_stats), not wall seconds.
+    KGSL reset_count changes are diagnostic GPU-start counts, not evidence of a devfreq stats reset.
     """
     parsed = []
     for boundary, record in (('start', start), ('end', end)):
@@ -216,7 +245,7 @@ def gpu_residency_delta(start, end):
         if record['uptime_end'] < record['uptime_start']:
             raise ValueError(f'GPU {boundary} snapshot uptime reset')
         parsed.append(parse_gpu_time_in_state(record.get('raw'), record.get('source'), record.get('frequencies')))
-    for key in ('device', 'scene', 'T0', 'serial_sha256', 'boot_id', 'source', 'reset_count'):
+    for key in ('device', 'scene', 'T0', 'serial_sha256', 'boot_id', 'source'):
         if start.get(key) != end.get(key):
             raise ValueError(f'mismatched GPU snapshot {key}')
     if end['uptime_start'] < start['uptime_end']:
@@ -233,8 +262,31 @@ def gpu_residency_delta(start, end):
     total = sum(deltas.values())
     if not total:
         raise ValueError('GPU cumulative counters did not advance')
+    # KGSL reset_count counts GPU starts (including wake from slumber), not devfreq statistics resets.
+    # The actual per-frequency counter deltas and read-time bounds establish whether a snapshot pair is usable.
+    try:
+        reset_delta = int(end.get('reset_count', '')) - int(start.get('reset_count', ''))
+    except (TypeError, ValueError):
+        reset_delta = None
+    elapsed_lower = end['uptime_start'] - start['uptime_end']
+    elapsed_upper = end['uptime_end'] - start['uptime_start']
+    scale = {'s': 1, 'ms': 1e-3, 'us': 1e-6, 'ns': 1e-9}.get(before['counter_unit'].lower())
+    sanity = {'status': 'unavailable', 'reason': 'counter unit has no known seconds conversion',
+              'elapsed_lower_s': elapsed_lower, 'elapsed_upper_s': elapsed_upper}
+    if scale is not None:
+        seconds = total * scale
+        # Suspended devfreq / active-clock counters may cover LESS than elapsed time. Never require a lower bound.
+        # Permit sysfs accounting granularity and small timestamp/clock differences, but reject impossible totals.
+        allowance = max(1.0, elapsed_upper * 0.05)
+        if seconds > elapsed_upper + allowance:
+            raise ValueError(f'GPU counter total {seconds:.3f}s exceeds elapsed upper bound '
+                             f'{elapsed_upper:.3f}s plus {allowance:.3f}s tolerance')
+        sanity = {'status': 'passed', 'counter_seconds': seconds, 'elapsed_lower_s': elapsed_lower,
+                  'elapsed_upper_s': elapsed_upper, 'allowance_s': allowance}
     return {k: before[k] for k in ('source', 'counter_unit', 'frequency_unit', 'counter_kind')} | {
-        'deltas': deltas, 'total_delta': total, 'fractions': {f: d / total for f, d in deltas.items()}}
+        'deltas': deltas, 'total_delta': total, 'fractions': {f: d / total for f, d in deltas.items()},
+        'reset_count_start': start.get('reset_count'), 'reset_count_end': end.get('reset_count'),
+        'reset_count_delta': reset_delta, 'time_sanity': sanity}
 
 
 def capture_gpu_snapshot(serial, device, scene, t0, boundary):
@@ -345,7 +397,7 @@ def main():
                     print(f'sampler: device: {line}', file=sys.stderr)
                     continue
                 now = time.time()
-                line, kswapd = add_kswapd(line, now, kswapd)
+                line, kswapd = add_kswapd(add_power(line), now, kswapd)
                 out.write(f'{now:.1f} {line}\n')
                 n += 1
     except Stop:

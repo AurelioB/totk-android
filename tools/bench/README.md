@@ -7,7 +7,7 @@ and comparing against the recorded baselines. The full procedure is the `totk-be
 Device side: `su` root (for `sendevent`, the app's private `totk.log` and `settings.env`, `dmesg`, and the thermal /
 cpufreq / kgsl sysfs files). Nothing is pushed to the device; the device writes are the dmesg marker of
 `collect.sh --mark` and the live-switch control file of `live.sh` / `ab.sh` (`<game>/totk.ctl`, written with the game
-folder's owner and `chcon --reference=<game dir>`). Everything is read from `totk.log` and sysfs / procfs, never from
+folder's owner and explicit SELinux context from `ls -Zd <game dir>`). Everything is read from `totk.log` and sysfs / procfs, never from
 logcat (some devices' logd drops the game's lines). `bench_input.sh`, `pan.sh` and `live.sh` run every root command
 through one persistent root shell per device (`rootsh.py`; `sampler.py` holds its own), pinned to the slowest cpufreq
 cluster: a `su -c` per command costs the device a su session and, with Magisk, a su-notify `app_process` on any core.
@@ -110,10 +110,33 @@ column, never its transition matrix; fixed-width concatenated headers are suppor
 KGSL `gpu_clock_stats` is a vector in `gpu_available_frequencies` order and counts **active clock time**: its fractions
 are an active-frequency distribution, not wall-time residency. Boundary reads bracket the pan but include small
 host/control latency; timestamps/uptimes and raw text remain available for that audit.
-Missing/failed snapshots, source/frequency/unit/boot changes, resets and non-advancing counters produce explicit
-unavailable residency, never fake zeroes. Older logs without these snapshots cannot recover exact residency.
-Sampler rows add `ac` / `usb` (online 0/1) and `level` (battery percent), null when unavailable; pan JSON retains
-those timestamped rows so different charging states are visible rather than inferred from thermals.
+Missing/failed snapshots, source/frequency/unit/boot changes, actual per-frequency counter regressions and
+non-advancing counters produce unavailable residency, never fake zeroes. KGSL `reset_count` is **not a devfreq
+statistics-reset generation**: Qualcomm's [reset attribute](https://github.com/qualcomm-linux/kgsl/blob/d70a6765a318eda3e400c711587ce373c693c99e/kgsl_pwrctrl.c)
+returns `device->reset_counter`, incremented by [Gen8 GPU boot](https://github.com/qualcomm-linux/kgsl/blob/d70a6765a318eda3e400c711587ce373c693c99e/adreno_gen8_gmu.c)
+including normal wake after slumber (and recovery). A change alone does not invalidate monotonic residency.
+The raw start/end values and `reset_count_delta` remain diagnostic; they do not establish a GPU fault count.
+This upstream evidence is not a claim that the Odin's exact vendor kernel source was identified.
+
+For declared `s`/`ms`/`us`/`ns` counters, `time_sanity` records the converted total and device-uptime read bounds.
+Reject a total exceeding the elapsed upper bound plus `max(1 s, 5% of elapsed)` (accounting granularity/clock
+tolerance). Do not impose a lower bound: devfreq suspension / active-clock counters may legitimately cover less
+than wall time. Unknown units retain raw fractions with an explicitly unavailable time-sanity check, never a guessed
+unit conversion. Older logs without boundary snapshots cannot recover exact residency.
+
+Sampler `external_power` is **any readable online non-battery kernel supply** (JSON boolean, null when no online
+observation exists). It is not Android BatteryService's AC/USB enum: the Odin can expose sysfs `usb=1` while
+`dumpsys battery` calls the same external power AC. Each `supply.<name>.type` / `supply.<name>.online` token is
+retained under per-pan `power_supplies`; legacy `ac` / `usb` remain raw kernel-type category observations, never
+relabeled to match dumpsys. Battery/BMS supplies are excluded from external-power aggregation. `level` is battery
+percent. Historical rows derive external_power from available raw ac/usb fields; no readable source stays null.
+Pan JSON retains timestamped fields rather than inferring charger state from temperatures.
+
+Android toybox `chcon` does not support GNU `--reference`. `live.sh` reads `CTX=$(ls -Zd "$GAME")`,
+extracts its first field (including the full `s0:c...` MLS categories), then runs `chcon "$CTX" "$GAME/totk.ctl"`
+before appending. Missing context or failed chcon aborts the write. There is no totk.env writer in these tools;
+when writing one manually, apply the same game-directory owner/mode/context procedure to `"$GAME/totk.env"`,
+not a generic `app_data_file:s0` label that discards its categories.
 
 Example (one device, one scene; placeholders in `<>`):
 
