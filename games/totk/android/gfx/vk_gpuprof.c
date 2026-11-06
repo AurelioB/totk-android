@@ -85,6 +85,7 @@ int vk_gpuprof_pipeline_on;
 static uint32_t pipeline_phase, pipeline_launch_phase, pipeline_ordinal;
 static uint32_t pipeline_population = VK_GPUPROF_PIPE_ORDINALS;
 static gp_pipeline *pipeline_open;
+static gp_record *pipeline_parent;
 static VkPipeline pipeline_last;
 static vk_shader *pipeline_shaders[3];
 static VkCommandBuffer pipeline_cb;
@@ -877,7 +878,7 @@ void vk_gpuprof_slot_cancel(vk_gpuprof_slot **slot) {
     if (current == *slot) {
         if (sample_budget && current && current->segment[0].first_valid) sample_frame_started = 0;
         current = NULL; open_record = NULL; scope_n = scope_overflow = 0;
-        pipeline_open = NULL; pipeline_last = VK_NULL_HANDLE;
+        pipeline_open = NULL; pipeline_parent = NULL; pipeline_last = VK_NULL_HANDLE;
     }
     background_enqueue(slot, 1);
 }
@@ -1327,7 +1328,7 @@ void vk_gpuprof_pipeline_break(VkCommandBuffer cb) {
         pipeline_timestamp(cb, pipeline_open->query1);
         pipeline_open->timestamps++;
     }
-    pipeline_open = NULL; pipeline_last = VK_NULL_HANDLE;
+    pipeline_open = NULL; pipeline_parent = NULL; pipeline_last = VK_NULL_HANDLE;
 }
 void vk_gpuprof_pipeline_begin(VkCommandBuffer cb, VkPipeline pipeline, vk_shader *const shaders[6]) {
     if (!vk_gpuprof_pipeline_on || !current) return;
@@ -1336,6 +1337,7 @@ void vk_gpuprof_pipeline_begin(VkCommandBuffer cb, VkPipeline pipeline, vk_shade
     if (pipeline_last && pipeline == pipeline_last && pipeline_cb == cb &&
         !memcmp(selected, pipeline_shaders, sizeof selected)) return;
     vk_gpuprof_pipeline_break(pipeline_cb);
+    pipeline_parent = open_record;
     gp_segment *segment = &current->segment[current->nsegment - 1];
     segment->pipeline_population = pipeline_population; segment->pipeline_phase = pipeline_phase;
     segment->pipeline_observed++;
@@ -1404,7 +1406,10 @@ void vk_gpuprof_end_emit(VkCommandBuffer cb, const vk_gpuprof_end_token *token) 
     if (token->timestamp_count) (*token->timestamp_count)++;
 }
 void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpuprof_end_token *token) {
-    if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(pipeline_cb);
+    /* A nested pre-upload record must not close its still-open main group.
+       Only the exact record owning the group may terminate its query lease. */
+    if (vk_gpuprof_pipeline_on && pipeline_parent == open_record)
+        vk_gpuprof_pipeline_break(pipeline_cb);
     memset(token, 0, sizeof *token);
     if (!open_record) return;
     open_record->reason = (uint32_t)reason; open_record->detail = detail;

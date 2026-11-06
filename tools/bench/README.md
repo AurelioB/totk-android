@@ -545,8 +545,10 @@ failures, background losses, corrupt timestamps and negative full-mode gaps.
 Pipeline fixtures additionally pin probability/rotation bounds, unknown primitive semantics, null missing
 timings, explicit overflow/discard loss, full variant mapping and fixed inverse-probability weighting.
 The real `--pipeline-groups` fixture changes actual color-mask pipelines within a pass (3/2/4 draws), spans
-one-draw secondary chunks and executes a real seeded compute dispatch; `--pipeline-overflow` exercises
-2049 alternating groups. The existing mode/default-off and sealed-present fixtures also cover this switch.
+one-draw secondary chunks and executes a real seeded compute dispatch. A continuation draw after a nested
+pre-upload scope must remain in the exact main parent group; ending the child cannot close the parent's
+pipeline query. `--pipeline-overflow` exercises 2049 alternating groups and domain growth. The existing
+mode/default-off and sealed-present fixtures also cover this switch.
 The optional `GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs for
 modes 0/1/2/3, recorder workers 0/2, statistics on/off/unsupported, ordinal windows off/on, split-frame and
 unsent multi-frame reconciliation, direct pre uploads while main rendering is open, default row/byte reduction

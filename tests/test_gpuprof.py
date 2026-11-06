@@ -1752,6 +1752,9 @@ class Lavapipe(unittest.TestCase):
                 self.assertNotEqual(first[0]['pipeline'], first[1]['pipeline'])
                 self.assertEqual({(r['vs'], r['fs']) for r in first}, {(first[0]['vs'], first[0]['fs'])})
                 self.assertTrue(all(r['primitives'] == r['draws'] for r in rows if r['kind'] == 'render'))
+                continued = [r for r in rows if r['frame'] == 303 and r['kind'] == 'render']
+                self.assertEqual([r['draws'] for r in continued], [2],
+                                 'nested pre upload cannot terminate the main pipeline group')
                 compute = [r for r in rows if r['kind'] == 'compute']
                 self.assertTrue(compute)
                 self.assertTrue(all(r['dispatches'] == 1 and r['draws'] == 0 and r['primitives'] is None and

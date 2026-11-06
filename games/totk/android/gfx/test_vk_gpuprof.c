@@ -772,6 +772,10 @@ int main(int argc, char **argv) {
     if (vk_gpuprof_on) vk_gpuprof_scope_begin(pre, "upload");
     vkCmdFillBuffer(pre, upload_buffer, upload_offset, 256, 0x13579bdf);
     if (vk_gpuprof_on) vk_gpuprof_scope_end(pre);
+    if (pipeline_groups == 1) {
+        p_draw continuation = {4, 0, 3, 0, 0};
+        op(OP_DRAW, &continuation, sizeof continuation);
+    }
     record_readback(&targets[0], memory);
     op(OP_END, NULL, 0); mtl_exec(recording); used = 0;
     vk_end_rendering(); vk_gpuprof_test_frame(vk_cb());
@@ -783,6 +787,6 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < 64; i++) bad_upload += upload[i] != 0x13579bdf;
     CHECK(!bad_upload, "direct profiled pre scope really fills bytes before the open main rendering executes");
     check_pixels(&targets[0], memory); check_pixels(&targets[1], memory);
-    frames += 2; expected_passes += 2; expected_draws += 4;
+    frames += 2; expected_passes += 2; expected_draws += pipeline_groups == 1 ? 5 : 4;
     return finish_fixture(frames, expected_passes, expected_draws, supported);
 }
