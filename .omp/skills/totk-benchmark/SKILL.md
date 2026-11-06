@@ -235,6 +235,15 @@ The current legacy FPS60 uncapped policy uses a 120-Hz clock, not a promise of u
 intervals can still change. Inspect `[fps-policy]` effective interval/uncapped lines to confirm the actual path;
 conflicting physical-clock/display modes may override uncapped controls. Never assume the switch erased every dip.
 
+The analyzer detects the effective collected `TOTK_UNCAPPED=1` (settings first, developer override second), or accepts
+`--uncapped` for older captures. This flag changes analysis only. It **disables dip classification**:
+`dip_metrics_valid=false`, null dip counts/fractions/steady fps, and `throughput_fps` (frames / summed window time)
+as the primary speed. An uncapped ~40fps run is not labelled 100% dip just because the preset target is60.
+`compare.py` / `abtest.py` compare uncapped throughput and independent frame-time tails, never emit a dip-confounded
+verdict there, and make mixed capped/uncapped comparisons inconclusive. Keep game-frame p50/p95/p99 per window
+and their maxima, >33/>50ms counts, p99/p50 spread and population window-fps standard deviation.
+Game-frame p99 comes from `帧间隔 至帧 ... p99`, not the presentation-fence p99; absent tails stay unavailable.
+
 Use this when isolating CPU/GPU throughput changes that a capped controller plateau would hide or decide, with the
 same save, camera, caps, cache and thermal state, long pans and reversed arm order. It can change GPU load, residency,
 power, thermals and latency: retain a capped 60-preset round for user-facing acceptance, and never pool capped and

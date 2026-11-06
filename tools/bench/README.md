@@ -57,6 +57,24 @@ points) says **verdict confounded by dips** rather than declaring a speed win fr
 steady-fps estimate. Historical JSON without pacing data is labelled unavailable and retains legacy comparisons;
 re-analyze its original logs with the preset target to obtain a pacing-aware comparison.
 
+**Uncapped mode:** effective `TOTK_UNCAPPED=1` is detected by reading collected `settings-<device>.env` followed by
+`totk-env-<device>.txt` overrides; `analyze.py --uncapped` explicitly forces this interpretation for all devices in
+an older capture. It does not change the device's settings. Windows are labelled `pacing_state=uncapped` and
+summaries report `uncapped=true`, `speed_mode=uncapped`, `dip_metrics_valid=false`; dip counts/fractions and
+`fps_steady` are null, not a statement that a 40fps uncapped run is entirely in a dip.
+`throughput_fps` is total complete-window frames divided by their summed time (300/fps per window), and is the
+primary speed metric in both `compare.py` and paired `abtest.py`. It is also emitted informationally for capped runs.
+Uncapped comparisons use frame p50/p95/p99 window maxima, worst frame and >33/>50ms rates as primary tail metrics.
+They never apply the dip-confounding veto; mixed capped/uncapped comparisons are inconclusive.
+
+Frame-time tails remain independent of presentation-fence tails: each window retains `p50_ms`, `p95_ms`, and
+`p99_ms` from the game's `帧间隔 至帧 ... p99` line (`p99_samples` preserves its sample count). No p99 is invented
+when that line is absent, and a present-fence p99 is never substituted. Per-pan/arm/run summaries include
+`p50_ms_max`, `p95_ms_max`, `p99_ms_max`, `p99_windows`, `over33_total`, `over50_total`, and `stutter_windows` coverage.
+`p99_p50_ratio` per window / `p99_p50_ratio_max` summarize relative frame-time spread; `fps_stddev` is the population
+standard deviation across included window fps values. Spread metrics are informational, with throughput and tails
+reported separately so identical ~40fps means with different tail spikes do not collapse to one speed-only verdict.
+
 Draws are a **cumulative** backend counter: `draws_per_frame` uses consecutive 300-frame sample differences,
 `(D_now - D_previous)/(frame_now - frame_previous)`, never `D_now/300`. First samples, counter/frame resets and
 missing intermediate samples have no rate (null); the next complete monotonic pair resumes measurement.

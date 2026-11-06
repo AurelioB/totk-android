@@ -288,6 +288,86 @@ def ab_log(windows, ctl):
     return '\n'.join(lines + [e[1] for e in events]) + '\n'
 
 
+class UncappedReporting(unittest.TestCase):
+    @staticmethod
+    def make_run(d, spikes=False, setting='1', override=None, force=False, speedup=False):
+        (d / 'logs').mkdir(parents=True)
+        lines = [f'[totk-ctl] gen={i + 1} frame={i * 900 + 1} mark ab arm={arm} block={i + 1}'
+                 for i, arm in enumerate('ABBA')]
+        for frame in range(300, 3601, 300):
+            arm_b = (frame - 1) // 900 in (1, 2)
+            spike = spikes and arm_b
+            fps = 44 if speedup and arm_b else 40
+            p95, p99, worst, over33, over50 = (55, 90, 120, 20, 4) if spike else (27, 35, 40, 3, 0)
+            lines += [f'[nvn] 计时 至帧 {frame}： 帧时间 p50 25.00 / p95 {p95} / 最大 {worst} ms（300 帧）；',
+                      f'[nvn] 帧间隔 至帧 {frame}：>16.7ms 300 / 300 帧，p99 {p99} ms',
+                      f'[nvn-vk] frame {frame}: {fps}.0 fps over the last 300, {frame * 5000} draws',
+                      f'[nvn-vk] frame {frame}, per frame: recording 2.0 ms, waiting for the GPU 1.0 ms, GPU 10.0 ms',
+                      f'[nvn-vk] frame {frame}, stutter: longest frame {worst} ms, {over33} frames over 33 ms, {over50} over 50 ms']
+        (d / 'logs/thor.log').write_text('\n'.join(lines) + '\n')
+        (d / 'settings-thor.env').write_text(f'TOTK_FPS60=1\nTOTK_UNCAPPED={setting}\n')
+        if override is not None:
+            (d / 'totk-env-thor.txt').write_text(f'TOTK_UNCAPPED={override}\n')
+        (d / 'pans.txt').write_text(''.join(f'thor hateno F0={i * 900} F1={(i + 1) * 900} '
+                                          f'T0={100 + i * 100} T1={130 + i * 100} V=16000\n' for i in range(4)))
+        result = run(BENCH / 'analyze.py', d, '--arms', '--json', d / 'result.json', *(['--uncapped'] if force else []))
+        if result.returncode:
+            raise AssertionError(result.stderr)
+        return json.loads((d / 'result.json').read_text()), result.stdout
+
+    def test_effective_env_and_explicit_flag_skip_dips_at_40_fps(self):
+        for setting, override, force, expected in (('1', None, False, True), ('0', '1', False, True),
+                                                  ('1', '0', False, False), ('0', '0', True, True)):
+            with self.subTest(setting=setting, override=override, force=force), tempfile.TemporaryDirectory() as tmp:
+                doc, text = self.make_run(Path(tmp), setting=setting, override=override, force=force)
+                record = doc['runs'][0]
+                summary = record['summary']
+                self.assertEqual(doc['devices']['thor']['uncapped'], expected)
+                self.assertEqual(summary['throughput_fps'], 40)
+                self.assertIs(summary['dip_metrics_valid'], not expected)
+                if expected:
+                    self.assertIsNone(summary['dip_windows'])
+                    self.assertTrue(all(w['pacing_state'] == 'uncapped' for w in record['windows']))
+                    self.assertIn('uncapped throughput 40.000 fps', text)
+                else:
+                    self.assertEqual(summary['dip_windows'], 8)
+                self.assertEqual((summary['p50_ms_max'], summary['p95_ms_max'], summary['p99_ms_max']), (25, 27, 35))
+                self.assertEqual(summary['p99_p50_ratio_max'], 1.4)
+                self.assertEqual(summary['fps_stddev'], 0)
+                self.assertEqual(summary['over33_total'], 24)
+                self.assertEqual(record['windows'][0]['p99_samples'], 300)
+        s = analyze.summarize([{'fps': 30, 'uncapped': True}, {'fps': 50, 'uncapped': True}])
+        self.assertEqual(s['throughput_fps'], 37.5)  # frames/time, not arithmetic mean 40
+        self.assertEqual(s['fps_stddev'], 10)
+        self.assertIsNone(s['p99_ms_max'])
+        self.assertEqual(s['p99_windows'], 0)
+
+    def test_uncapped_comparisons_use_throughput_and_tails_never_dip_confounding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quiet, _ = self.make_run(root / 'quiet')
+            spiky, _ = self.make_run(root / 'spiky', spikes=True)
+            self.make_run(root / 'faster', speedup=True)
+            for label, expected in (('quiet', 'SAME'), ('spiky', 'WORSE'), ('faster', 'BETTER')):
+                result = run(BENCH / 'abtest.py', root / label / 'result.json')
+                self.assertEqual(result.returncode, expected == 'WORSE', result.stdout + result.stderr)
+                self.assertIn(f'arm B vs A: {expected}', result.stdout)
+                self.assertNotIn('verdict confounded by dips', result.stdout)
+                self.assertRegex(result.stdout, rf'throughput fps .* {"better" if label == "faster" else "same"} \*')
+            qs, ss = quiet['runs'][0]['summary'], spiky['runs'][0]['summary']
+            self.assertEqual(benchlib.scene_verdicts(qs, ss)[1], 'worse')
+            self.assertEqual(benchlib.scene_verdicts(qs, dict(qs, throughput_fps=44))[1], 'better')
+            self.assertEqual(benchlib.scene_verdicts(dict(qs, dip_time_fraction=0),
+                                                   dict(qs, dip_time_fraction=1))[1], 'same')
+            capped = dict(qs, uncapped=False, speed_mode='capped')
+            self.assertEqual(benchlib.scene_verdicts(qs, capped)[1], 'inconclusive')
+            result = run(BENCH / 'compare.py', root / 'quiet/result.json', root / 'spiky/result.json')
+            self.assertEqual(result.returncode, 0, result.stderr)  # no frequency signature in this fixture
+            self.assertIn('WORSE', result.stdout)
+            self.assertIn('time-weighted throughput and frame-time tails are primary', result.stdout)
+            self.assertNotIn('verdict confounded by dips', result.stdout)
+
+
 class PresentationReporting(unittest.TestCase):
     def test_per_pan_and_arm_recording_quantiles_and_weighted_bin_shares(self):
         ctl = [(1, '[totk-ctl] gen=1 frame=1 mark ab arm=A block=1'),

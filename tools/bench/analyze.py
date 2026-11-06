@@ -29,7 +29,7 @@ samples-<d>.txt, settings-<d>.env, facts-<d>.txt, totk-env-<d>.txt (only when a 
 pans.txt lines with the same device and scene (a trailing repeat number is ignored: hateno2 = hateno) form one run.
 --meta: a JSON object deep-merged over the generated document (curated device names / profiles, build fields);
 its "caveats" are appended to the generated ones. Never writes a baseline file (benchlib.guard_output)."""
-import argparse, collections, datetime, json, os, re, sys
+import argparse, collections, datetime, json, os, re, statistics, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchlib import SCHEMA, caps_of_limits, device_signature, guard_output, parse_freq_tokens, sig_caps_text  # noqa: E402
@@ -58,7 +58,9 @@ FAULT_RE = re.compile(r'page ?fault|smmu.*fault|context fault|gpu fault|adreno.*
 CTL_RE = re.compile(r'\[totk-ctl\] gen=(\d+) frame=(\d+) (applied|mark)(?: (.*))?$')
 GUARD_FRAMES = 2
 # Block metrics compared by abtest.py (rates per window).
-AB_METRICS = ('fps_steady', 'dip_time_fraction', 'fps_mean', 'fps_min', 'p50_ms_median', 'p95_ms_max', 'max_ms', 'gpu_ms_mean', 'over50_total', 'long_ge45_total')
+AB_METRICS = ('fps_steady', 'dip_time_fraction', 'throughput_fps', 'fps_mean', 'fps_min', 'fps_stddev',
+              'p50_ms_median', 'p50_ms_max', 'p95_ms_max', 'p99_ms_max', 'p99_p50_ratio_max', 'max_ms',
+              'gpu_ms_mean', 'over33_total', 'over50_total', 'long_ge45_total')
 PRESENT_BIN_LABELS = ('<12.5', '12.5-20.9', '20.9-29', '29-37.5', '37.5-45.8', '>=45.8')
 
 
@@ -67,9 +69,12 @@ def parse_log(path):
     frame_ms, near33, draw_samples = {}, {}, []
     last_window = None
     recording, present_stats, present_bins, traces = {}, {}, {}, {}
+    frame_p99 = {}
     for line in open(path, encoding='utf-8', errors='replace'):
         if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):
             timing[int(m[1])] = tuple(float(x) for x in m.groups()[1:])
+        if m := re.search(r'帧间隔 至帧 (\d+)：>16\.7ms \d+ / (\d+) 帧，p99 ([\d.]+) ms', line):
+            frame_p99[int(m[1])] = (float(m[3]), int(m[2]))
         if m := re.search(r'\[nvn-vk\] frame (\d+), per frame: recording ([\d.]+) ms, waiting for the GPU ([\d.]+) ms, GPU ([\d.]+) ms', line):
             gpu[int(m[1])] = float(m[4])
             recording[int(m[1])] = float(m[2])
@@ -112,7 +117,7 @@ def parse_log(path):
                 traces[key] = row if key not in traces or traces[key] == row else None
     info['frame_ms'], info['near33'] = frame_ms, near33
     info['draw_rates'] = cumulative_draw_rates(draw_samples)
-    info.update(recording=recording, present_stats=present_stats, present_bins=present_bins,
+    info.update(recording=recording, present_stats=present_stats, present_bins=present_bins, frame_p99=frame_p99,
                 present_intervals=present_trace_intervals(traces))
     return timing, gpu, fps, stut, longf, info
 
@@ -164,6 +169,12 @@ def print_presentation(summary, prefix='  '):
     print(f'{prefix}presentation: recording mean {fmt(summary["recording_ms_mean"])} ms; '
           f'fence p95/p99 window maxima {fmt(summary["present_p95_ms_max"])}/'
           f'{fmt(summary["present_p99_ms_max"])} ms ({summary["present_quantile_windows"]} windows)')
+    print(f'{prefix}frame tails p50/p95/p99 window maxima '
+          f'{fmt(summary.get("p50_ms_max"))}/{fmt(summary.get("p95_ms_max"))}/{fmt(summary.get("p99_ms_max"))} ms; '
+          f'p99/p50 max {fmt(summary.get("p99_p50_ratio_max"))}; fps stddev {fmt(summary.get("fps_stddev"))}; '
+          f'>33/>50 ms {summary.get("over33_total")}/{summary.get("over50_total")}')
+    if summary.get('uncapped'):
+        print(f'{prefix}uncapped throughput {fmt(summary.get("throughput_fps"))} fps; dip_metrics_valid=false')
     shares = summary['present_interval_bin_shares']
     print(f'{prefix}present bin shares: ' + (', '.join(f'{label} ms {share * 100:.2f}%'
           for label, share in zip(PRESENT_BIN_LABELS, shares)) if shares is not None else 'unavailable') +
@@ -185,7 +196,7 @@ def cumulative_draw_rates(samples):
         previous = frame, draws
     return rates
 
-def pacing_of(end, fps, target, info):
+def pacing_of(end, fps, target, info, uncapped=False):
     """Classify >=20% half-rate frames as a dip; otherwise use fps < 5/6 target when frame coverage is incomplete.
 
     Complete raw durations take precedence over the fence interval histogram. Sparse long-frame/late traces are
@@ -203,14 +214,15 @@ def pacing_of(end, fps, target, info):
         source = 'sparse-frame-durations-lower-bound' if times else 'unavailable'
     dip = None
     classification = 'unknown'
-    if target:
+    if target and not uncapped:
         if target == 60 and (full or count >= 60):
             dip, classification = count >= 60, source
         else:
             dip = fps < target * 5 / 6 if fps is not None else None
             classification = 'window-fps' if dip is not None else 'unknown'
-    return {'pacing_state': 'dip' if dip else 'steady' if dip is False else 'unknown',
-            'pacing_source': classification, 'target_fps': target,
+    return {'pacing_state': 'uncapped' if uncapped else 'dip' if dip else 'steady' if dip is False else 'unknown',
+            'pacing_source': 'uncapped' if uncapped else classification, 'target_fps': target,
+            'uncapped': uncapped, 'dip_metrics_valid': False if uncapped else dip is not None,
             'duration_s': 300 / fps if fps and fps > 0 else None,
             'frames_near33': count if full or times else None, 'frames_near33_source': source}
 
@@ -261,6 +273,9 @@ def window_generation(start, end, gens, guard=GUARD_FRAMES):
 def summarize(windows, thermal=()):
     vals = lambda k: [w[k] for w in windows if w.get(k) is not None]
     p50s = sorted(vals('p50_ms'))
+    valid_fps = [fps for fps in vals('fps') if fps > 0]
+    throughput = round(300 * len(valid_fps) / sum(300 / fps for fps in valid_fps), 2) if valid_fps else None
+    uncapped = bool(windows) and all(w.get('uncapped') for w in windows)
     classified = [w for w in windows if w.get('pacing_state') in ('steady', 'dip')]
     pacing = {}
     if classified:
@@ -269,6 +284,7 @@ def summarize(windows, thermal=()):
         total_time = sum(w['duration_s'] for w in durations)
         pacing = {
             'fps_steady': round(sum(steady) / len(steady), 2) if steady else None,
+            'dip_metrics_valid': True,
             'dip_windows': sum(w['pacing_state'] == 'dip' for w in classified),
             'pacing_windows': len(classified),
             'dip_time_fraction': round(sum(w['duration_s'] for w in durations if w['pacing_state'] == 'dip') /
@@ -281,19 +297,29 @@ def summarize(windows, thermal=()):
             'frames_near33_lower_bound': any(w.get('frames_near33_source') != 'frame-durations' and
                                            w.get('frames_near33_source') != 'present-fence-histogram' for w in classified),
         }
+    if uncapped:
+        pacing = {'uncapped': True, 'speed_mode': 'uncapped', 'dip_metrics_valid': False,
+                  'fps_steady': None, 'dip_windows': None, 'dip_time_fraction': None}
     return {
         'windows': len(windows),
         **pacing,
         **presentation_summary(windows),
         'fps_min': min(vals('fps'), default=None), 'fps_max': max(vals('fps'), default=None),
         'fps_mean': round(sum(vals('fps')) / len(vals('fps')), 2) if vals('fps') else None,
+        'throughput_fps': throughput, 'throughput_windows': len(valid_fps),
+        'fps_stddev': round(statistics.pstdev(vals('fps')), 3) if vals('fps') else None,
         'draws_per_frame_mean': round(sum(vals('draws_per_frame')) / len(vals('draws_per_frame')), 2)
                                 if vals('draws_per_frame') else None,
         'draws_windows': len(vals('draws_per_frame')),
         'p50_ms_median': p50s[len(p50s) // 2] if p50s else None,
         'p95_ms_max': max(vals('p95_ms'), default=None), 'max_ms': max(vals('max_ms'), default=None),
+        'p50_ms_max': max(vals('p50_ms'), default=None), 'p99_ms_max': max(vals('p99_ms'), default=None),
+        'p99_p50_ratio_max': max(vals('p99_p50_ratio'), default=None),
+        'p99_windows': len(vals('p99_ms')),
         'gpu_ms_mean': round(sum(vals('gpu_ms')) / len(vals('gpu_ms')), 2) if vals('gpu_ms') else None,
         'long_ge45_total': sum(vals('long_ge45')), 'long_ge25_total': sum(vals('long_ge25')),
+        'over33_total': sum(vals('over33')) if vals('over33') else None,
+        'stutter_windows': len(vals('over33')),
         'over50_total': sum(vals('over50')),
         'cpu_max_c': mx(t['cpu_max_c'] for t in thermal), 'gpu_max_c': mx(t['gpu_max_c'] for t in thermal),
     }
@@ -304,7 +330,7 @@ def block_metric(summary, key):
     v = summary.get(key)
     if v is None:
         return None
-    if key in ('over50_total', 'long_ge45_total'):
+    if key in ('over33_total', 'over50_total', 'long_ge45_total'):
         return round(v / summary['windows'], 3) if summary.get('windows') else None
     return v
 
@@ -535,6 +561,8 @@ def main():
     ap.add_argument('--commit', help='source commit of the measured APK (its assets/build.txt)')
     ap.add_argument('--meta', help='JSON object deep-merged over the result (device names, profiles, extra caveats)')
     ap.add_argument('--arms', action='store_true', help='in-session A/B: assign windows to the arms of the live-switch marks')
+    ap.add_argument('--uncapped', action='store_true',
+                    help='uncapped measurement: disable dip classification and compare time-weighted throughput')
     ap.add_argument('--target-fps', type=int, choices=(30, 60),
                     help='override pacing target (otherwise pans.txt TARGET_FPS or preset TOTK_FPS60)')
     ap.add_argument('--guard-frames', type=int, default=GUARD_FRAMES,
@@ -571,6 +599,7 @@ def main():
         facts[dev] = read_kv(os.path.join(out, f'facts-{dev}.txt'))
         senv = read_kv(os.path.join(out, f'settings-{dev}.env')) or dict(info.get('settings', {}))
         senv.pop('TOTK_DATA_DIR', None)
+        effective = {**senv, **read_kv(os.path.join(out, f'totk-env-{dev}.txt'))}
         f = facts[dev]
         displays = f.get('displays')
         devices[dev] = {
@@ -578,6 +607,7 @@ def main():
             'android': f.get('android') or None, 'profile': None,
             'screens': {'1': 'single', '2': 'dual'}.get(displays, displays) if displays else None,
             'settings_env': senv,
+            'uncapped': a.uncapped or effective.get('TOTK_UNCAPPED') == '1',
         }
         if f.get('serial_sha256'):
             devices[dev]['serial_sha256'] = f['serial_sha256']
@@ -614,7 +644,7 @@ def main():
             if not plist:
                 continue
             print(f'\n## {dev} / {scene}')
-            print('window          fps    p50    p95    max   GPU ms  long>=25  long>=45  over33/over50(stutter line)')
+            print('window          fps    p50    p95    p99    max   GPU ms  long>=25  long>=45  over33/over50(stutter line)')
             windows, thermal, all_rows, pan_residencies, batteries, targets, pan_summaries = [], [], [], [], [], [], []
             samples = parse_sample_rows(os.path.join(out, f'samples-{dev}.txt'))
             for kv in plist:
@@ -627,13 +657,17 @@ def main():
                     lf = [x for x in longf if f - 300 < x[0] <= f]
                     st = stut.get(f)
                     w = {'frames': [f - 299, f], 'fps': fps.get(f), 'p50_ms': timing[f][0], 'p95_ms': timing[f][1],
+                         'p99_ms': info['frame_p99'].get(f, (None, None))[0],
+                         'p99_samples': info['frame_p99'].get(f, (None, None))[1],
                          'max_ms': round(timing[f][2], 1), 'gpu_ms': gpu.get(f), 'long_ge25': sum(x[1] >= 25 for x in lf),
                          'long_ge45': sum(x[1] >= 45 for x in lf), 'over33': st[0] if st else None,
                          'over50': st[2] if st else None, 'draws_per_frame': info['draw_rates'].get(f)}
-                    w.update(pacing_of(f, w['fps'], target, info))
+                    w.update(pacing_of(f, w['fps'], target, info, devices[dev]['uncapped']))
+                    w['p99_p50_ratio'] = w['p99_ms'] / w['p50_ms'] if w['p99_ms'] is not None and w['p50_ms'] > 0 else None
                     w.update(presentation_of(f - 299, f, info))
                     windows.append(w)
-                    print(f'{f-299:>6}-{f:<6} {w["fps"] or 0:5.1f} {w["p50_ms"]:6.2f} {w["p95_ms"]:6.2f} {w["max_ms"]:6.1f} '
+                    print(f'{f-299:>6}-{f:<6} {w["fps"] or 0:5.1f} {w["p50_ms"]:6.2f} {w["p95_ms"]:6.2f} '
+                          f'{w["p99_ms"] if w["p99_ms"] is not None else float("nan"):6.2f} {w["max_ms"]:6.1f} '
                           f'{w["gpu_ms"] if w["gpu_ms"] is not None else float("nan"):7.1f}  {w["long_ge25"]:>6}    '
                           f'{w["long_ge45"]:>6}    {st[0] if st else "-"}/{st[2] if st else "-"} '
                           f'(>{st[1] if st else "-"}/>{st[3] if st else "-"}) {w["pacing_state"]} '
@@ -683,7 +717,13 @@ def main():
                 print('  memory / pressure (worst over the windows): ' + ', '.join(f'{k} {v}' for k, v in memory.items()))
             summary = summarize(windows, thermal)
             print_presentation(summary)
-            if summary.get('pacing_windows'):
+            if summary.get('uncapped'):
+                print(f'  uncapped: throughput {summary["throughput_fps"]} fps; dip_metrics_valid=false; '
+                      f'fps stddev {summary["fps_stddev"]}; frame p50/p95/p99 window maxima '
+                      f'{summary["p50_ms_max"]}/{summary["p95_ms_max"]}/{summary["p99_ms_max"]} ms; '
+                      f'p99/p50 max {summary["p99_p50_ratio_max"]}; >33/>50 ms '
+                      f'{summary["over33_total"]}/{summary["over50_total"]}')
+            elif summary.get('pacing_windows'):
                 steady = summary['fps_steady']
                 print(f'  pacing: steady fps {steady if steady is not None else "-"}; mean fps {summary["fps_mean"]} '
                       f'(time-weighted {summary["fps_time_mean"]}); dip windows {summary["dip_windows"]}/{len(windows)}, '
