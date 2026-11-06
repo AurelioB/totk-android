@@ -1764,12 +1764,25 @@ CLEAR, STORE and DONT_CARE-store attachment operations/frame and logical attachm
 MiB/frame (**not actual traffic**). JSONL also reports the first-to-last Vulkan GPU span and
 signed `gap_ms = span_ms - measured_ms`, including barriers, queue bubbles and remaining unscoped work.
 The compact top-N signature rows are sorted by total GPU ms/frame; percentages are
-shares of the measured total, not the full GPU span. Stable keys include render/compute
-kind, ordered attachment formats, exact reduced attachment-width/render-width and
-attachment-height/render-height fractions, sample count, color slot count, load/store
-ops and the first draw's combined resolved shader-key hash. Draw counts and absolute
-render dimensions are not identity. Frame ordinals are reported separately.
-Actual attachment identities/guest addresses are deliberately absent from signatures.
+shares of the measured total, not the full GPU span. Schema **3** exact pass keys include
+render/compute kind, absolute renderArea width/height, ordered attachment formats and absolute
+width/height, sample count, color slot count, load/store ops and first-draw shader-content hash.
+Draw counts, frame ordinals, scene references and guest addresses are not part of the key.
+Absolute JSONL `render_width/height` and attachment `width/height` allow exact-area driver joins.
+
+The common per-frame reference is its largest depth+MRT renderArea (at least two active color
+attachments), emitted as frame `scene_width/height`; `0/0` explicitly means none was observed.
+Pass `reference_width/height` use that scene extent, or `TOTK_RENDER_RES` when no scene was
+observed (otherwise the game's handheld 1280×720/docked 1600×900 mode default). Attachment
+fractions are exact reduced absolute/reference ratios, **never** divided by their own pass area.
+Completed-frame observations are retained until that reference is known, even across retired slots.
+
+Analyzer families normalize depth+MRT layouts and scene-sized depth-only prepasses against this
+reference (`scene_relative=true`). Thus a G-buffer and its depth prepass remain one family each
+through dynamic-resolution changes. Other passes retain absolute family dimensions: fixed 360²
+shadows stay one shadow family as the scene changes, and 360² versus 720² depth targets remain
+distinct. Exact pass tables retain every absolute key/area/reference variant, independent of family
+grouping. Schema 2 is rejected rather than silently reinterpreting its old self-normalized ratios.
 
 Traffic is an **uncompressed logical estimate**, render area × bytes/texel × samples per
 LOAD/STORE, not an Adreno hardware counter. It excludes metadata, resolves, compression,
@@ -1777,7 +1790,8 @@ alignment and driver decisions such as sysmem rendering. Depth and stencil opera
 counted separately, splitting packed D24S8 into 3+1 bytes and D32S8 into 4+1. Unsupported or
 block-compressed view byte sizes are excluded and counted in `unknown-byte attachments`.
 Capacity is 2,048 timed records and statistics queries and 64 frame segments per submission,
-and 16,384 key+ordinal aggregates per window; nonzero drops/query failures mean incomplete coverage.
+and 16,384 retained observations per frame/key+ordinal+reference aggregates per window;
+nonzero drops/query failures mean incomplete coverage.
 When off, there are no profiling query pools, allocations, timestamps or audit scans;
 draw/access hooks are a single disabled branch. Diagnostic-on CPU cost is not negligible.
 

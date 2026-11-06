@@ -1458,6 +1458,11 @@ measurements, the ownership contract is:
   `reconciliation_failed`, never clamped away. External GL/QCOM/LSFG execution, compositor work and scanout
   are outside Vulkan timestamp authority. Profiling requires graphics/compute timestamps and hostQueryReset;
   query pools are host-reset only after their existing slot fence, before either pre or main can use them.
+- **Profiler size identity (schema 3):** exact keys retain absolute renderArea/attachment dimensions for
+  driver-area joins. Each completed frame reports its largest depth+multi-color scene extent; pass attachment
+  fractions use that common reference, with the game resolution as an explicit no-scene fallback, not the pass area.
+  Analyzer families merge scene-relative MRTs and scene-sized depth prepasses through DRS; fixed depth targets
+  keep absolute families. Window rows preserve separate reference variants of the same absolute key.
 
 Pipeline handle selection deliberately remains on the walking thread in this cutover. `pipe_get`'s cold asynchronous
 misses skip draws; emitted draws immediately update cumulative synthetic samples, used by later reports and conditions.

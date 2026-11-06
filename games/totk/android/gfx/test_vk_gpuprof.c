@@ -55,8 +55,8 @@ static void record_draws(tex_t *target, prog_t *program, uint8_t *memory, unsign
     viewport.v[0][3] = (float)target->d.height; viewport.v[0][5] = 1;
     op(OP_VIEWPORTS, &viewport, sizeof viewport);
     p_scissor scissor = {0, 0, target->d.width, target->d.height}; op(OP_SCISSOR, &scissor, sizeof scissor);
-    /* Change the clear's scissor with the target, otherwise alternating extents
-     * intentionally create LOAD vs CLEAR keys rather than testing scale invariance. */
+    /* Keep each target's clear full-area so size is the only key difference,
+     * rather than alternating LOAD vs CLEAR attachment operations. */
     p_clear_color clear = {0, 15, {0, 0, 0, 1}}; op(OP_CLEAR_COLOR, &clear, sizeof clear);
     p_draw draw = {4, 0, 3, 0, 0};
     for (unsigned i = 0; i < draws; i++) op(OP_DRAW, &draw, sizeof draw);
@@ -75,13 +75,111 @@ static void check_pixels(tex_t *target, uint8_t *memory) {
     for (size_t i = 0; i < pixels; i++) bad += readback[i] != 255;
     CHECK(!bad, "profiled draw produces exact all-white real Vulkan readback at both render extents");
 }
+static int finish_fixture(unsigned frames, unsigned passes, unsigned draws, int supported) {
+    int mode = getenv("TOTK_VK_GPU_PROFILE") ? atoi(getenv("TOTK_VK_GPU_PROFILE")) : 0;
+    int workers = getenv("TOTK_VK_REC_THREADS") ? atoi(getenv("TOTK_VK_REC_THREADS")) : 0;
+    int stats = getenv("TOTK_VK_GPU_PROFILE_STATS") && !strcmp(getenv("TOTK_VK_GPU_PROFILE_STATS"), "1");
+    CHECK(vk_gpuprof_on == mode, "launch-time GPU profile mode remains effective");
+    CHECK(!!vk_record_enabled() == !!workers, "GPU profiling does not force requested recorder workers inline");
+    CHECK(!!vk_gpuprof_stats_mask() == !!(mode && stats && V.has_pipeline_statistics),
+        "statistics are available only when requested and supported");
+    if (workers && draws) {
+        uint64_t leases[4]; vk_record_test_leases(leases);
+        CHECK(leases[1] && leases[2], "parallel recorder secondary leases are actually used and returned");
+    }
+    vk_rec_lock(); vk_gpuprof_test_flush(); vk_rec_unlock();
+    printf("gpuprof-fixture frames=%u passes=%u draws=%u mode=%d workers=%d stats_supported=%d stats_enabled=%d checks=%u failures=%u\n",
+        frames, passes, draws, mode, workers, supported,
+        !!vk_gpuprof_stats_mask(), checks, failures);
+    return failures != 0;
+}
+static void area_texture(tex_t *target, pool_t *gpu, size_t *offset,
+                         unsigned format, unsigned width, unsigned height, uint64_t serial) {
+    target->d = (nvn_texdesc){.target = 1, .format = format, .width = width,
+        .height = height, .depth = 1, .levels = 1};
+    nvn_tex_layout(&target->d, &target->L);
+    *offset = (*offset + 0xffff) & ~(size_t)0xffff;
+    if (*offset > gpu->size || target->L.size > gpu->size - *offset) DIE("GPU profiler area fixture texture overflow");
+    target->mem = gpu->mem + *offset; target->pool = gpu; target->serial = serial;
+    *offset += target->L.size;
+}
+static uint8_t *area_readback(const tex_t *target, uint8_t *memory) {
+    return memory + (target->mem - target->pool->mem);
+}
+static void record_area_clear(tex_t *colors, tex_t *depth, uint8_t *memory) {
+    p_set_rt rt = {.n = colors ? 2 : 0, .depth = depth};
+    if (colors) { rt.color[0] = &colors[0]; rt.color[1] = &colors[1]; }
+    op(OP_SET_RT, &rt, sizeof rt);
+    p_scissor scissor = {0, 0, depth->d.width, depth->d.height}; op(OP_SCISSOR, &scissor, sizeof scissor);
+    for (int i = 0; i < rt.n; i++) {
+        p_clear_color clear = {i, 15, {i == 0, i == 1, 0, 1}};
+        op(OP_CLEAR_COLOR, &clear, sizeof clear);
+    }
+    p_clear_ds clear = {0.25f, 1, 0, 0}; op(OP_CLEAR_DS, &clear, sizeof clear);
+    /* A copy forces pending load-clears into the real dynamic-rendering path.
+     * It also proves the supplied NVN metadata describes actual GPU images. */
+    for (int i = 0; i <= rt.n; i++) {
+        tex_t *target = i < rt.n ? &colors[i] : depth;
+        memset(area_readback(target, memory), 0xc7, (size_t)target->d.width * target->d.height * 4);
+        p_copy_b2t copy = {.src = (uint64_t)(uintptr_t)area_readback(target, memory), .tex = target,
+            .r = {0, 0, 0, target->d.width, target->d.height, 1}};
+        op(OP_COPY_T2B, &copy, sizeof copy);
+    }
+}
+static void check_area_pixels(const tex_t *target, uint8_t *memory, int color) {
+    const uint8_t *pixels = area_readback(target, memory);
+    size_t bad = 0, count = (size_t)target->d.width * target->d.height;
+    for (size_t i = 0; i < count; i++) {
+        if (color < 0) {
+            float depth; memcpy(&depth, pixels + i * 4, sizeof depth); bad += depth != 0.25f;
+        } else {
+            const uint8_t *p = pixels + i * 4;
+            bad += p[0] != (color == 0 ? 255 : 0) || p[1] != (color == 1 ? 255 : 0) || p[2] || p[3] != 255;
+        }
+    }
+    CHECK(!bad, "area fixture real Vulkan color/depth clear has exact readback pixels");
+}
+static int run_areas(uint8_t *memory, pool_t *gpu, int supported) {
+    tex_t scene[2][3] = {0}, fixed[2] = {0}; size_t offset = 0;
+    for (unsigned extent = 0; extent < 2; extent++) for (unsigned slot = 0; slot < 3; slot++)
+        area_texture(&scene[extent][slot], gpu, &offset, slot == 2 ? 0x34 : 0x25,
+            64u << extent, 36u << extent, 86000 + extent * 3 + slot);
+    area_texture(&fixed[0], gpu, &offset, 0x34, 360, 360, 86006);
+    area_texture(&fixed[1], gpu, &offset, 0x34, 128, 128, 86007);
+    for (unsigned frame = 0; frame < 3; frame++) {
+        unsigned geometry = frame == 0 ? 1 : frame == 1 ? 2 : 0;
+        unsigned prepass = frame < 2, transfers = frame == 0 ? 6 : frame == 1 ? 9 : 2;
+        unsigned width = frame < 2 ? 64u << frame : 0, height = frame < 2 ? 36u << frame : 0;
+        if (prepass) {
+            record_area_clear(NULL, &scene[frame][2], memory);
+            record_area_clear(scene[frame], &scene[frame][2], memory);
+        }
+        /* The smaller MRT comes last: scene selection must take the largest
+         * render area, not the most recent pass or the larger fixed shadow.
+         * This exact key also has two distinct completed-frame references. */
+        if (frame == 1) record_area_clear(scene[0], &scene[0][2], memory);
+        record_area_clear(NULL, &fixed[0], memory);
+        record_area_clear(NULL, &fixed[1], memory);
+        submit(1);
+        if (frame < 2) for (unsigned extent = 0; extent <= frame; extent++) {
+            for (int color = 0; color < 2; color++) check_area_pixels(&scene[extent][color], memory, color);
+            check_area_pixels(&scene[extent][2], memory, -1);
+        }
+        check_area_pixels(&fixed[0], memory, -1); check_area_pixels(&fixed[1], memory, -1);
+        printf("gpuprof-areas-frame frame=%u scene_width=%u scene_height=%u passes=%u prepass=%u geometry=%u shadow=1 other_depth=1 transfers=%u\n",
+            frame + 1, width, height, prepass + geometry + 2, prepass, geometry, transfers);
+    }
+    printf("gpuprof-areas frames=3 passes=11 draws=0 exact_keys=6 families=5 transfers=17\n");
+    return finish_fixture(3, 11, 0, supported);
+}
 int main(int argc, char **argv) {
     unsigned frames = 302;
+    int areas = argc == 2 && !strcmp(argv[1], "--areas");
     if (argc == 3 && !strcmp(argv[1], "--frames")) {
         char *end; unsigned long value = strtoul(argv[2], &end, 10);
         if (!*argv[2] || *end || !value || value > 10000) return 2;
         frames = (unsigned)value;
-    } else if (argc != 1) return 2;
+    } else if (argc != 1 && !areas) return 2;
     /* Force short secondary chunks so workers=2 tests a real parallel pass,
      * rather than merely checking an enabled worker setting on inline draws. */
     setenv("TOTK_VK_REC_CHUNK_DRAWS", "1", 1); setenv("TOTK_VK_REC_LEAD_DRAWS", "1", 1);
@@ -98,6 +196,7 @@ int main(int argc, char **argv) {
         .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
     pool_t gpu = pool; gpu.mem = memory + (2u << 20); gpu.size = 2u << 20;
     gpu.flags = NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+    if (areas) return run_areas(memory, &gpu, supported);
     tex_t targets[2]; memset(targets, 0, sizeof targets);
     for (unsigned i = 0; i < 2; i++) {
         targets[i].d = (nvn_texdesc){.target = 1, .format = 0x25, .width = 64u << i,
@@ -161,20 +260,5 @@ int main(int argc, char **argv) {
     CHECK(!bad_upload, "direct profiled pre scope really fills bytes before the open main rendering executes");
     check_pixels(&targets[0], memory); check_pixels(&targets[1], memory);
     frames += 2; expected_passes += 2; expected_draws += 4;
-    int mode = getenv("TOTK_VK_GPU_PROFILE") ? atoi(getenv("TOTK_VK_GPU_PROFILE")) : 0;
-    int workers = getenv("TOTK_VK_REC_THREADS") ? atoi(getenv("TOTK_VK_REC_THREADS")) : 0;
-    int stats = getenv("TOTK_VK_GPU_PROFILE_STATS") && !strcmp(getenv("TOTK_VK_GPU_PROFILE_STATS"), "1");
-    CHECK(vk_gpuprof_on == mode, "launch-time GPU profile mode remains effective");
-    CHECK(!!vk_record_enabled() == !!workers, "GPU profiling does not force requested recorder workers inline");
-    CHECK(!!vk_gpuprof_stats_mask() == !!(mode && stats && V.has_pipeline_statistics),
-        "statistics are available only when requested and supported");
-    if (workers) {
-        uint64_t leases[4]; vk_record_test_leases(leases);
-        CHECK(leases[1] && leases[2], "parallel recorder secondary leases are actually used and returned");
-    }
-    vk_rec_lock(); vk_gpuprof_test_flush(); vk_rec_unlock();
-    printf("gpuprof-fixture frames=%u passes=%u draws=%u mode=%d workers=%d stats_supported=%d stats_enabled=%d checks=%u failures=%u\n",
-        frames, expected_passes, expected_draws, mode, workers, supported,
-        !!vk_gpuprof_stats_mask(), checks, failures);
-    return failures != 0;
+    return finish_fixture(frames, expected_passes, expected_draws, supported);
 }

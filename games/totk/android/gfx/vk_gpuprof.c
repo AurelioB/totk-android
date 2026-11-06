@@ -23,7 +23,7 @@ enum { GP_IA_VERTICES, GP_IA_PRIMITIVES, GP_VS, GP_CLIP_INVOCATIONS, GP_CLIP_PRI
     VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT | \
     VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)
 
-typedef struct { uint32_t format, w, h, load, store, bytes, width_den, height_den; } gp_attachment;
+typedef struct { uint32_t format, w, h, load, store, bytes; } gp_attachment;
 typedef struct {
     gp_attachment a[10];
     uint64_t shader;
@@ -49,7 +49,7 @@ struct vk_gpuprof_slot {
 };
 typedef struct {
     gp_key key; uint64_t hash, count, draws, counters[GP_STATS], stats_count, stats_draws;
-    uint32_t ordinal;
+    uint32_t ordinal, reference_w, reference_h, scene_relative;
     double ms, stats_ms;
 } gp_group;
 typedef struct {
@@ -81,6 +81,7 @@ static gp_group groups[GP_GROUPS];
 static struct {
     uint64_t frame, first, last, dropped;
     double measured;
+    uint32_t scene_w, scene_h;
     int has_ticks, failed;
 } completed;
 static uint64_t last_completed, window_frames;
@@ -92,6 +93,8 @@ typedef struct {
     gp_group *pass;
 } gp_long_frame;
 static gp_long_frame *long_ring;
+static gp_long_frame frame_pending; /* one reusable completion-owner frame outside long-frame mode */
+static uint32_t game_reference_w, game_reference_h; /* immutable fallback when no scene MRT was observed */
 static uint32_t long_frames;
 static double long_ms = 50;
 static uint64_t window, total_records, dropped_records, failed_slots, loads, clears, stores, discards;
@@ -164,25 +167,30 @@ static const char *kind_name(const gp_key *key) {
     static const char *const kinds[] = {"render", "compute", "upload", "transfer", "post", "upscale", "present", "framegen"};
     return key->compute < sizeof kinds / sizeof *kinds ? kinds[key->compute] : "other";
 }
+static uint32_t gcd_u32(uint32_t a, uint32_t b);
 static void output_pass(const gp_group *g, const char *type, uint64_t pass_frame) {
     const gp_key *k = &g->key;
     gp_json row = {0};
     uint64_t start = pass_frame ? (pass_frame - 1) / GP_WINDOW * GP_WINDOW + 1 : window * GP_WINDOW + 1;
     uint64_t end = pass_frame ? start + GP_WINDOW - 1 : report_end;
-    json_add(&row, "{\"schema\":2,\"type\":\"%s\",\"window_start\":%llu,\"window_end\":%llu,"
+    json_add(&row, "{\"schema\":3,\"type\":\"%s\",\"window_start\":%llu,\"window_end\":%llu,"
         "\"key\":\"%016llx\",\"kind\":\"%s\",\"ordinal\":%u,\"samples\":%u,\"shader\":\"%016llx\","
         "\"gpu_ms\":%.9f,\"count\":%llu,\"draws\":%llu,\"stats_valid\":%llu",
         type, (unsigned long long)start, (unsigned long long)end,
         (unsigned long long)g->hash, kind_name(k), g->ordinal, k->samples, (unsigned long long)k->shader,
         g->ms, (unsigned long long)g->count, (unsigned long long)g->draws, (unsigned long long)g->stats_count);
+    json_add(&row, ",\"render_width\":%u,\"render_height\":%u,\"reference_width\":%u,\"reference_height\":%u,"
+        "\"scene_relative\":%s", k->w, k->h, g->reference_w, g->reference_h, g->scene_relative ? "true" : "false");
     if (pass_frame) json_add(&row, ",\"frame\":%llu", (unsigned long long)pass_frame);
     json_add(&row, ",\"attachments\":[");
     int comma = 0;
     for (unsigned j = 0; j < 10; j++) if (k->a[j].format) {
         const gp_attachment *a = &k->a[j];
-        json_add(&row, "%s{\"slot\":%u,\"format\":%u,\"width_num\":%u,\"width_den\":%u,"
+        uint32_t gw = gcd_u32(a->w, g->reference_w), gh = gcd_u32(a->h, g->reference_h);
+        json_add(&row, "%s{\"slot\":%u,\"format\":%u,\"width\":%u,\"height\":%u,\"width_num\":%u,\"width_den\":%u,"
             "\"height_num\":%u,\"height_den\":%u,\"load\":%u,\"store\":%u}",
-            comma++ ? "," : "", j, a->format, a->w, a->width_den, a->h, a->height_den, a->load, a->store);
+            comma++ ? "," : "", j, a->format, a->w, a->h, a->w / gw, g->reference_w / gw,
+            a->h / gh, g->reference_h / gh, a->load, a->store);
     }
     json_add(&row, "]");
     if (g->stats_count) {
@@ -216,33 +224,36 @@ static uint32_t gcd_u32(uint32_t a, uint32_t b) {
 static uint64_t key_hash(const gp_key *key) {
     uint64_t h = UINT64_C(14695981039346656037);
     h = hash_bytes(h, &key->shader, sizeof key->shader);
-    const uint32_t fields[] = {key->samples, key->colors, key->compute};
+    const uint32_t fields[] = {key->w, key->h, key->samples, key->colors, key->compute};
     h = hash_bytes(h, fields, sizeof fields);
     for (unsigned j = 0; j < 10; j++) {
         const gp_attachment *a = &key->a[j];
-        const uint32_t values[] = {a->format, a->w, a->width_den, a->h, a->height_den, a->load, a->store};
+        const uint32_t values[] = {a->format, a->w, a->h, a->load, a->store};
         h = hash_bytes(h, values, sizeof values);
     }
     return h;
 }
 static int key_equal(const gp_key *a, const gp_key *b) {
-    if (a->shader != b->shader || a->samples != b->samples || a->colors != b->colors || a->compute != b->compute) return 0;
+    if (a->w != b->w || a->h != b->h || a->shader != b->shader || a->samples != b->samples ||
+        a->colors != b->colors || a->compute != b->compute) return 0;
     for (unsigned j = 0; j < 10; j++) {
         const gp_attachment *x = &a->a[j], *y = &b->a[j];
-        if (x->format != y->format || x->w != y->w || x->h != y->h || x->width_den != y->width_den ||
-            x->height_den != y->height_den || x->load != y->load || x->store != y->store) return 0;
+        if (x->format != y->format || x->w != y->w || x->h != y->h ||
+            x->load != y->load || x->store != y->store) return 0;
     }
     return 1;
 }
-static void long_capture(const gp_record *r, double ms, int stats_valid) {
-    if (!long_ring) return;
-    gp_long_frame *f = &long_ring[r->frame % long_frames];
+static gp_long_frame *pending_frame(uint64_t number) {
+    return long_ring ? &long_ring[number % long_frames] : &frame_pending;
+}
+static void capture_record(const gp_record *r, double ms, int stats_valid) {
+    gp_long_frame *f = pending_frame(r->frame);
     if (f->frame != r->frame) { f->frame = r->frame; f->n = 0; f->dropped = 0; }
-    if (f->n == GP_GROUPS) { f->dropped++; return; }
+    if (f->n == GP_GROUPS) { f->dropped++; completed.dropped++; dropped_records++; return; }
     if (f->n == f->capacity) {
         uint32_t capacity = f->capacity ? f->capacity * 2 : 256;
         gp_group *passes = realloc(f->pass, capacity * sizeof *passes);
-        if (!passes) { f->dropped++; return; }
+        if (!passes) { f->dropped++; completed.dropped++; dropped_records++; return; }
         f->pass = passes; f->capacity = capacity;
     }
     gp_group *g = &f->pass[f->n++];
@@ -264,6 +275,53 @@ static uint64_t long_finish(uint64_t number, double span, double measured, doubl
             (unsigned long long)number, span, measured, gap, f->n, (unsigned long long)f->dropped, long_ms);
     }
     return f->dropped;
+}
+static unsigned active_colors(const gp_key *key) {
+    unsigned colors = 0;
+    for (unsigned j = 0; j < 8; j++) colors += key->a[j].format != 0;
+    return colors;
+}
+static void aggregate_sample(const gp_group *sample) {
+    const gp_key *key = &sample->key;
+    total_records += sample->count; total_ms += sample->ms;
+    if (key->compute == 1) compute_ms += sample->ms;
+    else if (!key->compute) render_ms += sample->ms;
+    for (unsigned j = 0; j < 10; j++) {
+        const gp_attachment *a = &key->a[j]; if (!a->format) continue;
+        uint64_t bytes = (uint64_t)key->w * key->h * a->bytes * key->samples;
+        unknown_bytes += !a->bytes;
+        if (a->load == VK_ATTACHMENT_LOAD_OP_LOAD) { loads++; load_bytes += bytes; }
+        if (a->load == VK_ATTACHMENT_LOAD_OP_CLEAR) clears++;
+        if (a->store == VK_ATTACHMENT_STORE_OP_STORE) { stores++; store_bytes += bytes; } else discards++;
+    }
+    uint64_t reference = ((uint64_t)sample->reference_w << 32) | sample->reference_h;
+    size_t at = (sample->hash ^ sample->ordinal ^ reference ^ sample->scene_relative) % GP_GROUPS, tries = 0;
+    while (groups[at].count && (groups[at].hash != sample->hash || groups[at].ordinal != sample->ordinal ||
+        groups[at].reference_w != sample->reference_w || groups[at].reference_h != sample->reference_h ||
+        groups[at].scene_relative != sample->scene_relative || !key_equal(&groups[at].key, key)) &&
+        ++tries < GP_GROUPS) at = (at + 1) % GP_GROUPS;
+    if (tries == GP_GROUPS) { dropped_records++; completed.dropped++; return; }
+    gp_group *g = &groups[at];
+    if (!g->count) { *g = *sample; return; }
+    g->count += sample->count; g->draws += sample->draws; g->ms += sample->ms;
+    for (unsigned st = 0; st < GP_STATS; st++) g->counters[st] += sample->counters[st];
+    g->stats_count += sample->stats_count; g->stats_draws += sample->stats_draws; g->stats_ms += sample->stats_ms;
+}
+/* A frame can span several retired slots, and its largest scene MRT can be
+   recorded after a shadow/prepass. Resolve the common reference only once the
+   complete frame is known; query records cannot borrow retired-slot storage. */
+static void finalize_passes(void) {
+    gp_long_frame *f = pending_frame(completed.frame);
+    if (f->frame != completed.frame) return;
+    uint32_t w = completed.scene_w ? completed.scene_w : game_reference_w;
+    uint32_t h = completed.scene_h ? completed.scene_h : game_reference_h;
+    for (uint32_t i = 0; i < f->n; i++) {
+        gp_group *sample = &f->pass[i]; const gp_key *key = &sample->key;
+        sample->reference_w = w; sample->reference_h = h;
+        sample->scene_relative = !key->compute && key->a[8].format &&
+            (active_colors(key) >= 2 || (completed.scene_w && key->w == completed.scene_w && key->h == completed.scene_h));
+        aggregate_sample(sample);
+    }
 }
 /* Core VkFormat families are contiguous. Use the VIEW format, not guest storage: a BC
    texture can have an uncompressed attachment view and depth formats can be substituted. */
@@ -298,7 +356,7 @@ static void report(void) {
     if (!partial_report) report_end = (window + 1) * GP_WINDOW;
     for (size_t i = 0; i < n; i++) output_pass(rank[i], "pass", 0);
     gp_json summary = {0};
-    json_add(&summary, "{\"schema\":2,\"type\":\"window\",\"window_start\":%llu,\"window_end\":%llu,"
+    json_add(&summary, "{\"schema\":3,\"type\":\"window\",\"window_start\":%llu,\"window_end\":%llu,"
         "\"frames\":%llu,\"partial\":%s,\"measured_ms\":%.9f,\"span_ms\":%.9f,\"gap_ms\":%.9f,"
         "\"dropped\":%llu,\"failed_slots\":%llu,\"stats_failed_slots\":%llu,\"output_failures\":%llu}\n",
         (unsigned long long)(window * GP_WINDOW + 1), (unsigned long long)report_end,
@@ -318,12 +376,12 @@ static void report(void) {
         char attachments[800]; size_t used = 0; attachments[0] = 0;
         for (int j = 0; j < 10; j++) if (k->a[j].format) {
             const gp_attachment *a = &k->a[j];
-            int nn = snprintf(attachments + used, sizeof attachments - used, " %c%d=%u:%u/%ux%u/%u:%u/%u", j < 8 ? 'c' : 'd', j, a->format, a->w, a->width_den, a->h, a->height_den, a->load, a->store);
+            int nn = snprintf(attachments + used, sizeof attachments - used, " %c%d=%u:%ux%u:%u/%u", j < 8 ? 'c' : 'd', j, a->format, a->w, a->h, a->load, a->store);
             if (nn < 0 || (size_t)nn >= sizeof attachments - used) break;
             used += (size_t)nn;
         }
-        LOGV("[gpu-profile] #%zu sig=%016llx %s ordinal=%u samples=%u colors=%u shader=%016llx: %.3f ms/frame %.2f%% %.2f instances/frame %.2f draws/frame; attachments(fmt:relative-widthxheight:load/store)%s",
-             i + 1, (unsigned long long)g->hash, kind_name(k), g->ordinal, k->samples, k->colors,
+        LOGV("[gpu-profile] #%zu sig=%016llx %s ordinal=%u area=%ux%u reference=%ux%u samples=%u colors=%u shader=%016llx: %.3f ms/frame %.2f%% %.2f instances/frame %.2f draws/frame; attachments(fmt:absolute-widthxheight:load/store)%s",
+             i + 1, (unsigned long long)g->hash, kind_name(k), g->ordinal, k->w, k->h, g->reference_w, g->reference_h, k->samples, k->colors,
              (unsigned long long)k->shader, g->ms / GP_WINDOW, total_ms ? 100 * g->ms / total_ms : 0,
              g->count / (double)GP_WINDOW, g->draws / (double)GP_WINDOW, attachments);
         LOGV("[gpu-profile scale] sig=%016llx: %.2f draws/instance, %.1f ns/draw (whole pass); geometry-stats %s valid=%llu/%llu IA-vertices=%.0f IA-primitives=%.0f VS=%.0f clipping-invocations=%.0f clipping-primitives=%.0f fragments=%.0f/frame; %.2f verts/draw %.2f prims/draw %.3f fragments/prim %.3f ns/vertex %.3f ns/primitive",
@@ -354,16 +412,19 @@ static double tick_ms(uint64_t end, uint64_t start) {
 }
 static void finish_frame(void) {
     if (!completed.frame) return;
+    finalize_passes();
     double span = completed.has_ticks ? tick_ms(completed.last, completed.first) : 0;
     double gap = span - completed.measured;
     double epsilon = V.props.limits.timestampPeriod * (GP_RECORDS * 2.0 + 2) / 1e6;
     int failed = completed.failed || completed.dropped || !completed.has_ticks || gap < -epsilon;
     uint64_t long_dropped = long_finish(completed.frame, span, completed.measured, gap);
     gp_json row = {0};
-    json_add(&row, "{\"schema\":2,\"type\":\"frame\",\"frame\":%llu,\"span_ms\":%.9f,"
-        "\"measured_ms\":%.9f,\"gap_ms\":%.9f,\"dropped\":%llu,\"reconciliation_failed\":%s,\"long_dropped\":%llu}\n",
+    json_add(&row, "{\"schema\":3,\"type\":\"frame\",\"frame\":%llu,\"span_ms\":%.9f,"
+        "\"measured_ms\":%.9f,\"gap_ms\":%.9f,\"dropped\":%llu,\"reconciliation_failed\":%s,\"long_dropped\":%llu,"
+        "\"scene_width\":%u,\"scene_height\":%u}\n",
         (unsigned long long)completed.frame, span, completed.measured, gap,
-        (unsigned long long)completed.dropped, failed ? "true" : "false", (unsigned long long)long_dropped);
+        (unsigned long long)completed.dropped, failed ? "true" : "false", (unsigned long long)long_dropped,
+        completed.scene_w, completed.scene_h);
     output_row(row.data);
     if (output_file) fflush(output_file);
     window_span += span; window_gap += gap; window_frames++;
@@ -384,6 +445,18 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
             int requested = se && !strcmp(se, "1");
             stats_on = vk_gpuprof_on && requested && V.has_pipeline_statistics;
             if (requested) LOGV("[gpu-profile] geometry+fragment statistics %s (pipelineStatisticsQuery=%d; TOTK_VK_GPU_PROFILE_STATS=1)", stats_on ? "on" : "unavailable", V.has_pipeline_statistics);
+            if (vk_gpuprof_on) {
+                const char *mode = getenv("TOTK_OPERATION_MODE"), *resolution = getenv("TOTK_RENDER_RES");
+                int handheld = mode && !strcmp(mode, "handheld");
+                game_reference_w = handheld ? 1280 : 1600; game_reference_h = handheld ? 720 : 900;
+                unsigned w, h; char tail;
+                if (resolution && sscanf(resolution, "%ux%u%c", &w, &h, &tail) == 2 &&
+                    w >= 64 && h >= 64 && w <= 4096 && h <= 4096) {
+                    game_reference_w = w; game_reference_h = h;
+                }
+                LOGV("[gpu-profile] schema=3 absolute pass keys; frame reference=largest depth+MRT, game fallback=%ux%u",
+                    game_reference_w, game_reference_h);
+            }
             if (vk_gpuprof_on) output_init();
             if (vk_gpuprof_on == 3) {
                 long_frames = (uint32_t)env_u64("TOTK_VK_GPU_PROFILE_LONG_FRAMES", 8, 1, 64);
@@ -445,33 +518,16 @@ void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot) {
 }
 static void ingest_record(gp_record *r, double ms, int stats_valid) {
     completed.measured += ms;
-    long_capture(r, ms, stats_valid);
-    total_records++; total_ms += ms;
-    if (r->key.compute == 1) compute_ms += ms;
-    else if (!r->key.compute) render_ms += ms;
-    for (int j = 0; j < 10; j++) {
-        const gp_attachment *a = &r->key.a[j]; if (!a->format) continue;
-        uint64_t bytes = (uint64_t)r->key.w * r->key.h * a->bytes * r->key.samples;
-        unknown_bytes += !a->bytes;
-        if (a->load == VK_ATTACHMENT_LOAD_OP_LOAD) { loads++; load_bytes += bytes; }
-        if (a->load == VK_ATTACHMENT_LOAD_OP_CLEAR) clears++;
-        if (a->store == VK_ATTACHMENT_STORE_OP_STORE) { stores++; store_bytes += bytes; } else discards++;
+    if (!r->key.compute && r->key.a[8].format && active_colors(&r->key) >= 2 &&
+        (uint64_t)r->key.w * r->key.h > (uint64_t)completed.scene_w * completed.scene_h) {
+        completed.scene_w = r->key.w; completed.scene_h = r->key.h;
     }
-    uint64_t hash = key_hash(&r->key); size_t at = (hash ^ r->instance) % GP_GROUPS, tries = 0;
+    capture_record(r, ms, stats_valid);
     if (vk_gpuprof_on == 2) {
+        uint64_t hash = key_hash(&r->key);
         const char *reason = r->reason < sizeof end_names / sizeof *end_names ? end_names[r->reason] : "unknown";
         LOGV("[gpu-split] frame=%llu ordinal=%u sig=%016llx kind=%s end=%s detail=%#x draws=%u ms=%.4f",
             (unsigned long long)r->frame, r->instance, (unsigned long long)hash, kind_name(&r->key), reason, r->detail, r->draws, ms);
-    }
-    while (groups[at].count && (groups[at].hash != hash || groups[at].ordinal != r->instance ||
-        !key_equal(&groups[at].key, &r->key)) && ++tries < GP_GROUPS) at = (at + 1) % GP_GROUPS;
-    if (tries == GP_GROUPS) { dropped_records++; completed.dropped++; return; }
-    gp_group *g = &groups[at];
-    if (!g->count) { g->key = r->key; g->hash = hash; g->ordinal = r->instance; }
-    g->count++; g->draws += r->draws; g->ms += ms;
-    if (stats_valid) {
-        for (unsigned st = 0; st < GP_STATS; st++) g->counters[st] += r->counters[st];
-        g->stats_count++; g->stats_draws += r->draws; g->stats_ms += ms;
     }
 }
 void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
@@ -551,8 +607,7 @@ void vk_gpuprof_begin(VkCommandBuffer cb, const VkRenderingInfo *ri, const VkFor
         if (j == 9) bytes = 1;
         else if (j == 8 && formats[j] == VK_FORMAT_D32_SFLOAT_S8_UINT) bytes = 4;
         else if (j == 8 && formats[j] == VK_FORMAT_D24_UNORM_S8_UINT) bytes = 3;
-        uint32_t gw = gcd_u32(widths[j], k->w), gh = gcd_u32(heights[j], k->h);
-        k->a[j] = (gp_attachment){formats[j], widths[j] / gw, heights[j] / gh, a->loadOp, a->storeOp, bytes, k->w / gw, k->h / gh};
+        k->a[j] = (gp_attachment){formats[j], widths[j], heights[j], a->loadOp, a->storeOp, bytes};
         open_audit.lo[j] = (uint64_t)(uintptr_t)t->mem;
         open_audit.hi[j] = open_audit.lo[j] + t->L.size;
         if (a->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) vk_gpuprof_read(open_audit.lo[j], t->L.size);

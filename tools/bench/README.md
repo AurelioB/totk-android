@@ -51,10 +51,34 @@ python3 tools/bench/ledger.py add $OUT/result.json --commit <sha> --apk <apk> --
 
 ## GPU pass profile (host-only analysis)
 
-`python3 tools/bench/gpuprof.py 'capture/gpuprof-*.jsonl*' [--json analysis.json]` reads schema-2
-GPU-profiler rows, including the three `.1`/`.2`/`.3` rotations. `--json -` emits JSON only on stdout.
-The per-pass table retains the exact key and ordinal; families combine only the same kind, sample count and
-attachment slot/format/exact normalized width and height/load/store structure, ignoring shader identity.
+`python3 tools/bench/gpuprof.py 'capture/gpuprof-*.jsonl*' [--json analysis.json]` reads **schema-3 only**
+GPU-profiler rows, including the three `.1`/`.2`/`.3` rotations. Schema 2 is rejected because its attachment
+ratios used different reference semantics. `--json -` emits JSON only on stdout (`totk-gpuprof-analysis/3`).
+
+Pass and selected `long_frame` rows require absolute `render_width`/`render_height`,
+`reference_width`/`reference_height`, and boolean `scene_relative`. Every attachment retains its slot, format,
+load/store and reduced `width_num`/`width_den`, `height_num`/`height_den`, plus absolute `width`/`height`.
+The analyzer checks that each rational exactly equals attachment dimension / reference dimension, not attachment
+dimension / pass area. References are the completed frame's largest depth+MRT render area (at least two active
+color slots), or the game-config fallback when no such scene is observed: `TOTK_RENDER_RES`, otherwise handheld
+1280×720 or docked 1600×900. References and attachment dimensions are positive uint32; render dimensions are
+positive uint32 for render scopes and may be paired 0/0 for nonrender scopes. Frame rows require
+`scene_width`/`scene_height`: the observed largest depth+MRT render area, or 0/0 when absent.
+
+Exact producer keys hash **absolute** render and attachment dimensions along with scope kind, formats,
+load/store, samples and shaders; changing scene size changes its exact key, but not a fixed shadow's key.
+Per-pass JSON retains the exact key/ordinal, absolute `render_width`/`render_height` and attachment `width`/`height`
+for driver joins. Both pass and family tables expose every contributing `areas` variant with its exact `keys`,
+absolute render/attachment dimensions, reference dimensions, attachment rationals and `scene_relative` flag.
+Multiple reference extents in one window are distinct observations, not duplicate/conflicting rows, and are
+preserved even when their absolute key is the same.
+
+Families ignore shader/key/ordinal but retain kind, samples, slots, formats, load/store and `scene_relative`.
+For `scene_relative=true` (depth+MRT geometry, or depth render areas equal to that frame's observed scene),
+families compare exact render/reference and attachment/reference ratios, merging matching DRS geometry and
+scene-sized depth prepasses across extents. A half-scene MRT remains distinct from a full-scene MRT, including
+when both occur in one frame. Fixed depth shadows, color-only passes and all other `scene_relative=false`
+scopes compare **absolute** render/attachment dimensions; two depth-only target sizes do not collapse together.
 Times and counters are **summed before dividing**, never averages of producer ratios or per-frame ratios.
 Unavailable statistics stay unavailable. Time/draw ratios use only complete-stat rows so their denominators
 match; partial-stat rows still contribute their available counters to counter-to-counter ratios.
@@ -69,10 +93,14 @@ the history ring, **not** the number of over-threshold frames that can be dumped
 selects every frame. Exit 1 means malformed/conflicting rows; a partial final JSON line is a reported capture
 warning. Exit 2 means an input/output error.
 
-`tests/test_gpuprof.py` pins the schema, ratios, optional statistics, rotation and long-frame accounting without
-Vulkan. The optional `GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs
-for modes 0/1/2/3, recorder workers 0/2, statistics on/off/unsupported, split-frame and unsent multi-frame
-reconciliation, direct pre uploads while main rendering is open, and bounded file rotation.
+`tests/test_gpuprof.py` pins schema-3 dimensions/references, scene-relative and fixed-depth families, ratios,
+optional statistics, rotation and long-frame accounting without Vulkan. The optional
+`GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs for modes 0/1/2/3,
+recorder workers 0/2, statistics on/off/unsupported, split-frame and unsent multi-frame reconciliation,
+direct pre uploads while main rendering is open, and bounded file rotation. The color-only 64/128 scenario
+requires distinct absolute keys and families. Its `--areas` scenario covers changing depth+MRT scenes,
+scene-sized prepasses, a smaller MRT later in the same frame, fixed 360×360/128×128 depth targets, and a frame
+with no observed scene; all contributing absolute keys and reference variants remain available for joins.
 Build `vkgpuproftest` via `games/totk/android/Makefile`; it also builds the existing `vkdraw-seed`.
 Set `TOTK_SHADER_SEED_DIR` to that seed's absolute directory and select the host lavapipe loader as for `vkdrawtest`.
 The fixture verifies actual pixels and secondary recorder use; it does not establish Android overhead or speedup.

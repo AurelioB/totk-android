@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Analyze schema-2 GPU-profiler JSONL (host only, Python standard library).
+"""Analyze schema-3 GPU-profiler JSONL (host only, Python standard library).
 
-Pass gpu_ms and counters are window SUMS, not per-frame averages. Families group
-kind, sample count and exact normalized attachment structure, never shader/key.
+Pass gpu_ms and counters are window SUMS, not per-frame averages. Scene-relative
+families use exact scene ratios; other families retain absolute attachment areas.
 Long-frame rows are a separate, selected population and never added to windows.
 """
 import argparse
 import glob
+from fractions import Fraction
 import json
 import math
 from pathlib import Path
@@ -17,7 +18,10 @@ from benchlib import guard_output
 
 STATS = ('ia_vertices', 'ia_primitives', 'vs_invocations', 'clipping_invocations',
          'clipping_primitives', 'fs_invocations')
-ATTACHMENT = ('slot', 'format', 'width_num', 'width_den', 'height_num', 'height_den', 'load', 'store')
+ATTACHMENT = ('slot', 'format', 'width', 'height', 'load', 'store')
+ATTACHMENT_RATIOS = ('width_num', 'width_den', 'height_num', 'height_den')
+REFERENCE = ('reference_width', 'reference_height', 'scene_relative')
+UINT32_MAX = (1 << 32) - 1
 RATIOS = ('verts_per_draw', 'prims_per_draw', 'fragments_per_prim', 'ns_per_vertex', 'ns_per_primitive')
 
 
@@ -34,10 +38,19 @@ def number(row, key, integer=False, minimum=0):
     return value
 
 
+def dimensions(row, prefix, minimum=0):
+    width, height = (number(row, f'{prefix}_{axis}', True, minimum) for axis in ('width', 'height'))
+    if width > UINT32_MAX or height > UINT32_MAX:
+        raise ValueError(f'{prefix}: dimensions exceed uint32')
+    if bool(width) != bool(height):
+        raise ValueError(f'{prefix}: zero dimensions must be paired')
+    return width, height
+
+
 def validate(row):
-    """Reject malformed v2 rows; preserve additive producer metadata verbatim."""
-    if not isinstance(row, dict) or type(row.get('schema')) is not int or row['schema'] != 2:
-        raise ValueError('expected object with schema=2')
+    """Reject malformed v3 rows; preserve additive producer metadata verbatim."""
+    if not isinstance(row, dict) or type(row.get('schema')) is not int or row['schema'] != 3:
+        raise ValueError('expected object with schema=3')
     kind = row.get('type')
     if kind not in ('window', 'pass', 'frame', 'long_frame'):
         raise ValueError('unknown row type')
@@ -47,6 +60,8 @@ def validate(row):
             raise ValueError('window_end precedes window_start')
     if kind in ('frame', 'long_frame'):
         number(row, 'frame', True, 1)
+    if kind == 'frame':
+        dimensions(row, 'scene')
     if kind in ('window', 'frame'):
         for key in ('span_ms', 'measured_ms', 'gap_ms'):
             number(row, key)
@@ -63,6 +78,10 @@ def validate(row):
                 raise ValueError(f'{key}: expected nonempty string')
         if row['kind'] not in ('render', 'compute', 'upload', 'transfer', 'post', 'upscale', 'present', 'framegen'):
             raise ValueError('kind: unknown GPU scope kind')
+        dimensions(row, 'render', 1 if row['kind'] == 'render' else 0)
+        dimensions(row, 'reference', 1)
+        if not isinstance(row.get('scene_relative'), bool):
+            raise ValueError('scene_relative: expected boolean')
         number(row, 'ordinal', True)
         number(row, 'gpu_ms')
         count = number(row, 'count', True, 1)
@@ -91,8 +110,10 @@ def validate(row):
         for attachment in attachments:
             if not isinstance(attachment, dict):
                 raise ValueError('attachment: expected object')
-            for key in ATTACHMENT:
-                number(attachment, key, True)
+            for key in (*ATTACHMENT, *ATTACHMENT_RATIOS):
+                number(attachment, key, True, 1 if key in ('width', 'height') else 0)
+            if attachment['width'] > UINT32_MAX or attachment['height'] > UINT32_MAX:
+                raise ValueError('attachment: dimensions exceed uint32')
             if attachment['slot'] in slots:
                 raise ValueError('duplicate attachment slot')
             slots.add(attachment['slot'])
@@ -100,6 +121,8 @@ def validate(row):
                 n, d = (attachment[f'{axis}_{part}'] for part in ('num', 'den'))
                 if d == 0 or math.gcd(n, d) != 1:
                     raise ValueError(f'{axis}: expected reduced rational with positive denominator')
+                if n * row[f'reference_{axis}'] != attachment[axis] * d:
+                    raise ValueError(f'{axis}: rational differs from attachment/reference dimensions')
     return row
 
 
@@ -128,11 +151,11 @@ def identity(stream, row):
     if kind == 'window':
         fields = ('window_start', 'window_end')
     elif kind == 'pass':
-        fields = ('window_start', 'window_end', 'key', 'ordinal')
+        fields = ('window_start', 'window_end', 'key', 'ordinal', *REFERENCE)
     elif kind == 'frame':
         fields = ('frame',)
     else:
-        fields = ('frame', 'key', 'ordinal')
+        fields = ('frame', 'key', 'ordinal', *REFERENCE)
     return (stream, kind, *(row[key] for key in fields))
 
 
@@ -177,9 +200,22 @@ def load(paths):
     return list(observations.values()), counts, issues
 
 
-def family(row):
+def absolute_area(row):
     attachments = sorted(row['attachments'], key=lambda a: a['slot'])
-    return (row['kind'], row['samples'], tuple(tuple(a[k] for k in ATTACHMENT) for a in attachments))
+    return (row['render_width'], row['render_height'],
+            tuple(tuple(a[k] for k in ATTACHMENT) for a in attachments))
+
+
+def family(row):
+    if not row['scene_relative']:
+        area = absolute_area(row)
+    else:
+        attachments = sorted(row['attachments'], key=lambda a: a['slot'])
+        area = (Fraction(row['render_width'], row['reference_width']),
+                Fraction(row['render_height'], row['reference_height']),
+                tuple((a['slot'], a['format'], *(a[k] for k in ATTACHMENT_RATIOS), a['load'], a['store'])
+                      for a in attachments))
+    return (row['kind'], row['samples'], row['scene_relative'], area)
 
 
 def ratio(numerator, denominator):
@@ -189,16 +225,29 @@ def ratio(numerator, denominator):
 def aggregate(rows, per_family=False):
     groups = {}
     for row in rows:
-        structural = family(row)
-        ident = structural if per_family else (row['key'], row['ordinal'], structural, row['shader'])
+        absolute = absolute_area(row)
+        ident = family(row) if per_family else (
+            row['key'], row['ordinal'], row['kind'], row['samples'], absolute, row['shader'])
         if ident not in groups:
-            groups[ident] = dict(kind=row['kind'], samples=row['samples'],
-                                 attachments=sorted(row['attachments'], key=lambda a: a['slot']),
+            groups[ident] = dict(kind=row['kind'], samples=row['samples'], areas={},
                                  keys=set(), ordinals=set(), shaders=set(), rows=0, count=0, draws=0,
                                  gpu_ms=0.0, stats_valid=0, stats_missing=0, stats_partial_rows=0,
                                  stats={key: 0 for key in STATS}, ratio_draws=0, ratio_gpu_ms=0.0,
                                  ratio_stats={key: 0 for key in STATS})
+            if per_family:
+                groups[ident]['scene_relative'] = row['scene_relative']
+            else:
+                groups[ident].update(render_width=row['render_width'], render_height=row['render_height'],
+                                     attachments=[{k: a[k] for k in ATTACHMENT}
+                                                  for a in sorted(row['attachments'], key=lambda a: a['slot'])])
         group = groups[ident]
+        variant = (absolute, *(row[k] for k in REFERENCE))
+        if variant not in group['areas']:
+            group['areas'][variant] = dict(
+                keys=set(), render_width=row['render_width'], render_height=row['render_height'],
+                **{k: row[k] for k in REFERENCE},
+                attachments=sorted(row['attachments'], key=lambda a: a['slot']))
+        group['areas'][variant]['keys'].add(row['key'])
         group['keys'].add(row['key'])
         group['ordinals'].add(row['ordinal'])
         group['shaders'].add(row['shader'])
@@ -218,6 +267,8 @@ def aggregate(rows, per_family=False):
                 group['stats_partial_rows'] += 1
     result = []
     for group in groups.values():
+        group['areas'] = [{**area, 'keys': sorted(area['keys'])}
+                          for _, area in sorted(group['areas'].items())]
         for key in ('keys', 'ordinals', 'shaders'):
             group[key] = sorted(group[key])
         if not per_family:
@@ -279,7 +330,7 @@ def analyze(paths):
     pass_rows = [o['row'] for o in by_type['pass']]
     long_rows = [o['row'] for o in by_type['long_frame']]
     return {
-        'schema': 'totk-gpuprof-analysis/2', 'files': list(map(str, paths)),
+        'schema': 'totk-gpuprof-analysis/3', 'files': list(map(str, paths)),
         'coverage': {**counts, 'streams': len({o['stream'] for o in observations}),
                      'windows': len(windows), 'pass_rows': len(pass_rows), 'frame_rows': len(by_type['frame']),
                      'long_frame_rows': len(long_rows), 'long_frames': len({(o['stream'], o['row']['frame'])
@@ -298,7 +349,9 @@ def analyze(paths):
         'issues': issues,
         'method': 'Sum times/counters before division; ratios never averaged. Time/draw ratios use only rows with '
                   'complete statistics; partial-stat counters remain in counter-to-counter ratios. Families ignore '
-                  'shader/key/ordinal but keep kind, samples and exact attachment rationals/load/store. '
+                  'shader/key/ordinal but keep kind, samples, scene_relative and render/attachment layout. '
+                  'Scene-relative layouts use exact scene-reference ratios; other layouts use absolute dimensions. '
+                  'All contributing exact keys, absolute areas and scene-reference variants remain in areas. '
                   'Long-frame rows are threshold-selected, not a complete frame population. Window/frame timing '
                   'are separate views, never added together. Missing leading/trailing captures cannot be inferred.',
     }
@@ -310,16 +363,17 @@ def fmt(value):
 
 def render_table(title, groups, out):
     print(f'\n## {title}', file=out)
-    print('key(s) / ordinal(s) | kind | GPU sum ms | passes | draws | stats valid/missing | '
+    print('key(s) / ordinal(s) | kind | render area(s) | GPU sum ms | passes | draws | stats valid/missing | '
           'verts/draw | prims/draw | fragments/prim | ns/vertex | ns/primitive', file=out)
     for group in groups:
         ratios = group['ratios'] or {}
+        render_areas = sorted({(a['render_width'], a['render_height']) for a in group['areas']})
         values = [','.join(group['keys']) + ' / ' + ','.join(map(str, group['ordinals'])), group['kind'],
-                  group['gpu_ms'], group['count'], group['draws'],
+                  ','.join(f'{w}x{h}' for w, h in render_areas), group['gpu_ms'], group['count'], group['draws'],
                   f'{group["stats_valid"]}/{group["stats_missing"]}', *(ratios.get(k) for k in RATIOS)]
         print(' | '.join(map(fmt, values)), file=out)
-        print(f'  structure: samples={group["samples"]} attachments='
-              f'{json.dumps(group["attachments"], sort_keys=True, separators=(",", ":"))} '
+        print(f'  structure: samples={group["samples"]} areas='
+              f'{json.dumps(group["areas"], sort_keys=True, separators=(",", ":"))} '
               f'shaders={",".join(group["shaders"])}', file=out)
         print('  counters: ' + ('unavailable' if group['stats'] is None else
               ' '.join(f'{k}={group["stats"][k]}' for k in STATS)) +
@@ -328,7 +382,7 @@ def render_table(title, groups, out):
 
 
 def render(report, out=sys.stdout):
-    print('# GPU profile schema 2', file=out)
+    print('# GPU profile schema 3', file=out)
     print(report['method'], file=out)
     print('Coverage: ' + ' '.join(f'{k}={v}' for k, v in report['coverage'].items()), file=out)
     for kind, timing in report['timing'].items():
