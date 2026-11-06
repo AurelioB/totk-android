@@ -7,7 +7,7 @@ and comparing against the recorded baselines. The full procedure is the `totk-be
 Device side: `su` root (for `sendevent`, the app's private `totk.log` and `settings.env`, `dmesg`, and the thermal /
 cpufreq / kgsl sysfs files). Nothing is pushed to the device; the device writes are the dmesg marker of
 `collect.sh --mark` and the live-switch control file of `live.sh` / `ab.sh` (`<game>/totk.ctl`, written with the game
-folder's owner and `chcon --reference=<game dir>`). Everything is read from `totk.log` and sysfs / procfs, never from
+folder's owner and explicit SELinux context from `ls -Zd <game dir>`). Everything is read from `totk.log` and sysfs / procfs, never from
 logcat (some devices' logd drops the game's lines). `bench_input.sh`, `pan.sh` and `live.sh` run every root command
 through one persistent root shell per device (`rootsh.py`; `sampler.py` holds its own), pinned to the slowest cpufreq
 cluster: a `su -c` per command costs the device a su session and, with Magisk, a su-notify `app_process` on any core.
@@ -18,7 +18,7 @@ Common options: `-s <serial>` (adb serial), `--device <label>` (a short name use
 | Script | Use |
 |---|---|
 | `bench_input.sh -s <serial> [--event /dev/input/eventN] [--display <id>] <action>` | `press <A\|B\|X\|Y\|L\|R\|PLUS\|MINUS\|UP\|DOWN\|LEFT\|RIGHT> [ms]`, `rstick <x> [y]` (`rstick 0` releases), `shot <file>`, `log`, `detect`, `freqs` (the frequency limits as one line: `cpuN=<cpus>:<scaling_min>:<scaling_max>:<cpuinfo_max>` kHz per cpufreq policy, `gpu_maxclk`, `gpu_freqs`, `gpu_devfreq_max`, GPU power levels). Auto-detects the controller node (`getevent -p`: ABS_Z/ABS_RZ + BTN_SOUTH) and the first display (`dumpsys SurfaceFlinger --display-id`). |
-| `pan.sh -s <serial> --device <label> --scene <label> --seconds N [--value 16000] [--first right\|left] [--no-shot] --out <dir>` | Steady pan: stick right for N/2 s, left for N/2 s (`--first left`: the other way round), so the view returns. Appends `<device> <scene> F0= F1= T0= T1= V= D=` to `<dir>/pans.txt` and the frequency limits before / after the pan to `<dir>/freqs.txt`; after releasing the stick (outside the measured windows) a screenshot in `<dir>/shots/` unless `--no-shot`. The game must be running. |
+| `pan.sh -s <serial> --device <label> --scene <label> [--target-fps 30\|60] [--seconds N] [--repeat N] [--value 16000] [--first right\|left] [--no-shot] --out <dir>` | Return pan: stick right for half the time then left (`--first left`: reverse). Defaults to 48 s at 30 target, 144 s at 60 target. Records frame/time/frequency boundaries and exact GPU cumulative snapshots per pan, then optional screenshot outside motion. |
 | `rootsh.py -s <serial> run [-c <script>] \| status \| stop` | The serial's persistent root shell: a host-side broker holding one `adb shell su -c sh`, started by the first `run`, ended by `stop`, after 30 idle minutes or when the device goes. `run` executes the script (default: stdin) in its own `sh -c` and passes its stdout, stderr and status through (124: no answer in time, 125: no root shell). The shell pins itself to the slowest cpufreq cluster (`status` prints the cores). |
 | `live.sh -s <serial> set KEY=VALUE \| unset KEY \| mark <text>...` | Live switches (APP.md *Live switches*): appends the lines to `<game>/totk.ctl` in one write (one generation at the next presented frame) and prints the game's `[totk-ctl]` answer (a mark's acknowledgement, refusals); exit 3 when a mark is not acknowledged, 4 when a line was refused. |
 | `ab.sh -s <serial> --device <label> --scene <label> --arms 'A:<lines>;B:<lines>' [--order ABBAABBA] [--pan-seconds 30] [--settle 15] --out <dir>` | In-session A/B in one loaded scene: per block, the arm's lines plus `mark ab arm=<X> block=<n> scene=<scene> direction=<right\|left>` (live.sh), a settle, a pan (direction alternating). Writes `<dir>/arms.txt` with the direction recorded. |
@@ -35,6 +35,109 @@ GPU cap), listed in `docs/benchmarks/baselines/index.json`. Only `ledger.py add`
 `analyze.py`/`compare.py` refuse to write any baseline path. `baseline-1.0.0.json` is registered there without a GPU
 cap, so it gives reference-only comparisons.
 
+### Pacing states, not just a session average
+
+`analyze.py` uses the preset's `TOTK_FPS60` (`1`: 60 target, `0`: 30 target), recorded pan target, or explicit
+`--target-fps 30|60`. Unknown targets remain unclassified, never silently treated as 60. At 60, a window with
+at least 60/300 frames in 29–37.5 ms is a dip: complete frame durations take priority, then the complete
+present-fence interval histogram. Sparse `[长帧]` / `[frame-tl late]` traces only establish lower bounds; otherwise
+the fallback is window fps below 5/6 of target (below 50 for 60). A normal 30-target 33 ms window is steady.
+Fence signals are a framework pacing proxy, **not guaranteed hardware scanout** and not proof of controller causality.
+
+The JSON and console separate `fps_steady` (mean of non-dip window fps), `dip_windows`, `dip_time_fraction`
+(sum of dip-window seconds / classified-window seconds, using 300/fps), `frames_near33`, and `fps_mean`
+(legacy arithmetic window mean). `fps_time_mean` is the actual throughput over those complete windows, i.e.
+total frames / total time; neither mean includes warm-up, dropped edge windows or screenshot time. Missing frame
+counts remain null; `frames_near33_lower_bound` and coverage describe sparse traces. Do not infer counts from fps or
+from the stutter line's >33 ms total, which misses frames just below 33 ms.
+
+A/B comparisons report steady fps and dip time independently; a dip-time difference above 0.05 (five percentage
+points) says **verdict confounded by dips** rather than declaring a speed win from mean fps. All-dip arms have no
+steady-fps estimate. Historical JSON without pacing data is labelled unavailable and retains legacy comparisons;
+re-analyze its original logs with the preset target to obtain a pacing-aware comparison.
+
+Draws are a **cumulative** backend counter: `draws_per_frame` uses consecutive 300-frame sample differences,
+`(D_now - D_previous)/(frame_now - frame_previous)`, never `D_now/300`. First samples, counter/frame resets and
+missing intermediate samples have no rate (null); the next complete monotonic pair resumes measurement.
+`draws_per_frame_mean` and `draws_windows` report the mean and coverage over usable windows.
+
+### Presentation tails, bins and judder
+
+Each selected window retains `[nvn-vk]` `recording_ms` and the framework present-fence cadence line's
+`present_p95_ms` / `present_p99_ms`. Every `pans[].summary`, run summary and live-switch arm/block summary includes
+`recording_ms_mean`, `present_p95_ms_max`, `present_p99_ms_max` and their window coverage. The latter are **maxima
+of the reported window percentiles**, not reconstructed pooled p95/p99; percentiles cannot be pooled from quantiles.
+These fields are informational and do not silently change A/B verdict tolerances.
+
+Always-on AHB bins are `<12.5 / 12.5–20.9 / 20.9–29 / 29–37.5 / 37.5–45.8 / >=45.8 ms`.
+`present_interval_bin_counts` sums selected windows' observed pairs; `present_interval_bin_shares` divides by the
+total observed pair count, not by 300 or by window count. `present_judder_proxy_fraction` is the **20.9–29 ms bin
+share**, only a proxy: the bins cannot recover an exact >16.7 & <30 ms share. Missing histogram coverage is explicit.
+Cadence/histogram records are associated with the latest runtime FPS-window marker in the log, as for pacing-state
+analysis; asynchronous fence-result blocks are not claimed to be exact physical pan-boundary measurements.
+
+For exact timestamp arithmetic in a **separate diagnostic run**, set `TOTK_PRESENT_CADENCE_TRACE=1` in `totk.env`
+for both arms and restart. `[present-trace]` records carry immutable `generation`, transaction `id`, `source_frame`
+and `display_ns`. The analyzer sorts/join consecutive IDs within the same generation, requiring both framework fence
+timestamps to be present and increasing; it never joins callback order, bridges missing IDs or crosses generation
+boundaries. Intervals belong to included frame windows only when both source endpoints lie within that window
+(allowing its preceding boundary frame). Duplicate conflicting identities are excluded.
+`present_judder_exact_fraction` counts strictly **16,700,000 < delta_ns < 30,000,000**, with explicit
+`present_judder_exact_hits` / `present_judder_exact_pairs`: exact over the **observed valid trace pairs**, not an
+estimate for missing pairs or proof of physical scanout. It is null without valid traced intervals.
+`TOTK_FRAME_TIMELINE=1` logs only selected late per-frame intervals and is not a substitute for this full trace.
+Cadence tracing is high-volume and has measurably perturbed Thor timing: keep it off in ordinary performance arms,
+do not mix traced/untraced arms, and use independent distinct-picture evidence for displayed smoothness.
+
+### Long pans and exact GPU residency
+
+The target defaults to the active preset (`settings.env`, then developer `totk.env` override); `--target-fps`
+overrides detection. Unknown targets use 48 s and omit target metadata rather than incorrectly labelling a 60 run.
+For 60-target measurements use `pan.sh --target-fps 60 --out "$OUT" ...`: the default is a continuous **144 s**
+pan (72 s each direction), long enough for >=12 complete 300-frame windows even during 30-interval stretches.
+`--seconds N` explicitly chooses another length; `--repeat N` runs back-to-back return pans, each with independent
+boundaries. `--target-fps 60 --seconds 48 --repeat 3` is the recommended shorter-camera-cycle alternative.
+Keep at least 12 **included** windows per session/arm; the analyzer warns for shorter 60-target scene records.
+If a prolonged slowdown leaves fewer, lengthen/repeat rather than accepting a short run. Use the same duration,
+cycle length and direction schedule in both arms; explicit `ab.sh --pan-seconds 144` keeps its own block schedule.
+
+Every pan invokes `sampler.py --gpu-snapshot` just before and after motion via the persistent root shell, storing raw
+cumulative counters in `gpu-time-in-state.jsonl`. The first supported source is KGSL/devfreq `trans_stat`, then the
+KGSL `gpu_clock_stats` equivalent (or devfreq `time_in_state`). `analyze.py` reports each pan's frequency counter
+deltas and fractions, not a histogram of 3-second instantaneous clock samples. `trans_stat` uses the final residency
+column, never its transition matrix; fixed-width concatenated headers are supported. Counter units are preserved
+(`time(ms)` means milliseconds; an unspecified unit stays unknown), and frequencies are Hz.
+KGSL `gpu_clock_stats` is a vector in `gpu_available_frequencies` order and counts **active clock time**: its fractions
+are an active-frequency distribution, not wall-time residency. Boundary reads bracket the pan but include small
+host/control latency; timestamps/uptimes and raw text remain available for that audit.
+Missing/failed snapshots, source/frequency/unit/boot changes, actual per-frequency counter regressions and
+non-advancing counters produce unavailable residency, never fake zeroes. KGSL `reset_count` is **not a devfreq
+statistics-reset generation**: Qualcomm's [reset attribute](https://github.com/qualcomm-linux/kgsl/blob/d70a6765a318eda3e400c711587ce373c693c99e/kgsl_pwrctrl.c)
+returns `device->reset_counter`, incremented by [Gen8 GPU boot](https://github.com/qualcomm-linux/kgsl/blob/d70a6765a318eda3e400c711587ce373c693c99e/adreno_gen8_gmu.c)
+including normal wake after slumber (and recovery). A change alone does not invalidate monotonic residency.
+The raw start/end values and `reset_count_delta` remain diagnostic; they do not establish a GPU fault count.
+This upstream evidence is not a claim that the Odin's exact vendor kernel source was identified.
+
+For declared `s`/`ms`/`us`/`ns` counters, `time_sanity` records the converted total and device-uptime read bounds.
+Reject a total exceeding the elapsed upper bound plus `max(1 s, 5% of elapsed)` (accounting granularity/clock
+tolerance). Do not impose a lower bound: devfreq suspension / active-clock counters may legitimately cover less
+than wall time. Unknown units retain raw fractions with an explicitly unavailable time-sanity check, never a guessed
+unit conversion. Older logs without boundary snapshots cannot recover exact residency.
+
+Sampler `external_power` is **any readable online non-battery kernel supply** (JSON boolean, null when no online
+observation exists). It is not Android BatteryService's AC/USB enum: the Odin can expose sysfs `usb=1` while
+`dumpsys battery` calls the same external power AC. Each `supply.<name>.type` / `supply.<name>.online` token is
+retained under per-pan `power_supplies`; legacy `ac` / `usb` remain raw kernel-type category observations, never
+relabeled to match dumpsys. Battery/BMS supplies are excluded from external-power aggregation. `level` is battery
+percent. Historical rows derive external_power from available raw ac/usb fields; no readable source stays null.
+Pan JSON retains timestamped fields rather than inferring charger state from temperatures.
+
+Android toybox `chcon` does not support GNU `--reference`. `live.sh` reads `CTX=$(ls -Zd "$GAME")`,
+extracts its first field (including the full `s0:c...` MLS categories), then runs `chcon "$CTX" "$GAME/totk.ctl"`
+before appending. Missing context or failed chcon aborts the write. There is no totk.env writer in these tools;
+when writing one manually, apply the same game-directory owner/mode/context procedure to `"$GAME/totk.env"`,
+not a generic `app_data_file:s0` label that discards its categories.
+
 Example (one device, one scene; placeholders in `<>`):
 
 ```sh
@@ -42,7 +145,7 @@ OUT=.scratch/bench/<run-name>
 tools/bench/bench_input.sh -s <serial> freqs                               # the caps you are about to measure
 tools/bench/collect.sh -s <serial> --device <label> --out $OUT --mark     # after the scene settled
 python3 tools/bench/sampler.py -s <serial> --device <label> --out $OUT &  # keep running for the whole session
-tools/bench/pan.sh -s <serial> --device <label> --scene hateno --seconds 48 --out $OUT
+tools/bench/pan.sh -s <serial> --device <label> --scene hateno --target-fps 60 --seconds 48 --repeat 3 --out $OUT
 kill %1                                                                    # stop the sampler
 tools/bench/collect.sh -s <serial> --device <label> --out $OUT
 python3 tools/bench/analyze.py $OUT --commit <sha> --json $OUT/result.json

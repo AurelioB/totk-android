@@ -19,8 +19,10 @@ All scripts are in `tools/bench/` (paths below are relative to the repository ro
     `settings.env`, both in `/data/user/0/com.aure.totk/files` (readable only by the app or root). Never rely on logcat:
     some devices' logd drops the game's lines (the Pocket Duo showed none). A file root **writes** there (the live
     switches' `totk.ctl`) needs the game folder's owner and SELinux context, MLS categories included:
-    `chown $(stat -c %u:%g <game dir>)` and `chcon --reference=<game dir>`, else the app cannot read it (`live.sh` does
-    both).
+    `chown $(stat -c %u:%g <game dir>)`, mode0600 and an explicit `chcon "$CTX" <file>`, where
+    `CTX=$(ls -Zd <game dir>); CTX=${CTX%% *}` preserves the whole MLS context. Android toybox lacks GNU
+    `chcon --reference`. `live.sh` applies this to totk.ctl; use the same procedure for any manual totk.env write.
+    Abort on missing context or chcon failure rather than dropping the MLS categories.
   - **Kernel log and sysfs**: the dmesg marker and the GPU/SMMU fault check read the kernel log; the sampler and the
     frequency snapshots read thermal zones, cooling devices, cpufreq policies and `/sys/class/kgsl` (several of them
     root-only on production builds).
@@ -131,10 +133,14 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
 8. **Start the sampler** (first scene; it runs for the whole session):
    `python3 tools/bench/sampler.py -s <serial> --device <label> --out $OUT &` (note its PID if you run the next steps
    from another shell).
-9. **Pan**: `tools/bench/pan.sh -s <serial> --device <label> --scene <hateno|lookout|rotsumamu> --seconds 48 --out $OUT`
-   (right stick at 16000 of 32767, right then left; 48 s gives at least 4 full windows at 30 fps). It also records the
-   frequency limits just before and after the pan in `$OUT/freqs.txt`. Look at the screenshot it takes after releasing
-   the stick in `$OUT/shots/`. Repeat steps 5–6 and 9 for the other scenes.
+9. **Pan**: `tools/bench/pan.sh -s <serial> --device <label> --scene <hateno|lookout|rotsumamu> --target-fps 60 --out $OUT`
+   for a 60 preset (default **144 s**, half each direction). The recommended short-cycle alternative is
+   `--target-fps 60 --seconds 48 --repeat 3`: three back-to-back return pans. Require >=12 included 300-frame windows
+   per session/arm, even if it enters 30-interval stretches; lengthen/repeat if the analyzer warns of fewer. For a 30
+   preset use `--target-fps 30` (default 48 s). Keep the duration/cycle/direction schedule identical in both arms.
+   Each pan records frequency limits and raw cumulative GPU counter snapshots immediately before/after motion
+   (`freqs.txt`, `gpu-time-in-state.jsonl`), then takes a screenshot outside the measured motion. Check `$OUT/shots/`.
+   Repeat steps 5–6 and 9 for the other scenes; the sampler stays running across repeated pans.
 10. **Stop the sampler** (`kill %1` in the same shell, else `kill <pid>`, or Ctrl-C; it removes its device loop) and
     **collect**: `tools/bench/collect.sh -s <serial> --device <label> --out $OUT`. It must report 0 GPU/SMMU fault
     lines and 0 "device lost"; investigate otherwise.
@@ -169,11 +175,38 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
   (`[长帧]`) come from `totk.log`; temperatures, cooling states, GPU `thermal_pwrlevel` and cpufreq limits from the
   sampler over each pan; the frequency limits (per cluster `related_cpus`, `scaling_min/max`, `cpuinfo_max`; GPU cap,
   hardware maximum and power levels) from `freqs.txt` (`freq_limits` per pan, `freq_stable` per run).
-- `compare.py` verdicts: per metric `better` / `worse` / `same` within documented tolerances (`compare.py --help`); a
-  scene is worse if fps mean, p50, p95, GPU ms or >50 ms frames (per window) got worse. Each device pair is labelled by
-  frequency signature: **match** (a regression check; exit status 1 when such a scene is worse), **reference only**
-  (the reference has no GPU cap: indicative) or **NOT COMPARABLE** (signatures differ or are unknown: loud warning,
-  never decides the exit status).
+  Exact per-pan GPU residency comes from boundary differences of `trans_stat`'s final time column, never its
+  transition matrix or an instantaneous-clock histogram. The KGSL `gpu_clock_stats` alternative counts active time
+  in available-frequency order, so is labelled active-clock distribution, not full wall residency. Counter units
+  and raw snapshots are retained; absent/failed/identity-mismatched or regressing counters are unavailable, not zero.
+  KGSL `reset_count` tracks GPU boots/wakes as well as recovery, not devfreq statistics resets; its delta is reported
+  separately and does not veto monotonic counters. Declared time units must pass the elapsed upper-bound check
+  (device uptime plus max(1s,5%) tolerance); unknown units explicitly have no time-sanity check. See README sources.
+  Sampler `external_power` is any online non-battery kernel supply, not Android's AC/USB charger enum; it is null
+  without readable online state. Keep `power_supplies` raw type/online observations, raw legacy `ac`/`usb`, battery
+  `level` and timestamps. Sysfs USB online can correspond to dumpsys AC=true on Odin; never rename one into the other.
+- Read **steady fps, dip-window count, dip time fraction, ~33 ms frame count, and mean fps separately**. At a 60 target,
+  >=60/300 frames in 29–37.5 ms makes a dip window (complete durations, else complete fence histogram); without full
+  frame evidence the fallback is fps <50. At 30 target the fallback is <25; normal ~33 ms pacing is not a dip.
+  Sparse long-frame logs give lower-bound counts, not a complete duration trace. `--target-fps 30|60` overrides the
+  recorded target/preset; an unknown target must not be guessed. Dip time weights each window by 300/fps, not one vote.
+  `fps_mean` is the legacy arithmetic mean of window fps; `fps_time_mean` is frames / elapsed window time.
+- Each pan and arm summary retains backend `recording_ms_mean`, framework-fence `present_p95_ms_max` /
+  `present_p99_ms_max` (maxima of window percentiles, **not pooled percentiles**), plus six-bin counts/shares and
+  coverage. Bin shares use observed pairs, not D/300 or equal window votes. The **judder proxy** is the 20.9–29 ms
+  bin share (`present_judder_proxy_fraction`); it cannot identify the full >16.7 & <30 ms range.
+  For a separate diagnostic run, `TOTK_PRESENT_CADENCE_TRACE=1` emits immutable `[present-trace]` transaction
+  ID/generation/source-frame/framework-fence timestamps. The analyzer joins only consecutive valid IDs in one
+  generation, independent of callback order, and reports exact strict >16.7 & <30 ms share **among observed valid
+  pairs**, with hit/pair counts (`present_judder_exact_*`); missing/reset/reversed endpoints are never bridged.
+  This trace is high-volume and has perturbed Thor cadence: use both arms consistently and keep it off for ordinary
+  performance acceptance. `TOTK_FRAME_TIMELINE=1` only logs late per-frame rows and is not a complete trace.
+  All fence metrics remain framework proxies, not guaranteed panel scanout. Full field semantics: bench README.
+- `compare.py` / `abtest.py` compare steady fps and dip time separately. A dip fraction difference >0.05 (five
+  percentage points) reports **verdict confounded by dips**, not an optimization win/loss from a controller state.
+  All-dip arms have no steady estimate; historic results without pacing data keep labelled legacy comparisons.
+  Per-metric tolerances remain documented in `compare.py --help`. Frequency signatures still gate comparisons:
+  **match** (regression check), **reference only** (indicative), **NOT COMPARABLE** (never decides exit status).
 - Other **not comparable** warnings: a different `settings_env`, different cpufreq caps, or `freq_stable: false`.
 - Temperatures depend on how long the device has been running the game: a one-scene session ends cooler than the
   1.0.0 round, which measured three scenes back to back. They are reported, not part of the scene verdict.
@@ -189,6 +222,24 @@ Known caveats:
 - **Lookout Landing is indoors** in this save set (the shelter next to Monte).
 - Short runs (3–7 windows per scene): differences inside the tolerances are noise; repeat a run before calling a
   small change.
+
+### Uncapped throughput comparisons
+
+When capped 60-target A/B arms enter different stretches of the game's 60/30 controller, first report both pacing
+states and the confounding; do not call the lower session mean a code regression. For a **separate throughput
+experiment**, select the 60 fps preset and put `TOTK_UNCAPPED=1` in the developer `<game>/totk.env` for **both** arms,
+then restart the game. `TOTK_FPS60=1` is required: FPS60 off explicitly disables this uncapped path. Keep the rest of
+the environment identical, collect it, and label the result **uncapped profiling**, not Recommended/capped gameplay.
+The current legacy FPS60 uncapped policy uses a 120-Hz clock, not a promise of unlimited output; controller/present
+intervals can still change. Inspect `[fps-policy]` effective interval/uncapped lines to confirm the actual path;
+conflicting physical-clock/display modes may override uncapped controls. Never assume the switch erased every dip.
+
+Use this when isolating CPU/GPU throughput changes that a capped controller plateau would hide or decide, with the
+same save, camera, caps, cache and thermal state, long pans and reversed arm order. It can change GPU load, residency,
+power, thermals and latency: retain a capped 60-preset round for user-facing acceptance, and never pool capped and
+uncapped results or compare either to the other's baseline. Preserve the previous `totk.env`, restore it after the
+experiment and restart to restore normal behavior; benchmark tooling never enables uncapped mode by default.
+
 
 ## In-session A/B (live switches)
 

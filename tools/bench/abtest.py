@@ -19,13 +19,18 @@ Verdict rule for one metric:
   lean better/worse only the paired delta crosses tolerance, or the pooled delta has the opposite sign; informational
   better? worse?  fewer than two valid pairs covering both directions (unconfirmed; pooled delta if no pairs)
   n/a             a value is missing
-An arm is worse if any primary metric (fps mean, p50 median, p95 max, GPU ms mean, >50 ms per window) is worse, else
-better if any is better, else inconclusive if any is better? / worse?, else same. Exit 1 when any arm is worse.
-Memory and pressure are informational. Prefer ABBAABBA or longer on 60 fps devices."""
+Modern summaries compare steady fps and dip time fraction separately; fps mean is informational. A pooled or paired
+dip fraction difference above 0.05 absolute makes the overall result 'verdict confounded by dips', regardless of
+pair confirmation. Missing steady fps (including all-dip arms) or missing pacing data makes it inconclusive.
+Wholly legacy summaries retain the fps-mean primary rule and are labelled as lacking pacing info.
+Otherwise an arm is worse if any primary metric is worse, else better if any is better, else inconclusive if any
+is better? / worse?, else same. Exit 1 when any arm is worse. Memory and pressure are informational.
+Prefer ABBAABBA or longer on 60 fps devices."""
 import argparse, io, json, math, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchlib import METRICS, PRIMARY, guard_output  # noqa: E402
+from benchlib import (DIP_CONFOUNDED, DIP_TIME_FRACTION_TOLERANCE, LEGACY_PRIMARY, METRICS, PRIMARY,  # noqa: E402
+                      guard_output, pacing_note, pacing_verdict, primary_metrics)
 from analyze import AB_METRICS, MEMORY_FIELDS, block_metric, pan_direction  # noqa: E402
 
 
@@ -80,20 +85,47 @@ def metric_verdict(key, ref, arm, paired=None):
     tol = tol_abs if kind == 'abs' else max(tol_abs, tol_rel * abs(r))
     spreads = (ref['spread'].get(key), arm['spread'].get(key))
     noise = None if None in spreads else max(spreads)
-    if abs(d) <= tol:
+    if abs(d) <= tol or math.isclose(abs(d), tol, rel_tol=1e-12, abs_tol=1e-12):
         return d, tol, noise, 'same'
     word = 'better' if d * direction > 0 else 'worse'
     n = len(paired['pairs'])
     if n < 2 or len(paired['directions']) < 2:
         return d, tol, noise, word + '?'
-    if abs(a - r) <= tol or (a - r) * d <= 0:
+    if abs(a - r) <= tol or math.isclose(abs(a - r), tol, rel_tol=1e-12, abs_tol=1e-12) or (a - r) * d <= 0:
         return d, tol, noise, 'lean ' + word
     confirmed = paired['agreement'] == n or (n >= 6 and paired['p_value'] < 0.05)
     return d, tol, noise, word if confirmed else 'same'
 
 
-def arm_verdict(per):
-    prim = [per[k][3] for k in PRIMARY if k in per]
+def arm_verdict(per, ref=None, arm=None, paired=None):
+    """Overall arm verdict; modern callers supply records to check pooled as well as paired dip differences.
+
+    The per-only form retains historical callers. Recognizable modern metrics without the records are inconclusive:
+    a paired tuple alone cannot establish that the pooled dip fractions match.
+    """
+    modern = any(k in per and per[k][3] != 'n/a' for k in ('fps_steady', 'dip_time_fraction'))
+    if ref is None or arm is None:
+        if modern:
+            delta = per.get('dip_time_fraction', (None,))[0]
+            if delta is not None and abs(delta) > DIP_TIME_FRACTION_TOLERANCE and not math.isclose(
+                    abs(delta), DIP_TIME_FRACTION_TOLERANCE, rel_tol=1e-12, abs_tol=1e-12):
+                return DIP_CONFOUNDED
+            return 'inconclusive'
+        primary = LEGACY_PRIMARY
+    else:
+        primary = primary_metrics(ref['summary'], arm['summary'])
+        pacing = pacing_verdict(ref['summary'], arm['summary'])
+        if pacing == DIP_CONFOUNDED:
+            return pacing
+        if primary == PRIMARY:
+            dips = paired_metric('dip_time_fraction', ref, arm) if paired is None else paired['dip_time_fraction']
+            delta = dips['delta']
+            if delta is not None and abs(delta) > DIP_TIME_FRACTION_TOLERANCE and not math.isclose(
+                    abs(delta), DIP_TIME_FRACTION_TOLERANCE, rel_tol=1e-12, abs_tol=1e-12):
+                return DIP_CONFOUNDED
+            if pacing:
+                return pacing
+    prim = [per[k][3] for k in primary if k in per]
     if 'worse' in prim:
         return 'worse'
     if 'better' in prim:
@@ -132,10 +164,13 @@ def main():
                 continue
             paired = {k: paired_metric(k, ref, arm) for k in AB_METRICS}
             per = {k: metric_verdict(k, ref, arm, paired[k]) for k in AB_METRICS}
-            v = arm_verdict(per)
+            v = arm_verdict(per, ref, arm, paired)
             worse += v == 'worse'
-            p(f'\n  arm {name} vs {a.ref}: {v.upper()}  ({len(arm["blocks"])} vs {len(ref["blocks"])} blocks, '
+            headline = v if v == DIP_CONFOUNDED else v.upper()
+            p(f'\n  arm {name} vs {a.ref}: {headline}  ({len(arm["blocks"])} vs {len(ref["blocks"])} blocks, '
               f'{arm["summary"]["windows"]} vs {ref["summary"]["windows"]} windows)')
+            p(f'  {pacing_note(ref["summary"], arm["summary"])}')
+            primary = primary_metrics(ref['summary'], arm['summary'])
             p(f'  {"metric":<16} {a.ref:>9} {name:>9} {"pooled Δ":>9} {"paired Δ":>9} {"tolerance":>9} {"spread":>9}  verdict')
             for key, label, *_ in METRICS:
                 if key not in per:
@@ -147,7 +182,7 @@ def main():
                 p(f'  {label + (" /win" if rate else ""):<16} {"-" if rv is None else f"{rv:g}":>9} '
                   f'{"-" if av is None else f"{av:g}":>9} {fmt(pooled):>9} {fmt(paired[key]["delta"]):>9} '
                   f'{"-" if tol is None else f"{tol:.2f}":>9} '
-                  f'{"-" if noise is None else f"{noise:.2f}":>9}  {verdict}{" *" if key in PRIMARY else ""}')
+                  f'{"-" if noise is None else f"{noise:.2f}":>9}  {verdict}{" *" if key in primary else ""}')
                 stats = paired[key]
                 directions = ', '.join(f'{direction} {fmt(delta)}' for direction, delta in stats['directions'].items())
                 probability = '-' if stats['p_value'] is None else f'{stats["p_value"]:.4f}'
@@ -161,7 +196,8 @@ def main():
         p('\n  * primary metric. Rule: pooled AND paired deltas beyond the compare.py tolerance in the same direction, '
           'and (all pair signs agree or exact two-sided sign p < 0.05 with >=6 pairs); at least two pairs covering both '
           'directions. "lean" = only paired delta crosses tolerance (or pooled sign differs), informational only; '
-          '"?" = insufficient pairs. Same-arm spread is informational. Prefer ABBAABBA or longer at 60 fps.')
+          '"?" = insufficient pairs. A pooled or paired dip fraction difference above 0.05 absolute overrides the '
+          'arm result as dip-confounded. Same-arm spread is informational. Prefer ABBAABBA or longer at 60 fps.')
     sys.stdout.write(buf.getvalue())
     if a.out:
         with open(a.out, 'w', encoding='utf-8') as f:

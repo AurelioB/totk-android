@@ -20,6 +20,7 @@ import abtest  # noqa: E402
 import benchlib  # noqa: E402
 import check_baselines  # noqa: E402
 import ledger  # noqa: E402
+import sampler  # noqa: E402
 
 BASELINE = benchlib.BENCH_DOCS / 'baseline-1.0.0.json'
 # A Thor snapshot as `bench_input.sh freqs` prints it (no cap below the hardware maximum).
@@ -287,6 +288,161 @@ def ab_log(windows, ctl):
     return '\n'.join(lines + [e[1] for e in events]) + '\n'
 
 
+class PresentationReporting(unittest.TestCase):
+    def test_per_pan_and_arm_recording_quantiles_and_weighted_bin_shares(self):
+        ctl = [(1, '[totk-ctl] gen=1 frame=1 mark ab arm=A block=1'),
+               (601, '[totk-ctl] gen=2 frame=601 mark ab arm=B block=2')]
+        text = ab_log({600: (57, 20, 10, 0), 1200: (56, 21, 10, 0)}, ctl)
+        for frame, p95, p99, bins in ((600, 25, 34, '0/240/30/20/5/5'), (1200, 35, 45, '0/120/15/10/3/2')):
+            needle = next(line for line in text.splitlines() if line.startswith(f'[nvn-vk] frame {frame}:'))
+            text = text.replace(needle, needle + '\n'
+                                f'[nvn-vk] window present-fence cadence, last 300 results: '
+                                f'interval min/mean/max=16/20/50ms p50/p95/p99=17/{p95}/{p99}ms samples=300/300\n'
+                                '[nvn-vk] window present-fence interval bins ms '
+                                '[<12.5,12.5-20.9,20.9-29,29-37.5,37.5-45.8,>=45.8]: '
+                                f'all={bins}; adjacent immutable interval2=0/0/0/0/0/0')
+        text = text.replace('frame 1200, per frame: recording 2.0', 'frame 1200, per frame: recording 4.0')
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'logs').mkdir()
+            (d / 'logs/odin.log').write_text(text)
+            (d / 'pans.txt').write_text('odin hateno F0=0 F1=600 T0=100 T1=120 V=16000\n'
+                                      'odin hateno2 F0=600 F1=1200 T0=200 T1=220 V=16000\n')
+            result = run(BENCH / 'analyze.py', d, '--arms', '--json', d / 'result.json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads((d / 'result.json').read_text())['runs'][0]
+        s = record['summary']
+        self.assertEqual(s['recording_ms_mean'], 3)
+        self.assertEqual((s['present_p95_ms_max'], s['present_p99_ms_max']), (35, 45))
+        self.assertEqual(s['present_interval_bin_counts'], [0, 360, 45, 30, 8, 7])
+        self.assertEqual(s['present_interval_pairs'], 450)  # weight by observed pairs, not one vote/window
+        self.assertEqual(s['present_judder_proxy_fraction'], 0.1)
+        self.assertAlmostEqual(sum(s['present_interval_bin_shares']), 1)
+        self.assertEqual(record['pans'][0]['summary']['present_p99_ms_max'], 34)
+        self.assertEqual(record['pans'][1]['summary']['recording_ms_mean'], 4)
+        self.assertEqual(record['ab']['arms']['A']['summary']['present_p95_ms_max'], 25)
+        self.assertEqual(record['ab']['arms']['B']['summary']['recording_ms_mean'], 4)
+        self.assertIsNone(s['present_judder_exact_fraction'])
+        self.assertIn('20.9-29 ms 10.00%', result.stdout)
+        self.assertIn('fence p95/p99 window maxima 35.000/45.000', result.stdout)
+
+    def test_exact_trace_joins_ids_not_callback_order_and_keeps_strict_boundaries(self):
+        rows = [(1, 1, 300, 1_000_000_000), (2, 1, 301, 1_016_700_000),
+                (3, 1, 302, 1_036_700_000), (4, 1, 303, 1_066_700_000),
+                (5, 1, 304, 0), (6, 1, 305, 1_100_000_000), (8, 1, 306, 1_120_000_000),
+                (9, 2, 307, 1_140_000_000), (10, 2, 308, 1_169_999_999),
+                (11, 2, 309, 1_160_000_000), (12, 2, 310, 1_200_000_000),
+                (12, 2, 310, 1_210_000_000), (13, 2, 311, 1_230_000_000)]
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'totk.log'
+            # Deliberately reverse callback/log delivery. A conflicting duplicate invalidates ID12.
+            p.write_text(''.join(f'[nvn-vk] [present-trace] id={i} generation={g} source_frame={f} '
+                                 f'kind=real desired_ns=0 apply_ns=0 display_ns={ns} refresh_ns=16666667 interval=1 reason=0\n'
+                                 for i, g, f, ns in reversed(rows)))
+            info = analyze.parse_log(p)[5]
+        window = analyze.presentation_of(301, 600, info)
+        self.assertEqual(window['present_intervals_ns'], [16_700_000, 20_000_000, 30_000_000, 29_999_999])
+        s = analyze.presentation_summary([window])
+        self.assertEqual((s['present_judder_exact_hits'], s['present_judder_exact_pairs']), (2, 4))
+        self.assertEqual(s['present_judder_exact_fraction'], 0.5)
+        self.assertIsNone(s['present_judder_proxy_fraction'])  # cannot reverse-infer a histogram from sparse traces
+        # Never attribute a pair across a pan/window's incoming source-frame boundary.
+        self.assertEqual(analyze.presentation_of(308, 600, info)['present_intervals_ns'], [29_999_999])
+
+
+class Pacing(unittest.TestCase):
+    def test_bimodal_arms_do_not_turn_mean_changes_into_speed_verdicts(self):
+        base = {'windows': 12, 'fps_mean': 50, 'fps_steady': 57, 'dip_windows': 3,
+                'dip_time_fraction': 0.3, 'frames_near33': 200}
+        per, verdict = benchlib.scene_verdicts(base, dict(base, fps_mean=55))
+        self.assertEqual(verdict, 'same')
+        self.assertEqual(per['fps_mean'][1], 'better')  # informational only
+        self.assertEqual(benchlib.scene_verdicts(base, dict(base, fps_steady=59))[1], 'better')
+        self.assertEqual(benchlib.scene_verdicts(base, dict(base, fps_steady=55))[1], 'worse')
+        self.assertEqual(benchlib.scene_verdicts(base, dict(base, dip_time_fraction=0.35))[1], 'same')
+        self.assertEqual(benchlib.scene_verdicts(base, dict(base, fps_mean=58, dip_time_fraction=0.1))[1],
+                         'verdict confounded by dips')
+        self.assertEqual(benchlib.scene_verdicts(dict(base, fps_steady=None), base)[1], 'inconclusive')
+        self.assertEqual(benchlib.scene_verdicts({'fps_mean': 57}, base)[1], 'inconclusive')
+
+    def test_paired_bimodal_arms_and_cli_report_confounding(self):
+        ref, arm = InSessionAB.records([[1, 57, 57, 17, 34, 40, 10, 0, 0]] * 2,
+                                      [[1, 57, 57, 17, 34, 40, 10, 0, 0]] * 2)
+        for record in (ref, arm):
+            for s in [record['summary']] + [b['summary'] for b in record['blocks']]:
+                s.update(fps_steady=57, dip_time_fraction=0.1, dip_windows=0, frames_near33=0)
+        arm['summary'].update(fps_mean=40, dip_time_fraction=0.4)
+        per = {key: abtest.metric_verdict(key, ref, arm) for key in analyze.AB_METRICS}
+        self.assertEqual(per['dip_time_fraction'][3], 'same')  # pairs alone miss the pooled mismatch
+        self.assertEqual(abtest.arm_verdict(per, ref, arm), 'verdict confounded by dips')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'ab.json'
+            path.write_text(json.dumps({'runs': [{'device': 'odin', 'scene': 'hateno', 'ab': {
+                'windows': {'assigned': 4, 'straddling': 0, 'unlabelled': 0}, 'arms': {'A': ref, 'B': arm}}}]}))
+            result = run(BENCH / 'abtest.py', path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('arm B vs A: verdict confounded by dips', result.stdout)
+        self.assertIn('fps steady', result.stdout)
+        self.assertIn('dip time fraction', result.stdout)
+        arm['summary']['dip_time_fraction'] = 0.1
+        for b in arm['blocks']:
+            b['summary']['dip_time_fraction'] = 0.4
+        per = {key: abtest.metric_verdict(key, ref, arm) for key in analyze.AB_METRICS}
+        self.assertEqual(abtest.arm_verdict(per, ref, arm), 'verdict confounded by dips')
+
+    def test_cumulative_draw_counter_differences_and_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'totk.log'
+            p.write_text(''.join(f'[nvn-vk] frame {f}: 57.0 fps over the last 300, {d} draws\n'
+                                 for f, d in ((300, 1200000), (600, 2700000), (900, 100),
+                                              (1200, 1500100), (1800, 4500100), (2100, 6000100))))
+            rates = analyze.parse_log(p)[5]['draw_rates']
+        self.assertEqual(rates, {600: 5000, 1200: 5000, 2100: 5000})
+        self.assertNotIn(300, rates)  # no assumed zero origin
+        self.assertNotIn(900, rates)  # reset
+        self.assertNotIn(1800, rates)  # missing intermediate 300-frame sample
+
+    def test_steady_and_dip_report_separate_time_weighted_states(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'logs').mkdir()
+            (d / 'logs/odin.log').write_text(ab_log(
+                {600: (57, 20, 10, 0), 900: (34, 34, 10, 0)}, []), encoding='utf-8')
+            (d / 'settings-odin.env').write_text('TOTK_FPS60=1\n')
+            (d / 'pans.txt').write_text('odin hateno F0=0 F1=900 T0=100 T1=120 V=16000\n')
+            result = run(BENCH / 'analyze.py', d, '--json', d / 'result.json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads((d / 'result.json').read_text())['runs'][0]
+        s = record['summary']
+        self.assertEqual(s['fps_steady'], 57)
+        self.assertEqual(s['fps_mean'], 45.5)
+        self.assertEqual(s['dip_windows'], 1)
+        self.assertAlmostEqual(s['dip_time_fraction'], (300 / 34) / (300 / 57 + 300 / 34), places=6)
+        self.assertIsNone(s['frames_near33'])  # fps cannot recover individual frame counts
+        self.assertEqual([w['pacing_source'] for w in record['windows']], ['window-fps'] * 2)
+
+    def test_raw_durations_and_fence_histogram_precede_window_fps(self):
+        raw = {f: 33.33 if f <= 75 else 16.67 for f in range(1, 301)}
+        w = analyze.pacing_of(300, 51, 60, {'frame_ms': raw})
+        self.assertEqual((w['pacing_state'], w['frames_near33']), ('dip', 75))
+        self.assertEqual(w['pacing_source'], 'frame-durations')
+        self.assertEqual(analyze.pacing_of(300, 30, 30, {'frame_ms': raw})['pacing_state'], 'steady')
+        # Incomplete traces are not evidence that the unlogged frames were steady.
+        w = analyze.pacing_of(300, 34, 60, {'frame_ms': {1: 33.3}})
+        self.assertEqual((w['pacing_state'], w['pacing_source']), ('dip', 'window-fps'))
+        self.assertEqual(w['frames_near33'], 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'totk.log'
+            p.write_text('[nvn-vk] frame 300: 51.0 fps over the last 300, 1000 draws\n'
+                         '[nvn-vk] window present-fence interval bins ms '
+                         '[<12.5,12.5-20.9,20.9-29,29-37.5,37.5-45.8,>=45.8]: '
+                         'all=0/225/0/75/0/0; adjacent immutable interval2=0/0/0/70/0/0\n')
+            info = analyze.parse_log(p)[5]
+        w = analyze.pacing_of(300, 51, 60, info)
+        self.assertEqual((w['pacing_state'], w['frames_near33_source']), ('dip', 'present-fence-histogram'))
+        self.assertEqual(w['frames_near33'], 75)
+
+
 class InSessionAB(unittest.TestCase):
     CTL = [(1000, '[totk-ctl] gen=1 frame=1000 applied unset TOTK_VK_DESC_STOCK'),
            (1000, '[totk-ctl] gen=1 frame=1000 mark ab arm=A block=1 scene=hateno'),
@@ -406,7 +562,7 @@ class InSessionAB(unittest.TestCase):
                                  long_ge45=summary['long_ge45_total'] / summary['windows'])] * summary['windows']
             spreads = {}
             for key in analyze.AB_METRICS:
-                values = [analyze.block_metric(b['summary'], key) for b in blocks]
+                values = [value for b in blocks if (value := analyze.block_metric(b['summary'], key)) is not None]
                 spreads[key] = max(values) - min(values) if len(values) > 1 else None
             pooled = analyze.summarize(windows)
             pooled['fps_min'] = min(b['summary']['fps_min'] for b in blocks)
@@ -580,7 +736,9 @@ class InSessionAB(unittest.TestCase):
             log, ctl = dev.game / 'totk.log', dev.game / 'totk.ctl'
             # chcon must see a nonempty, mode-correct temp, never the published path.
             (dev.dir / 'bin/chcon').write_text(
-                '#!/bin/sh\nfor arg do file=$arg; done\n'
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_CHCON"\n'
+                '[ "$#" -eq 2 ] && [ "$1" = "$FAKE_CONTEXT" ] || exit 2\n'
+                'for arg do file=$arg; done\n'
                 f'[ "$file" != "{ctl}" ] && [ -s "$file" ] && [ "$(stat -c %a "$file")" = 600 ]\n')
             log.write_text('[totk-ctl] following\n')
             stop = threading.Event()
@@ -605,6 +763,13 @@ class InSessionAB(unittest.TestCase):
                 r = live('set', 'TOTK_X=1', 'mark', 'r')
                 self.assertEqual(r.returncode, 4, r.stderr)
                 self.assertIn('refused "set TOTK_X=1"', r.stdout)
+                attempts = (dev.dir / 'chcon-calls').read_text().splitlines()
+                self.assertEqual(len(attempts), 3)
+                for attempt in attempts:
+                    context, temporary = attempt.split()
+                    self.assertEqual(context, dev.env['FAKE_CONTEXT'])
+                    self.assertEqual(Path(temporary).parent, dev.game)
+                    self.assertTrue(Path(temporary).name.startswith('.totk.ctl.'))
             finally:
                 stop.set()
             self.assertEqual(dev.root_shells(), 1)
@@ -621,6 +786,17 @@ class InSessionAB(unittest.TestCase):
             self.assertIn('could not write', r.stderr)
             self.assertEqual(ctl.read_text(), 'mark previous\n')
             self.assertFalse(list(dev.game.glob('.totk.ctl.*')))
+
+    def test_live_context_failure_stops_before_appending(self):
+        with fake_device() as dev:
+            dev.env['FAKE_CONTEXT'] = '?'
+            result = subprocess.run(['sh', str(BENCH / 'live.sh'), '-s', 'x', '--game-dir', str(dev.game),
+                                     '--wait', '0', 'set', 'TOTK_VK_PIPE_BOOST=1'],
+                                    capture_output=True, text=True, env=dev.env)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertFalse((dev.game / 'totk.ctl').exists())
+            self.assertFalse(list(dev.game.glob('.totk.ctl.*')))
+            self.assertFalse((dev.dir / 'chcon-calls').exists())
 
 
 FAKE_ADB = r'''#!/bin/sh
@@ -642,11 +818,17 @@ class fake_device:
         self.tmp = tempfile.TemporaryDirectory()
         d = self.dir = Path(self.tmp.name)
         (d / 'bin').mkdir(); (d / 'game').mkdir()
-        for name, text in (('adb', FAKE_ADB), ('chcon', '#!/bin/sh\nexit 0\n')):
+        for name, text in (
+                ('adb', FAKE_ADB),
+                ('ls', '#!/bin/sh\nif [ "$1" = "-Zd" ]; then printf "%s %s\\n" "$FAKE_CONTEXT" "$2"; '
+                       'else exec /bin/ls "$@"; fi\n'),
+                ('chcon', '#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_CHCON"\n'
+                          '[ "$#" -eq 2 ] && [ "$1" = "$FAKE_CONTEXT" ] || exit 2\n')):
             (d / 'bin' / name).write_text(text); (d / 'bin' / name).chmod(0o755)
         self.game, self.calls = d / 'game', d / 'calls'
         self.env = dict(os.environ, PATH=f"{d / 'bin'}:{os.environ['PATH']}", FAKE_CALLS=str(self.calls),
-                        XDG_RUNTIME_DIR=str(d))
+                        XDG_RUNTIME_DIR=str(d), FAKE_CONTEXT='u:object_r:app_data_file:s0:c123,c456',
+                        FAKE_CHCON=str(d / 'chcon-calls'))
         return self
 
     def rootsh(self, *args, stdin=None):
@@ -709,7 +891,157 @@ class RootShell(unittest.TestCase):
             self.assertIn(b'not running', dev.rootsh('status').stdout)
 
 
+class PanMeasurement(unittest.TestCase):
+    def test_long_default_and_repeats_keep_independent_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'pan.sh').write_text((BENCH / 'pan.sh').read_text())
+            scripts = {
+                'adb': '#!/bin/sh\nexit 0\n',
+                'bench_input.sh': '#!/bin/sh\necho "input $*" >> "$CALLS"\ncase "$*" in *freqs) echo "cpu0=0:1:2:2";; esac\n',
+                'sleep': '#!/bin/sh\necho "sleep $*" >> "$CALLS"\n',
+                'date': '#!/bin/sh\nn=$(cat "$CLOCK" 2>/dev/null); n=$(( ${n:-100} + 1 )); echo "$n" > "$CLOCK"; echo "$n"\n',
+                'python3': '#!/bin/sh\necho "python $*" >> "$CALLS"\n'
+                           'case "$1" in *rootsh.py) case "$*" in *settings.env*) echo 1;; '
+                           '*) n=$(cat "$FRAME" 2>/dev/null); n=$(( ${n:-0} + 300 )); '
+                           'echo "$n" > "$FRAME"; echo "至帧 $n";; esac;; esac\n',
+            }
+            for name, content in scripts.items():
+                (d / name).write_text(content)
+                (d / name).chmod(0o755)
+            env = dict(os.environ, PATH=str(d) + os.pathsep + os.environ['PATH'], CALLS=str(d / 'calls'),
+                       CLOCK=str(d / 'clock'), FRAME=str(d / 'frame'))
+            common = ['sh', str(d / 'pan.sh'), '-s', 'fake', '--device', 'odin', '--scene', 'hateno',
+                      '--target-fps', '60', '--no-shot', '--event', '/fake', '--display', '0']
+            result = subprocess.run(common + ['--out', str(d / 'long')], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((d / 'calls').read_text().count('sleep 72\n'), 2)
+            (d / 'calls').write_text('')
+            result = subprocess.run(common + ['--seconds', '48', '--repeat', '3', '--out', str(d / 'repeats')],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = (d / 'repeats/pans.txt').read_text().splitlines()
+            self.assertEqual(len(rows), 3)
+            identities = [dict(t.split('=', 1) for t in row.split()[2:]) for row in rows]
+            self.assertEqual(len({r['T0'] for r in identities}), 3)
+            self.assertTrue(all(r['TARGET_FPS'] == '60' for r in identities))
+            calls = (d / 'calls').read_text()
+            self.assertEqual(calls.count('sleep 24\n'), 6)
+            self.assertEqual(calls.count('--boundary start'), 3)
+            self.assertEqual(calls.count('--boundary end'), 3)
+            self.assertEqual(len((d / 'repeats/freqs.txt').read_text().splitlines()), 6)
+            # Existing callers (including ab.sh) omit --target-fps: infer the live 60 preset, never stamp 30.
+            index = common.index('--target-fps')
+            auto = common[:index] + common[index + 2:]
+            (d / 'calls').write_text('')
+            result = subprocess.run(auto + ['--out', str(d / 'auto')], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('TARGET_FPS=60', (d / 'auto/pans.txt').read_text())
+            self.assertEqual((d / 'calls').read_text().count('sleep 72\n'), 2)
+
+
+class GpuResidency(unittest.TestCase):
+    SOURCE = '/sys/class/kgsl/kgsl-3d0/devfreq/trans_stat'
+
+    @staticmethod
+    def trans_stat(high, low):
+        # Kernel uses fixed 10-character columns: adjacent 10-digit frequencies have no separating whitespace.
+        return ('     From  :   To\n           :11000000001050000000   time(ms)\n'
+                f'*1100000000:         0        80 {high:10d}\n'
+                f' 1050000000:        90         0 {low:10d}\nTotal transition : 170\n')
+
+    def record(self, boundary, high, low):
+        return {'schema': sampler.GPU_SNAPSHOT_SCHEMA, 'device': 'odin', 'scene': 'hateno', 'T0': 100,
+                'boundary': boundary, 'serial_sha256': 'a' * 64, 'boot_id': 'boot', 'status': 'ok',
+                'source': self.SOURCE, 'reset_count': '0', 'uptime_start': 1 if boundary == 'start' else 50,
+                'uptime_end': 2 if boundary == 'start' else 51, 'raw': self.trans_stat(high, low)}
+
+    def test_trans_stat_uses_residency_column_not_transitions(self):
+        parsed = sampler.parse_gpu_time_in_state(self.trans_stat(1000, 2000), self.SOURCE)
+        self.assertEqual(parsed['counters'], {1100000000: 1000, 1050000000: 2000})
+        self.assertEqual(parsed['counter_unit'], 'ms')
+        a, b = self.record('start', 1000, 2000), self.record('end', 1300, 2100)
+        delta = sampler.gpu_residency_delta(a, b)
+        self.assertEqual(delta['deltas'], {1100000000: 300, 1050000000: 100})
+        self.assertEqual(delta['fractions'], {1100000000: 0.75, 1050000000: 0.25})
+        self.assertEqual(delta['counter_kind'], 'residency')
+        for broken in (dict(b, raw=self.trans_stat(999, 2100)), dict(b, boot_id='reboot'),
+                       dict(b, uptime_start=0), dict(b, status='error')):
+            with self.subTest(broken=broken):
+                with self.assertRaises(ValueError):
+                    sampler.gpu_residency_delta(a, broken)
+        with self.assertRaises(ValueError):
+            sampler.gpu_residency_delta(None, b)
+
+    def test_gpu_start_count_change_keeps_monotonic_sane_residency(self):
+        a = dict(self.record('start', 1000, 2000), reset_count='73936', uptime_start=100, uptime_end=100.01)
+        b = dict(self.record('end', 21000, 126700), reset_count='73937', uptime_start=244.70, uptime_end=244.71)
+        delta = sampler.gpu_residency_delta(a, b)
+        self.assertEqual(delta['reset_count_delta'], 1)
+        self.assertEqual(delta['total_delta'], 144700)
+        self.assertAlmostEqual(delta['time_sanity']['counter_seconds'], 144.7)
+        self.assertEqual(delta['time_sanity']['status'], 'passed')
+        # Actual counter regression remains invalid independently of GPU-start count.
+        with self.assertRaisesRegex(ValueError, 'counter reset'):
+            sampler.gpu_residency_delta(a, dict(b, raw=self.trans_stat(999, 126700)))
+        with self.assertRaisesRegex(ValueError, 'exceeds elapsed'):
+            sampler.gpu_residency_delta(a, dict(b, raw=self.trans_stat(1000000, 126700)))
+        unknown = dict(b, raw=b['raw'].replace('time(ms)', 'time(jiffies)'))
+        old_unknown = dict(a, raw=a['raw'].replace('time(ms)', 'time(jiffies)'))
+        self.assertEqual(sampler.gpu_residency_delta(old_unknown, unknown)['time_sanity']['status'], 'unavailable')
+
+    def test_clock_stats_vector_is_active_time_not_wall_residency(self):
+        parsed = sampler.parse_gpu_time_in_state('100 300\n', '/sys/class/kgsl/kgsl-3d0/gpu_clock_stats',
+                                                 '660000000 734000000')
+        self.assertEqual(parsed['counters'], {660000000: 100, 734000000: 300})
+        self.assertEqual(parsed['counter_kind'], 'active')
+        self.assertEqual(parsed['counter_unit'], 'unknown')
+        with self.assertRaises(ValueError):
+            sampler.parse_gpu_time_in_state('100 300', '/sys/class/kgsl/kgsl-3d0/gpu_clock_stats')
+
+    def test_analyzer_reports_per_pan_residency_and_battery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'logs').mkdir()
+            (d / 'logs/odin.log').write_text(ab_log({600: (57, 20, 10, 0)}, []))
+            (d / 'pans.txt').write_text('odin hateno F0=0 F1=600 T0=100 T1=120 V=16000 TARGET_FPS=60\n')
+            (d / 'samples-odin.txt').write_text('101 f=300 ac= usb=1 level=82 '
+                                              'supply.usb.type=USB supply.usb.online=1 caps= 1/1\n')
+            path = d / sampler.GPU_SNAPSHOT_FILE
+            records = [self.record('start', 1000, 2000), self.record('end', 1300, 2100)]
+            path.write_text(''.join(json.dumps(r) + '\n' for r in records))
+            self.assertEqual(set(sampler.parse_gpu_snapshots(path)), {('odin', 100)})
+            result = run(BENCH / 'analyze.py', d, '--json', d / 'result.json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads((d / 'result.json').read_text())['runs'][0]
+            path.write_text(json.dumps(records[0]) + '\n' + json.dumps(records[0]) + '\n')
+            with self.assertRaises(ValueError):
+                sampler.parse_gpu_snapshots(path)
+        self.assertEqual(record['pans'][0]['gpu_residency']['fractions']['1100000000'], 0.75)
+        self.assertEqual(record['pans'][0]['battery'], [{'epoch': 101, 'ac': None, 'usb': 1, 'level': 82,
+                         'external_power': True, 'power_supplies': {'usb': {'type': 'USB', 'online': 1}}}])
+        self.assertIn('1100 MHz 75.00%', result.stdout)
+        self.assertIn('only 1 complete windows', result.stdout)
+
+
 class MemorySampling(unittest.TestCase):
+    def test_external_power_is_any_kernel_supply_not_android_charger_category(self):
+        cases = [
+            ({'ac': '', 'usb': '1', 'supply.usb.type': 'USB', 'supply.usb.online': '1'}, True),
+            ({'supply.dc.type': 'Mains', 'supply.dc.online': '0',
+              'supply.wireless.type': 'Wireless', 'supply.wireless.online': '1'}, True),
+            ({'supply.dc.type': 'Mains', 'supply.dc.online': '0'}, False),
+            ({'supply.usb.type': 'USB', 'supply.usb.online': ''}, None),
+            ({'supply.battery.type': 'Battery', 'supply.battery.online': '1'}, None),
+            ({'ac': '', 'usb': '1'}, True),  # historical rows
+            ({}, None)]
+        for tokens, expected in cases:
+            with self.subTest(tokens=tokens):
+                self.assertIs(sampler.power_of_tokens(tokens)['external_power'], expected)
+        line = sampler.add_power('f=300 ac= usb=1 supply.usb.type=USB supply.usb.online=1 caps= 1/1')
+        self.assertIn('external_power=1 caps=', line)
+        self.assertIn('supply.usb.type=USB supply.usb.online=1', line)
+
     LINE = ('f={f} cpu=55000 gpu=60000 cool=0 tpl=0 gclk=1 gcap=2 mav={mav} rss=2000000 swp={swp} shm=1000 kgk=1048576 '
             'kgm= kgi=2097152 pcs=1.50 pcf=0.00 pms={pms} pmf=3.25 kst={kst} caps= 2016000/2016000')
 

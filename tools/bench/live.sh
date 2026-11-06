@@ -61,7 +61,10 @@ trap 'rm -f \"\$tmp\"' EXIT
 cat > \"\$tmp\" <<'TOTK_CTL_END'
 ${LINES}TOTK_CTL_END
 chown \$(stat -c %u:%g $GAME) \"\$tmp\" && chmod 0600 \"\$tmp\" || exit 1
-chcon --reference=$GAME \"\$tmp\" 2>/dev/null || chcon \$(ls -Zd $GAME | cut -d' ' -f1) \"\$tmp\" || exit 1
+CTX=\$(ls -Zd $GAME) || exit 1
+CTX=\${CTX%% *}
+case \$CTX in *:*:*:*) ;; *) echo 'cannot read game SELinux context' >&2; exit 1 ;; esac
+chcon \"\$CTX\" \"\$tmp\" || exit 1
 mv -f \"\$tmp\" $CTL"
 root "$REMOTE" || die "could not write $CTL (root, owner or SELinux context)"
 

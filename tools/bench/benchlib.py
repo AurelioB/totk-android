@@ -1,6 +1,6 @@
 """Shared helpers of the benchmark tools: repository paths, the baseline write guard and store (per frequency signature),
 frequency limits and signatures, and the comparison metrics."""
-import datetime, hashlib, json, re, sys
+import datetime, hashlib, json, math, re, sys
 from pathlib import Path
 
 SCHEMA = 'totk-android-benchmark/1'
@@ -257,10 +257,15 @@ def sig_caps_text(sig):
 # Comparison metrics: (summary key, label, direction (+1 higher is better, -1 lower is better), kind, tolerance).
 # kind 'abs_rel': same while |delta| <= max(abs, rel * |baseline|); kind 'rate': the value is a total over the windows,
 # compared per window, same while |delta per window| <= max(abs, rel * baseline per window); kind 'abs': |delta| <= abs.
-# A difference beyond the tolerance is 'better' or 'worse' by the direction. PRIMARY metrics decide a scene's verdict:
-# worse if any primary metric is worse, else better if any is better, else same.
+# A difference beyond the tolerance is 'better' or 'worse' by the direction. Modern summaries compare steady FPS and
+# dip time separately; mean FPS is informational. Only wholly legacy comparisons retain the historical primary set.
+DIP_TIME_FRACTION_TOLERANCE = 0.05   # Five percentage points, absolute; the boundary is still 'same'.
+DIP_CONFOUNDED = 'verdict confounded by dips'
+PACING_KEYS = ('fps_steady', 'dip_windows', 'dip_time_fraction', 'frames_near33')
 METRICS = [
     ('fps_mean',        'fps mean',        +1, 'abs_rel', (0.5, 0.02)),
+    ('fps_steady',      'fps steady',      +1, 'abs_rel', (0.5, 0.02)),
+    ('dip_time_fraction', 'dip time fraction', -1, 'abs', (DIP_TIME_FRACTION_TOLERANCE, 0)),
     ('fps_min',         'fps min',         +1, 'abs_rel', (1.0, 0.05)),
     ('p50_ms_median',   'p50 median ms',   -1, 'abs_rel', (0.3, 0.02)),
     ('p95_ms_max',      'p95 max ms',      -1, 'abs_rel', (1.0, 0.05)),
@@ -271,7 +276,8 @@ METRICS = [
     ('cpu_max_c',       'CPU max C',       -1, 'abs',     (3.0, 0)),
     ('gpu_max_c',       'GPU max C',       -1, 'abs',     (3.0, 0)),
 ]
-PRIMARY = ('fps_mean', 'p50_ms_median', 'p95_ms_max', 'gpu_ms_mean', 'over50_total')
+PRIMARY = ('fps_steady', 'dip_time_fraction', 'p50_ms_median', 'p95_ms_max', 'gpu_ms_mean', 'over50_total')
+LEGACY_PRIMARY = ('fps_mean', 'p50_ms_median', 'p95_ms_max', 'gpu_ms_mean', 'over50_total')
 
 
 def metric_verdict(key, base, new):
@@ -288,19 +294,49 @@ def metric_verdict(key, base, new):
         b, n = b / bw, n / nw
     d = n - b
     tol = tol_abs if kind == 'abs' else max(tol_abs, tol_rel * abs(b))
-    if abs(d) <= tol:
+    if abs(d) <= tol or math.isclose(abs(d), tol, rel_tol=1e-12, abs_tol=1e-12):
         return delta, 'same'
     return delta, 'better' if d * direction > 0 else 'worse'
+
+
+def primary_metrics(base, new):
+    """Use the historical mean-FPS rule only when neither summary contains pacing information."""
+    return PRIMARY if any(k in s for s in (base, new) for k in PACING_KEYS) else LEGACY_PRIMARY
+
+
+def pacing_verdict(base, new):
+    """A pacing veto of the overall verdict, or None; a missing steady value never falls back to mean FPS."""
+    if primary_metrics(base, new) == LEGACY_PRIMARY:
+        return None
+    dip = metric_verdict('dip_time_fraction', base, new)[1]
+    if dip in ('better', 'worse'):
+        return DIP_CONFOUNDED
+    if dip == 'n/a' or base.get('fps_steady') is None or new.get('fps_steady') is None:
+        return 'inconclusive'
+    return None
+
+
+def pacing_note(base, new):
+    """Explain the pacing policy, including legacy or all-dip summaries, without hiding per-metric deltas."""
+    if primary_metrics(base, new) == LEGACY_PRIMARY:
+        return 'pacing info unavailable (legacy summaries); fps mean retains the historical verdict rule.'
+    note = ('fps mean is informational; steady fps and dip time fraction are compared separately '
+            f'(dip tolerance {DIP_TIME_FRACTION_TOLERANCE:g} absolute).')
+    if base.get('dip_time_fraction') is None or new.get('dip_time_fraction') is None:
+        note += ' pacing info unavailable for at least one summary; no speed conclusion.'
+    if base.get('fps_steady') is None or new.get('fps_steady') is None:
+        note += ' steady fps unavailable for at least one summary (no comparable steady windows); no speed conclusion.'
+    return note
 
 
 def scene_verdicts(base, new):
     """{metric: (delta, verdict)} and the scene's overall verdict for two runs' summaries."""
     per = {m[0]: metric_verdict(m[0], base, new) for m in METRICS}
-    prim = [per[k][1] for k in PRIMARY]
+    prim = [per[k][1] for k in primary_metrics(base, new)]
     overall = 'worse' if 'worse' in prim else 'better' if 'better' in prim else 'same'
     if all(v == 'n/a' for v in prim):
         overall = 'n/a'
-    return per, overall
+    return per, pacing_verdict(base, new) or overall
 
 
 def caps_of(run):
@@ -389,8 +425,10 @@ def compare_docs(base_doc, new_doc, out=sys.stdout, base_path=None, new_path=Non
             b, n = bruns[run['scene']]['summary'], run['summary']
             per, overall = scene_verdicts(b, n)
             verdicts[(new_label, run['scene'])] = (overall, relation)
-            head = overall.upper() + {'match': '', 'reference-only': ' (reference only)'}.get(relation, ' (NOT COMPARABLE)')
+            head = (overall if overall == DIP_CONFOUNDED else overall.upper())
+            head += {'match': '', 'reference-only': ' (reference only)'}.get(relation, ' (NOT COMPARABLE)')
             print(f'\n## {title}: {head}  (windows {b.get("windows")} -> {n.get("windows")})', file=out)
+            print(f'  {pacing_note(b, n)}', file=out)
             print(f'| {"metric":<16} | {"baseline":>9} | {"new":>9} | {"delta":>8} | verdict |', file=out)
             print(f'|{"-" * 18}|{"-" * 11}|{"-" * 11}|{"-" * 10}|---------|', file=out)
             for key, label, *_ in METRICS:
