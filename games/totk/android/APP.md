@@ -3842,6 +3842,7 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 | Frame-rate option | Android default | Effect |
 | --- | --- | --- |
 | `TOTK_FPS60` | `0` | `1` permits the game's 60-fps controller; `0` retains the shipping 30-fps minimum interval. |
+| `TOTK_FPS60_HYSTERESIS` | `0` (native) when unset; menu writes `1` only for Snapdragon 8 Elite-class native 60 fps | Startup-only, FPS60/v143: raise after seven consecutive over-budget decisions instead of three, then reload cooldown 2 instead of 6. `<game>/totk.env` `=0` overrides the menu. Compare interval-2 share/episode length and missed-refresh tails; details below. |
 | `TOTK_FPS_AUTO` | `0` (off) | `1`, only with `TOTK_FPS60=1`, selects effective 60/30 presentation intervals from measured sustainability; guest code is not repatched. |
 | `TOTK_GPU_TIME` | `hardware` when `TOTK_FPS60` is unset/`0`; `latency` when `TOTK_FPS60=1` | Android shipping-30 mode defaults to replay-free hardware-equivalent GPU reports. Explicit `hardware` or `latency` overrides either mode; unknown values log and retain latency. DRS also consumes these reports; they are not physical busy-time measurements. |
 | `TOTK_FRAME_LAG` | `0` on every platform and in every FPS mode | Only explicit `TOTK_FRAME_LAG=1` enables protected lag; unset, `0` and every other value leave it off. |
@@ -3874,6 +3875,14 @@ Rotsumamu was neutral at the 60 fps cap. At the 60 fps preset, the Duo (~27 fps)
 (4/4 pairs), while Thor (~30 fps) was neutral. These gates limit the default to the measured beneficial chip family.
 Compare off/on on the same warmed route after restarting: fps, p95, GPU-clock residency, power and temperature;
 retain `[split-pass]` and `[totk-perf] ADPF span` logs.
+
+The **60 fps** preset on Snapdragon 8 Elite-class chips (`CQ8725S`/`SM8750`, the same exact chip-class check as
+GPU busy) also writes `TOTK_FPS60_HYSTERESIS=1`. This is internal profile policy, not another visible option:
+it follows any 60-fps custom mix, independently of GPU busy, and is omitted at 30 fps or with frame generation.
+Existing stores adopt it when loaded without adding or replacing a preference; the menu already rewrites
+`settings.env` at game start. Light, Balanced and Smooth retain their previous bytes on every chip, as do all
+Thor/Duo/unknown-chip presets. The runtime remains native when the switch is unset, and developer
+`<game>/totk.env` `TOTK_FPS60_HYSTERESIS=0` still wins. This branch's default awaits device validation before merging.
 
 ### Android performance hints (experimental full mode)
 
@@ -3976,7 +3985,7 @@ Stored `min/max=2/3` with FPS60 enabled is **expected**: the patch changes compa
 instructions, not those configuration words. Native emulation explicitly checks that interval 1 is
 selected while the stored words remain 2/3; seeing 2/3 is not evidence that the patch is absent.
 
-**Odin dip experiments (both startup-only and default off):**
+**Odin dip policies (both startup-only; runtime defaults off, with hysteresis enabled by the Odin native-60 menu profile):**
 `TOTK_FPS60_HYSTERESIS=1` requires FPS60/v143 and changes three guarded controller loads:
 over-limit 6 (raise on the seventh consecutive over-budget decision, versus native limit 2/third),
 cooldown reload 2 versus native 6. Work/bias math, min/max, freeze, listener veto and interval setter

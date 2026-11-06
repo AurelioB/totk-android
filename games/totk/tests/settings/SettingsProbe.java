@@ -19,8 +19,9 @@ import java.util.Map;
  *    profile soc                   Settings.profile, profileKnown and socClass ('-' = null SOC_MODEL), space-separated
  *    first soc                     Settings.firstRun values
  *    env locale k=v...             Settings.env(locale) with newlines as '|' ('-' = no locale)
+ *    envsoc soc locale k=v...      Settings.env(locale) from a stored map with this chip
  *    envpreset name locale k=v...  apply a preset, then Settings.env(locale)
- *    envsocpreset name soc locale  firstRun(soc), apply a preset, then Settings.env(locale)
+ *    envsocpreset name soc locale k=v...  firstRun(soc), apply a preset, optional overrides, then Settings.env(locale)
  *    envdir locale dir k=v...      Settings.env(locale, dir) ('-' = primary folder, no TOTK_DATA_DIR)
  *    write dir name text           Settings.writeAtomic(dir, name, text): "ok" or "error <exception message>" */
 public final class SettingsProbe {
@@ -72,6 +73,7 @@ public final class SettingsProbe {
                 case "first": answer = dump(Settings.firstRun(w.length > 1 ? w[1] : null)); break;
                 case "defaults": { Settings s = new Settings(pairs(w, 3), w[2]); s.defaults(w[1], w[2]); answer = dump(s); break; }
                 case "env": answer = new Settings(pairs(w, 2), null).env(w[1].equals("-") ? null : w[1]).replace('\n', '|'); break;
+                case "envsoc": answer = new Settings(pairs(w, 3), w[1]).env(w[2].equals("-") ? null : w[2]).replace('\n', '|'); break;
                 case "envpreset": {
                     Settings s = new Settings(pairs(w, 3), null);
                     s.applyPreset(w[1]);
@@ -80,6 +82,7 @@ public final class SettingsProbe {
                 case "envsocpreset": {
                     Settings s = Settings.firstRun(w[2]);
                     s.applyPreset(w[1]);
+                    for (Map.Entry<String, String> e : pairsInOrder(w, 4)) s.set(e.getKey(), e.getValue());
                     answer = s.env(w[3].equals("-") ? null : w[3]).replace('\n', '|'); break;
                 }
                 case "envdir": answer = new Settings(pairs(w, 3), null).env(w[1].equals("-") ? null : w[1], w[2].equals("-") ? null : w[2]).replace('\n', '|'); break;
