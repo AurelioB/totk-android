@@ -1752,8 +1752,8 @@ on that same primary. `TOTK_VK_REC_THREADS=0` is also supported. Do not combine 
 
 Each existing submission slot owns a timestamp query pool, reset when that slot is reused.
 `vkCmdWriteTimestamp2(ALL_COMMANDS)` brackets primary rendering instances (including attachment
-loads/stores and their existing trailing barrier) and individual compute dispatches. The
-completion thread reads results only after its existing slot fence; the profiler adds no
+loads/stores), compute dispatches and named backend upload/transfer/post/upscale/present/framegen
+work. The completion thread reads results only after its existing slot fence; the profiler adds no
 GPU wait, queue submission or barrier. A frame boundary closes an outstanding rendering
 instance so its audit belongs to one frame. Query results can arrive several frames late;
 the 300-frame report appears only once an existing completed submission proves that window
@@ -1761,8 +1761,8 @@ has ended. An idle renderer therefore need not immediately print its last partia
 
 Read `[gpu-profile] frames A-B` for summed measured render/compute ms/frame, actual LOAD,
 CLEAR, STORE and DONT_CARE-store attachment operations/frame and logical attachment load/store
-MiB/frame (**not actual traffic**). It is **not** the whole-frame GPU span: transfers, pre-command-buffer uploads,
-presentation/compositor work, queue bubbles and gaps between timed passes are excluded.
+MiB/frame (**not actual traffic**). JSONL also reports the first-to-last Vulkan GPU span and
+signed `gap_ms = span_ms - measured_ms`, including barriers, queue bubbles and remaining unscoped work.
 The compact top-N signature rows are sorted by total GPU ms/frame; percentages are
 shares of the measured total, not the full GPU span. Stable keys include render/compute
 kind, ordered attachment formats, exact reduced attachment-width/render-width and
@@ -1776,8 +1776,8 @@ LOAD/STORE, not an Adreno hardware counter. It excludes metadata, resolves, comp
 alignment and driver decisions such as sysmem rendering. Depth and stencil operations are
 counted separately, splitting packed D24S8 into 3+1 bytes and D32S8 into 4+1. Unsupported or
 block-compressed view byte sizes are excluded and counted in `unknown-byte attachments`.
-Capacity is 2,048 timed passes/dispatches per submission and 16,384 distinct signatures per
-window; `dropped` and `failed-slots` must both be zero for complete timing coverage.
+Capacity is 2,048 timed records and statistics queries and 64 frame segments per submission,
+and 16,384 key+ordinal aggregates per window; nonzero drops/query failures mean incomplete coverage.
 When off, there are no profiling query pools, allocations, timestamps or audit scans;
 draw/access hooks are a single disabled branch. Diagnostic-on CPU cost is not negligible.
 

@@ -10,6 +10,10 @@
 #define GP_RECORDS 2048
 #define GP_GROUPS 16384
 #define GP_WINDOW 300
+#define GP_SEGMENTS 64
+#define GP_SPAN_BASE (GP_RECORDS * 2)
+#define GP_PRE_QUERY (GP_SPAN_BASE + GP_SEGMENTS + 1)
+#define GP_TIMESTAMPS (GP_PRE_QUERY + 1)
 enum { GP_IA_VERTICES, GP_IA_PRIMITIVES, GP_VS, GP_CLIP_INVOCATIONS, GP_CLIP_PRIMITIVES, GP_FS, GP_STATS };
 #define GP_STATS_MASK (VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT | \
     VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT | \
@@ -28,10 +32,15 @@ typedef struct {
     gp_key key; uint64_t frame, counters[GP_STATS];
     uint32_t draws, instance, reason, detail, stats_q1, stats_count, stats_invalid;
 } gp_record;
+typedef struct { uint64_t frame; uint32_t first, last; } gp_segment;
 struct vk_gpuprof_slot {
     VkQueryPool pool, stats;
     uint32_t n, dropped, ns;
     uint64_t sealed;
+    uint32_t nsegment, has_pre;
+    VkCommandBuffer pre_cb;
+    gp_segment segment[GP_SEGMENTS];
+    uint64_t span_ticks[GP_SEGMENTS + 1], pre_tick;
     gp_record rec[GP_RECORDS];
     uint64_t ticks[GP_RECORDS * 2];
     uint64_t counters[GP_RECORDS][GP_STATS];
@@ -53,6 +62,13 @@ static int stats_on, secondary_pass;
 static vk_gpuprof_slot *current;
 static gp_record *open_record;
 static gp_audit open_audit;
+static VkCommandBuffer open_cb;
+typedef struct {
+    gp_record *parent; gp_audit audit; VkCommandBuffer parent_cb, cb;
+    int secondary, skipped;
+} gp_scope;
+static gp_scope scopes[16];
+static unsigned scope_n, scope_overflow;
 static gp_audit *audit;
 static size_t audit_n, audit_cap;
 static uint64_t frame = 1;
@@ -61,6 +77,14 @@ static uint64_t audit_load_passes, audit_store_passes, audit_load_ops, audit_sto
 static uint64_t audit_overflow;
 /* Timing aggregates below are accessed ONLY by the completion thread. */
 static gp_group groups[GP_GROUPS];
+static struct {
+    uint64_t frame, first, last, dropped;
+    double measured;
+    int has_ticks, failed;
+} completed;
+static uint64_t last_completed, window_frames;
+static double window_span, window_gap;
+static int partial_report;
 static uint64_t window, total_records, dropped_records, failed_slots, loads, clears, stores, discards;
 static uint64_t stats_failures;
 static uint64_t load_bytes, store_bytes, unknown_bytes;
@@ -127,7 +151,10 @@ static void json_add(gp_json *row, const char *format, ...) {
     if (n < 0 || (size_t)n >= sizeof row->data - row->used) { row->failed = 1; return; }
     row->used += (size_t)n;
 }
-static const char *kind_name(const gp_key *key) { return key->compute ? "compute" : "render"; }
+static const char *kind_name(const gp_key *key) {
+    static const char *const kinds[] = {"render", "compute", "upload", "transfer", "post", "upscale", "present", "framegen"};
+    return key->compute < sizeof kinds / sizeof *kinds ? kinds[key->compute] : "other";
+}
 static void output_pass(const gp_group *g, const char *type, uint64_t pass_frame) {
     const gp_key *k = &g->key;
     gp_json row = {0};
@@ -226,13 +253,14 @@ static void report(void) {
     gp_group *rank[GP_GROUPS]; size_t n = 0;
     for (size_t i = 0; i < GP_GROUPS; i++) if (groups[i].count) rank[n++] = &groups[i];
     qsort(rank, n, sizeof *rank, rank_cmp);
-    report_end = (window + 1) * GP_WINDOW;
+    if (!partial_report) report_end = (window + 1) * GP_WINDOW;
     for (size_t i = 0; i < n; i++) output_pass(rank[i], "pass", 0);
     gp_json summary = {0};
     json_add(&summary, "{\"schema\":2,\"type\":\"window\",\"window_start\":%llu,\"window_end\":%llu,"
-        "\"frames\":300,\"partial\":false,\"measured_ms\":%.9f,\"dropped\":%llu,\"failed_slots\":%llu,"
-        "\"stats_failed_slots\":%llu,\"output_failures\":%llu}\n",
-        (unsigned long long)(window * GP_WINDOW + 1), (unsigned long long)report_end, total_ms,
+        "\"frames\":%llu,\"partial\":%s,\"measured_ms\":%.9f,\"span_ms\":%.9f,\"gap_ms\":%.9f,"
+        "\"dropped\":%llu,\"failed_slots\":%llu,\"stats_failed_slots\":%llu,\"output_failures\":%llu}\n",
+        (unsigned long long)(window * GP_WINDOW + 1), (unsigned long long)report_end,
+        (unsigned long long)window_frames, partial_report ? "true" : "false", total_ms, window_span, window_gap,
         (unsigned long long)dropped_records, (unsigned long long)failed_slots,
         (unsigned long long)stats_failures, (unsigned long long)output_failures);
     output_row(summary.data);
@@ -272,8 +300,33 @@ static void report(void) {
     if (stats_on) LOGV("[gpu-profile scale] pipeline-stat failed slots=%llu; counts are implementation-defined invocations, not covered pixels", (unsigned long long)stats_failures);
     stats_failures = 0;
     load_bytes = store_bytes = unknown_bytes = 0; total_ms = render_ms = compute_ms = 0;
+    window_frames = 0; window_span = window_gap = 0;
 }
 static void advance(uint64_t target) { while (window < target) { report(); window++; } }
+static uint64_t tick_delta(uint64_t end, uint64_t start) {
+    uint64_t delta = end - start;
+    return V.timestamp_bits < 64 ? delta & ((UINT64_C(1) << V.timestamp_bits) - 1) : delta;
+}
+static double tick_ms(uint64_t end, uint64_t start) {
+    return (double)tick_delta(end, start) * V.props.limits.timestampPeriod / 1e6;
+}
+static void finish_frame(void) {
+    if (!completed.frame) return;
+    double span = completed.has_ticks ? tick_ms(completed.last, completed.first) : 0;
+    double gap = span - completed.measured;
+    double epsilon = V.props.limits.timestampPeriod * (GP_RECORDS * 2.0 + 2) / 1e6;
+    int failed = completed.failed || completed.dropped || !completed.has_ticks || gap < -epsilon;
+    gp_json row = {0};
+    json_add(&row, "{\"schema\":2,\"type\":\"frame\",\"frame\":%llu,\"span_ms\":%.9f,"
+        "\"measured_ms\":%.9f,\"gap_ms\":%.9f,\"dropped\":%llu,\"reconciliation_failed\":%s}\n",
+        (unsigned long long)completed.frame, span, completed.measured, gap,
+        (unsigned long long)completed.dropped, failed ? "true" : "false");
+    output_row(row.data);
+    if (output_file) fflush(output_file);
+    window_span += span; window_gap += gap; window_frames++;
+    last_completed = completed.frame;
+    memset(&completed, 0, sizeof completed);
+}
 
 void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
     static int initialized;
@@ -281,9 +334,9 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
         initialized = 1;
         const char *e = getenv("TOTK_VK_GPU_PROFILE");
         if (e && (!strcmp(e, "1") || !strcmp(e, "2"))) {
-            vk_gpuprof_on = V.timestamp_bits && V.props.limits.timestampComputeAndGraphics && V.props.limits.timestampPeriod > 0 ? atoi(e) : 0;
+            vk_gpuprof_on = V.has_host_query_reset && V.timestamp_bits && V.props.limits.timestampComputeAndGraphics && V.props.limits.timestampPeriod > 0 ? atoi(e) : 0;
             LOGV("[gpu-profile] %s (TOTK_VK_GPU_PROFILE=%s); 300-frame windows, exact primary pass parts; recorder workers supported",
-                 vk_gpuprof_on ? "enabled" : "unavailable: queue/device lacks graphics+compute timestamps", e);
+                 vk_gpuprof_on ? "enabled" : "unavailable: graphics+compute timestamps or hostQueryReset missing", e);
             const char *se = getenv("TOTK_VK_GPU_PROFILE_STATS");
             int requested = se && !strcmp(se, "1");
             stats_on = vk_gpuprof_on && requested && V.has_pipeline_statistics;
@@ -294,7 +347,7 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
     if (!vk_gpuprof_on) return;
     if (!*slot) {
         *slot = calloc(1, sizeof **slot); if (!*slot) DIE("GPU profiler slot allocation");
-        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GP_RECORDS * 2};
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GP_TIMESTAMPS};
         VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &(*slot)->pool));
         if (stats_on) {
             qi.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS; qi.queryCount = GP_RECORDS;
@@ -303,70 +356,118 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
         }
     }
     current = *slot; current->n = current->dropped = 0; current->sealed = 0;
-    current->ns = 0;
-    vkCmdResetQueryPool(cb, current->pool, 0, GP_RECORDS * 2);
-    if (stats_on) vkCmdResetQueryPool(cb, current->stats, 0, GP_RECORDS);
+    current->ns = 0; current->has_pre = 0; current->pre_cb = VK_NULL_HANDLE;
+    current->nsegment = 1; current->segment[0] = (gp_segment){frame, 0, 0};
+    vkResetQueryPool(V.dev, current->pool, 0, GP_TIMESTAMPS);
+    if (stats_on) vkResetQueryPool(V.dev, current->stats, 0, GP_RECORDS);
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE);
+}
+void vk_gpuprof_slot_pre(vk_gpuprof_slot *slot, VkCommandBuffer cb) {
+    if (!slot) return;
+    slot->has_pre = 1; slot->pre_cb = cb;
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot->pool, GP_PRE_QUERY);
+}
+void vk_gpuprof_slot_end(vk_gpuprof_slot *slot, VkCommandBuffer cb) {
+    if (!slot) return;
+    slot->segment[slot->nsegment - 1].last = slot->nsegment;
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot->pool, GP_SPAN_BASE + slot->nsegment);
+}
+void vk_gpuprof_slot_cancel(vk_gpuprof_slot *slot) {
+    if (current == slot) { current = NULL; open_record = NULL; scope_n = scope_overflow = 0; }
+}
+static void frame_marker(VkCommandBuffer cb) {
+    if (!current) return;
+    if (current->nsegment == GP_SEGMENTS) { current->dropped++; return; }
+    uint32_t marker = current->nsegment;
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE + marker);
+    current->segment[marker - 1].last = marker;
+    current->segment[marker] = (gp_segment){frame + 1, marker, marker};
+    current->nsegment++;
 }
 void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot) {
     if (!slot) return;
     slot->sealed = frame - 1; current = NULL;
 }
+static void ingest_record(gp_record *r, double ms, int stats_valid) {
+    completed.measured += ms;
+    total_records++; total_ms += ms;
+    if (r->key.compute == 1) compute_ms += ms;
+    else if (!r->key.compute) render_ms += ms;
+    for (int j = 0; j < 10; j++) {
+        const gp_attachment *a = &r->key.a[j]; if (!a->format) continue;
+        uint64_t bytes = (uint64_t)r->key.w * r->key.h * a->bytes * r->key.samples;
+        unknown_bytes += !a->bytes;
+        if (a->load == VK_ATTACHMENT_LOAD_OP_LOAD) { loads++; load_bytes += bytes; }
+        if (a->load == VK_ATTACHMENT_LOAD_OP_CLEAR) clears++;
+        if (a->store == VK_ATTACHMENT_STORE_OP_STORE) { stores++; store_bytes += bytes; } else discards++;
+    }
+    uint64_t hash = key_hash(&r->key); size_t at = (hash ^ r->instance) % GP_GROUPS, tries = 0;
+    if (vk_gpuprof_on == 2) {
+        const char *reason = r->reason < sizeof end_names / sizeof *end_names ? end_names[r->reason] : "unknown";
+        LOGV("[gpu-split] frame=%llu ordinal=%u sig=%016llx kind=%s end=%s detail=%#x draws=%u ms=%.4f",
+            (unsigned long long)r->frame, r->instance, (unsigned long long)hash, kind_name(&r->key), reason, r->detail, r->draws, ms);
+    }
+    while (groups[at].count && (groups[at].hash != hash || groups[at].ordinal != r->instance ||
+        !key_equal(&groups[at].key, &r->key)) && ++tries < GP_GROUPS) at = (at + 1) % GP_GROUPS;
+    if (tries == GP_GROUPS) { dropped_records++; completed.dropped++; return; }
+    gp_group *g = &groups[at];
+    if (!g->count) { g->key = r->key; g->hash = hash; g->ordinal = r->instance; }
+    g->count++; g->draws += r->draws; g->ms += ms;
+    if (stats_valid) {
+        for (unsigned st = 0; st < GP_STATS; st++) g->counters[st] += r->counters[st];
+        g->stats_count++; g->stats_draws += r->draws; g->stats_ms += ms;
+    }
+}
 void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
     if (!slot) return;
     VkResult result = slot->n ? vkGetQueryPoolResults(V.dev, slot->pool, 0, slot->n * 2,
         slot->n * 2 * sizeof(uint64_t), slot->ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) : VK_SUCCESS;
+    VkResult span_result = vkGetQueryPoolResults(V.dev, slot->pool, GP_SPAN_BASE, slot->nsegment + 1,
+        (slot->nsegment + 1) * sizeof(uint64_t), slot->span_ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    if (slot->has_pre && vkGetQueryPoolResults(V.dev, slot->pool, GP_PRE_QUERY, 1,
+        sizeof slot->pre_tick, &slot->pre_tick, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT)) span_result = VK_NOT_READY;
     VkResult sr = stats_on && slot->ns ? vkGetQueryPoolResults(V.dev, slot->stats, 0, slot->ns,
         slot->ns * sizeof slot->counters[0], slot->counters, sizeof slot->counters[0], VK_QUERY_RESULT_64_BIT) : VK_SUCCESS;
-    stats_failures += sr != VK_SUCCESS;
     for (uint32_t q = 0; sr == VK_SUCCESS && q < slot->ns; q++)
         for (unsigned st = 0; st < GP_STATS; st++)
             slot->rec[slot->stats_owner[q]].counters[st] += slot->counters[q][st];
-    for (uint32_t i = 0; i < slot->n; i++) {
-        gp_record *r = &slot->rec[i]; advance((r->frame - 1) / GP_WINDOW);
-        if (result) continue;
-        /* Unsigned subtraction also handles wrap on devices with fewer than 64 timestamp bits. */
-        uint64_t delta = slot->ticks[2 * i + 1] - slot->ticks[2 * i];
-        if (V.timestamp_bits < 64) delta &= (UINT64_C(1) << V.timestamp_bits) - 1;
-        double ms = (double)delta * V.props.limits.timestampPeriod / 1e6;
-        total_records++; total_ms += ms; if (r->key.compute) compute_ms += ms; else render_ms += ms;
-        for (int j = 0; j < 10; j++) {
-            const gp_attachment *a = &r->key.a[j]; if (!a->format) continue;
-            uint64_t bytes = (uint64_t)r->key.w * r->key.h * a->bytes * r->key.samples;
-            unknown_bytes += !a->bytes;
-            if (a->load == VK_ATTACHMENT_LOAD_OP_LOAD) { loads++; load_bytes += bytes; }
-            if (a->load == VK_ATTACHMENT_LOAD_OP_CLEAR) clears++;
-            if (a->store == VK_ATTACHMENT_STORE_OP_STORE) { stores++; store_bytes += bytes; } else discards++;
+    for (uint32_t s = 0; s < slot->nsegment; s++) {
+        const gp_segment *segment = &slot->segment[s];
+        if (completed.frame && completed.frame != segment->frame) finish_frame();
+        advance((segment->frame - 1) / GP_WINDOW);
+        completed.frame = segment->frame;
+        if (!s) {
+            completed.dropped += slot->dropped; dropped_records += slot->dropped;
+            failed_slots += result != VK_SUCCESS || span_result != VK_SUCCESS;
+            stats_failures += sr != VK_SUCCESS;
         }
-        uint64_t hash = key_hash(&r->key); size_t at = (hash ^ r->instance) % GP_GROUPS, tries = 0;
-        if (vk_gpuprof_on == 2) {
-            const char *reason = r->reason < sizeof end_names / sizeof *end_names ? end_names[r->reason] : "unknown";
-            LOGV("[gpu-split] frame=%llu instance=%u sig=%016llx kind=%s end=%s detail=%#x draws=%u ms=%.4f; emitted-tail srcStage=%#llx srcAccess=%#llx dstStage=%#llx dstAccess=%#llx",
-                 (unsigned long long)r->frame, r->instance, (unsigned long long)hash, r->key.compute ? "compute" : "render", reason, r->detail, r->draws, ms,
-                 (unsigned long long)VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, (unsigned long long)VK_ACCESS_2_MEMORY_WRITE_BIT,
-                 (unsigned long long)VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, (unsigned long long)(VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT));
+        completed.failed |= result != VK_SUCCESS || span_result != VK_SUCCESS;
+        if (span_result == VK_SUCCESS) {
+            uint64_t first = !s && slot->has_pre ? slot->pre_tick : slot->span_ticks[segment->first];
+            if (!completed.has_ticks) completed.first = first;
+            completed.last = slot->span_ticks[segment->last]; completed.has_ticks = 1;
         }
-        while (groups[at].count && (groups[at].hash != hash || groups[at].ordinal != r->instance || !key_equal(&groups[at].key, &r->key)) && ++tries < GP_GROUPS) at = (at + 1) % GP_GROUPS;
-        if (tries == GP_GROUPS) { dropped_records++; continue; }
-        gp_group *g = &groups[at]; if (!g->count) { g->key = r->key; g->hash = hash; g->ordinal = r->instance; }
-        g->count++; g->draws += r->draws; g->ms += ms;
-        if (r->stats_count && !r->stats_invalid && sr == VK_SUCCESS) {
-            for (unsigned st = 0; st < GP_STATS; st++) g->counters[st] += r->counters[st];
-            g->stats_count++; g->stats_draws += r->draws; g->stats_ms += ms;
+        for (uint32_t i = 0; i < slot->n; i++) {
+            gp_record *r = &slot->rec[i];
+            if (r->frame != segment->frame || result != VK_SUCCESS) continue;
+            ingest_record(r, tick_ms(slot->ticks[2 * i + 1], slot->ticks[2 * i]),
+                r->stats_count && !r->stats_invalid && sr == VK_SUCCESS);
         }
+        if (segment->frame <= slot->sealed) finish_frame();
     }
-    dropped_records += slot->dropped; failed_slots += result != VK_SUCCESS;
     if (slot->sealed) advance(slot->sealed / GP_WINDOW);
 }
 static void begin_record(VkCommandBuffer cb, int compute) {
     open_record = NULL; memset(&open_audit, 0, sizeof open_audit);
     if (!current || current->n == GP_RECORDS) { if (current) current->dropped++; audit_overflow++; return; }
-    open_record = &current->rec[current->n]; memset(open_record, 0, sizeof *open_record);
+    uint32_t index = current->n++;
+    open_record = &current->rec[index]; memset(open_record, 0, sizeof *open_record);
     open_record->frame = frame; open_record->key.compute = (uint32_t)compute;
-    open_record->instance = ++frame_instance;
-    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, current->n * 2);
+    open_record->instance = ++frame_instance; open_cb = cb;
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, index * 2);
     if (!compute && stats_on && !secondary_pass && current->ns < GP_RECORDS) {
         open_record->stats_q1 = ++current->ns; open_record->stats_count++;
-        current->stats_owner[current->ns - 1] = current->n;
+        current->stats_owner[current->ns - 1] = index;
         vkCmdBeginQuery(cb, current->stats, open_record->stats_q1 - 1, 0);
     }
 }
@@ -446,20 +547,41 @@ void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpupro
     memset(token, 0, sizeof *token);
     if (!open_record) return;
     open_record->reason = (uint32_t)reason; open_record->detail = detail;
-    *token = (vk_gpuprof_end_token){current->pool, current->stats, current->n * 2 + 1, open_record->stats_q1};
+    *token = (vk_gpuprof_end_token){current->pool, current->stats,
+        (uint32_t)(open_record - current->rec) * 2 + 1, open_record->stats_q1};
     if (!open_record->key.compute) {
         if (audit_n == audit_cap) { audit_cap = audit_cap ? 2 * audit_cap : 256; audit = realloc(audit, audit_cap * sizeof *audit); if (!audit) DIE("GPU profiler audit allocation"); }
         open_audit.key = open_record->key;
         audit[audit_n++] = open_audit;
     }
-    current->n++; open_record = NULL;
+    open_record = NULL; open_cb = VK_NULL_HANDLE;
 }
 void vk_gpuprof_end(VkCommandBuffer cb, vk_pass_end_kind reason, uint32_t detail) {
     vk_gpuprof_end_token token;
     vk_gpuprof_end_deferred(reason, detail, &token);
     vk_gpuprof_end_emit(cb, &token);
 }
+void vk_gpuprof_scope_begin(VkCommandBuffer cb, const char *label) {
+    if (scope_n == sizeof scopes / sizeof *scopes) { scope_overflow++; return; }
+    gp_scope *scope = &scopes[scope_n++];
+    *scope = (gp_scope){.parent = open_record, .audit = open_audit, .parent_cb = open_cb,
+        .cb = cb, .secondary = secondary_pass, .skipped = open_record && cb == open_cb};
+    if (scope->skipped) return;
+    static const char *const names[] = {"upload", "transfer", "post", "upscale", "present", "framegen"};
+    unsigned kind = 2;
+    for (unsigned i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(label, names[i])) { kind = i + 2; break; }
+    begin_record(cb, (int)kind);
+}
+void vk_gpuprof_scope_end(VkCommandBuffer cb) {
+    if (scope_overflow) { scope_overflow--; return; }
+    if (!scope_n) return;
+    gp_scope *scope = &scopes[--scope_n];
+    if (!scope->skipped) vk_gpuprof_end(cb, VK_PASS_END_OTHER, 0);
+    open_record = scope->parent; open_audit = scope->audit;
+    open_cb = scope->parent_cb; secondary_pass = scope->secondary;
+}
 void vk_gpuprof_present(void) {
+    if (current) frame_marker(vk_cb());
     for (size_t i = 0; i < audit_n; i++) {
         uint32_t unused = audit[i].stored & ~audit[i].read;
         audit_load_passes += audit[i].load_dead != 0; audit_store_passes += unused != 0;
@@ -483,3 +605,13 @@ void vk_gpuprof_present(void) {
     frame++;
     frame_instance = 0;
 }
+#ifdef TOTK_VK_TESTS
+void vk_gpuprof_test_frame(VkCommandBuffer cb) {
+    if (!vk_gpuprof_on) return;
+    (void)cb; vk_gpuprof_present();
+}
+void vk_gpuprof_test_flush(void) {
+    if (!vk_gpuprof_on || !window_frames) return;
+    partial_report = 1; report_end = last_completed; report(); partial_report = 0;
+}
+#endif

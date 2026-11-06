@@ -311,9 +311,19 @@ static void pp_end(VkCommandBuffer cb, int i) { if (i >= 0) pp_ts(cb, PP.rec[i].
 int vk_native_gpu_begin(VkCommandBuffer cb, unsigned op) {
     if (op >= VK_NUI_OPS) return -1;
     native_count[op]++;
+    if (vk_gpuprof_on) {
+        static const char *const labels[VK_NUI_OPS] = {
+            "upscale", "upscale", "transfer", "transfer", "upscale",
+            "upscale", "present", "present", "post"
+        };
+        vk_gpuprof_scope_begin(cb, labels[op]);
+    }
     return pp_begin(cb,2+(int)op);
 }
-void vk_native_gpu_end(VkCommandBuffer cb, int scope) { pp_end(cb,scope); }
+void vk_native_gpu_end(VkCommandBuffer cb, int scope) {
+    pp_end(cb,scope);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
+}
 void vk_native_gpu_skip(unsigned op) { if (op < VK_NUI_OPS) native_skipped[op]++; }
 #ifdef TOTK_VK_TESTS
 void vk_native_gpu_counts(uint64_t executed[VK_NUI_OPS], uint64_t skipped[VK_NUI_OPS]) {
@@ -425,7 +435,9 @@ static void pd_copy(VkCommandBuffer cb, vk_tex *x, unsigned level, unsigned laye
     if (!vk_mem_alloc(&req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &e.mem)) { vkDestroyBuffer(V.dev, e.buf, NULL); LOGV("pass dump: no memory for %s", e.name); return; }
     VKCHECK(vkBindBufferMemory(V.dev, e.buf, e.mem.mem, e.mem.off));
     VkBufferImageCopy r = {0, 0, 0, {depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1}, {0, 0, 0}, {w, h, 1}};
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     vkCmdCopyImageToBuffer(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, e.buf, 1, &r);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     if (PD.ne == PD.cap) { PD.cap = PD.cap ? 2 * PD.cap : 64; PD.e = realloc(PD.e, (size_t)PD.cap * sizeof *PD.e); }
     PD.e[PD.ne++] = e;
 }
@@ -437,7 +449,9 @@ static void pd_copy_range(VkCommandBuffer cb, VkBuffer src, uint64_t so, uint64_
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, e.buf, &req);
     if (!vk_mem_alloc(&req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &e.mem)) { vkDestroyBuffer(V.dev, e.buf, NULL); return; }
     VKCHECK(vkBindBufferMemory(V.dev, e.buf, e.mem.mem, e.mem.off));
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     VkBufferCopy r = {so, 0, size}; vkCmdCopyBuffer(cb, src, e.buf, 1, &r);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     if (PD.ne == PD.cap) { PD.cap = PD.cap ? 2 * PD.cap : 64; PD.e = realloc(PD.e, (size_t)PD.cap * sizeof *PD.e); }
     PD.e[PD.ne++] = e;
 }
@@ -699,8 +713,10 @@ static void probe_pass(VkCommandBuffer cb) {
     uint32_t w = vk_tex_width(x, R.c0_level), h = vk_tex_height(x, R.c0_level);
     VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, R.c0_level, R.c0_layer, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)fr, 1}, .dstOffsets = {{0, slot * 8, 0}, {8, slot * 8 + 8, 1}}};
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     vkCmdBlitImage(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, g_probe_img, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
     vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     probe_meta *pm = &g_probe[fr].m[slot];
     *pm = (probe_meta){.serial = R.c0_serial, .draws = g_stat_draws - R.draws0, .img = (uint64_t)(uintptr_t)vk_tex_image(x), .w = w, .h = h, .fmt = R.c0_fmt, .nin = g_npin, .dummy = g_pdummy, .zero = g_pzero};
     memcpy(pm->in, g_pin, sizeof g_pin); memcpy(pm->key, g_pkey, sizeof g_pkey);
@@ -719,8 +735,10 @@ static void probe_frame_end(uint64_t frame_no) {   /* at present: copy this fram
     if (g_probe_n) {
         VkCommandBuffer cb = vk_cb();
         VkBufferImageCopy c = {.bufferOffset = (VkDeviceSize)fr * PROBE_SLOTS * 64 * 8, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)fr, 1}, .imageExtent = {8, 8 * (uint32_t)g_probe_n, 1}};
+        if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
         vkCmdCopyImageToBuffer(cb, g_probe_img, VK_IMAGE_LAYOUT_GENERAL, g_probe_buf, 1, &c);
         vk_barrier_all(cb);
+        if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     }
     p->n = g_probe_n; p->fence = mtl_last_fence() + 1;
     atomic_store(&p->frame, frame_no);
@@ -744,8 +762,10 @@ static void probe_write_note(char kind, vk_tex *x, vk_tex *src, uint32_t draws) 
             for (int k = 0; k < 64; k++) r[k] = (VkBufferImageCopy){.bufferOffset = base + (VkDeviceSize)k * 4, .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, R.dlevel, R.dlayer, 1},
                 .imageOffset = {(int32_t)(lw * (2 * (k % 8) + 1) / 16), (int32_t)(lh * (2 * (k / 8) + 1) / 16), 0}, .imageExtent = {1, 1, 1}};
             VkCommandBuffer cb = vk_cb();
+            if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
             vkCmdCopyImageToBuffer(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, g_probe_buf, 64, r);
             vk_barrier_all(cb);
+            if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
             w->dsamp = 1;
         }
     }
@@ -2471,7 +2491,9 @@ static void fg_extract_capture(vk_tex *canvas, unsigned level, unsigned layer) {
         FGX.signature = c->signature; FGX.stable_frames = 1; vk_fg_history_cut();
     }
     vk_fg_camera(c->camera);
-    if (!vk_fg_capture(vk_cb(),canvas,level,layer,depth,c->depth_key.mip,c->depth_key.layer,
+    VkCommandBuffer cb = vk_cb();
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
+    if (!vk_fg_capture(cb,canvas,level,layer,depth,c->depth_key.mip,c->depth_key.layer,
         vk_tex_width(canvas,level),vk_tex_height(canvas,level))) {
         fg_extract_snapshot_state("copy-format-ring-resources",result,before);
         fg_extract_reject(VK_FG_STRUCTURE_CHANGED,"generation source format, ring or GPU resources unavailable");
@@ -2480,6 +2502,7 @@ static void fg_extract_capture(vk_tex *canvas, unsigned level, unsigned layer) {
         vk_fg_capture_geometry(FGX.frame,c->admitted_viewport,c->admitted_scissor);
         fg_extract_snapshot_state("captured",result,before);
     }
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = g_pipe_dirty = 1;
     descriptor_unbind(); vk_stage_sig_invalidate(0x3fu);
 }
@@ -3135,7 +3158,9 @@ static void fg_extract_replay_batch(void) {
     int interpolating = vk_fg_interpolating();
     for (unsigned pass = 0; pass < (interpolating ? 2u : 1u); pass++) {
         int final = pass ? 2 : 0; /* Capture UI's affine RGB blend over black/white. */
+        if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
         if (!vk_fg_replay_begin(cb,first->width,first->height,first->format,final)) {
+            if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
             fg_extract_reject(VK_FG_STRUCTURE_CHANGED,"private UI canvas unavailable"); return;
         }
         for (unsigned i = 0; i + 1 < FGX.nreplay; i++) {
@@ -3144,6 +3169,7 @@ static void fg_extract_replay_batch(void) {
             else vk_fg_replay_draw(cb,&packet->draw,packet->sets);
         }
         vk_fg_replay_end(cb,final);
+        if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     }
     int terminal_capture=vk_fg_adaptive();
 #ifdef TOTK_VK_TESTS
@@ -3160,11 +3186,14 @@ static void fg_extract_replay_batch(void) {
     if (!interpolating || vk_fg_interp_compose(cb)) {
         if (vk_fg_qcom_requested() || vk_fg_lsfg_requested()) cb=vk_cb(); /* External handoff can seal the primary. */
         const fg_extract_replay_draw *last = &FGX.replay_draw[FGX.nreplay - 1];
+        if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
         if (!vk_fg_replay_begin(cb,last->width,last->height,last->format,1)) {
+            if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
             fg_extract_reject(VK_FG_STRUCTURE_CHANGED,"private terminal image unavailable"); return;
         }
         vk_fg_replay_draw(cb,&last->draw,last->sets);
         vk_fg_replay_end(cb,1);
+        if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     }
     g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = g_pipe_dirty = 1;
     descriptor_unbind(); vk_stage_sig_invalidate(0x3fu);
@@ -3196,10 +3225,20 @@ void vk_fg_extract_present(const tex_t *t) {
                 native_ready,(void *)native.image,native.w,native.h,native.format);
             fg_extract_reject(VK_FG_STRUCTURE_CHANGED,"native terminal attachment/extent/encoding does not match presented sibling");
         }
-        else if (vk_fg_interpolating() && !vk_fg_capture_real(vk_cb(),window,0,0))
-            fg_extract_reject(VK_FG_STRUCTURE_CHANGED,"native presented real image could not be retained exactly");
-    } else if (!FGX.invalid && vk_fg_interpolating())
-        (void)vk_fg_capture_real(vk_cb(),window,0,0); /* masked pairs require this; known pairs need no fallback */
+        else if (vk_fg_interpolating()) {
+            VkCommandBuffer cb = vk_cb();
+            if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
+            int captured = vk_fg_capture_real(cb,window,0,0);
+            if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
+            if (!captured)
+                fg_extract_reject(VK_FG_STRUCTURE_CHANGED,"native presented real image could not be retained exactly");
+        }
+    } else if (!FGX.invalid && vk_fg_interpolating()) {
+        VkCommandBuffer cb = vk_cb();
+        if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
+        (void)vk_fg_capture_real(cb,window,0,0); /* masked pairs require this; known pairs need no fallback */
+        if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
+    }
     if (!FGX.invalid) fg_extract_replay_batch();
     FGX.eligible = !FGX.invalid;
     const char *reason = FGX.invalid ? FGX.reason : "eligible scene -> canvas -> final transfer -> present";
@@ -5275,8 +5314,11 @@ static int canvas_draw_prepare(vk_shader *const sh[6], vk_canvas_image *transfer
                 if (vk_tex_native_output(target,&native)) { width=native.w; height=native.h; }
             }
             FGX.ui_width = width; FGX.ui_height = height; FGX.ui_format = vk_tex_format(target);
-            (void)vk_fg_prepare_canvas(vk_cb(),width,height);
-            (void)vk_fg_replay_depth(vk_cb(),FGX.ui_depth,FGX.ui_depth_level,FGX.ui_depth_layer);
+            VkCommandBuffer cb = vk_cb();
+            if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
+            (void)vk_fg_prepare_canvas(cb,width,height);
+            (void)vk_fg_replay_depth(cb,FGX.ui_depth,FGX.ui_depth_level,FGX.ui_depth_layer);
+            if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
         }
         if (one) RED(16,"native UI v2: FragCoord.xy/storage shader %.64s executes at 1x",sh[1]->key);
     }
@@ -6044,12 +6086,14 @@ static void copy_b2t(const p_copy_b2t *c) {   /* buffer -> texture (row stride f
     vk_tex_native_read(x);
     if (trace) vk_texcopy_image("CopyBufferToTexture", "dst", c->tex, x);
     VkCommandBuffer cb = vk_cb(); vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "upload");
     VkBufferImageCopy r = {.bufferOffset = o, .bufferRowLength = (uint32_t)(row / bpb * bw), .bufferImageHeight = (uint32_t)(rows * bh),
         .imageSubresource = {copy_aspect(x), level, is3d ? 0 : layer0 + c->r.zoffset, is3d ? 1 : (uint32_t)nz},
         .imageOffset = {c->r.xoffset, c->r.yoffset, is3d ? c->r.zoffset : 0}, .imageExtent = {(uint32_t)c->r.width, (uint32_t)c->r.height, is3d ? (uint32_t)nz : 1}};
     vkCmdCopyBufferToImage(cb, b, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     totk_ft_count(FT_COUNT_TEX_UPLOADS, 1);
     vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     vk_tex_native_patch(x, level, layer0, &c->r);
     if (vk_fg_extract_active) fg_extract_texture_write(c->tex, level, is3d ? 0 : layer0 + c->r.zoffset,
         is3d ? 1 : (unsigned)nz, copy_aspect(x),
@@ -6096,6 +6140,7 @@ static void copy_t2b(const p_copy_b2t *c) {   /* texture -> buffer */
     if (trace) vk_texcopy_image("CopyTextureToBuffer", "src", c->tex, x);
     if (vk_gpuprof_on) vk_gpuprof_read((uint64_t)(uintptr_t)c->tex->mem, c->tex->L.size);
     VkCommandBuffer cb = vk_cb(); vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     VkBufferImageCopy r = {.bufferOffset = o, .bufferRowLength = (uint32_t)(row / bpb * bw), .bufferImageHeight = (uint32_t)(rows * bh),
         .imageSubresource = {copy_aspect(x), level, is3d ? 0 : layer0 + c->r.zoffset, is3d ? 1 : (uint32_t)nz},
         .imageOffset = {c->r.xoffset, c->r.yoffset, is3d ? c->r.zoffset : 0}, .imageExtent = {(uint32_t)c->r.width, (uint32_t)c->r.height, is3d ? (uint32_t)nz : 1}};
@@ -6103,6 +6148,7 @@ static void copy_t2b(const p_copy_b2t *c) {   /* texture -> buffer */
     vk_pso_life_external_read(vk_tex_width(x, level), vk_tex_height(x, level), "texture-to-buffer-read");
     vk_fg_extract_memory_write(c->src, img * nz);
     vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     if (trace) {
         totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyTextureToBuffer result=success encoded=1 src_serial=%llu bytes=%zu", (unsigned long long)c->tex->serial, img * nz);
         vk_texcopy_readback("CopyTextureToBuffer", "src", c->tex, x, level, layer0, &c->r);
@@ -6146,6 +6192,7 @@ static void copy_t2t(const p_copy_t2t *c) {   /* texture -> texture: same size a
     }
     if (vk_gpuprof_on) vk_gpuprof_read((uint64_t)(uintptr_t)c->src->mem, c->src->L.size);
     VkCommandBuffer cb = vk_cb(); vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     int same = c->sr.width == c->dr.width && c->sr.height == c->dr.height && (c->sr.depth ? c->sr.depth : 1) == (c->dr.depth ? c->dr.depth : 1) && s3 == d3;
     int bwa, bha, bwb, bhb, bpa = nvn_fmt_bpb(c->src->d.format, &bwa, &bha), bpbb = nvn_fmt_bpb(c->dst->d.format, &bwb, &bhb);
     unsigned copied_layers = 0;
@@ -6174,6 +6221,7 @@ static void copy_t2t(const p_copy_t2t *c) {   /* texture -> texture: same size a
         RED(4, "texture copy %dx%dx%d -> %dx%dx%d (3D %d -> %d) not done", c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth, s3, d3);
     }
     vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     if (copied_layers) vk_tex_native_patch(d, dl, dz0, &c->dr);
     if (vk_fg_extract_active && copied_layers) fg_extract_copy(c, s, d, copied_layers);
     vk_tex_mark_gpu_written(d); probe_write_note('C', d, s, 0);
@@ -6300,6 +6348,7 @@ static void clear_tex(const p_clear_tex *c) {   /* clear a texture region with a
     vk_end_rendering_at(VK_PASS_END_CLEAR, OP_CLEAR_TEX);
     vk_tex_native_read(x);
     VkCommandBuffer cb = vk_cb(); vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     VkImageSubresourceRange rr = {as, lv, 1, vk_tex_is3d(x) ? 0 : l0 + c->r.zoffset, vk_tex_is3d(x) ? 1 : (uint32_t)nz};
     VkClearValue value;
     if (!color) value.depthStencil = (VkClearDepthStencilValue){vk_tex_format(x) == VK_FORMAT_D16_UNORM ? d16_clear(c->c.f[0]) : c->c.f[0], (as & VK_IMAGE_ASPECT_DEPTH_BIT) ? c->c.u[1] : c->c.u[0]};
@@ -6334,6 +6383,7 @@ static void clear_tex(const p_clear_tex *c) {   /* clear a texture region with a
         } else vkCmdClearColorImage(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, &value.color, 1, &rr);
     }
     vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     if (native_region) vk_tex_native_patch(x,lv,l0,&c->r);
     else vk_tex_native_written(x, 0);
     if (vk_fg_extract_active) fg_extract_texture_write(c->tex, lv, rr.baseArrayLayer, rr.layerCount, as, 1, region, 0);
@@ -6608,7 +6658,9 @@ static void pd_sample_copy(VkCommandBuffer cb, vk_tex *x, VkImageAspectFlags asp
         rg[r] = (VkBufferImageCopy){.bufferOffset = g_pd_used + r * rb, .bufferRowLength = 0, .imageSubresource = {aspect, level, is3d ? 0 : layer, 1},
             .imageOffset = {0, (int32_t)y, is3d ? (int32_t)layer : 0}, .imageExtent = {w, 1, 1}};
     }
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     vkCmdCopyImageToBuffer(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, g_pd_buf, rows, rg);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     free(rg);
     if (g_npd == g_cappd) { g_cappd = g_cappd ? 2 * g_cappd : 256; g_pd = realloc(g_pd, (size_t)g_cappd * sizeof *g_pd); }
     g_pd[g_npd++] = (pd_img){g_pd_pass, att, aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? VK_FORMAT_S8_UINT : f, nvnfmt, w, h, rows, g_pd_used, rb, serial, level, layer, tb};
@@ -6775,7 +6827,9 @@ static void shot(const tex_t *t, uint64_t n, const int crop[4]) {
     VkBufferImageCopy r = {.bufferOffset = o, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageOffset = {cx, cy, 0}, .imageExtent = {w, h, 1}};
     int bpb = nvn_fmt_bpb(t->d.format, NULL, NULL);
     if (bpb != 4) { RED(2, "screenshot of a format %#x image (not 4 bytes per pixel) skipped", t->d.format); return; }
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     vkCmdCopyImageToBuffer(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, b, 1, &r);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     vk_flush_wait();
     VkFormat f = vk_tex_format(x);
     if (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB) for (size_t i = 0; i < (size_t)w * h; i++) { uint8_t c = p[4 * i]; p[4 * i] = p[4 * i + 2]; p[4 * i + 2] = c; }
@@ -9569,9 +9623,13 @@ static void present_generated(const tex_t *t, vk_tex *x, int srgb, const pres_bu
         dw=(int32_t)fit.w; dh=(int32_t)fit.h; dx=fit.x; dy=fit.y;
     }
     vk_post_output post = generated;
-    if (vk_post_enabled() && vk_post_run(cb,(unsigned)i,vk_fg_raw_view((unsigned)i),
-            fw,fh,cx,cy,w,h,(uint32_t)dw,(uint32_t)dh,srgb,&post)) {
-        cx=cy=0; w=post.w; h=post.h;
+    if (vk_post_enabled()) {
+        if (vk_gpuprof_on && !prepare_slots) vk_gpuprof_scope_begin(cb, "post");
+        if (vk_post_run(cb,(unsigned)i,vk_fg_raw_view((unsigned)i),
+                fw,fh,cx,cy,w,h,(uint32_t)dw,(uint32_t)dh,srgb,&post)) {
+            cx=cy=0; w=post.w; h=post.h;
+        }
+        if (vk_gpuprof_on && !prepare_slots) vk_gpuprof_scope_end(cb);
     }
     pres_buf *b=&g_pres[i]; b->zero=0;
     b->rotation=real->rotation;
@@ -9615,6 +9673,7 @@ static void present_generated(const tex_t *t, vk_tex *x, int srgb, const pres_bu
         output_ok=0; goto generated_enqueue;
     }
     cb=vk_cb(); vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "present");
     VkClearColorValue black={{0,0,0,1}};
     VkImageSubresourceRange rr={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
     vkCmdClearColorImage(cb,g_pimg,VK_IMAGE_LAYOUT_GENERAL,&black,1,&rr); vk_barrier_all(cb);
@@ -9626,6 +9685,7 @@ static void present_generated(const tex_t *t, vk_tex *x, int srgb, const pres_bu
     vk_barrier_all(cb); vk_overlay_record(cb,g_pimg,VK_IMAGE_LAYOUT_GENERAL,ow,oh,(unsigned)i,0);
     VkBufferImageCopy copy={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={ow,oh,1}};
     vkCmdCopyImageToBuffer(cb,g_pimg,VK_IMAGE_LAYOUT_GENERAL,b->buf,1,&copy); vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
 generated_enqueue:
     vk_present_job_begin(&b->job); /* generated jobs bypass pres_enqueue */
     b->generation=real->generation; b->desired_ns=b->copy_open_ns=midpoint;
@@ -10378,7 +10438,6 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     if (vk_gpuprof_on) {
         vk_end_rendering_at(VK_PASS_END_PRESENT, 0);
         if (t) vk_gpuprof_read((uint64_t)(uintptr_t)t->mem, t->L.size);
-        vk_gpuprof_present();
     }
 #ifdef TOTK_ANDROID_APP
     int fg_requested=fg_extract_requested_config();
@@ -10393,6 +10452,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         vk_fg_present_end(vk_submit_now());
     }
 #endif
+    /* The real-frame endpoint follows our post, window copy and synthetic GPU
+     * recordings, including their slot submissions, rather than the game pass. */
+    if (vk_gpuprof_on) vk_gpuprof_present();
     vk_native_frame_end();
     if (vk_canvas_on) vk_canvas_frame_end();
     if (__builtin_expect(vk_rec_profile_on, 0)) { vk_rec_profile_end(); vk_rec_profile_present(n); }

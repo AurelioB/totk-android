@@ -1448,6 +1448,16 @@ measurements, the ownership contract is:
   captured end handles/indices without consulting or waiting for the walking profiler.
   Keep profiler mode fixed for worker-count A/Bs; CPU split profiling still measures only the walking thread,
   with worker busy time and waits reported separately rather than added into its exclusive categories.
+- **Profiler coverage:** named `upload`, `transfer`, `post`, `upscale`, `present` and `framegen` scopes
+  cover backend-owned Vulkan commands; game compute dispatches retain their own records. Slot envelopes
+  start in pre (when present), include adopted immutable framegen primaries and every main primary, and
+  reconcile each frame's pass sum against its first-to-last GPU timestamp span. JSONL `gap_ms` is the
+  measured residual (barriers, queue/CPU starvation bubbles and any unscoped commands), not profiler overhead.
+  Frame boundaries after post/present can split a still-open slot without forcing a submission. Cross-frame
+  pre uploads can execute before their recording frame's main work; such overlap is surfaced by
+  `reconciliation_failed`, never clamped away. External GL/QCOM/LSFG execution, compositor work and scanout
+  are outside Vulkan timestamp authority. Profiling requires graphics/compute timestamps and hostQueryReset;
+  query pools are host-reset only after their existing slot fence, before either pre or main can use them.
 
 Pipeline handle selection deliberately remains on the walking thread in this cutover. `pipe_get`'s cold asynchronous
 misses skip draws; emitted draws immediately update cumulative synthetic samples, used by later reports and conditions.
