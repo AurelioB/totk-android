@@ -6,7 +6,8 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('cpuprof_capture', ROOT / 'tools/bench/cpuprof_capture.py')
@@ -92,6 +93,42 @@ setprop() {{ printf '%s\\n' "$2" > '{props}/'$1; }}
             with patch.object(cap, 'root') as root, self.assertRaises(SystemExit):
                 cap.main(['-s', 'b', '--out', tmp, '--recover'])
             root.assert_not_called()
+
+    def test_rc8_short_commit_and_missing_build_id_bind_exact_allocated_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            symbols = Path(tmp) / 'symbols'
+            symbols.mkdir()
+            (symbols / 'libtotk.so').write_bytes(b'unstripped')
+            apk = Path(tmp) / 'installed.apk'
+            with zipfile.ZipFile(apk, 'w') as archive:
+                archive.writestr('assets/build.txt', 'commit 34210734b46f\n')
+                archive.writestr('lib/arm64-v8a/libtotk.so', b'stripped')
+            identity = dict(build_id=None, has_symtab=True, has_debug_info=True)
+            report = SimpleNamespace(read_elf_identity=Mock(return_value=identity),
+                                     elf_alloc_sha256=Mock(return_value='a' * 64))
+            with patch.dict('sys.modules', {'cpuprof_report': report}):
+                state = cap.apk_identity(apk, symbols, '34210734b46ffc340ff61f1304f355bf32271bca')
+            self.assertEqual(state['elf_alloc_sha256'], 'a' * 64)
+            self.assertEqual(state['commit'], '34210734b46f')
+            self.assertIsNone(state['build_id'])
+            self.assertEqual(len(state['symbols_sha256']), 64)
+            self.assertEqual(len(state['apk_sha256']), 64)
+
+    def test_rc8_same_commit_without_build_ids_still_rejects_different_elf_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            symbols = Path(tmp) / 'symbols'
+            symbols.mkdir()
+            (symbols / 'libtotk.so').write_bytes(b'unstripped')
+            apk = Path(tmp) / 'installed.apk'
+            with zipfile.ZipFile(apk, 'w') as archive:
+                archive.writestr('assets/build.txt', 'commit 34210734b46f\n')
+                archive.writestr('lib/arm64-v8a/libtotk.so', b'wrong build')
+            identity = dict(build_id=None, has_symtab=True, has_debug_info=True)
+            report = SimpleNamespace(read_elf_identity=Mock(return_value=identity),
+                                     elf_alloc_sha256=Mock(side_effect=['a' * 64, 'b' * 64]))
+            with patch.dict('sys.modules', {'cpuprof_report': report}):
+                with self.assertRaisesRegex(ValueError, 'allocated ELF sections'):
+                    cap.apk_identity(apk, symbols, '3421073')
 
 
 if __name__ == '__main__':

@@ -125,10 +125,11 @@ def deploy(args, state, script):
 
 
 def apk_identity(apk, symbols, commit):
-    from cpuprof_report import read_elf_identity
+    from cpuprof_report import elf_alloc_sha256, read_elf_identity
     local = read_elf_identity(symbols / 'libtotk.so')
-    if not local['build_id'] or not local['has_symtab'] or not local['has_debug_info']:
-        raise ValueError('symbols/libtotk.so must have GNU build ID, full symbol table and DWARF')
+    if not local['has_symtab'] or not local['has_debug_info']:
+        raise ValueError('symbols/libtotk.so must have full symbol table and DWARF')
+    allocated = elf_alloc_sha256(symbols / 'libtotk.so')
     with zipfile.ZipFile(apk) as archive:
         metadata = archive.read('assets/build.txt').decode().strip()
         match = re.fullmatch(r'commit ([0-9a-f]{12,40})', metadata)
@@ -139,7 +140,10 @@ def apk_identity(apk, symbols, commit):
             shipped.write_bytes(archive.read('lib/arm64-v8a/libtotk.so'))
             if read_elf_identity(shipped)['build_id'] != local['build_id']:
                 raise ValueError('installed APK libtotk build ID does not match supplied exact-build symbols')
+            if elf_alloc_sha256(shipped) != allocated:
+                raise ValueError('installed APK allocated ELF sections do not match supplied exact-build symbols')
     return dict(commit=match[1], build_id=local['build_id'],
+                elf_alloc_sha256=allocated,
                 symbols=str(symbols / 'libtotk.so'),
                 symbols_sha256=hashlib.sha256((symbols / 'libtotk.so').read_bytes()).hexdigest(),
                 apk_sha256=hashlib.sha256(apk.read_bytes()).hexdigest())
@@ -217,6 +221,8 @@ def capture(args):
         if (args.out / 'record-status').read_text().strip() != '0':
             raise RuntimeError('simpleperf record failed; see simpleperf.log')
         pull_root(args, remote + '/perf.data', args.out / 'perf.data')
+        state['data_sha256'] = hashlib.sha256((args.out / 'perf.data').read_bytes()).hexdigest()
+        save_json(args.out / 'capture.json', state)
         cleanup(args, state)
     except BaseException:
         print(f'Capture incomplete. Originals: {args.out}/controls.before. '
@@ -224,7 +230,7 @@ def capture(args):
         raise
     cmd = [sys.executable, str(HERE / 'cpuprof_report.py'), str(args.out / 'perf.data'),
            '--symbols', str(args.symbols), '--ndk-simpleperf', str(args.ndk_simpleperf),
-           '--out', str(args.out / 'report.json')]
+           '--out', str(args.out / 'report.json'), '--capture-manifest', str(args.out / 'capture.json')]
     run(args, cmd)
     print(f'cpuprof: capture complete, controls restored and verified: {args.out}')
 

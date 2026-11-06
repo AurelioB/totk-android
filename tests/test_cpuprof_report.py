@@ -5,6 +5,7 @@ are constructed data, never compiled or executed. Run with unittest discovery fr
 """
 import contextlib
 import io
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -76,9 +77,12 @@ class FakeReportLib:
         # Copy resolved targets now: the private symfs is intentionally short lived.
         self.index_targets = {}
         for line in self.index.splitlines():
+            if not line:
+                continue
             key, relative = line.split('=', 1)
             self.index_targets[key] = (self.symfs / relative).resolve()
         self.symfs_files = {p.name for p in self.symfs.iterdir()}
+        self.symfs_libtotk = (self.symfs / 'libtotk.so').resolve()
 
     def SetRecordFile(self, path):
         self.record_file = path
@@ -94,8 +98,9 @@ def elf_note(build_id, endian='<'):
     return struct.pack(endian + 'III', 4, len(desc), 3) + b'GNU\0' + desc + b'\0' * (-len(desc) % 4)
 
 
-def elf_bytes(build_id=BUILD_ID, symtab=True, debug_info=True, elf_class=2, endian='<', program_only=False,
-              notes=None):
+def elf_bytes(build_id: str | None = BUILD_ID, symtab=True, debug_info=True, elf_class=2, endian='<', program_only=False,
+              notes=None, text=b'\x11\x22\x33\x44', alloc_name='.text', alloc_type=1, alloc_flags=6,
+              alloc_addr=0x1000, bss_size=32):
     """Minimal ELF32/64 metadata for the identity reader; no executable instructions."""
     is_64 = elf_class == 2
     header_size = 64 if is_64 else 52
@@ -113,15 +118,16 @@ def elf_bytes(build_id=BUILD_ID, symtab=True, debug_info=True, elf_class=2, endi
                    (4, note_offset, 0, 0, len(notes), len(notes), 0, 4))
         return ident + struct.pack(endian + header_fmt, *header) + struct.pack(endian + program_fmt, *program) + notes
 
-    names = b'\0.shstrtab\0.note.gnu.build-id\0.symtab\0.debug_info\0'
+    names = b'\0.shstrtab\0.note.gnu.build-id\0.symtab\0.debug_info\0.text\0.code\0.bss\0'
     blob = bytearray(header_size)
     sections = [(0,) * 10]
 
-    def section(name, kind, payload):
+    def section(name, kind, payload, flags=0, addr=0, size=None):
         offset = len(blob)
         blob.extend(payload)
         blob.extend(bytes(-len(blob) % 4))
-        sections.append((names.index(name.encode()), kind, 0, 0, offset, len(payload), 0, 0, 4, 0))
+        sections.append((names.index(name.encode()), kind, flags, addr, offset,
+                         len(payload) if size is None else size, 0, 0, 4, 0))
 
     section('.shstrtab', 3, names)
     section('.note.gnu.build-id', 7, notes)
@@ -129,6 +135,8 @@ def elf_bytes(build_id=BUILD_ID, symtab=True, debug_info=True, elf_class=2, endi
         section('.symtab', 2, bytes(24 if is_64 else 16))
     if debug_info:
         section('.debug_info', 1, bytes(4))
+    section(alloc_name, alloc_type, text, flags=alloc_flags, addr=alloc_addr)
+    section('.bss', 8, b'', flags=3, addr=0x2000, size=bss_size)
     shoff = len(blob)
     for entry in sections:
         blob.extend(struct.pack(endian + section_fmt, *entry))
@@ -358,6 +366,37 @@ class ElfIdentity(unittest.TestCase):
         self.assertTrue(result['has_symtab'])
         self.assertFalse(result['has_debug_info'])
 
+    def test_allocated_hash_is_stable_when_debug_and_symbol_tables_are_stripped(self):
+        full = report.elf_alloc_sha256(self.save(build_id=None))
+        stripped = report.elf_alloc_sha256(self.save(build_id=None, symtab=False, debug_info=False))
+        self.assertEqual(full, stripped)
+        self.assertRegex(full, '^[0-9a-f]{64}$')
+
+    def test_allocated_hash_has_a_deterministic_metadata_and_bytes_encoding(self):
+        expected = hashlib.sha256(b'totk-elf-alloc-sha256-v1\0')
+        expected.update(struct.pack('<BBHHI', 2, 1, 3, 183, 0))
+        for name, kind, flags, addr, size, content in (
+                (b'.text', 1, 6, 0x1000, 4, b'\x11\x22\x33\x44'),
+                (b'.bss', 8, 3, 0x2000, 32, b'')):
+            expected.update(struct.pack('<I', len(name)) + name)
+            expected.update(struct.pack('<IQQQ', kind, flags, addr, size))
+            expected.update(content)
+        self.assertEqual(report.elf_alloc_sha256(self.save(build_id=None)), expected.hexdigest())
+
+    def test_allocated_bytes_and_all_identity_metadata_change_the_hash(self):
+        baseline = report.elf_alloc_sha256(self.save(build_id=None))
+        mutations = [
+            {'text': b'\x11\x22\x33\x45'}, {'text': b'\x11\x22'}, {'alloc_name': '.code'},
+            {'alloc_type': 7}, {'alloc_flags': 2}, {'alloc_addr': 0x1004}, {'bss_size': 33},
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(report.elf_alloc_sha256(self.save(build_id=None, **mutation)), baseline)
+
+    def test_allocated_hash_rejects_a_sectionless_elf(self):
+        with self.assertRaisesRegex(report.ReportError, 'SHF_ALLOC sections'):
+            report.elf_alloc_sha256(self.save(program_only=True))
+
     def test_conflicting_notes_and_truncation_are_rejected(self):
         notes = elf_note(BUILD_ID) + elf_note(OTHER_ID)
         with self.assertRaisesRegex(report.ReportError, 'conflicting GNU build IDs'):
@@ -403,6 +442,116 @@ class HostIntegration(unittest.TestCase):
         self.symbols.mkdir()
         self.library = self.symbols / 'libtotk.so'
         self.library.write_bytes(elf_bytes())
+
+    def capture_manifest(self, **overrides):
+        manifest = {
+            'data_sha256': hashlib.sha256(self.data.read_bytes()).hexdigest(),
+            'symbols_sha256': hashlib.sha256(self.library.read_bytes()).hexdigest(),
+            'elf_alloc_sha256': report.elf_alloc_sha256(self.library),
+            'apk_sha256': 'a' * 64,
+            'commit': '342107300000',
+        }
+        manifest.update(overrides)
+        path = self.root / 'capture.json'
+        path.write_text(json.dumps(manifest))
+        return path
+
+    def test_missing_gnu_ids_require_manifest_and_verified_basename_symfs(self):
+        self.library.write_bytes(elf_bytes(build_id=None))
+        manifest = self.capture_manifest()
+        lib = FakeReportLib([record()], {TOTK: ''})
+        with mock.patch.object(report, 'load_report_lib', return_value=lambda: lib):
+            result = report.build_report(self.data, self.symbols, capture_manifest=manifest)
+        self.assertEqual(result['symbols']['identity_method'], 'capture-manifest')
+        self.assertIsNone(result['symbols']['build_id'])
+        self.assertEqual(result['symbols']['recorded_dsos'], {TOTK: None})
+        self.assertEqual(result['capture_manifest']['commit'], '342107300000')
+        self.assertEqual(result['capture_manifest']['file'], str(manifest))
+        self.assertEqual(lib.symfs_libtotk, self.library)
+        self.assertEqual(lib.index_targets, {})
+        self.assertTrue(lib.closed)
+        with mock.patch.object(report, 'load_report_lib') as load:
+            with self.assertRaisesRegex(report.ReportError, '--capture-manifest'):
+                report.build_report(self.data, self.symbols)
+        load.assert_not_called()
+
+    def test_manifest_never_bypasses_present_build_id_mismatch(self):
+        for supplied_id in [BUILD_ID, None]:
+            with self.subTest(supplied_id=supplied_id):
+                self.library.write_bytes(elf_bytes(build_id=supplied_id))
+                manifest = self.capture_manifest()
+                lib = FakeReportLib([record()], {TOTK: '0x' + OTHER_ID})
+                with mock.patch.object(report, 'load_report_lib', return_value=lambda: lib):
+                    with self.assertRaisesRegex(report.ReportError, 'build ID mismatch'):
+                        report.build_report(self.data, self.symbols, capture_manifest=manifest)
+
+    def test_manifest_accepts_zero_missing_ids_but_not_malformed_recorded_ids(self):
+        self.library.write_bytes(elf_bytes(build_id=None))
+        manifest = self.capture_manifest()
+        lib = FakeReportLib([record()], {TOTK: '0x' + '0' * 40})
+        with mock.patch.object(report, 'load_report_lib', return_value=lambda: lib):
+            result = report.build_report(self.data, self.symbols, capture_manifest=manifest)
+        self.assertEqual(result['symbols']['recorded_dsos'], {TOTK: None})
+        lib = FakeReportLib([record()], {TOTK: 'not-an-id'})
+        with mock.patch.object(report, 'load_report_lib', return_value=lambda: lib):
+            with self.assertRaisesRegex(report.ReportError, 'unusable recorded'):
+                report.build_report(self.data, self.symbols, capture_manifest=manifest)
+
+    def test_manifest_catches_mutated_recording_before_loading_native_library(self):
+        manifest = self.capture_manifest()
+        self.data.write_bytes(self.data.read_bytes() + b'mutation')
+        with mock.patch.object(report, 'load_report_lib') as load:
+            with self.assertRaisesRegex(report.ReportError, 'recording SHA-256 mismatch'):
+                report.build_report(self.data, self.symbols, capture_manifest=manifest)
+        load.assert_not_called()
+
+    def test_manifest_catches_mutated_symbols_even_if_allocated_image_is_unchanged(self):
+        self.library.write_bytes(elf_bytes(build_id=None))
+        manifest = self.capture_manifest()
+        previous_alloc = report.elf_alloc_sha256(self.library)
+        self.library.write_bytes(elf_bytes(build_id=None, debug_info=False))
+        self.assertEqual(report.elf_alloc_sha256(self.library), previous_alloc)
+        with mock.patch.object(report, 'load_report_lib') as load:
+            with self.assertRaisesRegex(report.ReportError, 'symbols SHA-256 mismatch'):
+                report.build_report(self.data, self.symbols, capture_manifest=manifest)
+        load.assert_not_called()
+
+    def test_manifest_requires_allocated_identity_in_addition_to_exact_symbols_hash(self):
+        self.library.write_bytes(elf_bytes(build_id=None))
+        manifest = self.capture_manifest(elf_alloc_sha256='f' * 64)
+        with mock.patch.object(report, 'load_report_lib') as load:
+            with self.assertRaisesRegex(report.ReportError, 'allocated ELF SHA-256 mismatch'):
+                report.build_report(self.data, self.symbols, capture_manifest=manifest)
+        load.assert_not_called()
+
+    def test_manifest_requires_complete_capture_provenance(self):
+        manifest = self.capture_manifest()
+        complete = json.loads(manifest.read_text())
+        for key in ['data_sha256', 'symbols_sha256', 'elf_alloc_sha256', 'apk_sha256', 'commit']:
+            for value in [None, 'bad']:
+                with self.subTest(key=key, value=value):
+                    changed = dict(complete)
+                    changed[key] = value
+                    manifest.write_text(json.dumps(changed))
+                    with self.assertRaisesRegex(report.ReportError, 'capture manifest requires'):
+                        report.validate_capture_manifest(manifest, self.data, self.library)
+        for value in ['{bad', '[]']:
+            manifest.write_text(value)
+            with self.assertRaisesRegex(report.ReportError, 'capture manifest'):
+                report.validate_capture_manifest(manifest, self.data, self.library)
+
+    def test_cli_passes_capture_manifest_and_reports_legacy_identity(self):
+        self.library.write_bytes(elf_bytes(build_id=None))
+        manifest = self.capture_manifest()
+        lib = FakeReportLib([record()], {TOTK: ''})
+        with mock.patch.object(report, 'load_report_lib', return_value=lambda: lib):
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = report.main([str(self.data), '--symbols', str(self.symbols),
+                                      '--capture-manifest', str(manifest)])
+        self.assertEqual(status, 0)
+        result = json.loads(self.data.with_suffix('.json').read_text())
+        self.assertEqual(result['symbols']['identity_method'], 'capture-manifest')
+        self.assertEqual(result['capture_manifest']['data_sha256'], hashlib.sha256(self.data.read_bytes()).hexdigest())
 
     def test_import_is_lazy_and_requires_no_ndk_or_native_library(self):
         with mock.patch.dict(sys.modules, {'simpleperf_report_lib': None, 'simpleperf_utils': None}):

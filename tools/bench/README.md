@@ -426,11 +426,13 @@ taskset -c 0-3 nice -n 10 tools/bench/cpuprof.sh -s <serial> \
 
 `build_release.py:138–155` keeps unstripped libraries in its `--work` directory's
 `symbols/`; RC8 is commit `34210734b46ffc340ff61f1304f355bf32271bca`.
-The capture authenticates installed `assets/build.txt` and the APK library's GNU
-build ID against the supplied DWARF/symbol-bearing `libtotk.so` before changing
-perf controls. A rebuild with the same source commit is not sufficient unless
-its build ID matches. The Android arm64 binary comes from NDK
-`28.2.13676358/simpleperf/bin/android/arm64/simpleperf` by default.
+The capture authenticates installed `assets/build.txt` and every allocated ELF section
+against the supplied DWARF/symbol-bearing `libtotk.so` before changing perf controls.
+New runtime links also carry a SHA-1 GNU build ID. RC8 predates that link flag:
+its no-build-ID fallback binds the verified allocated-section digest, full symbols
+digest and installed APK digest to the resulting perf.data digest in `capture.json`.
+A rebuild with the same source commit is not sufficient. The Android arm64 binary
+comes from NDK `28.2.13676358/simpleperf/bin/android/arm64/simpleperf` by default.
 Deployment pushes to a unique shell-accessible flat `/data/local/tmp` pathname,
 then root-copies/chmods into its private capture directory; it never asks the
 non-root adb shell user to push inside a mode-0700 root directory.
@@ -447,7 +449,9 @@ failed recordings are not successful profiles.
 
 `cpuprof_report.py <perf.data> --symbols <release-work>/symbols --out <report.json>`
 re-symbolizes offline using the NDK ReportLib API and rejects mismatched recorded
-libtotk build IDs. Rankings retain each TID and group walker, recorders, submit,
+libtotk build IDs. For RC8, additionally pass `--capture-manifest <capture.json>`;
+missing IDs are accepted only after both recording and exact-symbol hashes match
+that capture's installed-APK section identity. Rankings retain each TID and group walker, recorders, submit,
 game (`g-*`) and other threads. CPU milliseconds use event periods, not sample
 counts. Inclusive stacks count a recursive symbol once per sample; they overlap
 and are not additive wall-time/critical-path measurements. Frame-pointer gaps,
