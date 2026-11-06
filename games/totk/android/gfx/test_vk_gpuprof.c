@@ -16,6 +16,7 @@
 #include "vk_gpuprof_pipe.h"
 #include "vk_gpuprof_compact.h"
 int vk_gpuprof_test_compact_run(int argc, char **argv);
+int vk_gpuprof_test_record_run(void);
 #include "vk_load.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include <errno.h>
@@ -693,6 +694,8 @@ static int run_unavailable_span(int supported) {
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--compact-fixture"))
         return vk_gpuprof_test_compact_run(argc, argv);
+    if (argc == 2 && !strcmp(argv[1], "--record-fixture"))
+        return vk_gpuprof_test_record_run();
     timestamp_contract();
     pipeline_contract();
     compact_contract();
@@ -829,7 +832,7 @@ int main(int argc, char **argv) {
     }
     if (backpressure) {
         uint64_t counts[3]; vk_gpuprof_test_background(counts);
-        CHECK(counts[0] == 16 && counts[1] == 0 && counts[2] > 0,
+        CHECK(counts[0] == 32 && counts[1] == 0 && counts[2] > 0,
             "walker and GPU completion progress while all bounded profiler leases are paused");
         printf("gpuprof-backpressure frames=%u queued=%llu processed=%llu dropped=%llu\n",
             frames, (unsigned long long)counts[0], (unsigned long long)counts[1], (unsigned long long)counts[2]);

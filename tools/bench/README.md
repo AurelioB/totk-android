@@ -406,7 +406,7 @@ scans texture/storage-image bindings, looks up/copies the texture registry, sear
 allocates audit arrays or logs liveness candidates, including on unselected passes. Static attachment
 LOAD/CLEAR/STORE/DONT_CARE operations and logical byte estimates remain pass-key-derived summaries,
 not a speculative liveness audit or hardware traffic counter. The dedicated `totk-gpuprof` worker
-owns query result reads, aggregation, formatting/output and resets; its sixteen prepared leases are
+owns query result reads, aggregation, formatting/output and resets; its 32 prepared leases are
 bounded. One-time opt-in startup preparation can wait, but exhaustion during play drops coverage
 (`background_dropped_slots`, cumulative, plus missing frame coverage), never waits for profiler I/O.
 CPU present has an independent ordered closure FIFO (256 entries, header `background_closures`).
@@ -612,6 +612,17 @@ agreement between encodings. It does **not** claim exact finite-sample recovery 
 churn. A P1-shaped regression retains 63/70 leading optional lease rows plus intact 86+11 rows: the seven
 missing rows must produce an explicit `retained-row-count-mismatch`, while 137 valid samples remain
 unestimable under independent rotation/missing-window/background-drop authority.
+Missing `session_end` is also a pipeline censor reason, for raw and compact alike. Complete-looking
+retained windows do not prove that the final partial window or final loss counters were captured.
+Regression cases remove the footer (and separately leave a partial footer JSON line) from both
+known-truth encodings; both estimates and counter-completeness authority must fail closed.
+The bounded pool is 32 leases (51,980,288 bytes including pipeline/parent CPU arrays; driver query-pool
+memory is additional). Duo's prior 13–14-lease backlog motivated the margin; worker throughput must
+still exceed production. `--worker-scale 2700 --pace 1 --seconds 600 --fps 60` models the measured
+device/host CPU-service ratio with test-only worker sleep. Report backlog over the run and final drain,
+not just zero drops from the larger pool. `--record-fixture` isolates production hook/lease CPU at
+4096 groups and 8192 draws/frame, counting but not driver-encoding timestamp calls.
+
 
 For parent-owned host execution, `vkgpuprofcompacttest` builds the production-worker fixture without
 shader seeds or a Vulkan instance. Set `OUT` to an absolute host output directory:

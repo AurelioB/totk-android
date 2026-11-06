@@ -1468,12 +1468,12 @@ measurements, the ownership contract is:
   close keeps its original one-argument ordinary entry; the enabled token copy has a separate
   profiled entry selected by the draw-side guard, not a token-preserving wrapper around ordinary work.
   Cached `vk_gpuprof_on` guards remain predictable branches, not a claim of zero instructions.
-  One opt-in startup preparation creates sixteen query-slot leases on the dedicated `totk-gpuprof`
+  One opt-in startup preparation creates 32 query-slot leases on the dedicated `totk-gpuprof`
   worker; startup may wait for readiness once. Thereafter the walker takes a prepared lease with
   a short private O(1) mutex operation, without query resets, result reads, formatting or I/O.
   Existing fence completion only detaches/enqueues the fenced lease and releases the game ring slot.
   The profiler worker alone reads results without WAIT or polling, aggregates, formats, writes/logs,
-  resets queries and returns prepared leases. The bounded sixteen-lease FIFO never blocks the game
+  resets queries and returns prepared leases. The bounded 32-lease FIFO never blocks the game
   for output: no available lease means dropped profiler coverage, recorded by cumulative
   `background_dropped_slots` and missing frame coverage. Its mutex is not the recorder-worker mutex.
   CPU frame closure has its own bounded 256-entry FIFO under the same private background mutex:
@@ -1577,7 +1577,7 @@ measurements, the ownership contract is:
   Actual GPU timing includes timestamp cost and intervening GPU state/setup; ALL_COMMANDS can serialize
   work/change tiled scheduling. A group is not an isolated shader invocation or marginal cost.
   Bounds: at most **2k extra timestamp writes/frame**, 2048 metadata records/lease and 1024 query pairs/
-  lease (64 frame segments × max budget 16); sixteen existing leases bound backlog. Space for ALL selected
+  lease (64 frame segments × max budget 16); 32 prepared leases bound backlog. Space for ALL selected
   groups is reserved; optional unselected detail uses at most 1024 records/lease, with additional omitted
   detail explicitly counted as `unretained_groups`, not a selected timing drop. Thus a long pass cannot
   crowd tail samples out. Lease arrays/query pools are allocated only when PIPELINES is enabled.
@@ -1628,6 +1628,15 @@ measurements, the ownership contract is:
   per-pair samples before ranking. No device calibration was performed as part of the implementation.
   Compact state is fixed: 8192 exact keys, a 16384-cell open-addressed index, 8192 frame-touched IDs and
   64 exposure strata: **4,230,400 bytes** on the supported 64-bit ABI (`sizeof` also published in headers).
+  Pipeline lease storage is separately bounded at **51,980,288 bytes** for all 32 leases (including
+  pipeline metadata, parent records and readback arrays; excluding Vulkan driver/query-pool storage).
+  This is not RSS. The previous Duo gate reached 13–14 queued/active leases and dropped five with
+  capacity 16; 32 provides more than 2x that measured backlog, not a substitute for worker throughput.
+  The worker uses nice +10 on Linux/Android and retains its inherited CPU mask, with no extra pinning.
+  Bucket selection mixes the pipeline handle; full shader strings and compute kind still determine
+  exact identity, including reused handles. No per-observation shader-byte hashing or second key copy
+  remains. Only selected keys enter the per-frame moment-reduction list; optional counters still
+  accumulate exactly. A frame-ordered cursor walks each immutable lease once across frame segments.
   The compact aggregator makes no per-group/window allocations; existing parent pass buffering/histograms
   remain separately bounded. Inactive previous-window dictionary entries are
   evicted under lifetime churn; IDs are never reused. Current-window entries cannot be evicted: saturation
@@ -1658,6 +1667,13 @@ measurements, the ownership contract is:
   lease to keep generated datasets identical; producer wait and wall time MUST therefore be reported:
   zero fixture drops alone does not prove the host kept pace. Backlog is queued+active host leases,
   not GPU latency. This excludes real query calls/GPU/driver/device scheduling and proves no Duo result.
+  `--worker-scale 2700 --pace 1 --seconds 600 --fps 60` adds test-only sleep equal to 1.7x each
+  lease's measured worker CPU service, emulating Duo's observed ~2.7x device/host ratio for ten wall
+  minutes at 60 fps. It is a queue/throughput stress model, not real GPU readback or a device gate.
+  Check stable low backlog, producer waits, queued/processed equality and the writer-end footer;
+  a larger pool with growing backlog is not success. `--record-fixture` measures production pipeline
+  hooks and lease handoffs at 4096 groups/8192 draws per frame. Its counted timestamp sink excludes
+  driver command encoding: report this CPU lower bound separately from real Vulkan/device recording.
   Host commands run with `taskset -c 0-3 nice -n 10`; matrices also hold the shared hosttest flock.
 
 - **Profiler capture lifecycle:** the default is 128 MiB per JSONL file × four files; compact windows
@@ -1681,9 +1697,10 @@ measurements, the ownership contract is:
   describe activated queries/leases in abandoned, never-submitted recordings, not submitted work.
   Historical footers without `query_retirement` retain nullable `all_queries_retired: null` as unknown.
   Force-stop/crash/kill normally has no footer; the analyzer reports missing closure, not a fabricated
-  end marker or GPU failure. The footer also retains `pending_frame_closures`; zero pending CPU closures
+  end marker or GPU failure. Missing closure censors both raw and compact pipeline estimates
+  (`streams_without_end`), even when retained complete windows are internally consistent. The footer also retains `pending_frame_closures`; zero pending CPU closures
   alone does not establish query retirement. The additive header `background_closures: 256` records the
-  closure FIFO capacity, independently of the sixteen query leases.
+  closure FIFO capacity, independently of the 32 query leases.
   Enabled GPU draining has one two-second budget. On expiry, `query_drain_timed_out: true` accompanies
   the retirement accounting; uncompleted leases and unread queries remain outstanding rather than
   being fabricated as retired. The additive timeout field is boolean when present; old footers without

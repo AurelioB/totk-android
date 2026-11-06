@@ -50,15 +50,13 @@ typedef struct {
     double cpu_ms;
 } gp_compact;
 static uint64_t gp_compact_hash(const gp_compact_key *key) {
-    uint64_t h = UINT64_C(14695981039346656037);
-    const unsigned char *p = (const unsigned char *)&key->pipeline;
-    for (unsigned i = 0; i < sizeof key->pipeline; i++) { h ^= p[i]; h *= UINT64_C(1099511628211); }
-    h ^= key->compute; h *= UINT64_C(1099511628211);
-    for (unsigned j = 0; j < 3; j++) for (unsigned i = 0; i < sizeof key->shader[j]; i++) {
-        h ^= (unsigned char)key->shader[j][i]; h *= UINT64_C(1099511628211);
-        if (!key->shader[j][i]) break;
-    }
-    return h;
+    /* The handle distributes buckets; full shader strings below still decide
+       identity (including a reused handle). Do not rehash 140+ shader bytes for
+       every optional observation. Mix aligned Vulkan handles before masking. */
+    uint64_t h = key->pipeline ^ ((uint64_t)key->compute << 63);
+    h ^= h >> 30; h *= UINT64_C(0xbf58476d1ce4e5b9);
+    h ^= h >> 27; h *= UINT64_C(0x94d049bb133111eb);
+    return h ^ (h >> 31);
 }
 static gp_compact_entry *gp_compact_get(gp_compact *c, const gp_compact_key *key) {
     uint64_t hash = gp_compact_hash(key);
@@ -101,10 +99,6 @@ static void gp_compact_observe(gp_compact *c, const gp_compact_key *key, int sel
         uint64_t draws, uint64_t dispatches, uint64_t primitives, uint64_t unknown_draws) {
     gp_compact_entry *e = gp_compact_get(c, key);
     if (!e) return;
-    if (e->frame != c->frame) {
-        e->frame = c->frame; memset(e->pending, 0, sizeof e->pending);
-        c->touched[c->ntouched++] = (uint32_t)(e - c->key);
-    }
     double *v = e->v;
     if (discarded) {
         v[GC_DISCARDED]++; e->selected_discarded += selected; c->frame_bad = 1; return;
@@ -121,6 +115,10 @@ static void gp_compact_observe(gp_compact *c, const gp_compact_key *key, int sel
     v[GC_DRAWS] += draws; v[GC_DISPATCHES] += dispatches;
     v[GC_PRIMITIVES] += primitives; v[GC_UNKNOWN_DRAWS] += unknown_draws;
     if (!selected) return;
+    if (e->frame != c->frame) {
+        e->frame = c->frame; memset(e->pending, 0, sizeof e->pending);
+        c->touched[c->ntouched++] = (uint32_t)(e - c->key);
+    }
     if (!valid || !population || !numerator || out_of_range) {
         v[GC_MISSING]++; e->pending[4]++; return;
     }

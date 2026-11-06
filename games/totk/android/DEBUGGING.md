@@ -1752,7 +1752,7 @@ For lower query volume, start with **`TOTK_VK_GPU_PROFILE_SAMPLE=2`** and statis
 budgets `1`–`16` select at most that many pass parts per frame by deterministic ordinal rotation.
 Do not combine it with `TOTK_VK_PASS_PROFILE`, pass dumps, screenshots or the pass probe for performance measurements.
 
-Opt-in startup prepares sixteen reusable timestamp/statistics query-slot leases on the dedicated
+Opt-in startup prepares 32 reusable timestamp/statistics query-slot leases on the dedicated
 `totk-gpuprof` worker; the caller can wait for that initialization once. During play, taking a prepared
 lease is a short private-mutex O(1) operation, with no query reset, result read, formatting or I/O.
 `vkCmdWriteTimestamp2(ALL_COMMANDS)` brackets primary rendering instances (including attachment
@@ -1765,7 +1765,7 @@ draws, areas and completed-frame scene metadata remain recorded, even with zero 
 Existing fence completion detaches/enqueues the fenced profiler lease and immediately releases the
 game ring slot; it does not read queries or report inline. The profiler worker owns result reads
 without WAIT or polling, aggregation, JSONL/log output, query resets and lease return. Its bounded
-sixteen-lease FIFO does not share the recorder-worker mutex. No free lease drops profiler coverage
+32-lease FIFO does not share the recorder-worker mutex. No free lease drops profiler coverage
 (`background_dropped_slots`, cumulative, and missing frame coverage), never blocks the game for I/O.
 CPU present independently publishes `{frame, end_sequence}` to a bounded 256-entry closure FIFO under
 the private background mutex. The worker finalizes only after all fenced leases through that sequence

@@ -319,7 +319,7 @@ class Analyzer(unittest.TestCase):
                                  pipeline_coverage(observed_groups=len(rows),
                                                    selected_groups=sum(r['selected'] for r in rows),
                                                    timestamp_count=sum(r['timestamp_count'] for r in rows))]),
-                             *rows])['pipelines']
+                             *rows, session_end()])['pipelines']
 
     def test_pipeline_weights_do_not_apportion_pass_draws(self):
         rows = [pipeline_row(), pipeline_row(group=1, pipeline='2' * 16, draws=9,
@@ -391,7 +391,8 @@ class Analyzer(unittest.TestCase):
                                   unretained_groups=3998, population=4096, phase=3000,
                                   selected_groups=2, timestamp_count=4),
                 pipeline_row(frame=2, group=3000, vs='tail_variant', selection_denominator=4096),
-                pipeline_row(frame=2, group=3001, vs='tail_variant', selection_denominator=4096)]
+                pipeline_row(frame=2, group=3001, vs='tail_variant', selection_denominator=4096),
+                session_end(last_frame=2)]
         report = self.analyze(rows)['pipelines']
         self.assertEqual(report['coverage']['invalid_coverage'], 0)
         self.assertEqual(report['eligible_frames'], 1)
@@ -546,6 +547,23 @@ class Analyzer(unittest.TestCase):
         self.assertGreater(compact['coverage']['rotation_evictions'], 0)
         self.assertTrue(raw['pipelines']['censored'])
         self.assertTrue(all(g['eligible_estimated_gpu_ms'] is None for g in compact['pipelines']['shader_pairs']))
+
+    def test_missing_writer_end_censors_raw_and_compact_even_without_other_loss(self):
+        for rows in compact_runs(frames=1024, truth=True):
+            with self.subTest(output=rows[0].get('pipeline_output', 'raw')):
+                complete = self.analyze(rows)['pipelines']
+                self.assertFalse(complete['censored'])
+                self.assertTrue(any(g['eligible_estimated_gpu_ms'] is not None for g in complete['pipelines']))
+                for tail in ('', '{"schema":3,"type":"session_end"'):
+                    path = self.file('unfinished.jsonl', rows[:-1], tail=tail)
+                    report = gpuprof.analyze([path])
+                    self.assertEqual(report['coverage']['streams_without_end'], 1)
+                    pipeline = report['pipelines']
+                    self.assertTrue(pipeline['censored'])
+                    self.assertFalse(pipeline['coverage_complete'])
+                    self.assertIn('streams_without_end', pipeline['censor_reasons'])
+                    self.assertTrue(all(g['estimated_gpu_ms'] is None and g['eligible_estimated_gpu_ms'] is None
+                                        and not g['counts_complete'] for g in pipeline['pipelines']))
 
     def test_pipeline_compact_strict_numeric_columns_and_exposure(self):
         _, rows = compact_runs(frames=1)
@@ -1963,7 +1981,7 @@ class Lavapipe(unittest.TestCase):
                 self.assertEqual(first['ordinals'], bool(ordinals))
                 self.assertEqual(first['max_bytes'], 4096 if rotate else 134217728)
                 self.assertEqual(first['span_limit_ms'], 10000)
-                self.assertEqual(first['background_slots'], 16)
+                self.assertEqual(first['background_slots'], 32)
                 self.assertEqual(first['background_worker'], 'totk-gpuprof')
                 self.assertEqual(first['background_closures'], 256)
                 if sample_budget:
@@ -2026,7 +2044,7 @@ class Lavapipe(unittest.TestCase):
                 return report
             if backpressure:
                 self.assertEqual(frames, 42)
-                self.assertIn('gpuprof-backpressure frames=40 queued=16 processed=0', result.stdout)
+                self.assertIn('gpuprof-backpressure frames=40 queued=32 processed=0', result.stdout)
                 self.assertGreater(report['coverage']['background_dropped_slots'], 0)
                 self.assertLess(report['coverage']['frame_rows'], frames)
                 self.assertGreater(report['coverage']['missing_frame_ids'], 0)

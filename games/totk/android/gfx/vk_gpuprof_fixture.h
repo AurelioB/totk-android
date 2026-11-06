@@ -14,6 +14,8 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pace") && value <= 1) pace = (unsigned)value;
         else if (!strcmp(argv[i], "--loss") && value <= 1) loss = (unsigned)value;
         else if (!strcmp(argv[i], "--frames") && value) limit_frames = (unsigned)value;
+        else if (!strcmp(argv[i], "--worker-scale") && value >= 1000 && value <= 10000)
+            fixture_worker_scale = (unsigned)value;
         else return 2;
     }
     fixture_mode = 1; vk_gpuprof_on = 1; vk_gpuprof_pipeline_on = 4;
@@ -71,13 +73,13 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
                 /* Recurrent pool plus fresh variants exercises bounded lifetime
                    eviction, not just an immortal fixed 4096-entry dictionary. */
                 uint64_t variant = key + (key % 64 ? 0 : (number - 1) / 300 * 4096);
-                *p = (gp_pipeline){.frame = number, .pipeline = key + 1, .ordinal = ordinal,
+                *p = (gp_pipeline){.frame = number, .key = {.pipeline = key + 1}, .ordinal = ordinal,
                     .population = population, .selected = selected, .draws = 1 + key % 7,
                     .primitives = 2 + key % 11, .unknown_draws = key % 19 == 0};
-                snprintf(p->shader[0], sizeof p->shader[0], "%016llx%016llx%016llx%016llx-vs",
+                snprintf(p->key.shader[0], sizeof p->key.shader[0], "%016llx%016llx%016llx%016llx-vs",
                     (unsigned long long)variant, (unsigned long long)(variant * 13),
                     (unsigned long long)(variant * 31), (unsigned long long)(variant * 43));
-                snprintf(p->shader[1], sizeof p->shader[1], "%016llx%016llx%016llx%016llx-fs",
+                snprintf(p->key.shader[1], sizeof p->key.shader[1], "%016llx%016llx%016llx%016llx-fs",
                     (unsigned long long)(variant * 7), (unsigned long long)(variant * 17),
                     (unsigned long long)(variant * 37), (unsigned long long)(variant * 47));
                 if (selected) {
@@ -115,7 +117,8 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         "worker_thread_cpu_ms=%.6f thread_cpu_ms_per_window=%.6f thread_cpu_peak_window_ms=%.6f "
         "backlog_peak=%llu aggregation_memory_bytes=%zu lease_memory_bytes=%zu parent_aggregation_memory_bound_bytes=%zu "
         "aggregation_allocations=0 output_write_calls=%llu close_flush_cpu_ms=%.6f close_wall_ms=%.6f "
-        "producer_wait_ms=%.6f wall_ms=%.6f dropped_slots=%llu output_failures=%llu\n",
+        "producer_wait_ms=%.6f wall_ms=%.6f dropped_slots=%llu output_failures=%llu worker_scale=%u "
+        "queued_slots=%llu processed_slots=%llu\n",
         frames, logical, fps, pace, loss, pipeline_raw, (unsigned long long)windows,
         (unsigned long long)output_serialized_bytes, output_serialized_bytes / (double)windows,
         worker_cpu_total_ms, worker_cpu_total_ms / windows, worker_window_cpu_peak_ms,
@@ -125,6 +128,65 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         sizeof groups + GP_GROUPS * sizeof(gp_group),
         (unsigned long long)output_write_calls, compact_close_cpu_ms, fixture_elapsed_ms(close_start, close_end), producer_wait_ms,
         fixture_elapsed_ms(wall_start, close_end), (unsigned long long)atomic_load(&background_dropped_slots),
-        (unsigned long long)atomic_load(&output_failures));
+        (unsigned long long)atomic_load(&output_failures), fixture_worker_scale,
+        (unsigned long long)atomic_load(&background_queued_slots),
+        (unsigned long long)atomic_load(&background_processed_slots));
     return atomic_load(&output_failures) != 0;
+}
+
+/* CPU-only recording microbenchmark. The production hooks and lease handoffs
+   run unchanged; the timestamp sink counts calls but excludes Vulkan/driver
+   command encoding. No worker, GPU, formatting, or fixture string generation
+   is charged to the recording measurements. */
+static uint64_t fixture_query_writes;
+static void VKAPI_PTR fixture_write_timestamp(VkCommandBuffer cb, VkPipelineStageFlags2 stage,
+        VkQueryPool pool, uint32_t query) {
+    (void)cb; (void)stage; (void)pool; (void)query;
+    fixture_query_writes++;
+}
+int vk_gpuprof_test_record_run(void) {
+    const unsigned frames = 12000, groups_per_frame = 4096, draws_per_frame = 8192;
+    vk_gpuprof_slot *slot = calloc(1, sizeof *slot);
+    if (!slot) return 1;
+    slot->pipeline = calloc(GP_RECORDS, sizeof *slot->pipeline);
+    if (!slot->pipeline) { free(slot); return 1; }
+    vk_shader shaders[2] = {0}; vk_shader *bound[6] = {&shaders[0], &shaders[1]};
+    memset(shaders[0].key, 'a', 67); memset(shaders[1].key, 'b', 67);
+    shaders[0].key[67] = shaders[1].key[67] = 0;
+    vkCmdWriteTimestamp2 = fixture_write_timestamp;
+    unsetenv("TOTK_VK_GPU_PROFILE"); vk_gpuprof_on = 1;
+    vk_gpuprof_pipeline_on = 4; pipeline_population = 4096;
+    VkCommandBuffer cb = (VkCommandBuffer)(uintptr_t)1;
+    double hook_ms = 0, lease_ms = 0;
+    for (unsigned f = 0; f < frames; f++) {
+        frame = f + 1; pipeline_ordinal = 0; pipeline_phase = (17 + f * 4) & 4095;
+        for (unsigned part = 0; part < 2; part++) {
+            double start = thread_cpu_ms();
+            background_free[background_nfree++] = slot;
+            vk_gpuprof_slot *owner = NULL; vk_gpuprof_slot_begin(&owner, cb);
+            lease_ms += thread_cpu_ms() - start;
+            slot->n = 1; open_record = &slot->rec[0]; open_record->key.compute = 0;
+            start = thread_cpu_ms();
+            for (unsigned j = 0; j < groups_per_frame / 2; j++) {
+                VkPipeline handle = (VkPipeline)(uintptr_t)(part * 2048 + j + 1);
+                vk_gpuprof_pipeline_begin(cb, handle, bound);
+                vk_gpuprof_pipeline_count(4, 3, 1, 0);
+                vk_gpuprof_pipeline_begin(cb, handle, bound); /* unchanged-bind fast path */
+                vk_gpuprof_pipeline_count(4, 3, 1, 0);
+            }
+            vk_gpuprof_pipeline_break(cb);
+            hook_ms += thread_cpu_ms() - start;
+            start = thread_cpu_ms();
+            vk_gpuprof_slot_seal(slot); vk_gpuprof_slot_complete(&owner);
+            slot = background_queue[background_head++ % GP_BACKLOG];
+            lease_ms += thread_cpu_ms() - start;
+        }
+    }
+    printf("gpuprof-record-fixture frames=%u groups_per_frame=%u draws_per_frame=%u "
+        "pipeline_hook_cpu_ms_per_frame=%.9f lease_cpu_ms_per_frame=%.9f "
+        "query_writes_per_frame=%.3f pipeline_query_writes_per_frame=8 driver_encoding_included=0\n",
+        frames, groups_per_frame, draws_per_frame, hook_ms / frames, lease_ms / frames,
+        fixture_query_writes / (double)frames);
+    free(slot->pipeline); free(slot);
+    return fixture_query_writes != (uint64_t)frames * 10;
 }

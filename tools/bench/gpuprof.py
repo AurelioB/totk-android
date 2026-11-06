@@ -369,7 +369,7 @@ def pipeline_report(by_type, loss):
     coverage['missing_compact_windows'] = len(missing_compact_contexts)
     loss_keys = ('malformed_rows', 'truncated_rows', 'conflicting_rows', 'missing_frame_ids',
                  'missing_windows', 'rotation_evictions', 'missing_rotation_files', 'header_conflicts',
-                 'output_failures', 'background_dropped_slots', 'background_dropped_closures')
+                 'output_failures', 'background_dropped_slots', 'background_dropped_closures', 'streams_without_end')
     complete = not compact_losses and not any(coverage[key] for key in (
         'dropped_groups', 'discarded_groups', 'discarded_segments', 'missing_selected', 'invalid_coverage',
         'missing_headers', 'missing_dictionary', 'missing_compact_windows', 'missing_compact_frames')) and not any(
