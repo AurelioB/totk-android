@@ -264,20 +264,31 @@ DIP_CONFOUNDED = 'verdict confounded by dips'
 PACING_KEYS = ('fps_steady', 'dip_windows', 'dip_time_fraction', 'frames_near33')
 METRICS = [
     ('fps_mean',        'fps mean',        +1, 'abs_rel', (0.5, 0.02)),
+    ('throughput_fps',  'throughput fps',  +1, 'abs_rel', (0.5, 0.02)),
+    ('fps_stddev',      'fps stddev',      -1, 'abs_rel', (0.5, 0.10)),
     ('fps_steady',      'fps steady',      +1, 'abs_rel', (0.5, 0.02)),
     ('dip_time_fraction', 'dip time fraction', -1, 'abs', (DIP_TIME_FRACTION_TOLERANCE, 0)),
     ('fps_min',         'fps min',         +1, 'abs_rel', (1.0, 0.05)),
     ('p50_ms_median',   'p50 median ms',   -1, 'abs_rel', (0.3, 0.02)),
+    ('p50_ms_max',      'p50 max ms',      -1, 'abs_rel', (0.3, 0.02)),
     ('p95_ms_max',      'p95 max ms',      -1, 'abs_rel', (1.0, 0.05)),
+    ('p99_ms_max',      'p99 max ms',      -1, 'abs_rel', (1.0, 0.05)),
+    ('p99_p50_ratio_max', 'p99/p50 max',   -1, 'abs_rel', (0.1, 0.05)),
     ('max_ms',          'worst frame ms',  -1, 'abs_rel', (5.0, 0.15)),
     ('gpu_ms_mean',     'GPU ms mean',     -1, 'abs_rel', (0.5, 0.03)),
     ('long_ge45_total', 'long >=45 ms',    -1, 'rate',    (0.5, 0.25)),
+    ('over33_total',    '>33 ms frames',   -1, 'rate',    (0.5, 0.25)),
     ('over50_total',    '>50 ms frames',   -1, 'rate',    (0.5, 0.25)),
     ('cpu_max_c',       'CPU max C',       -1, 'abs',     (3.0, 0)),
     ('gpu_max_c',       'GPU max C',       -1, 'abs',     (3.0, 0)),
 ]
 PRIMARY = ('fps_steady', 'dip_time_fraction', 'p50_ms_median', 'p95_ms_max', 'gpu_ms_mean', 'over50_total')
 LEGACY_PRIMARY = ('fps_mean', 'p50_ms_median', 'p95_ms_max', 'gpu_ms_mean', 'over50_total')
+UNCAPPED_PRIMARY = ('throughput_fps', 'p50_ms_max', 'p95_ms_max', 'p99_ms_max', 'max_ms', 'over33_total', 'over50_total')
+
+
+def is_uncapped(summary):
+    return summary.get('uncapped') is True or summary.get('speed_mode') == 'uncapped'
 
 
 def metric_verdict(key, base, new):
@@ -301,11 +312,17 @@ def metric_verdict(key, base, new):
 
 def primary_metrics(base, new):
     """Use the historical mean-FPS rule only when neither summary contains pacing information."""
+    if is_uncapped(base) or is_uncapped(new):
+        return UNCAPPED_PRIMARY
     return PRIMARY if any(k in s for s in (base, new) for k in PACING_KEYS) else LEGACY_PRIMARY
 
 
 def pacing_verdict(base, new):
     """A pacing veto of the overall verdict, or None; a missing steady value never falls back to mean FPS."""
+    if is_uncapped(base) or is_uncapped(new):
+        if not (is_uncapped(base) and is_uncapped(new)):
+            return 'inconclusive'
+        return None if base.get('throughput_fps') is not None and new.get('throughput_fps') is not None else 'inconclusive'
     if primary_metrics(base, new) == LEGACY_PRIMARY:
         return None
     dip = metric_verdict('dip_time_fraction', base, new)[1]
@@ -318,6 +335,11 @@ def pacing_verdict(base, new):
 
 def pacing_note(base, new):
     """Explain the pacing policy, including legacy or all-dip summaries, without hiding per-metric deltas."""
+    if is_uncapped(base) or is_uncapped(new):
+        if not (is_uncapped(base) and is_uncapped(new)):
+            return 'measurement modes differ (capped vs uncapped); no speed conclusion.'
+        return ('uncapped: dip_metrics_valid=false; time-weighted throughput and frame-time tails are primary. '
+                'Dip classification is disabled; mean-window fps and spread measures are informational.')
     if primary_metrics(base, new) == LEGACY_PRIMARY:
         return 'pacing info unavailable (legacy summaries); fps mean retains the historical verdict rule.'
     note = ('fps mean is informational; steady fps and dip time fraction are compared separately '

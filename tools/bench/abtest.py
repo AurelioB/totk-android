@@ -19,10 +19,11 @@ Verdict rule for one metric:
   lean better/worse only the paired delta crosses tolerance, or the pooled delta has the opposite sign; informational
   better? worse?  fewer than two valid pairs covering both directions (unconfirmed; pooled delta if no pairs)
   n/a             a value is missing
-Modern summaries compare steady fps and dip time fraction separately; fps mean is informational. A pooled or paired
-dip fraction difference above 0.05 absolute makes the overall result 'verdict confounded by dips', regardless of
-pair confirmation. Missing steady fps (including all-dip arms) or missing pacing data makes it inconclusive.
-Wholly legacy summaries retain the fps-mean primary rule and are labelled as lacking pacing info.
+Modern capped summaries compare steady fps and dip time fraction separately; fps mean is informational. A pooled or
+paired dip fraction difference above 0.05 absolute makes the overall result 'verdict confounded by dips', regardless
+of pair confirmation. Missing steady fps or pacing data makes capped comparisons inconclusive.
+Uncapped summaries disable dips and compare time-weighted throughput plus frame-time tails instead; capped versus
+uncapped is inconclusive, never dip-confounded. Wholly legacy summaries retain the labelled fps-mean primary rule.
 Otherwise an arm is worse if any primary metric is worse, else better if any is better, else inconclusive if any
 is better? / worse?, else same. Exit 1 when any arm is worse. Memory and pressure are informational.
 Prefer ABBAABBA or longer on 60 fps devices."""
@@ -123,8 +124,8 @@ def arm_verdict(per, ref=None, arm=None, paired=None):
             if delta is not None and abs(delta) > DIP_TIME_FRACTION_TOLERANCE and not math.isclose(
                     abs(delta), DIP_TIME_FRACTION_TOLERANCE, rel_tol=1e-12, abs_tol=1e-12):
                 return DIP_CONFOUNDED
-            if pacing:
-                return pacing
+        if pacing:
+            return pacing
     prim = [per[k][3] for k in primary if k in per]
     if 'worse' in prim:
         return 'worse'
@@ -176,7 +177,7 @@ def main():
                 if key not in per:
                     continue
                 _, tol, noise, verdict = per[key]
-                rate = key in ('over50_total', 'long_ge45_total')
+                rate = key in ('over33_total', 'over50_total', 'long_ge45_total')
                 rv, av = block_metric(ref['summary'], key), block_metric(arm['summary'], key)
                 pooled = av - rv if rv is not None and av is not None else None
                 p(f'  {label + (" /win" if rate else ""):<16} {"-" if rv is None else f"{rv:g}":>9} '
@@ -196,8 +197,9 @@ def main():
         p('\n  * primary metric. Rule: pooled AND paired deltas beyond the compare.py tolerance in the same direction, '
           'and (all pair signs agree or exact two-sided sign p < 0.05 with >=6 pairs); at least two pairs covering both '
           'directions. "lean" = only paired delta crosses tolerance (or pooled sign differs), informational only; '
-          '"?" = insufficient pairs. A pooled or paired dip fraction difference above 0.05 absolute overrides the '
-          'arm result as dip-confounded. Same-arm spread is informational. Prefer ABBAABBA or longer at 60 fps.')
+          '"?" = insufficient pairs. Capped-only dip fractions differing by >0.05 override their arm result; '
+          'uncapped arms compare throughput and tails with dips disabled. Same-arm spread is informational. '
+          'Prefer ABBAABBA or longer at 60 fps.')
     sys.stdout.write(buf.getvalue())
     if a.out:
         with open(a.out, 'w', encoding='utf-8') as f:
