@@ -21,7 +21,8 @@ All scripts are in `tools/bench/` (paths below are relative to the repository ro
     switches' `totk.ctl`) needs the game folder's owner and SELinux context, MLS categories included:
     `chown $(stat -c %u:%g <game dir>)`, mode0600 and an explicit `chcon "$CTX" <file>`, where
     `CTX=$(ls -Zd <game dir>); CTX=${CTX%% *}` preserves the whole MLS context. Android toybox lacks GNU
-    `chcon --reference`. `live.sh` applies this to totk.ctl; use the same procedure for any manual totk.env write.
+    `chcon --reference`. `live.sh` prepares a same-directory temporary batch before atomic rename to totk.ctl;
+    it never republishes old commands. Use the same owner/mode/context procedure for any manual totk.env write.
     Abort on missing context or chcon failure rather than dropping the MLS categories.
   - **Kernel log and sysfs**: the dmesg marker and the GPU/SMMU fault check read the kernel log; the sampler and the
     frequency snapshots read thermal zones, cooling devices, cpufreq policies and `/sys/class/kgsl` (several of them
@@ -258,7 +259,7 @@ with `totk.env`.
      --order ABBAABBA --pan-seconds 30 --settle 15 --out $OUT
    ```
    Per block it writes the arm's lines and `mark ab arm=<X> block=<n> scene=<scene> direction=<right|left>` to
-   `<game>/totk.ctl` with `live.sh` (one write: one generation, applied at the next presented frame), waits for the game's
+   `<game>/totk.ctl` with `live.sh` (one atomic batch replacement: one generation, applied at the next presented frame), waits for the game's
    `[totk-ctl] gen=N frame=F mark …` acknowledgement (it stops on a refused line or no acknowledgement), settles, then
    pans with `pan.sh` (right first on odd blocks, left first on even ones; the view returns each time). `arms.txt` lists
    the blocks with their generation, frame and direction. Arm lines are comma-separated `live.sh` lines; an arm may set several

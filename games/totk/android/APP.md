@@ -1888,7 +1888,7 @@ needs `su`). The folder holds what the adb-shell folder holds:
 | `user-data/` | saves to import: on the first start (no private saves yet) they're copied into the app's private storage, where the game keeps its saves from then on. `install_app.sh saves` copies those to the computer. |
 | `totk.env` | options, one `NAME=value` per line (`#` comments), e.g. `TOTK_VK_SHOT=300` or `TOTK_FACE_BUTTONS=position`. Read after the launcher menu's `settings.env` (app-private `files/settings.env`, written by the menu; only the menu's own option keys are accepted there, others are logged and ignored), so a line here overrides the menu. |
 | `totk.log` | the log of the last start (`install_app.sh log`) |
-| `totk.ctl` | live switches for in-session A/B runs (below), written by `tools/bench/live.sh`; only lines appended after the start are read |
+| `totk.ctl` | live switches for in-session A/B runs (below), atomically replaced with each new batch by `tools/bench/live.sh`; startup contents are skipped |
 
 ### Diagnostics: logcat copy, crash reports and the stall watchdog
 
