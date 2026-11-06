@@ -292,11 +292,12 @@ int main(int argc, char **argv) {
     unsigned frames = 302;
     int areas = argc == 2 && !strcmp(argv[1], "--areas");
     int unavailable_span = argc == 2 && !strcmp(argv[1], "--unavailable-span");
+    int sampling = argc == 2 && !strcmp(argv[1], "--sampling");
     if (argc == 3 && !strcmp(argv[1], "--frames")) {
         char *end; unsigned long value = strtoul(argv[2], &end, 10);
         if (!*argv[2] || *end || !value || value > 10000) return 2;
         frames = (unsigned)value;
-    } else if (argc != 1 && !areas && !unavailable_span) return 2;
+    } else if (argc != 1 && !areas && !unavailable_span && !sampling) return 2;
     /* Force short secondary chunks so workers=2 tests a real parallel pass,
      * rather than merely checking an enabled worker setting on inline draws. */
     setenv("TOTK_VK_REC_CHUNK_DRAWS", "1", 1); setenv("TOTK_VK_REC_LEAD_DRAWS", "1", 1);
@@ -340,10 +341,16 @@ int main(int argc, char **argv) {
     const float triangle[] = {-1, -1, 3, -1, -1, 3}; memcpy(memory + 0x20000, triangle, sizeof triangle);
     unsigned expected_draws = 0, expected_passes = 0;
     for (unsigned frame = 0; frame < frames; frame++) {
-        tex_t *target = &targets[frame & 1]; unsigned draws = frame & 1 ? 3 : 1;
-        record_draws(target, &programs[(frame / 2) & 1], memory, draws);
-        record_readback(target, memory);
-        expected_draws += draws; expected_passes++;
+        /* Sampling needs stable keys at every frame ordinal, not one key on
+         * odd frames and another on even frames: that would alias rotation. */
+        tex_t *target = NULL; unsigned draws = 0;
+        for (unsigned part = 0; part < (sampling ? 2u : 1u); part++) {
+            unsigned index = sampling ? part : frame & 1;
+            target = &targets[index]; draws = index ? 3 : 1;
+            record_draws(target, &programs[(frame / 2) & 1], memory, draws);
+            record_readback(target, memory);
+            expected_draws += draws; expected_passes++;
+        }
         if (frame % 11 == 7) {
             /* A frame spanning two actual submissions must have one frame row,
              * no lost first segment and pass ordinals independent of slot reuse. */
@@ -353,6 +360,7 @@ int main(int argc, char **argv) {
         }
         submit(1);
         check_pixels(target, memory);
+        if (sampling) check_pixels(&targets[0], memory);
     }
     /* Record a genuine pre upload while the main render record is OPEN. The
      * uploader must restore that parent rather than losing its timestamp/key/

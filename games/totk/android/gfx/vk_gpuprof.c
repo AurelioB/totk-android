@@ -14,8 +14,9 @@
 #define GP_WINDOW 300
 #define GP_SEGMENTS 64
 #define GP_SPAN_BASE (GP_RECORDS * 2)
-#define GP_PRE_QUERY (GP_SPAN_BASE + GP_SEGMENTS + 1)
+#define GP_PRE_QUERY (GP_SPAN_BASE + GP_SEGMENTS * 2 + 1)
 #define GP_TIMESTAMPS (GP_PRE_QUERY + 1)
+#define GP_HISTOGRAM 272
 enum { GP_IA_VERTICES, GP_IA_PRIMITIVES, GP_VS, GP_CLIP_INVOCATIONS, GP_CLIP_PRIMITIVES, GP_FS, GP_STATS };
 #define GP_STATS_MASK (VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT | \
     VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT | \
@@ -33,16 +34,20 @@ typedef struct {
 typedef struct {
     gp_key key; uint64_t frame, counters[GP_STATS];
     uint32_t draws, instance, reason, detail, stats_q1, stats_count, stats_invalid;
+    uint32_t timestamp_q1, timestamp_count, selected;
 } gp_record;
-typedef struct { uint64_t frame; uint32_t first, last; } gp_segment;
+typedef struct {
+    uint64_t frame;
+    uint32_t first, last, first_valid, last_valid, timestamp_count;
+} gp_segment;
 struct vk_gpuprof_slot {
     VkQueryPool pool, stats;
-    uint32_t n, dropped, ns;
+    uint32_t n, dropped, ns, nt;
     uint64_t sealed;
     uint32_t nsegment, has_pre;
     VkCommandBuffer pre_cb;
     gp_segment segment[GP_SEGMENTS];
-    vk_gpuprof_timestamp span_ticks[GP_SEGMENTS + 1], pre_tick;
+    vk_gpuprof_timestamp span_ticks[GP_SEGMENTS * 2 + 1], pre_tick;
     vk_gpuprof_time_domain domain;
     uint8_t timestamp_marks[GP_TIMESTAMPS]; /* counted/invalid once per queried endpoint */
     gp_record rec[GP_RECORDS];
@@ -54,6 +59,8 @@ typedef struct {
     gp_key key; uint64_t hash, count, draws, counters[GP_STATS], stats_count, stats_draws;
     uint32_t ordinal, reference_w, reference_h, scene_relative;
     double ms, stats_ms;
+    uint64_t sampled, observed_frames, sampled_frames, last_observed_frame, last_sampled_frame;
+    uint64_t *histogram; /* window aggregates only, allocated only in sampled mode */
 } gp_group;
 typedef struct {
     gp_key key;
@@ -63,6 +70,9 @@ typedef struct {
 
 int vk_gpuprof_on;
 static int stats_on, secondary_pass;
+static uint32_t sample_budget, sample_previous_passes, sample_selected;
+static uint64_t sample_cursor;
+static int sample_frame_started;
 static vk_gpuprof_slot *current;
 static gp_record *open_record;
 static gp_audit open_audit;
@@ -83,12 +93,13 @@ static uint64_t audit_overflow;
 static gp_group groups[GP_GROUPS];
 static struct {
     uint64_t frame, dropped, unavailable_timestamps, invalid_timestamps, timestamp_wraps;
+    uint64_t timestamp_count, observed_passes, sampled_passes;
     vk_gpuprof_timestamp first, last;
     vk_gpuprof_time_domain first_domain, last_domain;
     vk_gpuprof_time_status status;
     double measured;
     uint32_t scene_w, scene_h;
-    int has_ticks, failed;
+    int has_ticks, has_end, failed;
 } completed;
 static uint64_t last_completed, window_frames;
 static double window_span, window_gap;
@@ -107,6 +118,7 @@ static int window_ordinals;
 static double long_ms = 50;
 static uint64_t window, total_records, dropped_records, failed_slots, loads, clears, stores, discards;
 static uint64_t stats_failures;
+static uint64_t window_sample_count, window_observed_passes, window_timestamp_count;
 static uint64_t load_bytes, store_bytes, unknown_bytes;
 static double total_ms, render_ms, compute_ms;
 static const char *const end_names[] = {
@@ -201,15 +213,16 @@ static void output_init(void) {
     json_add(row, ",\"apk_sha256\":null,\"apk_sha256_reason\":\"not computed in process; join capture APK hash\","
         "\"profile\":%d,\"stats\":%s,\"ordinals\":%s,\"max_bytes\":%llu,\"retained_files\":4,"
         "\"window_frames\":%d,\"span_limit_ms\":%.0f,\"timestamp_bits\":%u,\"timestamp_period_ns\":%.9f,"
-        "\"driver\":{\"vendor_id\":%u,\"device_id\":%u,\"api_version\":%u,\"driver_version\":%u,\"device_name\":",
+        "\"sample_budget\":%u,\"driver\":{\"vendor_id\":%u,\"device_id\":%u,\"api_version\":%u,\"driver_version\":%u,\"device_name\":",
         vk_gpuprof_on, stats_on ? "true" : "false", window_ordinals ? "true" : "false",
         (unsigned long long)output_limit, GP_WINDOW, VK_GPUPROF_MAX_FRAME_MS, V.timestamp_bits, V.props.limits.timestampPeriod,
-        V.props.vendorID, V.props.deviceID, V.props.apiVersion, V.props.driverVersion);
+        sample_budget, V.props.vendorID, V.props.deviceID, V.props.apiVersion, V.props.driverVersion);
     json_string(row, V.props.deviceName);
     json_add(row, ",\"requested_driver\":"); json_string(row, getenv("TOTK_VK_DRIVER"));
     json_add(row, ",\"binary_sha256\":null,\"binary_sha256_reason\":\"join captured driver artifact\"},\"env\":{");
     static const char *const names[] = {
         "TOTK_VK_DRIVER", "TOTK_VK_GPU_PROFILE", "TOTK_VK_GPU_PROFILE_STATS", "TOTK_VK_GPU_PROFILE_ORDINALS",
+        "TOTK_VK_GPU_PROFILE_SAMPLE",
         "TOTK_VK_GPU_PROFILE_LONG_MS", "TOTK_VK_GPU_PROFILE_LONG_FRAMES", "TOTK_VK_GPU_PROFILE_MAX_BYTES",
         "TOTK_VK_REC_THREADS", "TOTK_VK_REC_CHUNK_DRAWS", "TOTK_VK_REC_INLINE_DRAWS", "TOTK_VK_REC_LEAD_DRAWS",
         "TOTK_OPERATION_MODE", "TOTK_RENDER_RES", "TOTK_FPS60", "TOTK_SCENE_SCALE", "TOTK_VK_PRESENT",
@@ -287,6 +300,10 @@ static const char *kind_name(const gp_key *key) {
     return key->compute < sizeof kinds / sizeof *kinds ? kinds[key->compute] : "other";
 }
 static uint32_t gcd_u32(uint32_t a, uint32_t b);
+static unsigned sample_bucket(double ms) {
+    double bucket = ms > 0 ? ceil(log2(ms * 1e6) * 8) : 0;
+    return bucket <= 0 ? 0 : bucket >= GP_HISTOGRAM - 1 ? GP_HISTOGRAM - 1 : (unsigned)bucket;
+}
 static void output_pass(const gp_group *g, const char *type, uint64_t pass_frame) {
     const gp_key *k = &g->key;
     gp_json row = {0};
@@ -298,6 +315,16 @@ static void output_pass(const gp_group *g, const char *type, uint64_t pass_frame
         type, (unsigned long long)start, (unsigned long long)end,
         (unsigned long long)g->hash, kind_name(k), g->ordinal, k->samples, (unsigned long long)k->shader,
         g->ms, (unsigned long long)g->count, (unsigned long long)g->draws, (unsigned long long)g->stats_count);
+    if (sample_budget) {
+        json_add(&row, ",\"sampling\":{\"budget\":%u,\"observed_count\":%llu,\"sample_count\":%llu,"
+            "\"observed_frames\":%llu,\"sampled_frames\":%llu,\"histogram\":[",
+            sample_budget, (unsigned long long)g->count, (unsigned long long)g->sampled,
+            (unsigned long long)g->observed_frames, (unsigned long long)g->sampled_frames);
+        unsigned bucket = sample_bucket(g->ms);
+        for (unsigned b = 0; b < GP_HISTOGRAM; b++) json_add(&row, "%s%llu", b ? "," : "",
+            (unsigned long long)(g->histogram ? g->histogram[b] : g->sampled && b == bucket));
+        json_add(&row, "]}");
+    }
     json_add(&row, ",\"render_width\":%u,\"render_height\":%u,\"reference_width\":%u,\"reference_height\":%u,"
         "\"scene_relative\":%s", k->w, k->h, g->reference_w, g->reference_h, g->scene_relative ? "true" : "false");
     if (pass_frame) json_add(&row, ",\"frame\":%llu", (unsigned long long)pass_frame);
@@ -365,7 +392,7 @@ static int key_equal(const gp_key *a, const gp_key *b) {
 static gp_long_frame *pending_frame(uint64_t number) {
     return long_ring ? &long_ring[number % long_frames] : &frame_pending;
 }
-static void capture_record(const gp_record *r, double ms, int stats_valid) {
+static void capture_record(const gp_record *r, double ms, int stats_valid, int sampled) {
     gp_long_frame *f = pending_frame(r->frame);
     if (f->frame != r->frame) { f->frame = r->frame; f->n = 0; f->dropped = 0; }
     if (f->n == GP_GROUPS) { f->dropped++; completed.dropped++; dropped_records++; return; }
@@ -377,7 +404,9 @@ static void capture_record(const gp_record *r, double ms, int stats_valid) {
     }
     gp_group *g = &f->pass[f->n++];
     *g = (gp_group){.key = r->key, .hash = key_hash(&r->key), .ordinal = r->instance,
-        .count = 1, .draws = r->draws, .ms = ms};
+        .count = 1, .draws = r->draws, .ms = ms, .sampled = sampled,
+        .observed_frames = 1, .sampled_frames = sampled,
+        .last_observed_frame = r->frame, .last_sampled_frame = sampled ? r->frame : 0};
     if (stats_valid) {
         memcpy(g->counters, r->counters, sizeof g->counters);
         g->stats_count = 1; g->stats_draws = r->draws; g->stats_ms = ms;
@@ -422,10 +451,26 @@ static void aggregate_sample(const gp_group *sample) {
         ++tries < GP_GROUPS) at = (at + 1) % GP_GROUPS;
     if (tries == GP_GROUPS) { dropped_records++; completed.dropped++; return; }
     gp_group *g = &groups[at];
-    if (!g->count) { *g = *sample; g->ordinal = ordinal; return; }
-    g->count += sample->count; g->draws += sample->draws; g->ms += sample->ms;
-    for (unsigned st = 0; st < GP_STATS; st++) g->counters[st] += sample->counters[st];
-    g->stats_count += sample->stats_count; g->stats_draws += sample->stats_draws; g->stats_ms += sample->stats_ms;
+    if (!g->count) { *g = *sample; g->ordinal = ordinal; }
+    else {
+        g->count += sample->count; g->draws += sample->draws; g->ms += sample->ms;
+        for (unsigned st = 0; st < GP_STATS; st++) g->counters[st] += sample->counters[st];
+        g->stats_count += sample->stats_count; g->stats_draws += sample->stats_draws; g->stats_ms += sample->stats_ms;
+        g->sampled += sample->sampled;
+        if (sample->last_observed_frame != g->last_observed_frame) {
+            g->observed_frames++; g->last_observed_frame = sample->last_observed_frame;
+        }
+        if (sample->sampled && sample->last_sampled_frame != g->last_sampled_frame) {
+            g->sampled_frames++; g->last_sampled_frame = sample->last_sampled_frame;
+        }
+    }
+    if (sample_budget && sample->sampled) {
+        if (!g->histogram) {
+            g->histogram = calloc(GP_HISTOGRAM, sizeof *g->histogram);
+            if (!g->histogram) DIE("GPU profiler histogram allocation");
+        }
+        g->histogram[sample_bucket(sample->ms)]++; window_sample_count++;
+    }
 }
 /* A frame can span several retired slots, and its largest scene MRT can be
    recorded after a shadow/prepass. Resolve the common reference only once the
@@ -483,6 +528,10 @@ static void report(void) {
         (unsigned long long)(window + 1), window_ordinals ? "true" : "false",
         (unsigned long long)window_frames, partial_report ? "true" : "false", total_ms,
         window_invalid_spans ? "false" : "true", window_span, window_gap, (unsigned long long)window_valid_span_frames);
+    if (sample_budget) json_add(&summary, "\"sample_budget\":%u,\"sample_count\":%llu,"
+        "\"observed_passes\":%llu,\"timestamp_count\":%llu,\"timing_scope\":\"main-frame\",",
+        sample_budget, (unsigned long long)window_sample_count, (unsigned long long)window_observed_passes,
+        (unsigned long long)window_timestamp_count);
     if (window_invalid_spans) json_add(&summary, "\"span_ms\":null,\"gap_ms\":null,");
     else json_add(&summary, "\"span_ms\":%.9f,\"gap_ms\":%.9f,", window_span, window_gap);
     json_add(&summary, "\"dropped\":%llu,\"failed_slots\":%llu,\"stats_failed_slots\":%llu,"
@@ -491,6 +540,9 @@ static void report(void) {
         (unsigned long long)window_unavailable_timestamps, (unsigned long long)window_invalid_timestamps,
         (unsigned long long)window_invalid_spans, (unsigned long long)atomic_load(&output_failures));
     output_window(summary.data, window + 1, report_end);
+    if (sample_budget) LOGV("[gpu-profile sample] budget=%u sampled=%llu observed=%llu timestamps=%llu frames=%llu; pass sums are sampled only, not frame totals",
+        sample_budget, (unsigned long long)window_sample_count, (unsigned long long)window_observed_passes,
+        (unsigned long long)window_timestamp_count, (unsigned long long)window_frames);
     LOGV("[gpu-profile] frames %llu-%llu: measured %.3f ms/frame (render %.3f compute %.3f), %.2f passes+dispatches/frame; LOAD %.2f CLEAR %.2f STORE %.2f DONT_CARE-store %.2f ops/frame; logical attachment estimate load %.3f store %.3f MiB/frame (not actual traffic); unknown-byte attachments %llu; dropped %llu failed-slots %llu",
          (unsigned long long)(window * GP_WINDOW + 1), (unsigned long long)((window + 1) * GP_WINDOW),
          total_ms / GP_WINDOW, render_ms / GP_WINDOW, compute_ms / GP_WINDOW, total_records / (double)GP_WINDOW,
@@ -521,6 +573,7 @@ static void report(void) {
              g->counters[0] ? g->stats_ms * 1e6 / g->counters[0] : 0,
              g->counters[1] ? g->stats_ms * 1e6 / g->counters[1] : 0);
     }
+    if (sample_budget) for (size_t i = 0; i < n; i++) free(rank[i]->histogram);
     memset(groups, 0, sizeof groups);
     total_records = dropped_records = failed_slots = loads = clears = stores = discards = 0;
     if (stats_on) LOGV("[gpu-profile scale] pipeline-stat failed slots=%llu; counts are implementation-defined invocations, not covered pixels", (unsigned long long)stats_failures);
@@ -528,6 +581,7 @@ static void report(void) {
     load_bytes = store_bytes = unknown_bytes = 0; total_ms = render_ms = compute_ms = 0;
     window_frames = 0; window_span = window_gap = 0;
     window_unavailable_timestamps = window_invalid_timestamps = window_invalid_spans = window_valid_span_frames = 0;
+    window_sample_count = window_observed_passes = window_timestamp_count = 0;
 }
 static void advance(uint64_t target) { while (window < target) { report(); window++; } }
 static vk_gpuprof_time_domain current_time_domain(void) {
@@ -564,7 +618,7 @@ static void finish_frame(void) {
     if (!completed.frame) return;
     finalize_passes();
     vk_gpuprof_interval interval = {.status = GP_TIME_MISSING};
-    if (completed.has_ticks) interval = vk_gpuprof_interval_check(completed.first, completed.last,
+    if (completed.has_ticks && completed.has_end) interval = vk_gpuprof_interval_check(completed.first, completed.last,
         completed.first_domain, completed.last_domain);
     if (interval.status != GP_TIME_OK && completed.status == GP_TIME_OK) {
         frame_time_failure(interval.status);
@@ -575,7 +629,7 @@ static void finish_frame(void) {
     double gap = interval.ms - completed.measured;
     double epsilon = V.props.limits.timestampPeriod * (GP_RECORDS * 2.0 + 2) / 1e6;
     if (completed.status == GP_TIME_OK && (completed.failed || completed.dropped)) frame_time_failure(GP_TIME_INCOMPLETE);
-    if (completed.status == GP_TIME_OK && gap < -epsilon) frame_time_failure(GP_TIME_NEGATIVE_GAP);
+    if (!sample_budget && completed.status == GP_TIME_OK && gap < -epsilon) frame_time_failure(GP_TIME_NEGATIVE_GAP);
     int valid = completed.status == GP_TIME_OK;
     char span_text[64] = "null", gap_text[64] = "null", raw_text[64] = "null", first_text[32] = "null", last_text[32] = "null";
     if (interval.has_value) snprintf(raw_text, sizeof raw_text, "%.9f", interval.ms);
@@ -598,7 +652,7 @@ static void finish_frame(void) {
         "\"measured_ms\":%.9f,\"gap_ms\":%s,\"raw_span_ms\":%s,\"span_valid\":%s,\"span_reason\":\"%s\","
         "\"unavailable_timestamps\":%llu,\"invalid_timestamps\":%llu,\"timestamp_wraps\":%llu,"
         "\"first_tick\":%s,\"last_tick\":%s,\"timestamp_bits\":%u,\"timestamp_period\":%.12g,\"queue_family\":%u,"
-        "\"dropped\":%llu,\"reconciliation_failed\":%s,\"long_dropped\":%llu,\"scene_width\":%u,\"scene_height\":%u}\n",
+        "\"dropped\":%llu,\"reconciliation_failed\":%s,\"long_dropped\":%llu,\"scene_width\":%u,\"scene_height\":%u",
         (unsigned long long)completed.frame, span_text, completed.measured, gap_text, raw_text,
         valid ? "true" : "false", vk_gpuprof_time_reason(completed.status),
         (unsigned long long)completed.unavailable_timestamps, (unsigned long long)completed.invalid_timestamps,
@@ -606,11 +660,29 @@ static void finish_frame(void) {
         completed.first_domain.valid_bits, completed.first_domain.period_ns, completed.first_domain.queue_family,
         (unsigned long long)completed.dropped, valid ? "false" : "true", (unsigned long long)long_dropped,
         completed.scene_w, completed.scene_h);
+    if (sample_budget) {
+        json_add(&row, ",\"sample_budget\":%u,\"sampled_passes\":%llu,\"observed_passes\":%llu,"
+            "\"timestamp_count\":%llu,\"timing_scope\":\"main-frame\"",
+            sample_budget, (unsigned long long)completed.sampled_passes, (unsigned long long)completed.observed_passes,
+            (unsigned long long)completed.timestamp_count);
+        window_observed_passes += completed.observed_passes; window_timestamp_count += completed.timestamp_count;
+    }
+    json_add(&row, "}\n");
     output_frame(row.data, completed.frame);
     window_frames++; last_completed = completed.frame;
     memset(&completed, 0, sizeof completed);
 }
 
+/* Unlike full-mode slot envelopes, sampled mode writes just one distinct
+   main-frame start/end pair even when the frame spans several submissions.
+   Each segment reserves separate start/end coordinates; unused ones stay
+   unavailable and are never consumed as endpoints. */
+static void sampled_frame_begin(VkCommandBuffer cb) {
+    if (!sample_budget || sample_frame_started || !current || cb == current->pre_cb) return;
+    gp_segment *segment = &current->segment[current->nsegment - 1];
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE + segment->first);
+    segment->first_valid = 1; segment->timestamp_count++; sample_frame_started = 1;
+}
 void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
     static int initialized;
     if (!initialized) {
@@ -628,6 +700,9 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
             window_ordinals = oe && !strcmp(oe, "1");
             LOGV("[gpu-profile] window ordinals=%d (TOTK_VK_GPU_PROFILE_ORDINALS=%s; default=0; ordinal=0 means all frame ordinals)",
                 window_ordinals, oe ? oe : "unset");
+            sample_budget = (uint32_t)env_u64("TOTK_VK_GPU_PROFILE_SAMPLE", 0, 0, 16);
+            LOGV("[gpu-profile] sample-budget=%u (TOTK_VK_GPU_PROFILE_SAMPLE; 0=full, 1..16=rotating passes; timestamps/frame <=2k+2)",
+                sample_budget);
             if (vk_gpuprof_on) {
                 const char *mode = getenv("TOTK_OPERATION_MODE"), *resolution = getenv("TOTK_RENDER_RES");
                 int handheld = mode && !strcmp(mode, "handheld");
@@ -667,21 +742,24 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
         }
     }
     current = *slot; current->n = current->dropped = 0; current->sealed = 0;
-    current->ns = 0; current->has_pre = 0; current->pre_cb = VK_NULL_HANDLE;
+    current->ns = current->nt = 0; current->has_pre = 0; current->pre_cb = VK_NULL_HANDLE;
     current->nsegment = 1; current->segment[0] = (gp_segment){frame, 0, 0};
     current->domain = current_time_domain();
     memset(current->timestamp_marks, 0, sizeof current->timestamp_marks);
     vkResetQueryPool(V.dev, current->pool, 0, GP_TIMESTAMPS);
     if (stats_on) vkResetQueryPool(V.dev, current->stats, 0, GP_RECORDS);
-    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE);
+    if (sample_budget) sampled_frame_begin(cb);
+    else vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE);
 }
 void vk_gpuprof_slot_pre(vk_gpuprof_slot *slot, VkCommandBuffer cb) {
     if (!slot) return;
-    slot->has_pre = 1; slot->pre_cb = cb;
+    slot->pre_cb = cb;
+    if (sample_budget) return;
+    slot->has_pre = 1;
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot->pool, GP_PRE_QUERY);
 }
 void vk_gpuprof_slot_end(vk_gpuprof_slot *slot, VkCommandBuffer cb) {
-    if (!slot) return;
+    if (!slot || sample_budget) return;
     slot->segment[slot->nsegment - 1].last = slot->nsegment;
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot->pool, GP_SPAN_BASE + slot->nsegment);
 }
@@ -692,36 +770,45 @@ static void frame_marker(VkCommandBuffer cb) {
     if (!current) return;
     if (current->nsegment == GP_SEGMENTS) { current->dropped++; return; }
     uint32_t marker = current->nsegment;
-    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE + marker);
-    current->segment[marker - 1].last = marker;
-    current->segment[marker] = (gp_segment){frame + 1, marker, marker};
+    sampled_frame_begin(cb);
+    uint32_t query = sample_budget ? marker * 2 - 1 : marker;
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE + query);
+    current->segment[marker - 1].last = query;
+    current->segment[marker - 1].last_valid = 1; current->segment[marker - 1].timestamp_count++;
+    current->segment[marker] = (gp_segment){.frame = frame + 1,
+        .first = sample_budget ? marker * 2 : marker, .last = sample_budget ? marker * 2 : marker};
+    if (sample_budget) sample_frame_started = 0;
     current->nsegment++;
 }
 void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot) {
     if (!slot) return;
     slot->sealed = frame - 1; current = NULL;
 }
-static void ingest_record(gp_record *r, double ms, int stats_valid) {
+static void ingest_record(gp_record *r, double ms, int stats_valid, int sampled) {
     completed.measured += ms;
     if (!r->key.compute && r->key.a[8].format && active_colors(&r->key) >= 2 &&
         (uint64_t)r->key.w * r->key.h > (uint64_t)completed.scene_w * completed.scene_h) {
         completed.scene_w = r->key.w; completed.scene_h = r->key.h;
     }
-    capture_record(r, ms, stats_valid);
+    capture_record(r, ms, stats_valid, sampled);
     if (vk_gpuprof_on == 2) {
         uint64_t hash = key_hash(&r->key);
         const char *reason = r->reason < sizeof end_names / sizeof *end_names ? end_names[r->reason] : "unknown";
         LOGV("[gpu-split] frame=%llu ordinal=%u sig=%016llx kind=%s end=%s detail=%#x draws=%u ms=%.4f",
             (unsigned long long)r->frame, r->instance, (unsigned long long)hash, kind_name(&r->key), reason, r->detail, r->draws, ms);
+        if (sample_budget) LOGV("[gpu-split sample] frame=%llu ordinal=%u timed=%d (zero on an unmeasured pass is not a duration)",
+            (unsigned long long)r->frame, r->instance, sampled);
     }
 }
 void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
     if (!slot) return;
     const VkQueryResultFlags flags = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
-    VkResult result = slot->n ? vkGetQueryPoolResults(V.dev, slot->pool, 0, slot->n * 2,
-        slot->n * 2 * sizeof slot->ticks[0], slot->ticks, sizeof slot->ticks[0], flags) : VK_SUCCESS;
-    VkResult span_result = vkGetQueryPoolResults(V.dev, slot->pool, GP_SPAN_BASE, slot->nsegment + 1,
-        (slot->nsegment + 1) * sizeof slot->span_ticks[0], slot->span_ticks, sizeof slot->span_ticks[0], flags);
+    uint32_t timed = sample_budget ? slot->nt : slot->n;
+    VkResult result = timed ? vkGetQueryPoolResults(V.dev, slot->pool, 0, timed * 2,
+        timed * 2 * sizeof slot->ticks[0], slot->ticks, sizeof slot->ticks[0], flags) : VK_SUCCESS;
+    uint32_t spans = sample_budget ? slot->nsegment * 2 : slot->nsegment + 1;
+    VkResult span_result = vkGetQueryPoolResults(V.dev, slot->pool, GP_SPAN_BASE, spans,
+        spans * sizeof slot->span_ticks[0], slot->span_ticks, sizeof slot->span_ticks[0], flags);
     VkResult pre_result = slot->has_pre ? vkGetQueryPoolResults(V.dev, slot->pool, GP_PRE_QUERY, 1,
         sizeof slot->pre_tick, &slot->pre_tick, sizeof slot->pre_tick, flags) : VK_SUCCESS;
     VkResult sr = stats_on && slot->ns ? vkGetQueryPoolResults(V.dev, slot->stats, 0, slot->ns,
@@ -729,7 +816,8 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
     for (uint32_t q = 0; sr == VK_SUCCESS && q < slot->ns; q++)
         for (unsigned st = 0; st < GP_STATS; st++)
             slot->rec[slot->stats_owner[q]].counters[st] += slot->counters[q][st];
-    int slot_failed = result != VK_SUCCESS || span_result != VK_SUCCESS || pre_result != VK_SUCCESS;
+    int slot_failed = sample_budget ? !query_readable(result) || !query_readable(span_result) :
+        result != VK_SUCCESS || span_result != VK_SUCCESS || pre_result != VK_SUCCESS;
     int slot_reported = 0;
     for (uint32_t s = 0; s < slot->nsegment; s++) {
         const gp_segment *segment = &slot->segment[s];
@@ -745,25 +833,49 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
         vk_gpuprof_timestamp first = query_readable(first_result) ?
             (!s && slot->has_pre ? slot->pre_tick : slot->span_ticks[segment->first]) : (vk_gpuprof_timestamp){0};
         vk_gpuprof_timestamp last = query_readable(span_result) ? slot->span_ticks[segment->last] : (vk_gpuprof_timestamp){0};
-        count_timestamp(slot, first_query, first, first_result);
-        count_timestamp(slot, GP_SPAN_BASE + segment->last, last, span_result);
-        vk_gpuprof_interval segment_time = vk_gpuprof_interval_check(first, last, slot->domain, slot->domain);
-        check_interval(slot, GP_SPAN_BASE + segment->last, segment_time);
-        if (completed.has_ticks) check_interval(slot, first_query,
-            vk_gpuprof_interval_check(completed.last, first, completed.last_domain, slot->domain));
-        else { completed.first = first; completed.first_domain = slot->domain; }
-        completed.last = last; completed.last_domain = slot->domain; completed.has_ticks = 1;
-        if (segment_time.status != GP_TIME_OK || completed.status != GP_TIME_OK) slot_failed = 1;
+        if (sample_budget) {
+            if (completed.has_ticks && !vk_gpuprof_same_domain(completed.first_domain, slot->domain))
+                frame_time_failure(GP_TIME_DOMAIN);
+            completed.timestamp_count += segment->timestamp_count;
+            if (segment->first_valid) {
+                count_timestamp(slot, first_query, first, first_result);
+                if (!completed.has_ticks) {
+                    completed.first = first; completed.first_domain = slot->domain; completed.has_ticks = 1;
+                } else invalid_timestamp(slot, first_query, GP_TIME_DOMAIN);
+            }
+            if (segment->last_valid) {
+                count_timestamp(slot, GP_SPAN_BASE + segment->last, last, span_result);
+                completed.last = last; completed.last_domain = slot->domain; completed.has_end = 1;
+            }
+        } else {
+            count_timestamp(slot, first_query, first, first_result);
+            count_timestamp(slot, GP_SPAN_BASE + segment->last, last, span_result);
+            vk_gpuprof_interval segment_time = vk_gpuprof_interval_check(first, last, slot->domain, slot->domain);
+            check_interval(slot, GP_SPAN_BASE + segment->last, segment_time);
+            if (completed.has_ticks) check_interval(slot, first_query,
+                vk_gpuprof_interval_check(completed.last, first, completed.last_domain, slot->domain));
+            else { completed.first = first; completed.first_domain = slot->domain; }
+            completed.last = last; completed.last_domain = slot->domain; completed.has_ticks = completed.has_end = 1;
+            if (segment_time.status != GP_TIME_OK || completed.status != GP_TIME_OK) slot_failed = 1;
+        }
         for (uint32_t i = 0; i < slot->n; i++) {
             gp_record *r = &slot->rec[i];
             if (r->frame != segment->frame) continue;
-            vk_gpuprof_timestamp start = query_readable(result) ? slot->ticks[2 * i] : (vk_gpuprof_timestamp){0};
-            vk_gpuprof_timestamp end = query_readable(result) ? slot->ticks[2 * i + 1] : (vk_gpuprof_timestamp){0};
-            count_timestamp(slot, 2 * i, start, result); count_timestamp(slot, 2 * i + 1, end, result);
+            completed.observed_passes++; completed.sampled_passes += r->selected;
+            completed.timestamp_count += r->timestamp_count;
+            if (!r->selected) { ingest_record(r, 0, 0, 0); continue; }
+            uint32_t query = r->timestamp_q1 - 1;
+            vk_gpuprof_timestamp start = query_readable(result) ? slot->ticks[query] : (vk_gpuprof_timestamp){0};
+            vk_gpuprof_timestamp end = query_readable(result) ? slot->ticks[query + 1] : (vk_gpuprof_timestamp){0};
+            count_timestamp(slot, query, start, result); count_timestamp(slot, query + 1, end, result);
             vk_gpuprof_interval pass_time = vk_gpuprof_interval_check(start, end, slot->domain, slot->domain);
-            check_interval(slot, 2 * i + 1, pass_time);
-            if (pass_time.status != GP_TIME_OK) { slot_failed = 1; continue; }
-            ingest_record(r, pass_time.ms, r->stats_count && !r->stats_invalid && sr == VK_SUCCESS);
+            check_interval(slot, query + 1, pass_time);
+            if (pass_time.status != GP_TIME_OK) {
+                slot_failed = 1;
+                if (sample_budget) ingest_record(r, 0, 0, 0);
+                continue;
+            }
+            ingest_record(r, pass_time.ms, r->stats_count && !r->stats_invalid && sr == VK_SUCCESS, 1);
         }
         if (slot_failed && !slot_reported) { failed_slots++; slot_reported = 1; }
         if (segment->frame <= slot->sealed) finish_frame();
@@ -773,11 +885,28 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
 static void begin_record(VkCommandBuffer cb, int compute) {
     open_record = NULL; memset(&open_audit, 0, sizeof open_audit);
     if (!current || current->n == GP_RECORDS) { if (current) current->dropped++; audit_overflow++; return; }
+    sampled_frame_begin(cb);
     uint32_t index = current->n++;
     open_record = &current->rec[index]; memset(open_record, 0, sizeof *open_record);
     open_record->frame = frame; open_record->key.compute = (uint32_t)compute;
     open_record->instance = ++frame_instance; open_cb = cb;
-    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, index * 2);
+    int selected = !sample_budget;
+    if (sample_budget && sample_selected < sample_budget) {
+        /* Prior frame count bounds an online schedule without buffering GPU
+           recording. Stable layouts cover all ordinals in ceil(N/k) frames;
+           changing layouts retain explicit observed/sample coverage. */
+        uint32_t count = sample_previous_passes ? sample_previous_passes : sample_budget;
+        uint32_t offset = (uint32_t)(sample_cursor % count);
+        uint32_t ordinal = open_record->instance - 1;
+        selected = ordinal < count && (ordinal + count - offset) % count < sample_budget;
+    }
+    open_record->selected = selected;
+    if (!selected) return;
+    sample_selected++;
+    uint32_t query = sample_budget ? current->nt++ * 2 : index * 2;
+    open_record->timestamp_q1 = query + 1;
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, query);
+    open_record->timestamp_count = 1;
     if (!compute && stats_on && !secondary_pass && current->ns < GP_RECORDS) {
         open_record->stats_q1 = ++current->ns; open_record->stats_count++;
         current->stats_owner[current->ns - 1] = index;
@@ -840,7 +969,7 @@ void vk_gpuprof_clear(uint32_t mask) {
 }
 void vk_gpuprof_secondary(int enabled) { secondary_pass = enabled; }
 int vk_gpuprof_chunk_query(VkQueryPool *pool, uint32_t *query) {
-    if (!stats_on || !current || !open_record) return 0;
+    if (!stats_on || !current || !open_record || !open_record->selected) return 0;
     if (current->ns == GP_RECORDS) { open_record->stats_invalid = 1; return 0; }
     *pool = current->stats; *query = current->ns++;
     current->stats_owner[*query] = (uint32_t)(open_record - current->rec);
@@ -854,13 +983,14 @@ void vk_gpuprof_end_emit(VkCommandBuffer cb, const vk_gpuprof_end_token *token) 
     if (!token->pool) return;
     if (token->stats_query1) vkCmdEndQuery(cb, token->stats, token->stats_query1 - 1);
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, token->pool, token->timestamp);
+    if (token->timestamp_count) (*token->timestamp_count)++;
 }
 void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpuprof_end_token *token) {
     memset(token, 0, sizeof *token);
     if (!open_record) return;
     open_record->reason = (uint32_t)reason; open_record->detail = detail;
-    *token = (vk_gpuprof_end_token){current->pool, current->stats,
-        (uint32_t)(open_record - current->rec) * 2 + 1, open_record->stats_q1};
+    if (open_record->selected) *token = (vk_gpuprof_end_token){current->pool, current->stats,
+        open_record->timestamp_q1, open_record->stats_q1, &open_record->timestamp_count};
     if (!open_record->key.compute) {
         if (audit_n == audit_cap) { audit_cap = audit_cap ? 2 * audit_cap : 256; audit = realloc(audit, audit_cap * sizeof *audit); if (!audit) DIE("GPU profiler audit allocation"); }
         open_audit.key = open_record->key;
@@ -913,6 +1043,10 @@ static void present_at(VkCommandBuffer cb) {
              audit_load_passes / (double)GP_WINDOW, audit_load_ops / (double)GP_WINDOW,
              audit_store_passes / (double)GP_WINDOW, audit_store_ops / (double)GP_WINDOW, (unsigned long long)audit_overflow);
         audit_load_passes = audit_store_passes = audit_load_ops = audit_store_ops = audit_overflow = 0;
+    }
+    if (sample_budget) {
+        sample_previous_passes = frame_instance;
+        sample_cursor += sample_budget; sample_selected = 0;
     }
     frame++;
     frame_instance = 0;

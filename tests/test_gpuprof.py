@@ -91,6 +91,44 @@ def session_end(**changes):
     return row
 
 
+def sampled_pass(durations=(0.001024, 0.004096), *, observed_count=20, observed_frames=20,
+                 sampled_frames=None, budget=2, stats=False, **changes):
+    histogram = [0] * 272
+    for duration in durations:
+        index = max(0, min(271, math.ceil(math.log2(duration * 1e6) * 8))) if duration else 0
+        histogram[index] += 1
+    count = len(durations)
+    row = pass_row(ordinal=0, count=observed_count, draws=observed_count * 2, gpu_ms=sum(durations),
+                   stats_valid=count if stats else 0, sampling=dict(
+                       budget=budget, observed_count=observed_count, sample_count=count,
+                       observed_frames=observed_frames,
+                       sampled_frames=count if sampled_frames is None else sampled_frames,
+                       histogram=histogram))
+    if stats and count:
+        row.update(stats=counters(count * 6, count * 2, count * 20),
+                   stats_draws=count * 2, stats_gpu_ms=sum(durations))
+    else:
+        row.pop('stats')
+    row.update(changes)
+    return row
+
+
+def sampled_frame(**changes):
+    row = frame(sample_budget=2, observed_passes=4, sampled_passes=1, timestamp_count=4,
+                timing_scope='main-frame')
+    row.update(changes)
+    return row
+
+
+def sampled_window(**changes):
+    row: dict = window(sample_budget=2, observed_passes=20, sample_count=2, timestamp_count=604,
+                       timing_scope='main-frame')
+    row.update(changes)
+    if 'measured_ms' in changes and 'gap_ms' not in changes and row['span_ms'] is not None:
+        row['gap_ms'] = row['span_ms'] - row['measured_ms']
+    return row
+
+
 class Analyzer(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -701,11 +739,214 @@ class Analyzer(unittest.TestCase):
         self.assertIn('"reference_width":64', rendered)
         self.assertIn('"reference_width":128', rendered)
 
+    def test_sampled_interval_merges_histograms_before_mean_and_percentiles(self):
+        first = sampled_pass(durations=(0.001024,), observed_count=30, observed_frames=30)
+        second = sampled_pass(durations=(0.004096,) * 3, observed_count=30, observed_frames=30,
+                              window_start=301, window_end=600)
+        report = self.analyze([sampled_window(measured_ms=first['gpu_ms'], observed_passes=30,
+                                              sample_count=1, timestamp_count=602), first,
+                               sampled_window(window_start=301, window_end=600, measured_ms=second['gpu_ms'],
+                                              observed_passes=30, sample_count=3, timestamp_count=606), second])
+        group = report['passes'][0]
+        self.assertEqual(len(report['passes']), 1, 'default must aggregate the whole input interval')
+        self.assertEqual(group['count'], 60)
+        self.assertEqual(group['sampling']['observed_count'], 60)
+        self.assertEqual(group['sampling']['sample_count'], 4)
+        self.assertEqual(group['sampling']['observed_frames'], 60)
+        self.assertEqual(group['sampling']['sampled_frames'], 4)
+        self.assertEqual(group['sampling']['histogram'][80], 1)
+        self.assertEqual(group['sampling']['histogram'][96], 3)
+        self.assertEqual(sum(group['sampling']['histogram']), 4)
+        self.assertAlmostEqual(group['mean_ms'], (0.001024 + 3 * 0.004096) / 4)
+        for percentile in ('p50_ms', 'p90_ms', 'p99_ms'):
+            self.assertAlmostEqual(group[percentile], 0.004096)
+        self.assertEqual(group['gpu_ms'], first['gpu_ms'] + second['gpu_ms'])
+        self.assertNotEqual(group['gpu_ms'], group['mean_ms'] * group['count'],
+                            'sampled totals must never be extrapolated to all observations')
+        self.assertEqual(report['coverage']['window_sum_mismatches'], 0)
+
+    def test_sampled_thin_warning_uses_interval_not_each_window(self):
+        rows = []
+        for index in range(5):
+            start, end = index * 300 + 1, (index + 1) * 300
+            rows.extend([sampled_window(window_start=start, window_end=end, sample_count=3,
+                                        observed_passes=300, timestamp_count=606, measured_ms=0.003072),
+                         sampled_pass(durations=(0.001024,) * 3, observed_count=300, observed_frames=300,
+                                      window_start=start, window_end=end)])
+        path = self.file('gpuprof-interval.jsonl', rows)
+        report = gpuprof.analyze([path], per_window=True)
+        group = report['passes'][0]
+        self.assertEqual(group['sampling']['sample_count'], 15)
+        self.assertEqual(group['sampling']['sampled_frames'], 15)
+        self.assertAlmostEqual(group['sampling']['frame_coverage'], 0.01)
+        self.assertFalse(group['sampling']['thin'])
+        self.assertFalse(any('thin' in issue.lower() for issue in report['issues']), report['issues'])
+        self.assertEqual(len(report['per_window']), 5)
+        self.assertTrue(all(w['passes'][0]['sampling']['sample_count'] == 3 for w in report['per_window']))
+        result = subprocess.run([sys.executable, str(ROOT / 'tools/bench/gpuprof.py'), str(path),
+                                 '--per-window', '--json', '-'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)['per_window']), 5)
+        for samples, observed in ((0, 300), (9, 300)):
+            with self.subTest(samples=samples, observed=observed):
+                thin = self.analyze([sampled_pass(durations=(0.001024,) * samples,
+                                                 observed_count=observed, observed_frames=observed)])
+                self.assertTrue(thin['passes'][0]['sampling']['thin'])
+                self.assertTrue(any('thin' in issue.lower() for issue in thin['issues']))
+                self.assertEqual(thin['coverage']['malformed_rows'], 0, 'thin coverage is only a warning')
+        threshold = self.analyze([sampled_pass(durations=(0.001024,) * 10,
+                                              observed_count=300, observed_frames=300)])
+        self.assertFalse(threshold['passes'][0]['sampling']['thin'],
+                         '10 sampled frames suffice even when coverage is below 5%')
+
+    def test_sampled_percentiles_expose_bucket_precision_and_sparse_tail_confidence(self):
+        row = sampled_pass(durations=(0.003,))
+        group = self.analyze([row])['passes'][0]
+        upper_bound = 2 ** (math.ceil(math.log2(3000) * 8) / 8) / 1e6
+        self.assertAlmostEqual(group['p99_ms'], upper_bound)
+        self.assertGreaterEqual(group['p99_ms'], 0.003)
+        self.assertLessEqual(group['p99_ms'], 0.003 * 2 ** (1 / 8))
+        self.assertTrue(group['p99_descriptive_only'])
+        for samples, descriptive in ((0, True), (99, True), (100, False)):
+            with self.subTest(samples=samples):
+                report = self.analyze([sampled_pass(durations=(0.001024,) * samples,
+                                                   observed_count=300, observed_frames=300)])
+                self.assertEqual(report['passes'][0]['p99_descriptive_only'], descriptive)
+                self.assertEqual(report['passes'][0]['p99_ms'] is None, samples == 0)
+
+    def test_sampled_zero_sample_keys_keep_observed_metadata_without_fake_times(self):
+        row = sampled_pass(durations=(), observed_count=30, observed_frames=30)
+        report = self.analyze([row])
+        group = report['passes'][0]
+        for field in ('key', 'kind', 'render_width', 'render_height', 'draws', 'count'):
+            self.assertEqual(group[field], row[field])
+        self.assertEqual(group['areas'][0]['attachments'], row['attachments'])
+        for actual, original in zip(group['attachments'], row['attachments']):
+            self.assertEqual(actual, {key: value for key, value in original.items()
+                                      if key not in ('width_num', 'width_den', 'height_num', 'height_den')})
+        for field in ('reference_width', 'reference_height', 'scene_relative'):
+            self.assertEqual(group['areas'][0][field], row[field])
+        self.assertEqual(group['gpu_ms'], 0)
+        self.assertEqual(group['sampling']['sample_count'], 0)
+        self.assertEqual(sum(group['sampling']['histogram']), 0)
+        self.assertIsNone(group['stats'])
+        for field in ('mean_ms', 'p50_ms', 'p90_ms', 'p99_ms', 'ns_per_draw'):
+            self.assertIsNone(group[field], field)
+
+    def test_sampled_statistics_use_only_matched_sample_draws_and_duration(self):
+        row = sampled_pass(stats=True)
+        group = self.analyze([row])['passes'][0]
+        self.assertEqual(group['count'], 20)
+        self.assertEqual(group['draws'], 40)
+        self.assertEqual(group['stats_valid'], 2)
+        self.assertEqual(group['ratio_draws'], 4)
+        self.assertEqual(group['ratio_gpu_ms'], row['gpu_ms'])
+        self.assertEqual(group['ratios']['verts_per_draw'], 3)
+        self.assertAlmostEqual(group['ratios']['ns_per_vertex'], row['gpu_ms'] * 1e6 / 12)
+        self.assertAlmostEqual(group['ns_per_draw'], row['gpu_ms'] * 1e6 / 4)
+
+    def test_sampled_histograms_and_coverage_are_strictly_validated(self):
+        valid = sampled_pass()
+        malformed = [
+            {'budget': value} for value in (0, 17, True, 1.5, '2')
+        ] + [
+            {'observed_count': 21}, {'sample_count': 21}, {'sample_count': True},
+            {'observed_frames': 301}, {'observed_frames': 21}, {'sampled_frames': 3},
+            {'sampled_frames': True}, {'sampled_frames': -1}, {'sampled_frames': 0},
+            {'histogram': [0] * 271}, {'histogram': [0] * 273}, {'histogram': [0] * 272},
+            {'histogram': [-1, 3] + [0] * 270}, {'histogram': [True, 1] + [0] * 270},
+            {'histogram': [1.0, 1] + [0] * 270},
+        ]
+        for changes in malformed:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                gpuprof.validate({**valid, 'sampling': {**valid['sampling'], **changes}})
+        for field in valid['sampling']:
+            sampling = dict(valid['sampling']); del sampling[field]
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                gpuprof.validate({**valid, 'sampling': sampling})
+        for row in (sampled_pass(durations=(), gpu_ms=1), sampled_pass(stats_valid=3),
+                    sampled_pass(type='long_frame', frame=1, ordinal=1),
+                    {**valid, 'sampling': None}):
+            with self.subTest(row=row), self.assertRaises(ValueError):
+                gpuprof.validate(row)
+        self.assertIs(gpuprof.validate(valid), valid)
+
+    def test_sampled_timestamp_count_is_actual_per_frame_and_bounded(self):
+        for budget in (1, 2):
+            for samples in range(budget + 1):
+                row = sampled_frame()
+                row.update(sample_budget=budget, sampled_passes=samples, timestamp_count=2 * samples + 2)
+                with self.subTest(budget=budget, samples=samples):
+                    self.assertIs(gpuprof.validate(row), row)
+            invalid = sampled_frame()
+            invalid.update(sample_budget=budget, sampled_passes=budget + 1, timestamp_count=2 * budget + 4)
+            with self.assertRaises(ValueError):
+                gpuprof.validate(invalid)
+        for changes in ({'timestamp_count': 1}, {'timestamp_count': 7}, {'timestamp_count': True},
+                        {'observed_passes': 0}, {'sampled_passes': -1}, {'timing_scope': 'pre-main-slot'}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                gpuprof.validate({**sampled_frame(), **changes})
+        for field in ('sample_budget', 'timestamp_count', 'observed_passes', 'sampled_passes', 'timing_scope'):
+            row = sampled_frame(); del row[field]
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                gpuprof.validate(row)
+        report = self.analyze([sampled_frame(), sampled_frame(frame=2, timestamp_count=6)])
+        self.assertEqual(report['timing']['frame']['timestamp_count'], 10)
+        self.assertEqual(report['timing']['frame']['timestamp_count_min'], 4)
+        self.assertEqual(report['timing']['frame']['timestamp_count_max'], 6)
+        for changes in ({'timestamp_count': 599}, {'timestamp_count': 1801},
+                        {'sample_count': 21}, {'sample_budget': 17}, {'timing_scope': 'pre-main-slot'}):
+            with self.subTest(window_changes=changes), self.assertRaises(ValueError):
+                gpuprof.validate({**sampled_window(), **changes})
+
+    def test_sampled_family_histograms_merge_without_fabricating_exact_frame_union(self):
+        rows = [sampled_pass(durations=(duration,) * 15, observed_count=30, observed_frames=30, key=key)
+                for key, duration in (('a', 0.001024), ('b', 0.004096))]
+        group = self.analyze(rows)['families'][0]
+        sampling = group['sampling']
+        self.assertEqual(sampling['sample_count'], 30)
+        self.assertEqual(sampling['observed_count'], 60)
+        self.assertEqual(sampling['histogram'][80], 15)
+        self.assertEqual(sampling['histogram'][96], 15)
+        self.assertEqual(sampling['observed_frames_bounds'], [30, 60])
+        self.assertEqual(sampling['sampled_frames_bounds'], [15, 30])
+        self.assertIsNone(sampling['observed_frames'])
+        self.assertIsNone(sampling['sampled_frames'])
+        self.assertAlmostEqual(group['mean_ms'], 0.00256)
+        self.assertAlmostEqual(group['p50_ms'], 0.001024)
+        self.assertAlmostEqual(group['p90_ms'], 0.004096)
+
+    def test_sampled_negative_residual_does_not_falsely_reject_main_frame_span(self):
+        report = self.analyze([sampled_frame(span_ms=2, measured_ms=3, gap_ms=-1),
+                               sampled_window(span_ms=2, measured_ms=3, gap_ms=-1)])
+        self.assertEqual(report['coverage']['invalid_frame_spans'], 0)
+        self.assertEqual(report['coverage']['invalid_window_spans'], 0)
+        self.assertEqual(report['timing']['frame']['gap_ms'], -1)
+        full = self.analyze([frame(span_ms=2, measured_ms=3, gap_ms=-1)])
+        self.assertEqual(full['coverage']['invalid_frame_spans'], 1)
+
+    def test_sampled_incomplete_pass_sum_does_not_disable_span_authority(self):
+        report = self.analyze([sampled_window(measured_ms=9), sampled_pass(),
+                               sampled_frame(span_valid=False, span_ms=None, gap_ms=None,
+                                             span_reason='unavailable-timestamp', unavailable_timestamps=1)])
+        self.assertEqual(report['coverage']['window_sum_mismatches'], 0,
+                         'sampled rows are not a complete whole-pass accounting')
+        self.assertEqual(report['coverage']['invalid_frame_spans'], 1)
+        self.assertEqual(report['coverage']['invalid_window_spans'], 1)
+        self.assertIsNone(report['timing']['frame']['span_ms'])
+
+    def test_full_mode_schema_and_ratios_remain_unchanged(self):
+        report = self.analyze([window(), pass_row(), frame()])
+        for field in ('sampling', 'mean_ms', 'p50_ms', 'p90_ms', 'p99_ms'):
+            self.assertNotIn(field, report['passes'][0])
+        self.assertEqual(report['passes'][0]['ns_per_draw'], 1e6)
+        self.assertEqual(report['coverage']['window_sum_mismatches'], 0)
+
 
 @unittest.skipUnless(os.environ.get('GPUPROF_TEST_BIN'), 'set GPUPROF_TEST_BIN to run the real Vulkan fixture')
 class Lavapipe(unittest.TestCase):
     def launch(self, mode, workers, stats, *, unsupported=False, rotate=False, areas=False, ordinals=None,
-               unavailable_span=False):
+               unavailable_span=False, sampling=False, sample_budget=None):
         binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
         self.assertTrue(binary.is_file(), f'no fixture binary: {binary}')
         seed = Path(os.environ.get('TOTK_SHADER_SEED_DIR', binary.parent / 'vkdraw-seed')).resolve()
@@ -722,13 +963,17 @@ class Lavapipe(unittest.TestCase):
                         'TOTK_FRAME_LAG', 'TOTK_VK_LAG_CAPTURE'):
                 env.pop(key, None)
             env.pop('TOTK_VK_GPU_PROFILE_ORDINALS', None)
+            env.pop('TOTK_VK_GPU_PROFILE_SAMPLE', None)
+            if sample_budget is not None:
+                env['TOTK_VK_GPU_PROFILE_SAMPLE'] = str(sample_budget)
             if ordinals is not None:
                 env['TOTK_VK_GPU_PROFILE_ORDINALS'] = str(ordinals)
             if not rotate:
                 env.pop('TOTK_VK_GPU_PROFILE_MAX_BYTES', None)  # exercise the actual 128 MiB default
             if unsupported:
                 env['GPUPROF_TEST_UNSUPPORTED'] = '1'
-            arguments = ['--unavailable-span'] if unavailable_span else ['--areas'] if areas else ['--frames', '302']
+            arguments = (['--unavailable-span'] if unavailable_span else ['--areas'] if areas else
+                         ['--sampling'] if sampling else ['--frames', '302'])
             result = subprocess.run([str(binary), *arguments], cwd=temporary, env=env,
                                     capture_output=True, text=True, timeout=180)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -751,12 +996,16 @@ class Lavapipe(unittest.TestCase):
             self.assertEqual(report['coverage']['streams_without_end'], 0)
             self.assertIsNone(report['sessions'][0]['all_queries_retired'])
             report['_fixture_output_bytes'] = sum(path.stat().st_size for path in paths)
+            report['_fixture_rows'] = [o['row'] for o in observations]
             for path in paths:
                 first = json.loads(path.read_text(encoding='utf-8').splitlines()[0])
                 self.assertEqual(first['type'], 'header', 'every rotated file must carry its launch identity')
                 self.assertEqual(first['ordinals'], bool(ordinals))
                 self.assertEqual(first['max_bytes'], 4096 if rotate else 134217728)
                 self.assertEqual(first['span_limit_ms'], 10000)
+                if sample_budget:
+                    self.assertEqual(first['sample_budget'], sample_budget)
+                    self.assertEqual(first['env']['TOTK_VK_GPU_PROFILE_SAMPLE'], str(sample_budget))
             if mode == 2:
                 raw_ordinals = re.findall(r'\[gpu-split\] frame=\d+ ordinal=(\d+)', result.stderr)
                 self.assertTrue(raw_ordinals)
@@ -812,6 +1061,10 @@ class Lavapipe(unittest.TestCase):
                 self.assertLess(report['coverage']['frame_rows'], frames, 'bounded rotation must discard old rows')
                 self.assertGreater(report['coverage']['rotation_evictions'], 0)
                 return report
+            if sample_budget:
+                self.check_sampling(report, observations, frames, passes, draws, sample_budget,
+                                    bool(enabled), mode)
+                return report
             self.assertEqual(report['coverage']['frame_rows'], frames)
             self.assertEqual(report['coverage']['windows'], 2)
             self.assertEqual(report['coverage']['window_sum_mismatches'], 0, report['issues'])
@@ -862,6 +1115,139 @@ class Lavapipe(unittest.TestCase):
             else:
                 self.assertEqual(report['coverage']['long_frames'], 0)
             return report
+
+    def check_sampling(self, report, observations, frames, passes, draws, budget, stats_enabled, mode):
+        rows = [o['row'] for o in observations]
+        frame_rows = [r for r in rows if r['type'] == 'frame']
+        pass_rows = [r for r in rows if r['type'] == 'pass']
+        windows = [r for r in rows if r['type'] == 'window']
+        self.assertEqual(len(frame_rows), frames)
+        self.assertEqual(len(windows), 2)
+        for field in ('missing_frame_ids', 'reconciliation_failures', 'dropped', 'failed_slots',
+                      'invalid_frame_spans', 'invalid_window_spans', 'window_sum_mismatches'):
+            self.assertEqual(report['coverage'][field], 0, (field, report['issues']))
+        renders = [r for r in pass_rows if r['kind'] == 'render']
+        self.assertEqual(sum(r['count'] for r in renders), passes)
+        self.assertEqual(sum(r['draws'] for r in renders), draws)
+        self.assertEqual({(r['render_width'], r['render_height']) for r in renders}, {(64, 64), (128, 128)})
+        self.assertTrue(any(r['kind'] == 'upload' for r in pass_rows),
+                        'even a rare unsampled pre upload must retain metadata')
+        self.assertTrue(any(r['sampling']['sample_count'] < r['count'] for r in renders))
+        # Per-ordinal diagnostics may expose one-off positions (for example an
+        # initial upload shifts the first frame). Rotation covers stable keys,
+        # not every transient ordinal/key pairing from a frame already gone.
+        sampled_keys = {g['key'] for g in report['passes'] if g['sampling']['sample_count']}
+        for group in report['passes']:
+            if group['kind'] in ('render', 'transfer') and group['sampling']['observed_frames'] >= 10:
+                self.assertIn(group['key'], sampled_keys, 'rotation must eventually time every stable observed key')
+        for row in frame_rows:
+            self.assertEqual(row['sample_budget'], budget)
+            self.assertEqual(row['timing_scope'], 'main-frame')
+            self.assertIs(type(row['timestamp_count']), int)
+            self.assertGreaterEqual(row['timestamp_count'], 2, 'whole main frame always has its own pair')
+            self.assertLessEqual(row['timestamp_count'], 2 * budget + 2)
+            self.assertLessEqual(row['sampled_passes'], budget)
+            self.assertLessEqual(row['sampled_passes'], row['observed_passes'])
+            self.assertEqual(row['timestamp_count'], 2 * row['sampled_passes'] + 2,
+                             'real completed fixture counts commands written, not query-pool capacity')
+            self.assertTrue(row['span_valid'])
+            self.assertFalse(row['reconciliation_failed'])
+            self.assertGreater(row['span_ms'], 0)
+            self.assertEqual((row['scene_width'], row['scene_height']), (0, 0))
+            mask = (1 << row['timestamp_bits']) - 1
+            ticks = (row['last_tick'] - row['first_tick']) & mask
+            self.assertAlmostEqual(row['span_ms'], ticks * row['timestamp_period'] / 1e6, delta=0.000002)
+        for row in windows:
+            members = [r for r in frame_rows if row['window_start'] <= r['frame'] <= row['window_end']]
+            aggregates = [r for r in pass_rows if r['window_start'] == row['window_start']]
+            self.assertEqual(row['sample_budget'], budget)
+            self.assertEqual(row['timestamp_count'], sum(r['timestamp_count'] for r in members))
+            self.assertEqual(row['observed_passes'], sum(r['observed_passes'] for r in members))
+            self.assertEqual(row['observed_passes'], sum(r['count'] for r in aggregates))
+            self.assertEqual(row['sample_count'], sum(r['sampling']['sample_count'] for r in aggregates))
+        for row in rows:
+            if row['type'] not in ('pass', 'long_frame'):
+                continue
+            coverage = row['sampling']
+            self.assertEqual(coverage['budget'], budget)
+            self.assertEqual(coverage['observed_count'], row['count'])
+            self.assertLessEqual(coverage['sample_count'], row['count'])
+            self.assertLessEqual(coverage['sampled_frames'], coverage['observed_frames'])
+            self.assertEqual(len(coverage['histogram']), 272)
+            self.assertEqual(sum(coverage['histogram']), coverage['sample_count'])
+            self.assertLessEqual(row['stats_valid'], coverage['sample_count'])
+            self.assertEqual('stats' in row, bool(row['stats_valid']))
+            if not coverage['sample_count']:
+                self.assertEqual(row['gpu_ms'], 0)
+                self.assertEqual(row['stats_valid'], 0)
+            available = stats_enabled and row['kind'] == 'render'
+            self.assertEqual(row['stats_valid'], coverage['sample_count'] if available else 0)
+            if row['stats_valid']:
+                self.assertLessEqual(row['stats_draws'], row['draws'])
+                self.assertEqual(row['stats']['ia_vertices'], row['stats_draws'] * 3)
+                self.assertEqual(row['stats']['ia_primitives'], row['stats_draws'])
+                self.assertAlmostEqual(row['stats_gpu_ms'], row['gpu_ms'], delta=0.000002)
+            if row['type'] == 'long_frame':
+                self.assertEqual(row['count'], 1)
+                self.assertIn(coverage['sample_count'], (0, 1))
+                self.assertGreater(row['ordinal'], 0)
+        self.assertEqual(report['coverage']['stats_missing'],
+                         sum(r['sampling']['sample_count'] - r['stats_valid'] for r in pass_rows))
+        self.assertEqual(report['timing']['frame']['timestamp_count'], sum(r['timestamp_count'] for r in frame_rows))
+        self.assertEqual(report['timing']['frame']['timestamp_count_max'], max(r['timestamp_count'] for r in frame_rows))
+        self.assertEqual(report['coverage']['long_frames'], frames if mode == 3 else 0)
+        if mode == 3:
+            self.assertTrue(any(r['type'] == 'long_frame' and r['kind'] == 'render' and
+                                r['sampling']['sample_count'] == 0 for r in rows),
+                            'raw frames must expose untimed render metadata, never drop those passes')
+
+    def test_sampled_budgets_workers_statistics_and_whole_main_frame_authority(self):
+        fields = ('key', 'kind', 'count', 'draws', 'window_start', 'window_end', 'ordinal',
+                  'render_width', 'render_height', 'reference_width', 'reference_height',
+                  'scene_relative', 'shader', 'samples', 'attachments')
+        def metadata(report):
+            return {json.dumps({key: row[key] for key in fields}, sort_keys=True)
+                    for row in report['_fixture_rows'] if row['type'] == 'pass'}
+        for workers in (0, 2):
+            for stats in (0, 1):
+                full = self.launch(3, workers, stats, sampling=True)
+                reference = metadata(full)
+                # Ignore only the final pre-upload frames: full mode includes pre;
+                # sampling explicitly promises main-frame authority, not pre.
+                full_frames = [r for r in full['_fixture_rows'] if r['type'] == 'frame' and r['frame'] <= 302]
+                for budget in (1, 2):
+                    with self.subTest(budget=budget, workers=workers, stats=stats):
+                        report = self.launch(3, workers, stats, sampling=True, sample_budget=budget)
+                        observed = metadata(report)
+                        self.assertEqual(observed, reference, 'sampling cannot change observed pass identity or counts')
+                        sampled_frames = [r for r in report['_fixture_rows']
+                                          if r['type'] == 'frame' and r['frame'] <= 302]
+                        self.assertEqual([r['frame'] for r in sampled_frames], [r['frame'] for r in full_frames])
+                        self.assertEqual({(r['timestamp_bits'], r['timestamp_period'], r['queue_family'])
+                                          for r in sampled_frames},
+                                         {(r['timestamp_bits'], r['timestamp_period'], r['queue_family'])
+                                          for r in full_frames})
+                        full_mean = sum(r['span_ms'] for r in full_frames) / len(full_frames)
+                        sampled_mean = sum(r['span_ms'] for r in sampled_frames) / len(sampled_frames)
+                        self.assertGreater(full_mean, 0)
+                        self.assertGreater(sampled_mean, 0)
+                        self.assertAlmostEqual(sampled_mean, full_mean, delta=max(0.25, full_mean * 2),
+                                               msg='lavapipe authority/extent comparison, not identical GPU durations')
+
+    def test_explicit_zero_sampling_keeps_full_mode_and_sampled_options(self):
+        absent = self.launch(1, 2, 1, sampling=True)
+        zero = self.launch(1, 2, 1, sampling=True, sample_budget=0)
+        for report in (absent, zero):
+            self.assertTrue(all('sampling' not in r for r in report['_fixture_rows']
+                                if r['type'] in ('pass', 'long_frame')))
+        def counts(report):
+            return sorted((g['key'], g['count'], g['draws'], g['stats']) for g in report['passes'])
+        self.assertEqual(counts(absent), counts(zero))
+        self.launch(0, 2, 1, sampling=True, sample_budget=2)
+        for mode, ordinal_mode, unsupported in ((1, None, False), (2, 1, False), (1, None, True)):
+            with self.subTest(mode=mode, ordinals=ordinal_mode, unsupported=unsupported):
+                self.launch(mode, 2, 1, sampling=True, sample_budget=2, ordinals=ordinal_mode,
+                            unsupported=unsupported)
 
     def check_areas(self, report, observations, stdout, stats_enabled):
         self.assertIn('gpuprof-areas frames=3 passes=11 draws=0 exact_keys=6 families=5 transfers=17', stdout)
@@ -939,7 +1325,8 @@ class Lavapipe(unittest.TestCase):
             if row['stats_valid']:
                 self.assertTrue(all(row['stats'][key] == 0 for key in gpuprof.STATS))
         self.assertEqual(report['coverage']['stats_missing'],
-                         sum(o['row']['count'] - o['row']['stats_valid']
+                         sum(o['row'].get('sampling', {}).get('sample_count', o['row']['count']) -
+                             o['row']['stats_valid']
                              for o in observations if o['row']['type'] == 'pass'))
 
     def test_scene_areas_prepasses_and_fixed_depth_families(self):
@@ -955,6 +1342,27 @@ class Lavapipe(unittest.TestCase):
                             if reference is None:
                                 reference = keys
                             self.assertEqual(keys, reference)
+
+    def test_sampled_scene_reference_includes_unselected_mrt_and_depth_metadata(self):
+        for budget in (1, 2):
+            for workers in (0, 2):
+                for stats in (0, 1):
+                    with self.subTest(budget=budget, workers=workers, stats=stats):
+                        # The existing real --areas scenario observes its largest
+                        # scene even when ordinal rotation does not time that MRT.
+                        report = self.launch(1, workers, stats, areas=True, sample_budget=budget)
+                        rows = report['_fixture_rows']
+                        for row in rows:
+                            if row['type'] == 'frame':
+                                self.assertEqual(row['timing_scope'], 'main-frame')
+                                self.assertGreaterEqual(row['timestamp_count'], 2)
+                                self.assertLessEqual(row['timestamp_count'], 2 * budget + 2)
+                                self.assertLessEqual(row['sampled_passes'], budget)
+                            elif row['type'] == 'pass':
+                                self.assertLessEqual(row['stats_valid'], row['sampling']['sample_count'])
+                        self.assertTrue(any(row['type'] == 'pass' and row['kind'] == 'render' and
+                                            not row['sampling']['sample_count'] for row in rows),
+                                        'short scene/reference changes must retain unsampled render metadata')
 
     def test_modes_workers_statistics_and_stable_keys(self):
         reference = None

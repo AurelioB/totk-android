@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Analyze schema-3 GPU-profiler JSONL (host only, Python standard library).
 
-Pass gpu_ms and counters are window SUMS, not per-frame averages. Scene-relative
+Pass gpu_ms and counters are window SUMS, not per-frame averages. Sampled gpu_ms
+contains measured samples only, never an extrapolated total. Scene-relative
 families use exact scene ratios; other families retain absolute attachment areas.
 Long-frame rows are a separate, selected population and never added to windows.
 """
@@ -24,6 +25,8 @@ REFERENCE = ('reference_width', 'reference_height', 'scene_relative')
 UINT32_MAX = (1 << 32) - 1
 WINDOW_FRAMES = 300
 SPAN_LIMIT_MS = 10000
+HISTOGRAM_BUCKETS = 272
+MAX_SAMPLE_BUDGET = 16
 RATIOS = ('verts_per_draw', 'prims_per_draw', 'fragments_per_prim', 'ns_per_vertex', 'ns_per_primitive')
 
 
@@ -49,6 +52,60 @@ def dimensions(row, prefix, minimum=0):
     return width, height
 
 
+def sample_budget(row, key='sample_budget', minimum=1):
+    budget = number(row, key, True, minimum)
+    if budget > MAX_SAMPLE_BUDGET:
+        raise ValueError(f'{key}: exceeds {MAX_SAMPLE_BUDGET}')
+    return budget
+
+
+def validate_sampling(row):
+    sampling = row['sampling']
+    if not isinstance(sampling, dict):
+        raise ValueError('sampling: expected object')
+    sample_budget(sampling, 'budget')
+    observed = number(sampling, 'observed_count', True, 1)
+    sampled = number(sampling, 'sample_count', True)
+    observed_frames = number(sampling, 'observed_frames', True, 1)
+    sampled_frames = number(sampling, 'sampled_frames', True)
+    frames = 1 if row['type'] == 'long_frame' else row['window_end'] - row['window_start'] + 1
+    if observed != row['count'] or sampled > observed:
+        raise ValueError('sampling: observed_count must equal count and sample_count must not exceed it')
+    if not sampled_frames <= observed_frames <= frames:
+        raise ValueError('sampling: invalid observed/sampled frame coverage')
+    if observed_frames > observed or sampled_frames > sampled or bool(sampled_frames) != bool(sampled):
+        raise ValueError('sampling: frame coverage differs from observed/sample counts')
+    if sampled > sampling['budget'] * sampled_frames:
+        raise ValueError('sampling: sample_count exceeds budget per sampled frame')
+    if row['type'] == 'long_frame' and (observed != 1 or sampled > 1):
+        raise ValueError('sampling: long_frame requires count=1 and sample_count=0 or 1')
+    if not sampled and row['gpu_ms'] != 0:
+        raise ValueError('sampling: unsampled rows require gpu_ms=0')
+    if row['stats_valid'] > sampled:
+        raise ValueError('sampling: stats_valid exceeds sample_count')
+    histogram = sampling.get('histogram')
+    if not isinstance(histogram, list) or len(histogram) != HISTOGRAM_BUCKETS:
+        raise ValueError(f'sampling: histogram requires {HISTOGRAM_BUCKETS} buckets')
+    if any(type(count) is not int or count < 0 for count in histogram):
+        raise ValueError('sampling: histogram counts must be nonnegative integers')
+    if sum(histogram) != sampled:
+        raise ValueError('sampling: histogram sum differs from sample_count')
+
+
+def validate_sampled_timing(row):
+    budget = sample_budget(row)
+    frames = 1 if row['type'] == 'frame' else row.get(
+        'frames', row['window_end'] - row['window_start'] + 1)
+    observed = number(row, 'observed_passes', True)
+    sampled = number(row, 'sampled_passes' if row['type'] == 'frame' else 'sample_count', True)
+    if sampled > min(observed, budget * frames):
+        raise ValueError('sample count exceeds observed passes or frame budget')
+    if not 2 * frames <= number(row, 'timestamp_count', True) <= (2 * budget + 2) * frames:
+        raise ValueError('timestamp_count outside whole-frame/sample timestamp budget')
+    if row.get('timing_scope') != 'main-frame':
+        raise ValueError('sampled timing requires timing_scope=main-frame')
+
+
 def validate(row):
     """Reject malformed v3 rows; preserve additive producer metadata verbatim."""
     if not isinstance(row, dict) or type(row.get('schema')) is not int or row['schema'] != 3:
@@ -66,6 +123,8 @@ def validate(row):
         number(row, 'span_limit_ms', minimum=1)
         if not isinstance(row.get('driver'), dict) or not isinstance(row.get('env'), dict):
             raise ValueError('header requires driver and env objects')
+        if 'sample_budget' in row:
+            sample_budget(row, minimum=0)
         return row
     if kind == 'session_end':
         if not isinstance(row.get('launch_id'), str) or not row['launch_id']:
@@ -115,6 +174,9 @@ def validate(row):
         for key in ('partial', 'reconciliation_failed', 'ordinals'):
             if key in row and not isinstance(row[key], bool):
                 raise ValueError(f'{key}: expected boolean')
+        budget = sample_budget(row, minimum=0) if 'sample_budget' in row else 0
+        if budget or any(key in row for key in ('observed_passes', 'sampled_passes', 'sample_count')):
+            validate_sampled_timing(row)
     else:
         for key in ('key', 'shader', 'kind'):
             if not isinstance(row.get(key), str) or not row[key]:
@@ -175,6 +237,8 @@ def validate(row):
                     raise ValueError(f'{axis}: expected reduced rational with positive denominator')
                 if n * row[f'reference_{axis}'] != attachment[axis] * d:
                     raise ValueError(f'{axis}: rational differs from attachment/reference dimensions')
+        if 'sampling' in row:
+            validate_sampling(row)
     return row
 
 
@@ -264,7 +328,30 @@ def load(paths, legacy_span_replay=False):
                         conflicts.add(ident)
                 else:
                     observations[ident] = {'stream': stream, 'source': where, 'row': row}
-    return list(observations.values()), counts, issues
+    # Rotations can begin with data rows, so apply launch-mode consistency only
+    # after collecting the entire stream. A missing header is censored, not fatal.
+    declared, inferred = {}, {}
+    for observation in observations.values():
+        row, stream = observation['row'], observation['stream']
+        if row['type'] == 'header':
+            declared.setdefault(stream, set()).add(row.get('sample_budget', 0))
+        elif row.get('sample_budget') or 'sampling' in row:
+            inferred.setdefault(stream, set()).add(
+                row.get('sample_budget', row.get('sampling', {}).get('budget')))
+    accepted = []
+    for observation in observations.values():
+        row, stream = observation['row'], observation['stream']
+        budgets = declared.get(stream, inferred.get(stream, set()))
+        if row['type'] in ('pass', 'long_frame', 'frame', 'window') and len(budgets) == 1:
+            expected = next(iter(budgets))
+            actual = row.get('sampling', {}).get('budget', 0) if row['type'] in (
+                'pass', 'long_frame') else row.get('sample_budget', 0)
+            if actual != expected:
+                counts['malformed_rows'] += 1
+                issues.append(f'{observation["source"]}: malformed row: sampling budget/mode differs from stream')
+                continue
+        accepted.append(observation)
+    return accepted, counts, issues
 
 
 def absolute_area(row):
@@ -289,12 +376,78 @@ def ratio(numerator, denominator):
     return numerator / denominator if denominator else None
 
 
-def aggregate(rows, per_family=False):
+def frame_coverage(contexts):
+    """Bound distinct-frame unions; aggregate counts do not identify frame IDs."""
+    streams = {}
+    for (stream, start, end), coverage in contexts.items():
+        observed = [counts[0] for counts in coverage]
+        sampled = [counts[1] for counts in coverage]
+        extent = end - start + 1
+        streams.setdefault(stream, []).append((
+            start, end, max(observed), min(extent, sum(observed)),
+            max(sampled), min(extent, sum(sampled))))
+    bounds = [0, 0, 0, 0]
+    for intervals in streams.values():
+        component = None
+        for start, end, *counts in sorted(intervals):
+            if component is None or start > component[1]:
+                if component is not None:
+                    for index, count in enumerate(component[2:]):
+                        bounds[index] += count
+                component = [start, end, *counts]
+            else:
+                component[1] = max(component[1], end)
+                extent = component[1] - component[0] + 1
+                component[2] = max(component[2], counts[0])
+                component[3] = min(extent, component[3] + counts[1])
+                component[4] = max(component[4], counts[2])
+                component[5] = min(extent, component[5] + counts[3])
+        if component is not None:
+            for index, count in enumerate(component[2:]):
+                bounds[index] += count
+    observed_low, observed_high, sampled_low, sampled_high = bounds
+    sampled_high = min(sampled_high, observed_high)
+    coverage_low = ratio(sampled_low, observed_high)
+    coverage_high = min(1.0, sampled_high / observed_low) if observed_low else None
+    thin = sampled_high < 10
+    sufficient = sampled_low >= 10
+    return dict(
+        observed_frames=observed_low if observed_low == observed_high else None,
+        sampled_frames=sampled_low if sampled_low == sampled_high else None,
+        observed_frames_bounds=[observed_low, observed_high],
+        sampled_frames_bounds=[sampled_low, sampled_high],
+        frame_coverage=coverage_low if coverage_low == coverage_high else None,
+        frame_coverage_bounds=[coverage_low, coverage_high],
+        thin=True if thin else False if sufficient else None,
+        coverage_status='thin' if thin else 'sufficient' if sufficient else 'uncertain')
+
+
+def sample_percentile(histogram, percent):
+    count = sum(histogram)
+    if not count:
+        return None
+    rank = (count * percent + 99) // 100
+    cumulative = 0
+    for index, frequency in enumerate(histogram):
+        cumulative += frequency
+        if cumulative >= rank:
+            return 2 ** (index / 8) / 1e6
+
+
+def sampling_context(row, stream=''):
+    if row['type'] == 'long_frame':
+        return stream, row['frame'], row['frame']
+    return stream, row['window_start'], row['window_end']
+
+
+def aggregate(rows, per_family=False, contexts=None):
     groups = {}
-    for row in rows:
+    for index, row in enumerate(rows):
+        context = (contexts[index] if contexts is not None else sampling_context(row)) if 'sampling' in row else None
         absolute = absolute_area(row)
-        ident = family(row) if per_family else (
-            row['key'], row['ordinal'], row['kind'], row['samples'], absolute, row['shader'])
+        ident = (family(row) if per_family else (
+            row['key'], row['ordinal'], row['kind'], row['samples'], absolute, row['shader']))
+        ident = ident, 'sampling' in row
         if ident not in groups:
             groups[ident] = dict(kind=row['kind'], samples=row['samples'], areas={},
                                  keys=set(), ordinals=set(), shaders=set(), rows=0, count=0, draws=0,
@@ -307,6 +460,10 @@ def aggregate(rows, per_family=False):
                 groups[ident].update(render_width=row['render_width'], render_height=row['render_height'],
                                      attachments=[{k: a[k] for k in ATTACHMENT}
                                                   for a in sorted(row['attachments'], key=lambda a: a['slot'])])
+            if 'sampling' in row:
+                groups[ident]['sampling'] = dict(
+                    budgets=set(), observed_count=0, sample_count=0,
+                    histogram=[0] * HISTOGRAM_BUCKETS, contexts={})
         group = groups[ident]
         variant = (absolute, *(row[k] for k in REFERENCE))
         if variant not in group['areas']:
@@ -321,7 +478,18 @@ def aggregate(rows, per_family=False):
         group['rows'] += 1
         for key in ('count', 'draws', 'gpu_ms', 'stats_valid'):
             group[key] += row[key]
-        group['stats_missing'] += row['count'] - row['stats_valid']
+        expected_stats = row.get('sampling', {}).get('sample_count', row['count'])
+        group['stats_missing'] += expected_stats - row['stats_valid']
+        if 'sampling' in row:
+            sampling = group['sampling']
+            source = row['sampling']
+            sampling['budgets'].add(source['budget'])
+            for key in ('observed_count', 'sample_count'):
+                sampling[key] += source[key]
+            for index, count in enumerate(source['histogram']):
+                sampling['histogram'][index] += count
+            sampling['contexts'].setdefault(context, []).append(
+                (source['observed_frames'], source['sampled_frames']))
         if row['stats_valid']:
             for key in STATS:
                 group['stats'][key] += row['stats'][key]
@@ -330,7 +498,7 @@ def aggregate(rows, per_family=False):
                 group['ratio_gpu_ms'] += row.get('stats_gpu_ms', row['gpu_ms'])
                 for key in STATS:
                     group['ratio_stats'][key] += row['stats'][key]
-            if row['stats_valid'] < row['count']:
+            if row['stats_valid'] < expected_stats:
                 group['stats_partial_rows'] += 1
     result = []
     for group in groups.values():
@@ -343,6 +511,17 @@ def aggregate(rows, per_family=False):
                 group['keys'][0], group['ordinals'][0], group['shaders'][0])
         group['draws_per_pass'] = ratio(group['draws'], group['count'])
         group['ns_per_draw'] = ratio(group['gpu_ms'] * 1e6, group['draws'])
+        if 'sampling' in group:
+            sampling = group['sampling']
+            sampling['budgets'] = sorted(sampling['budgets'])
+            sampling['budget'] = sampling['budgets'][0] if len(sampling['budgets']) == 1 else None
+            sampling.update(frame_coverage(sampling.pop('contexts')))
+            group['mean_ms'] = ratio(group['gpu_ms'], sampling['sample_count'])
+            for percent in (50, 90, 99):
+                group[f'p{percent}_ms'] = sample_percentile(sampling['histogram'], percent)
+            group['p99_descriptive_only'] = sampling['sample_count'] < 100
+            group['ns_per_draw'] = ratio(group['ratio_gpu_ms'] * 1e6, group['ratio_draws'])
+            group['ns_per_draw_scope'] = 'matched-statistics'
         stats = group['stats']
         matched = group.pop('ratio_stats')
         group['ratios'] = {
@@ -428,7 +607,7 @@ def span_analysis(by_type, issues):
                 reason = 'implausible-timestamp'
             elif span is None or gap is None:
                 reason = 'missing-endpoints'
-            elif gap < -0.01:
+            elif gap < -0.01 and not row.get('sample_budget'):
                 reason = 'negative-gap'
             elif kind == 'window' and any(
                     stream == observation['stream'] and row['window_start'] <= frame <= row['window_end']
@@ -465,7 +644,72 @@ def span_analysis(by_type, issues):
     return timing, rejected, invalid_frames, reconciliation_failures
 
 
-def analyze(paths, legacy_span_replay=False):
+def sampled_report(by_type, timing):
+    budgets = sorted({o['row'].get('sample_budget', o['row'].get('sampling', {}).get('budget', 0))
+                      for observations in by_type.values() for o in observations} - {0})
+    if not budgets:
+        return None
+    frames = []
+    for kind in ('frame', 'window'):
+        rows = [o['row'] for o in by_type[kind] if o['row'].get('sample_budget')]
+        if not rows:
+            continue
+        bounds = [(2 * row['sample_budget'] + 2) * (
+            1 if kind == 'frame' else row.get('frames', row['window_end'] - row['window_start'] + 1))
+            for row in rows]
+        counts = [row['timestamp_count'] for row in rows]
+        timing[kind].update(
+            timestamp_count=sum(counts), timestamp_count_min=min(counts), timestamp_count_max=max(counts),
+            timestamp_count_bound=sum(bounds), timestamp_count_max_bound=max(bounds),
+            timestamp_count_rows=len(rows), sample_budgets=sorted({row['sample_budget'] for row in rows}),
+            observed_passes=sum(row['observed_passes'] for row in rows),
+            sample_count=sum(row['sampled_passes' if kind == 'frame' else 'sample_count'] for row in rows),
+            timing_scope='main-frame' if len(rows) == len(by_type[kind]) else 'mixed',
+            measured_ms_scope='sampled-pass-sum' if len(rows) == len(by_type[kind]) else 'mixed-full-and-sampled-pass-sum',
+            gap_ms_scope='span-minus-sampled-pass-sum' if len(rows) == len(by_type[kind]) else 'mixed')
+        if kind == 'frame':
+            timing[kind]['sampled_passes'] = timing[kind].pop('sample_count')
+    for observation in sorted(by_type['frame'], key=lambda o: (o['stream'], o['row']['frame'])):
+        row = observation['row']
+        if row.get('sample_budget'):
+            frames.append(dict(
+                stream=observation['stream'], **{key: row[key] for key in (
+                    'frame', 'sample_budget', 'observed_passes', 'sampled_passes', 'timestamp_count', 'timing_scope')},
+                timestamp_count_bound=2 * row['sample_budget'] + 2))
+    sampled_passes = [o['row'] for o in by_type['pass'] if 'sampling' in o['row']]
+    mixed = any('sampling' not in o['row'] for kind in ('pass', 'long_frame') for o in by_type[kind]) or any(
+        not o['row'].get('sample_budget') for kind in ('frame', 'window') for o in by_type[kind])
+    return dict(mode='mixed' if mixed else 'sampled', budgets=budgets, aggregation='whole-input',
+                gpu_ms_scope='sampled-pass-sum', frame_span_scope='main-frame',
+                observed_count=sum(row['count'] for row in sampled_passes),
+                sample_count=sum(row['sampling']['sample_count'] for row in sampled_passes),
+                histogram_buckets=HISTOGRAM_BUCKETS, percentile_scope='histogram-bucket-upper-bound',
+                frames=frames)
+
+
+def warn_thin(groups, label, issues):
+    for group in groups:
+        sampling = group.get('sampling')
+        if sampling and sampling['thin'] is True:
+            issues.append(
+                f'{label} {",".join(group["keys"])} ordinal(s) {group["ordinals"]}: thin sampled coverage '
+                f'over whole input; sampled_frames={sampling["sampled_frames_bounds"]}, '
+                f'observed_frames={sampling["observed_frames_bounds"]}, '
+                f'frame_coverage={sampling["frame_coverage_bounds"]} '
+                '(fewer than 10 sampled frames)')
+
+
+def warn_p99(groups, label, issues):
+    for group in groups:
+        if group.get('p99_descriptive_only') and group['sampling']['sample_count']:
+            issues.append(
+                f'{label} {",".join(group["keys"])} ordinal(s) {group["ordinals"]}: '
+                f'p99 has only {group["sampling"]["sample_count"]} samples over whole input; '
+                'fewer than 100 samples gives a descriptive histogram quantile, '
+                'not a reliable stutter-tail estimate')
+
+
+def analyze(paths, legacy_span_replay=False, per_window=False):
     paths = inputs(paths)
     observations, counts, issues = load(paths, legacy_span_replay)
     by_type = {kind: [] for kind in ('header', 'session_end', 'window', 'pass', 'frame', 'long_frame')}
@@ -481,13 +725,15 @@ def analyze(paths, legacy_span_replay=False):
     missing_windows = sorted(set(pass_sums) - set(windows))
     mismatches = [] if legacy_span_replay else [
         ident for ident, row in windows.items()
-        if not math.isclose(pass_sums.get(ident, 0.0), row['measured_ms'], abs_tol=0.01, rel_tol=1e-5)]
+        if not row.get('sample_budget') and
+        not math.isclose(pass_sums.get(ident, 0.0), row['measured_ms'], abs_tol=0.01, rel_tol=1e-5)]
     if missing_windows:
         issues.append(f'{len(missing_windows)} pass window(s) have no summary (rotation/capture may be incomplete)')
     if mismatches:
         issues.append(f'{len(mismatches)} window(s) have pass sums different from measured_ms (censored rows)')
     sessions = retention(observations, issues)
     timing, rejected, invalid_frames, reconciliation_failures = span_analysis(by_type, issues)
+    sampling = sampled_report(by_type, timing)
     censored_frames = sum(bool(o['row']['dropped'] or o['row'].get('reconciliation_failed') or
                                (o['stream'], o['row']['frame']) in invalid_frames) for o in by_type['frame'])
     rejected_windows = {r['source'] for r in rejected if r['type'] == 'window'}
@@ -506,7 +752,15 @@ def analyze(paths, legacy_span_replay=False):
                          for a, b in zip(sorted(values), sorted(values)[1:]) if b > a + 1)
     pass_rows = [o['row'] for o in by_type['pass']]
     long_rows = [o['row'] for o in by_type['long_frame']]
-    return {
+    pass_contexts = [sampling_context(o['row'], o['stream']) for o in by_type['pass']]
+    long_contexts = [sampling_context(o['row'], o['stream']) for o in by_type['long_frame']]
+    passes = aggregate(pass_rows, contexts=pass_contexts)
+    families = aggregate(pass_rows, True, pass_contexts)
+    warn_thin(passes, 'Pass', issues)
+    warn_thin(families, 'Family', issues)
+    warn_p99(passes, 'Pass', issues)
+    warn_p99(families, 'Family', issues)
+    report = {
         'schema': 'totk-gpuprof-analysis/3', 'files': list(map(str, paths)), 'sessions': sessions,
         'legacy_span_replay': legacy_span_replay, 'rejected_spans': rejected,
         'coverage': {**counts, 'streams': len({o['stream'] for o in observations}),
@@ -529,13 +783,15 @@ def analyze(paths, legacy_span_replay=False):
                      'header_conflicts': sum(s['header_conflict'] for s in sessions),
                      'output_failures': sum(s['output_failures'] for s in sessions),
                      'ordinal_metadata_mismatches': ordinal_mismatches,
-                     'stats_missing': sum(r['count'] - r['stats_valid'] for r in pass_rows),
+                     'stats_missing': sum(r.get('sampling', {}).get('sample_count', r['count']) - r['stats_valid']
+                                          for r in pass_rows),
                      'dropped': sum(r['dropped'] for r in windows.values()),
                      'failed_slots': sum(r.get('failed_slots', 0) for r in windows.values()),
                      'stats_failed_slots': sum(r.get('stats_failed_slots', 0) for r in windows.values())},
         'timing': timing,
-        'passes': aggregate(pass_rows), 'families': aggregate(pass_rows, True),
-        'long_frame_passes': aggregate(long_rows), 'long_frame_families': aggregate(long_rows, True),
+        'passes': passes, 'families': families,
+        'long_frame_passes': aggregate(long_rows, contexts=long_contexts),
+        'long_frame_families': aggregate(long_rows, True, long_contexts),
         'issues': issues,
         'method': 'Sum times/counters before division; ratios never averaged. Ordinal 0 means all frame ordinals '
                   '(window aggregates only); positive ordinals identify individual frame positions. Time/draw ratios '
@@ -549,6 +805,31 @@ def analyze(paths, legacy_span_replay=False):
                   'Legacy replay reads frame/window timing only; it cannot reconstruct query availability, original '
                   'endpoints or schema-3 attachment/reference semantics.',
     }
+    if sampling is not None:
+        report['sampling'] = sampling
+        report['method'] += (
+            ' Sampled gpu_ms/measured_ms are sums of valid samples only, never estimates of total pass work; '
+            'whole-main-frame spans remain separate. Sampled gap_ms is a numerical span-minus-samples '
+            'residual, not total untimed work; pre-frame uploads or overlap may make it negative without '
+            'invalidating the span. Means divide sampled sums by sample_count. Histograms '
+            'are merged before percentile selection; percentiles are bucket upper bounds, never averages. '
+            'P99 with fewer than 100 samples is a descriptive histogram quantile, not a reliable stutter-tail '
+            'estimate. Coverage/thin warnings use the whole input interval, not individual windows. '
+            'Thin means fewer than 10 sampled frames; coverage fractions are descriptive, not a hard '
+            'percentage gate for deliberately sparse sampling. Distinct-frame '
+            'unions across keys/ordinals/reference variants use bounds when exact IDs cannot be recovered; '
+            'null coverage/thin means the bounds do not determine an exact value/status. Missing key '
+            'observations remain censored, not zero. Sampled time/draw uses matched statistics only.')
+    if per_window:
+        grouped = {ident: [] for ident in windows}
+        for observation in by_type['pass']:
+            row = observation['row']
+            grouped.setdefault((observation['stream'], row['window_start'], row['window_end']), []).append(row)
+        report['per_window'] = [
+            dict(stream=stream, window_start=start, window_end=end,
+                 passes=aggregate(rows), families=aggregate(rows, True))
+            for (stream, start, end), rows in sorted(grouped.items())]
+    return report
 
 
 def fmt(value):
@@ -574,6 +855,18 @@ def render_table(title, groups, out):
               ' '.join(f'{k}={group["stats"][k]}' for k in STATS)) +
               f'; ratio matched draws={group["ratio_draws"]} ms={group["ratio_gpu_ms"]:.3f}'
               f'; partial-stat rows={group["stats_partial_rows"]}', file=out)
+        if 'sampling' in group:
+            sampling = group['sampling']
+            print(
+                f'  sampling: budgets={sampling["budgets"]} observed_count={sampling["observed_count"]} '
+                f'sample_count={sampling["sample_count"]} sampled GPU sum ms={group["gpu_ms"]:.6f} '
+                f'mean_ms={fmt(group["mean_ms"])} p50/p90/p99_ms (bucket upper bounds)='
+                f'{fmt(group["p50_ms"])}/{fmt(group["p90_ms"])}/{fmt(group["p99_ms"])} '
+                f'observed_frames={sampling["observed_frames_bounds"]} '
+                f'sampled_frames={sampling["sampled_frames_bounds"]} '
+                f'frame_coverage={sampling["frame_coverage_bounds"]} coverage_status={sampling["coverage_status"]} '
+                f'p99_descriptive_only={group["p99_descriptive_only"]}',
+                file=out)
 
 
 def render(report, out=sys.stdout):
@@ -582,6 +875,11 @@ def render(report, out=sys.stdout):
     print('Coverage: ' + ' '.join(f'{k}={v}' for k, v in report['coverage'].items()), file=out)
     for kind, timing in report['timing'].items():
         print(f'{kind} timing sums: ' + ' '.join(f'{k}={fmt(v)}' for k, v in timing.items()), file=out)
+    if 'sampling' in report:
+        sampling = report['sampling']
+        print('Sampling: ' + ' '.join(f'{key}={value}' for key, value in sampling.items() if key != 'frames'), file=out)
+        for frame in sampling['frames']:
+            print('Sampled frame: ' + ' '.join(f'{key}={value}' for key, value in frame.items()), file=out)
     for issue in report['issues']:
         print(f'WARNING: {issue}', file=out)
     render_table('Per pass (exact key; ordinal 0 = all)', report['passes'], out)
@@ -589,6 +887,10 @@ def render(report, out=sys.stdout):
     if report['long_frame_passes']:
         render_table('Selected long-frame passes (not window totals)', report['long_frame_passes'], out)
         render_table('Selected long-frame families', report['long_frame_families'], out)
+    for window in report.get('per_window', []):
+        title = f'{window["stream"]} window {window["window_start"]}-{window["window_end"]}'
+        render_table(f'Per-window passes: {title}', window['passes'], out)
+        render_table(f'Per-window families: {title}', window['families'], out)
 
 
 def main(argv=None):
@@ -597,9 +899,11 @@ def main(argv=None):
     parser.add_argument('--json', metavar='FILE', help='write machine-readable analysis; - writes JSON only to stdout')
     parser.add_argument('--legacy-span-replay', action='store_true',
                         help='accept schema-2 frame/window timing only; do not reinterpret old pass areas')
+    parser.add_argument('--per-window', action='store_true',
+                        help='add window-local pass/family views; default aggregates the whole input interval')
     args = parser.parse_args(argv)
     try:
-        report = analyze(args.inputs, args.legacy_span_replay)
+        report = analyze(args.inputs, args.legacy_span_replay, args.per_window)
         if args.json:
             text = json.dumps(report, indent=2, allow_nan=False) + '\n'
             if args.json == '-':

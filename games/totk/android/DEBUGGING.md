@@ -1745,26 +1745,39 @@ make -C wt-frametl/games/totk/android TARGET=linux CC=cc \
 ## Per-pass GPU time and tile-traffic audit (2026-10-22)
 
 `TOTK_VK_GPU_PROFILE=1` enables the isolated `gfx/vk_gpuprof.c` diagnostic; default is off.
-The threaded recorder remains enabled. Each pass part retains its original primary's
-query coordinates; assembly closes the bracket after executing its secondary chunks,
-on that same primary. `TOTK_VK_REC_THREADS=0` is also supported. Do not combine it with
-`TOTK_VK_PASS_PROFILE`, pass dumps, screenshots or the pass probe for performance measurements.
+The threaded recorder remains enabled; `TOTK_VK_REC_THREADS=0` is also supported.
+`TOTK_VK_GPU_PROFILE_SAMPLE` defaults to **`0`**, preserving full profiling: every pass part retains
+its original primary's query coordinates, and assembly closes its bracket after the secondary chunks.
+For lower query volume, start with **`TOTK_VK_GPU_PROFILE_SAMPLE=2`** and statistics off; strict integer
+budgets `1`–`16` select at most that many pass parts per frame by deterministic ordinal rotation.
+Do not combine it with `TOTK_VK_PASS_PROFILE`, pass dumps, screenshots or the pass probe for performance measurements.
 
 Each existing submission slot owns a timestamp query pool, reset when that slot is reused.
 `vkCmdWriteTimestamp2(ALL_COMMANDS)` brackets primary rendering instances (including attachment
 loads/stores), compute dispatches and named backend upload/transfer/post/upscale/present/framegen
-work. The completion thread reads results only after its existing slot fence; the profiler adds no
-GPU wait, queue submission or barrier. A frame boundary closes an outstanding rendering
-instance so its audit belongs to one frame. Query results can arrive several frames late;
+work. Sampled mode brackets only selected passes, plus one completion-accurate **whole-main-frame**
+pair, with no pre/slot pairs. Per-frame `timestamp_count` counts actual profiler-owned
+`vkCmdWriteTimestamp2` commands (including deferred assembly ends), not reserved pool size or the game's
+independent timestamp reports: at least two and at most `2k+2` for budget `k`. All observed pass keys,
+draws, areas and completed-frame scene metadata remain recorded, even with zero samples.
+The completion thread reads results only after its existing slot fence; the profiler adds no
+explicit fence wait or submission, but timestamp/statistics commands themselves can serialize GPU work.
+A frame boundary closes an outstanding rendering instance so its audit belongs to one frame.
+Query results can arrive several frames late;
 the 300-frame report appears only once an existing completed submission proves that window
 has ended. An idle renderer therefore need not immediately print its last partial window.
 
 Read `[gpu-profile] frames A-B` for summed measured render/compute ms/frame, actual LOAD,
 CLEAR, STORE and DONT_CARE-store attachment operations/frame and logical attachment load/store
-MiB/frame (**not actual traffic**). JSONL also reports the first-to-last Vulkan GPU span and
+MiB/frame (**not actual traffic**). Full-mode JSONL reports the first-to-last Vulkan GPU span and
 signed `gap_ms = span_ms - measured_ms`, including barriers, queue bubbles and remaining unscoped work.
-The compact top-N signature rows are sorted by total GPU ms/frame; percentages are
-shares of the measured total, not the full GPU span. Schema **3** exact pass keys include
+Sampled spans have `timing_scope: "main-frame"` and deliberately exclude pre-envelope authority;
+sampled `measured_ms`/pass `gpu_ms` include only sampled durations, so their signed residual includes untimed
+work but can be negative when pre samples precede the main span or sampled scopes overlap.
+That alone does not invalidate sampled span authority. Never extrapolate the sampled sum or compare it
+as a complete pass reconciliation; the residual is not a total of untimed work.
+The compact top-N signature rows are sorted by summed measured GPU ms/frame; percentages are
+shares of that measured total, not the full GPU span. Schema **3** exact pass keys include
 render/compute kind, absolute renderArea width/height, ordered attachment formats and absolute
 width/height, sample count, color slot count, load/store ops and first-draw shader-content hash.
 Draw counts, frame ordinals, scene references and guest addresses are not part of the key.
@@ -1783,6 +1796,22 @@ restores per-ordinal windows. This launch-only switch defaults to `0` (all value
 are off), logged once as `[gpu-profile] window ordinals=0/1`. Mode-2 `[gpu-split]` and mode-3
 `long_frame` rows always preserve positive actual ordinals; compacting window rows does not change
 absolute areas, sample counts, counters or the statistics-matched time/draw denominators.
+
+The analyzer aggregates by key/family over the **whole input/measured interval** by default.
+`python3 tools/bench/gpuprof.py 'capture/gpuprof-*.jsonl*' --per-window --json analysis.json`
+also exposes individual windows for debugging, not as the default sampled population.
+Sampled groups retain `observed_count`, `sample_count`, observed/sampled frame coverage and the
+272-bin histogram. `mean_ms` divides sampled sum by sample count; p50/p90/p99 use **merged histogram
+bucket upper bounds**, never averages of per-window percentiles. Eighth-octave bins have up to about
+9.1% upper-bound quantization above 1 ns; zero/sub-nanosecond values share the first bin.
+Thin coverage means fewer than 10 sampled frames over the **whole interval**, not three samples
+in an individual 300-frame window. There is no hard percentage gate: a 48-second capture with
+15–30 samples/ordinal can be useful near 1% frame coverage. Keep that denominator visible.
+Below 100 samples, p99 is flagged descriptive-only rather than a reliable stutter-tail estimate;
+fine histogram buckets do not manufacture statistical confidence. Family frame unions can be bounded
+rather than exact; the analyzer exposes that uncertainty. Missing/censored keys are not zero-cost observations.
+Raw long-frame rows retain every actual positive ordinal and mark each pass as sampled or untimed;
+they remain a biased over-threshold population, separate from the normal interval tables.
 
 Default retention is **128 MiB × four files**, including `.1`/`.2`/`.3`; override per-file size with
 `TOTK_VK_GPU_PROFILE_MAX_BYTES`. Compact windows target a 6–8-minute pan without rotation, but
@@ -1824,10 +1853,12 @@ draw/access hooks are a single disabled branch. Diagnostic-on CPU cost is not ne
 
 `TOTK_VK_GPU_PROFILE_STATS=1` requests input-assembly vertices/primitives, vertex-shader
 invocations, clipping invocations/primitives and fragment invocations when the device
-supports pipeline statistics (default off). Worker chunks own disjoint queries inside
-their secondaries; the completed pass sums those queries without requiring inherited
-queries. Ratios use only statistics-valid passes: vertices/draw, primitives/draw,
-fragments/primitive and whole-pass ns/vertex or ns/primitive are not isolated shader costs.
+supports pipeline statistics (default off). In sampled mode, only selected passes get statistics.
+Worker chunks own disjoint queries inside their secondaries; the completed pass sums those queries
+without requiring inherited queries. Ratios use only statistics-matched draws and duration:
+vertices/draw, primitives/draw, fragments/primitive and whole-pass ns/vertex or ns/primitive are not
+isolated shader costs. Statistics still perturb sampled passes. Sampled duration representativeness
+is conditional on the profiler **not serializing/changing GPU execution**, not guaranteed by a small budget.
 
 `[gpu-profile audit]` is observation only, never a load/store optimization:
 
@@ -1864,15 +1895,20 @@ Device plan (operator, no device execution performed here):
 
 1. On Thor/Turnip and Odin 3/Turnip, retain identical save, camera, weather, resolution,
    warmed shaders/pipelines, target rate, AYN power profile and thermal start. Keep recorder
-   threads **0** for every profiler-on/off comparison.
-2. Capture at least three complete warmed 300-frame windows at Lookout Landing, Gerudo Town,
-   an open-field view and a shrine. First run with GPU_PROFILE unset, then `=1`, then unset;
-   repeat with reverse order to spot thermal/clock drift. Thor target 30 fps, Odin 3 60 fps.
-3. Retain `[gpu-profile]` totals/top rows and `[gpu-profile audit]`, plus existing per-frame GPU
-   time, fps/stutter, submissions and memory lines, GPU MHz, power and temperatures. Require
-   positive plausible timings, stable signatures, percentages summing to at most 100% for the
-   printed subset and zero dropped/failed slots. Compare measured sums with whole-slot GPU
-   time, allowing excluded work. Do not treat profiling-on fps as the threaded-recorder fps.
+   threads fixed (normally **2**, or explicit **0** for a separate synchronous A/B); do not change
+   worker policy between an unprofiled control and its profiled run.
+2. Capture equal warmed intervals at Lookout Landing, Gerudo Town, an open-field view and a shrine.
+   Start with GPU_PROFILE unset, then `=1` with SAMPLE `=2` and STATS `=0`, then the unprofiled control;
+   repeat in reverse order. Separately test sampled statistics and full SAMPLE `=0`.
+   Retain at least three complete 300-frame windows, and extend the interval when key coverage is thin.
+   Thor target 30 fps, Odin 3 60 fps. Keep all rotations and report the actual measured interval.
+3. Retain `[gpu-profile]` totals/top rows and audit, fps/stutter, submissions, memory, power and
+   temperatures. Compare **GPU clock time-in-state deltas** over equal intervals against the
+   **unprofiled control**, not merely point-in-time MHz; report thermal/clock drift.
+   Require plausible valid whole-main-frame spans, stable observed keys, per-frame `timestamp_count`
+   within `2k+2`, histogram/sample consistency and zero dropped/failed slots. Sampled pass sums do
+   not reconcile to full GPU time: remaining work is intentionally untimed. Compare matched frame
+   authority, not equal durations or profiling-on fps as though it were uninstrumented performance.
 4. As a separate experiment, repeat profiling with `TOTK_VK_CLEAR_LOAD=1`, then
    `TOTK_VK_STORE_CLEAR=1` (implies CLEAR_LOAD). Compare matching shader/attachment families,
    traffic totals and visual captures after the timing runs. Never enable a new discard from

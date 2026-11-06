@@ -55,6 +55,59 @@ python3 tools/bench/ledger.py add $OUT/result.json --commit <sha> --apk <apk> --
 GPU-profiler rows, including the three `.1`/`.2`/`.3` rotations. Normal analysis rejects schema 2 because its
 attachment ratios used different reference semantics. `--json -` emits JSON only on stdout (`totk-gpuprof-analysis/3`).
 
+Analysis defaults to **whole-input/measured-interval aggregation by exact key and structural family**,
+not one estimate per 300-frame window. Optional `--per-window` adds `per_window` JSON entries and a text
+breakdown while retaining those interval tables. Use a capture containing only the intended warmed measured
+interval when interpreting a result; missing/evicted files are censored coverage, not zero observations.
+
+### Sampled queries and interpretation
+
+`TOTK_VK_GPU_PROFILE_SAMPLE` defaults to **`0`**, including unset: existing full-mode behavior is unchanged.
+With `TOTK_VK_GPU_PROFILE=1`, `2` or `3`, a strict integer budget `1`–`16` enables deterministic rotating
+pass-ordinal sampling. Recommended initial capture: `TOTK_VK_GPU_PROFILE=1`,
+**`TOTK_VK_GPU_PROFILE_SAMPLE=2`**, `TOTK_VK_GPU_PROFILE_STATS=0`, with the normal recorder workers.
+Every observed pass still contributes its key, draw count, absolute attachments and scene/reference metadata;
+only selected passes have timestamps/statistics. Rotation is not randomized; inspect key coverage across the
+whole measured interval and extend captures when keys or frame ordinals are thin.
+
+Sampled pass rows add `sampling: {budget, observed_count, sample_count, observed_frames, sampled_frames,
+histogram}`. Existing `count` is still observed count; `gpu_ms` is **sampled duration sum only**.
+No synthetic total is extrapolated to unmeasured passes. Zero-sample keys remain present with zero measured
+sum, null mean/percentiles and absent counters; that is not evidence that the pass costs zero.
+`mean_ms = gpu_ms / sample_count`; `p50_ms`/`p90_ms`/`p99_ms` come from merged histogram counts,
+**never averaged per-window percentiles**. The 272 bins use eighth-octave nanosecond upper bounds
+`2^(i/8)` (zero and values ≤1 ns in bin 0). Above 1 ns the reported percentile is a bucket **upper bound**,
+within about 9.1% quantization, not an exact measured percentile. The final bin saturates.
+
+Group `sampling` reports count/frame coverage, histogram and budget(s). Exact distinct frame unions are
+reported only where recoverable; families with overlapping keys expose `*_bounds` instead of summing
+frame counts as if disjoint. Thin-coverage warnings use the **whole interval**: fewer than 10 sampled
+frames, not just three samples in one 300-frame window. There is **no hard percentage gate**:
+15–30 samples/ordinal in 48 seconds can be useful even near 1% frame coverage; the fraction and
+denominator remain visible. Below 100 samples, p99 is descriptive-only, not a reliable stutter-tail
+estimate; bucket precision does not establish statistical confidence. Uncertain unions are labeled uncertain.
+
+Frame rows emit `sample_budget`, `observed_passes`, `sampled_passes`, `timing_scope: "main-frame"` and
+**actual profiler-owned `vkCmdWriteTimestamp2` command `timestamp_count`**, including deferred assembly
+ends but excluding the game's independent timestamp reports: at least the whole-main pair and at most `2k+2`.
+`report.sampling.frames` retains each frame's actual count and bound; timing summaries include the sum,
+min/max and bound totals. The whole-main-frame pair remains completion-accurate `ALL_COMMANDS`,
+without pre/slot envelopes; full-mode spans can include pre work and are not interchangeable.
+Sampled frame/window `measured_ms` sums sampled durations; signed `gap_ms` includes intentionally untimed
+work but may be negative when sampled pre work precedes the main span or scopes overlap. It is not total
+untimed work. A negative sampled residual alone is not span failure; full-mode reconciliation is unchanged.
+The analyzer suppresses complete-pass reconciliation comparisons for sampled windows, not invalid span,
+query availability or timestamp-domain checks. Statistics coverage uses sampled count, not all observations;
+time/draw ratios use only explicitly matched statistics draws/time, never all observed draws.
+
+Sampling lowers query volume, not guaranteed perturbation: remaining `ALL_COMMANDS` timestamps can stall
+the GPU, and statistics still perturb the passes selected. Sampled duration representativeness is conditional
+on instrumentation **not serializing or otherwise changing GPU execution**. Device A/Bs must compare GPU
+clock **time-in-state deltas** over equal intervals with an **unprofiled control**, plus fps, power and
+temperatures; a point MHz reading or lavapipe timing does not establish mobile overhead.
+
+### Identity, retention and full-mode accounting
+
 Windows now default to **one row per exact key + reference extent + scene role**, with `ordinal: 0`
 meaning **all frame ordinals**, displayed as `all (0)`. `TOTK_VK_GPU_PROFILE_ORDINALS=1` restores
 per-ordinal windows (default `0`, read once; startup logs `[gpu-profile] window ordinals=0/1`).
@@ -107,8 +160,9 @@ scene-sized depth prepasses across extents. A half-scene MRT remains distinct fr
 when both occur in one frame. Fixed depth shadows, color-only passes and all other `scene_relative=false`
 scopes compare **absolute** render/attachment dimensions; two depth-only target sizes do not collapse together.
 Times and counters are **summed before dividing**, never averages of producer ratios or per-frame ratios.
-Unavailable statistics stay unavailable. Time/draw ratios use only complete-stat rows so their denominators
-match; partial-stat rows still contribute their available counters to counter-to-counter ratios.
+Unavailable statistics stay unavailable. Time/draw ratios use only complete-stat rows or explicitly matched
+statistics draws/time so their denominators match; partial-stat rows still contribute their available counters
+to counter-to-counter ratios. In sampled mode all-observed draws are never a duration denominator.
 
 The report includes measured/span/gap sums, absent frame IDs within the captured range, missing window summaries,
 complete missing window sequences, rotation eviction/absent files, absent end markers, pass/window sum mismatches,
@@ -138,11 +192,19 @@ malformed/conflicting rows; a partial final JSON line is a reported capture warn
 
 `tests/test_gpuprof.py` pins schema-3 dimensions/references, scene-relative and fixed-depth families, ratios,
 compact ordinal sentinel/dedup/statistics totals, capture-loss lifecycle metadata, legacy span replay, optional
-statistics, rotation and long-frame accounting without Vulkan. The optional
-`GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs for modes 0/1/2/3,
-recorder workers 0/2, statistics on/off/unsupported, ordinal windows off/on, split-frame and unsent multi-frame
-reconciliation, direct pre uploads while main rendering is open, default row/byte reduction and bounded file rotation.
-Every rotated file must carry its header, and orderly fixture exit must carry its writer-end marker.
+statistics, rotation and long-frame accounting without Vulkan. Sampled unit fixtures pin strict histogram/
+coverage validation, merged means/percentiles, zero-sample metadata, per-frame timestamp counts, interval
+thin warnings and optional per-window output, without changing full-mode output.
+The optional `GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs for
+modes 0/1/2/3, recorder workers 0/2, statistics on/off/unsupported, ordinal windows off/on, split-frame and
+unsent multi-frame reconciliation, direct pre uploads while main rendering is open, default row/byte reduction
+and bounded file rotation. Every rotated file must carry its header, and orderly fixture exit its writer-end marker.
+The `--sampling` fixture renders both stable extents in every frame so deterministic ordinal rotation is not
+aliased with alternating-frame keys. The acceptance matrix covers budgets **1/2 × workers 0/2 × stats 0/1**:
+all stable keys eventually sampled, all observed metadata retained, counters only on sampled passes,
+histogram/count consistency, and actual per-frame `2..2k+2` timestamp writes. It compares the same main-work
+authority with full mode using endpoint/domain checks and a generous software timing tolerance, **not**
+identical durations; full spans may also include pre work. Exact readback pixels and worker use remain required.
 `--unavailable-span` deliberately leaves a real span-end query in an unsubmitted command buffer;
 the existing submitted buffer's fence retires, but the unsubmitted end remains unavailable.
 The matrix requires null invalid frame/window spans, explicit unavailable counters and the orderly writer end,

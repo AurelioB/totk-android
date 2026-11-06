@@ -621,6 +621,7 @@ void vk_gpuprof_end(VkCommandBuffer cb, vk_pass_end_kind reason, uint32_t detail
 typedef struct {
     VkQueryPool pool, stats;
     uint32_t timestamp, stats_query1;
+    uint32_t *timestamp_count; /* immutable retired-slot record; assembler writes before its fence */
 } vk_gpuprof_end_token;
 void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpuprof_end_token *token);
 void vk_gpuprof_end_emit(VkCommandBuffer cb, const vk_gpuprof_end_token *token);
