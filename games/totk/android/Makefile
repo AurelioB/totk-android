@@ -328,6 +328,15 @@ $(OUT)/vkdrawtest: $(TOTK)/android/gfx/test_vkdraw.c $(VKTEST_SRC) $(VKTEST_FRON
 	@mkdir -p $(dir $@)
 	$(CC) $(VKTEST_FLAGS) -Wl,--gc-sections -o $@ $(filter %.c %.o,$^) $(VKTEST_LIBS)
 	@echo "built $@"
+# Real profiler/recorder integration; Python drives isolated launch modes and JSONL rotation.
+.PHONY: vkgpuproftest
+vkgpuproftest: $(OUT)/vkgpuproftest $(OUT)/vkdraw-seed/.done
+vktest: $(OUT)/vkgpuproftest
+$(OUT)/vkgpuproftest: $(TOTK)/android/gfx/test_vk_gpuprof.c $(VKTEST_SRC) $(TOTK)/android/gfx/vk_int.h $(TOTK)/android/gfx/vk_record.h $(TOTK)/android/gfx/vk_load_proof.h
+$(OUT)/vkgpuproftest: $(TOTK)/android/gfx/vk_gpuprof_time.h
+	@mkdir -p $(dir $@)
+	$(CC) $(VKTEST_FLAGS) -o $@ $(filter %.c,$^) $(VKTEST_LIBS)
+	@echo "built $@"
 $(OUT)/vkrectest: $(TOTK)/android/gfx/test_vkrecord.c
 	@mkdir -p $(dir $@)
 	$(CC) $(VKTEST_FLAGS) -o $@ $< $(VKTEST_LIBS)

@@ -783,6 +783,7 @@ static void vk_init_once(void) {
     V.has_layer_output = f12.shaderOutputLayer; V.has_logic_op = f2.features.logicOp; V.has_dual_src = f2.features.dualSrcBlend;
     V.has_cache_control = f13.pipelineCreationCacheControl;
     V.has_pipeline_statistics = f2.features.pipelineStatisticsQuery;
+    V.has_host_query_reset = f12.hostQueryReset;
     V.has_image_read_without_format = f2.features.shaderStorageImageReadWithoutFormat;
     V.has_image_write_without_format = f2.features.shaderStorageImageWriteWithoutFormat;
     V.samples = V.props.limits.framebufferColorSampleCounts & V.props.limits.framebufferDepthSampleCounts;
@@ -2101,7 +2102,7 @@ static void *completion_thread(void *arg) {
            Report before CPU post ops: their completion is not GPU finish. gpu_ns covers main buffers, not pre. */
         if (s->ft_frame && totk_ft_on()) totk_ft_slot_gpu(s->ft_frame, s->value, s->ft_gpu_done, gpu_ns);
         occl_complete(s);
-        if (vk_gpuprof_on) vk_gpuprof_slot_complete(s->gpuprof);
+        if (vk_gpuprof_on) vk_gpuprof_slot_complete(&s->gpuprof);
         if (!timing_valid) gpu_time_unavailable(s->guest_frame, "slot GPU bracket unavailable");
         vk_gpu_time_slot timing = {.guest_ns = s->guest_submit_ns, .raw_start_ns = raw_start_ns, .raw_end_ns = raw_end_ns};
         if (g_gpu_time_hardware && timing_valid && !g_gpu_time_uncertain)
@@ -2238,6 +2239,7 @@ void vk_submit_optional_cancel(void) {
     if (!g_cur || !g_optional_next || g_replay_pending || g_cur->adopted)
         DIE("invalid optional pre-submit cancellation");
     VKCHECK(vkEndCommandBuffer(g_cur->cb));
+    if (vk_gpuprof_on) vk_gpuprof_slot_cancel(&g_cur->gpuprof);
     pthread_mutex_lock(&g_mu);
     g_cur->busy=g_optional_next->busy=0;
     g_cur=g_optional_next=NULL;
@@ -2252,6 +2254,13 @@ void vk_submit_adopt_primary(VkCommandBuffer closed) {
      * Reuse the existing pre-primary timestamp envelope so framegen's GPU
      * sample includes ALL adopted work, not just the empty continuation. */
     (void)vk_pre_cb();
+    if (vk_gpuprof_on) {
+        /* Optional adoption starts with an otherwise empty ordinary primary.
+         * Queue order is pre, adopted, main: bracket the immutable primary
+         * without adding queries to a reusable, pre-recorded command stream. */
+        vk_gpuprof_scope_begin(g_cur->pre, "framegen");
+        vk_gpuprof_scope_end(g_cur->cb);
+    }
 }
 void vk_submit_optional_end(void) {
     /* Failure before the split leaves the spare slot unused. After the split,
@@ -2404,7 +2413,7 @@ static void slot_open(slot_t *s) {
     }
     g_cur = s;
     vk_record_slot_reset((unsigned)(s - g_ring));
-    vk_gpuprof_slot_begin(&s->gpuprof, s->cb);
+    vk_gpuprof_slot_begin(&s->gpuprof, s->cb); /* also reads the launch-time switch once */
 }
 static void slot_begin(void) { VK_REC_DO(VK_REC_O_SLOT, slot_begin_inner()); }
 void vk_barrier_all(VkCommandBuffer cb) {
@@ -2440,6 +2449,7 @@ VkCommandBuffer vk_pre_cb(void) {
     if (!g_cur->pre_open) {
         VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
         VKCHECK(vkBeginCommandBuffer(g_cur->pre, &bi)); g_cur->pre_open = 1;
+        if (vk_gpuprof_on) vk_gpuprof_slot_pre(g_cur->gpuprof, g_cur->pre);
         if ((g_gpu_time_hardware || (vk_fg_enabled() && vk_fg_interpolating())) && g_cur->ts_on) {
             vkCmdResetQueryPool(g_cur->pre, g_cur->ts, 2, 1);
             vkCmdWriteTimestamp2(g_cur->pre, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_cur->ts, 2);
@@ -2779,6 +2789,7 @@ static uint64_t slot_submit_inner(int with_posts, vk_pass_end_kind reason) {
     }
     barrier_host(s->cb);
     if (s->ts_on) vkCmdWriteTimestamp2(s->cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, s->ts, 1);
+    if (vk_gpuprof_on) vk_gpuprof_slot_end(s->gpuprof, s->cb);
     VKCHECK(vkEndCommandBuffer(s->cb));
     if (s->pre_open) { barrier_host(s->pre); VKCHECK(vkEndCommandBuffer(s->pre)); }
     if (with_posts && g_ncarry) {
@@ -3312,7 +3323,6 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
       if ((vk_write_range_hit(dst, n) || vk_write_range_hit(src, n)) && nb++ < 4000)
           LOGV("[b2b] fp=%llu src=%#llx dst=%#llx bytes=%#llx src_nonzero=%zu", (unsigned long long)(&g_frame_pub ? g_frame_pub : 0), (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n,
                totk_texcopy_nonzero((const void *)(uintptr_t)src, (size_t)(n > (1u << 20) ? (1u << 20) : n))); }
-    if (vk_gpuprof_on) vk_gpuprof_read(src, n);
     VkBuffer sb, db; uint64_t so, dof;
     int ok = vk_resolve(src, n, &sb, &so) && vk_resolve(dst, n, &db, &dof);
     if (ub_private_on()) { vk_ub_touch(src, n); vk_ub_touch(dst, n); }
@@ -3332,9 +3342,11 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     VkDescriptorBufferInfo frozen;
     if (vk_lag_read(src, n, 16, &frozen, VK_LAG_COPY)) { sb = frozen.buffer; so = frozen.offset; }
     VkCommandBuffer cb = vk_cb();
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     vk_barrier_all(cb);
     VkBufferCopy c = {so, dof, n}; vkCmdCopyBuffer(cb, sb, db, 1, &c);
     vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     if (trace)
         totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyBufferToBuffer result=success path=gpu src_ser=%llu dst_ser=%llu src_buffer=%#llx src_offset=%#llx dst_buffer=%#llx dst_offset=%#llx bytes=%llu content=not-sampled",
             (unsigned long long)trace_src.serial, (unsigned long long)trace_dst.serial,
@@ -3738,7 +3750,6 @@ static void ub_flush_inner(uint64_t lo, uint64_t hi) {
 static void ub_flush(void) { VK_REC_DO(VK_REC_S_UNIFORM, ub_flush_inner(0, UINT64_MAX)); }
 static int ub_pending_physical(uint64_t addr, uint64_t n);
 void vk_ub_touch(uint64_t addr, uint64_t n) {   /* a non-uniform access: the updates it may see go to memory first */
-    if (vk_gpuprof_on) vk_gpuprof_read(addr, n);
     if (!g_ub_unflushed || !n) return;
     addr = ub_address(addr, n);
     if (ub_pending_physical(addr, n)) {

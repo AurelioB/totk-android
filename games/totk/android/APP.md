@@ -3851,7 +3851,14 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 | `TOTK_FRAME_LAG` | `0` on every platform and in every FPS mode | Only explicit `TOTK_FRAME_LAG=1` enables protected lag; unset, `0` and every other value leave it off. |
 | `TOTK_VK_CHUNK_DRAWS` | `75` by default; `600` when resolved lag is on and native VMA pressure is absent | Explicit positive value or `0` wins (`0` disables automatic chunking). The resolved startup policy is logged once. |
 | `TOTK_VK_SPLIT_PASS_DRAWS` | `0` (off) | `n > 0` ends a still-open pass after `n` draws, submits that part through the chunk path and reopens the same targets with `loadOp=LOAD`. Each split adds a store and load of every attachment on tiled GPUs; try 512 or 256 and read `[split-pass]` every 300 presents (VULKAN.md). |
-| `TOTK_VK_REC_THREADS` | `2` on Android; `0` on other platforms | Explicit `0` keeps the synchronous recorder for A/B; positive overrides select up to four workers. Existing diagnostic guards still force inline recording. |
+| `TOTK_VK_REC_THREADS` | `2` on Android; `0` on other platforms | Explicit `0` keeps the synchronous recorder for A/B; positive overrides select up to four workers. `TOTK_VK_GPU_PROFILE` retains workers, including when pass sampling is enabled; other diagnostic guards still force inline recording. Keep profiler and sample/statistics settings fixed when comparing worker counts (VULKAN.md). |
+| `TOTK_VK_GPU_PROFILE` | `0` (off) | `1` collects pass-part timings with recorder workers; `2` also logs every split; `3` also retains a per-frame ring and dumps every over-threshold frame's observed passes. Every 300-frame window writes schema-3 aggregates by exact key + scene reference + scene role; ordinal `0` means all frame ordinals. Without `GPU_PROFILE_SAMPLE`, every pass is timed as before. Absolute areas remain available for driver joins and DRS-aware families (VULKAN.md). Compare profiling-off/on separately before interpreting performance. |
+| `TOTK_VK_GPU_PROFILE_SAMPLE` | `0` (full profiling unchanged) | With `GPU_PROFILE=1/2/3`, a strict positive integer `1`–`16` limits timestamped/statistics-enabled pass parts per frame; recommended **`2`**, initially with stats off. Deterministic ordinal rotation retains all observed keys, draws and scene metadata. Each frame also has one completion-accurate whole-main-frame timestamp pair; actual profiler-owned `vkCmdWriteTimestamp2` `timestamp_count` (including deferred assembly ends, excluding independent game reports) is at most `2k+2`, without pre/slot envelopes. If Android has already submitted the final command buffer before CPU present, SAMPLE adds **one small marker-only main submission** for the real end timestamp; the query-count bound still holds, but that extra submission has explicit cost. Pass `gpu_ms` is sampled-only, never an extrapolated total. Use the analyzer's whole-interval coverage, sampled mean and histogram percentiles; absent/`0` keeps the old full mode. |
+| `TOTK_VK_GPU_PROFILE_STATS` | `0` (off) | `1` adds six pipeline counters when supported: IA vertices/primitives, VS invocations, clipping invocations/primitives and fragment invocations. Secondary-chunk queries sum into their pass; missing counters are absent, not fabricated zeros. In sampled mode only selected passes get queries; those queries still perturb sampled passes, so sampled durations are representative only if instrumentation does not serialize/change the GPU workload. Device A/Bs must compare GPU clock time-in-state against an unprofiled control, not only instantaneous MHz. |
+| `TOTK_VK_GPU_PROFILE_ORDINALS` | `0` (off) | `1` restores per-ordinal window aggregates; every other value uses compact ordinal-`0` aggregates. Read once at launch and logged as `[gpu-profile] window ordinals=0/1`. Raw mode-2 split logs and mode-3 `long_frame` rows always keep their actual positive frame ordinals. Compare row counts/JSONL bytes with the same route and profile/stats settings; not a measured device-cost reduction. |
+| `TOTK_VK_GPU_PROFILE_MAX_BYTES` | `134217728` (128 MiB) | Maximum bytes per JSONL file (4096–1073741824); rotate complete rows through `.1`, `.2`, `.3`, retaining at most four bounded files per launch. Each file repeats launch/build/package/config/driver metadata. Window sequences and rotation indices expose missing/evicted coverage; normal app close writes a writer-end marker, not a GPU-retirement guarantee. |
+| `TOTK_VK_GPU_PROFILE_LONG_MS` | `50` | Mode `3` dumps every frame with a valid Vulkan GPU span strictly above this threshold (0–60000 ms; decimal values allowed). Each `long_frame` pass row names its frame and positive ordinal. Invalid frame spans/gaps are null with reasons/counters, not usable timing; measured pass sums remain separate. |
+| `TOTK_VK_GPU_PROFILE_LONG_FRAMES` | `8` | Mode `3` retains 1–64 frames of raw pass timings, bounded at 16,384 records per retained frame. This controls history memory, not a dump quota: every threshold crossing is emitted, subject only to explicit drops and JSONL rotation. |
 | `TOTK_VK_REC_WAKE_BATCH` | `0` (off) | `1`: the walker wakes a parked recorder worker only when none is already on its way; a worker that leaves work queued wakes the next. `n ≥ 2`: also an idle worker polls the queue for up to `n` µs before parking (try 50 and 200). Startup logs the value; `recorder wakes/frame: walker … worker-chained … polled hits … parks …` every 300 presents counts the futex wakes. Live (see Live switches). |
 | `TOTK_VK_TEX_MEMO` | `0` (off) | `1` memoizes texture ID → view lookups per thread until the registry, any texture/image identity or the submission changes, and keeps the registry revision on an unchanged re-registration (VULKAN.md, "Texture ID memo"). `[tex-memo]` every 300 presents gives hits, misses, hit rate, retirements and (unchanged) registrations per frame. Live (see Live switches). |
 | `TOTK_NVN_CALL_NOCOPY` | `0` (off) | `1`: CallCommands/CopyCommands record a marker holding a reference to the called copy, and the caller's EndRecording copies each body once, straight into its own copy (the default copies it at the call and again at EndRecording, on the game's recording threads). Same copy bytes and reported command memory use; the reference keeps a released called copy alive until then. Not referencing at replay: a shared body would be rewritten by every submit's deferred-bind read and needs lifetimes past the replay. Startup logs `[nvn] TOTK_NVN_CALL_NOCOPY=…`; the `[cmd] recording copies` line counts markers and bytes not copied at the call. `vkdrawtest --nvn-call` runs the probes, a race and a bench. Live. |
@@ -3861,6 +3868,35 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 | `TOTK_FRAME_RATE_HINT` | `0` | `1` requests FIXED_SOURCE content cadence through the window and zero-copy SurfaceControl. It is only a request, never evidence of a panel-mode change. |
 | `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
 | `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
+
+The timing profiler has no speculative LOAD-before-clear/STORE-without-observed-read audit.
+It retains static attachment load/store operations and logical byte estimates from pass keys.
+Its walking-thread draw hook does fixed work: count each draw and hash the bounded shader identities
+only on the first draw; pass begin copies at most ten attachments. Neither path scans bindings or
+earlier passes, locks/copies the texture registry, allocates or logs. A dedicated `totk-gpuprof`
+worker owns result reads, aggregation, JSONL/log output and query resets. Sixteen prepared leases
+bound its backlog; exhaustion drops profiling coverage, never waits for output on the game path.
+Preparation can wait once at opt-in startup, not per frame.
+
+CPU present publishes an ordered `{frame, end_sequence}` closure independently of an open command buffer.
+The private bounded 256-entry closure FIFO lets `totk-gpuprof` finish a sealed-then-present frame only after
+all fenced profiler leases through that submission sequence have been processed, including when the worker
+consumed them before CPU present. Full mode uses the final slot's real envelope end with no extra GPU query
+or submission. SAMPLE needs the marker-only submission described above when no command buffer remains;
+an open command buffer retains its in-buffer marker. Closure overflow is explicit cumulative
+`background_dropped_closures`, separate from dropped leases; neither is silently repaired.
+`gpuprof.py --frame-close-replay` is an opt-in **counterfactual-only** analysis of header-attributed d003f2d
+full-mode captures, not device correction: it preserves original invalidity and rejects missing authority,
+corrupt/unavailable timestamps, actual drops/failures, gaps and inconsistent sums (tools/bench/README.md).
+
+**Odin overhead evidence:** `.scratch/bench/rpmode/odin-overhead/report.md` records the old
+`716c122ff09b` timestamps-only arm at 21.55 fps versus 57.96 fps control: recording rose
+10.789 → 43.750 ms/frame while GPU busy fell 80.2 → 36.6%. This is a large CPU-side
+instrumentation/feeding perturbation, not evidence that GPU timestamp WFI dominated the FPS loss.
+The Turnip timestamp WFI still exists; the benchmark does not isolate its cost from the old CPU
+audit/reporting costs. This source cutover is not a new device speedup measurement.
+Force-stop normally omits `session_end`; the existing analyzer reports that incomplete closure
+without inventing a footer or discarding retained complete-window timing (DEBUGGING.md).
 
 **Keep the GPU busy** (Graphics → Performance) turns on `TOTK_VK_SPLIT_PASS_DRAWS=512` and `TOTK_ADPF_GPU=1`
 together. It feeds smaller batches earlier and requests clocks that keep up; a little more GPU and CPU clock costs

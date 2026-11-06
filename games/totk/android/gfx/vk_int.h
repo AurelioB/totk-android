@@ -154,6 +154,7 @@ typedef struct {
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mp;
     uint32_t timestamp_bits;   /* selected queue family's timestampValidBits */
     int has_pipeline_statistics;   /* pipelineStatisticsQuery, already enabled with supported core features */
+    int has_host_query_reset;   /* hostQueryReset, for fence-owned profiling pools shared by pre/main buffers */
     int has_custom_border, has_null_descriptor, has_index_u8, has_depth_clip_control, has_eds3, has_divisor, has_bc;
     int has_geometry, has_layer_output, has_logic_op, has_dual_src;
     int has_image_read_without_format, has_image_write_without_format;
@@ -604,17 +605,39 @@ typedef enum {
     VK_PASS_END_MERGE_HAZARD, VK_PASS_END_SPLIT
 } vk_pass_end_kind;
 extern int vk_gpuprof_on;   /* initialized once at first slot; off hot paths are a single branch */
+void vk_gpuprof_identity(const char *commit, const char *package, uint64_t version, const char *build);
+void vk_gpuprof_shutdown(void); /* drains already-fenced profiler leases/joins writer; in-flight GPU queries stay unknown */
 void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb);
-void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot);
-void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot);   /* completion thread, AFTER the existing fence */
+void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot); /* advances submission sequence even for a dropped/null lease */
+void vk_gpuprof_slot_complete(vk_gpuprof_slot **slot); /* fence completion: detach/enqueue only; no query reads or IO */
+void vk_gpuprof_slot_pre(vk_gpuprof_slot *slot, VkCommandBuffer cb);
+void vk_gpuprof_slot_end(vk_gpuprof_slot *slot, VkCommandBuffer cb);
+void vk_gpuprof_slot_cancel(vk_gpuprof_slot **slot); /* discard unsubmitted lease off walker */
+void vk_gpuprof_scope_begin(VkCommandBuffer cb, const char *label);
+void vk_gpuprof_scope_end(VkCommandBuffer cb);
 void vk_gpuprof_begin(VkCommandBuffer cb, const VkRenderingInfo *ri, const VkFormat formats[10],
                      const tex_t *const textures[10], const uint32_t widths[10], const uint32_t heights[10], uint32_t samples);
 void vk_gpuprof_end(VkCommandBuffer cb, vk_pass_end_kind reason, uint32_t detail);
-void vk_gpuprof_draw(vk_shader *const shaders[6], int compute);
+typedef struct {
+    VkQueryPool pool, stats;
+    uint32_t timestamp, stats_query1;
+    uint32_t *timestamp_count; /* immutable retired-slot record; assembler writes before its fence */
+} vk_gpuprof_end_token;
+void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpuprof_end_token *token);
+void vk_gpuprof_end_emit(VkCommandBuffer cb, const vk_gpuprof_end_token *token);
+VkQueryPipelineStatisticFlags vk_gpuprof_stats_mask(void);
+void vk_gpuprof_secondary(int enabled);
+int vk_gpuprof_chunk_query(VkQueryPool *pool, uint32_t *query);
+void vk_gpuprof_draw(vk_shader *const shaders[6]);
 void vk_gpuprof_dispatch_begin(VkCommandBuffer cb);
-void vk_gpuprof_clear(uint32_t mask);   /* proven full attachment clear, before any draw */
-void vk_gpuprof_read(uint64_t address, uint64_t size);
-void vk_gpuprof_present(void);   /* recording lock; no submission and no wait */
+void vk_gpuprof_present(void); /* recording lock; CPU closure; sampled sealed-CB path submits one end-marker slot */
+#ifdef TOTK_VK_TESTS
+void vk_gpuprof_test_frame(VkCommandBuffer cb);
+void vk_gpuprof_test_flush(void);
+void vk_gpuprof_test_wait(void);
+void vk_gpuprof_test_pause(int paused);
+void vk_gpuprof_test_background(uint64_t counts[3]); /* enqueued, processed, dropped leases */
+#endif
 #define D16_SPEC_ID 9001
 typedef struct vk_prog vk_prog;
 /* The program's shaders for the current bind state (variant per stage): 0 ok, -1 a variant is missing (draw skipped) */

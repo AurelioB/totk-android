@@ -151,3 +151,257 @@ tools/bench/collect.sh -s <serial> --device <label> --out $OUT
 python3 tools/bench/analyze.py $OUT --commit <sha> --json $OUT/result.json
 python3 tools/bench/ledger.py add $OUT/result.json --commit <sha> --apk <apk> --profile "<preset> (default)" --note "<why>"
 ```
+
+## GPU pass profile (host-only analysis)
+
+`python3 tools/bench/gpuprof.py 'capture/gpuprof-*.jsonl*' [--json analysis.json]` reads **schema-3 only**
+GPU-profiler rows, including the three `.1`/`.2`/`.3` rotations. Normal analysis rejects schema 2 because its
+attachment ratios used different reference semantics. `--json -` emits JSON only on stdout (`totk-gpuprof-analysis/3`).
+
+Analysis defaults to **whole-input/measured-interval aggregation by exact key and structural family**,
+not one estimate per 300-frame window. Optional `--per-window` adds `per_window` JSON entries and a text
+breakdown while retaining those interval tables. Use a capture containing only the intended warmed measured
+interval when interpreting a result; missing/evicted files are censored coverage, not zero observations.
+
+### Sampled queries and interpretation
+
+`TOTK_VK_GPU_PROFILE_SAMPLE` defaults to **`0`**, including unset: existing full-mode behavior is unchanged.
+With `TOTK_VK_GPU_PROFILE=1`, `2` or `3`, a strict integer budget `1`–`16` enables deterministic rotating
+pass-ordinal sampling. Recommended initial capture: `TOTK_VK_GPU_PROFILE=1`,
+**`TOTK_VK_GPU_PROFILE_SAMPLE=2`**, `TOTK_VK_GPU_PROFILE_STATS=0`, with the normal recorder workers.
+Every observed pass still contributes its key, draw count, absolute attachments and scene/reference metadata;
+only selected passes have timestamps/statistics. Rotation is not randomized; inspect key coverage across the
+whole measured interval and extend captures when keys or frame ordinals are thin.
+
+Sampled pass rows add `sampling: {budget, observed_count, sample_count, observed_frames, sampled_frames,
+histogram}`. Existing `count` is still observed count; `gpu_ms` is **sampled duration sum only**.
+No synthetic total is extrapolated to unmeasured passes. Zero-sample keys remain present with zero measured
+sum, null mean/percentiles and absent counters; that is not evidence that the pass costs zero.
+`mean_ms = gpu_ms / sample_count`; `p50_ms`/`p90_ms`/`p99_ms` come from merged histogram counts,
+**never averaged per-window percentiles**. The 272 bins use eighth-octave nanosecond upper bounds
+`2^(i/8)` (zero and values ≤1 ns in bin 0). Above 1 ns the reported percentile is a bucket **upper bound**,
+within about 9.1% quantization, not an exact measured percentile. The final bin saturates.
+
+Group `sampling` reports count/frame coverage, histogram and budget(s). Exact distinct frame unions are
+reported only where recoverable; families with overlapping keys expose `*_bounds` instead of summing
+frame counts as if disjoint. Thin-coverage warnings use the **whole interval**: fewer than 10 sampled
+frames, not just three samples in one 300-frame window. There is **no hard percentage gate**:
+15–30 samples/ordinal in 48 seconds can be useful even near 1% frame coverage; the fraction and
+denominator remain visible. Below 100 samples, p99 is descriptive-only, not a reliable stutter-tail
+estimate; bucket precision does not establish statistical confidence. Uncertain unions are labeled uncertain.
+
+Frame rows emit `sample_budget`, `observed_passes`, `sampled_passes`, `timing_scope: "main-frame"` and
+**actual profiler-owned `vkCmdWriteTimestamp2` command `timestamp_count`**, including deferred assembly
+ends but excluding the game's independent timestamp reports: at least the whole-main pair and at most `2k+2`.
+`report.sampling.frames` retains each frame's actual count and bound; timing summaries include the sum,
+min/max and bound totals. The whole-main-frame pair remains completion-accurate `ALL_COMMANDS`,
+without pre/slot envelopes; full-mode spans can include pre work and are not interchangeable.
+If Android has already sealed/submitted the final command buffer when CPU present runs, SAMPLE adds
+**one small marker-only main submission** for the actual end timestamp; the start was recorded earlier.
+The extra submission has explicit cost even though the timestamp bound is still `2k+2`. An open command
+buffer retains the existing in-buffer marker. Full mode uses its last slot's real envelope end with no
+additional GPU query or submission. Neither mode substitutes a CPU timestamp or a per-slot sample end.
+Sampled frame/window `measured_ms` sums sampled durations; signed `gap_ms` includes intentionally untimed
+work but may be negative when sampled pre work precedes the main span or scopes overlap. It is not total
+untimed work. A negative sampled residual alone is not span failure; full-mode reconciliation is unchanged.
+The analyzer suppresses complete-pass reconciliation comparisons for sampled windows, not invalid span,
+query availability or timestamp-domain checks. Statistics coverage uses sampled count, not all observations;
+time/draw ratios use only explicitly matched statistics draws/time, never all observed draws.
+
+Sampling lowers query volume, not guaranteed perturbation: remaining `ALL_COMMANDS` timestamps can stall
+the GPU, and statistics still perturb the passes selected. Sampled duration representativeness is conditional
+on instrumentation **not serializing or otherwise changing GPU execution**. Device A/Bs must compare GPU
+clock **time-in-state deltas** over equal intervals with an **unprofiled control**, plus fps, power and
+temperatures; a point MHz reading or lavapipe timing does not establish mobile overhead.
+
+The profiler's draw/pass CPU budget is O(1): count each draw, hash at most six bounded shader
+identities on the first draw, and capture at most ten attachment records at pass begin. It no longer
+scans texture/storage-image bindings, looks up/copies the texture registry, searches prior-pass reads,
+allocates audit arrays or logs liveness candidates, including on unselected passes. Static attachment
+LOAD/CLEAR/STORE/DONT_CARE operations and logical byte estimates remain pass-key-derived summaries,
+not a speculative liveness audit or hardware traffic counter. The dedicated `totk-gpuprof` worker
+owns query result reads, aggregation, formatting/output and resets; its sixteen prepared leases are
+bounded. One-time opt-in startup preparation can wait, but exhaustion during play drops coverage
+(`background_dropped_slots`, cumulative, plus missing frame coverage), never waits for profiler I/O.
+CPU present has an independent ordered closure FIFO (256 entries, header `background_closures`).
+Its `{frame, end_sequence}` events finalize only after the worker has processed all fenced leases through
+the sealed submission sequence, including closures published after those leases were consumed.
+This handles Android's sealed-then-present ordering and the last frame without needing a next-frame marker.
+Cumulative `background_dropped_closures` records closure overflow separately from lease drops; both are
+per-launch maxima in analysis, warn and censor coverage. Footer `pending_frame_closures` is retained;
+zero pending CPU events does not prove all GPU queries retired.
+
+**Attribution correction:** `.scratch/bench/rpmode/odin-overhead/report.md` measured old APK
+`716c122ff09b` timestamps-only P1 at 21.55 fps versus 57.96 fps C0, recording
+43.750 versus 10.789 ms/frame, and GPU busy 36.6% versus 80.2%. The source's old per-draw
+2×160 binding scan, registry mutex/copy and all-prior-pass read audit are CPU overhead candidates;
+the report does not isolate each mechanism's cost. Turnip `ALL_COMMANDS` timestamps still issue
+WFI, but that source fact is **not** proof that GPU serialization dominated the observed FPS loss.
+No post-cutover device improvement is established by host timing or this source analysis.
+
+### Identity, retention and full-mode accounting
+
+Windows now default to **one row per exact key + reference extent + scene role**, with `ordinal: 0`
+meaning **all frame ordinals**, displayed as `all (0)`. `TOTK_VK_GPU_PROFILE_ORDINALS=1` restores
+per-ordinal windows (default `0`, read once; startup logs `[gpu-profile] window ordinals=0/1`).
+Mode-2 raw `[gpu-split]` logs and mode-3 selected `long_frame` rows always retain their actual positive
+frame ordinals. Window `ordinals` records the selected policy; old schema-3 captures without it remain readable.
+Counts, times, absolute dimensions and statistics counters/explicitly matched time/draws remain unchanged sums.
+
+Default storage is **128 MiB per file × four files**, overridable with `TOTK_VK_GPU_PROFILE_MAX_BYTES`
+(4096–1073741824). Compact mode targets a 6–8-minute pan without rotation, not a duration guarantee.
+Each file begins with a `header` containing launch ID, rotation index, build commit from APK `assets/build.txt`,
+package/versionCode when available, Vulkan device/driver identity, effective profiling switches and a whitelist
+of requested launch environment values (null means unset, not necessarily an effective backend default).
+Host fixtures/missing APK metadata explicitly retain unavailable identity; no environment build string is trusted.
+Exact APK/driver artifact hashes must be joined from capture records, not inferred from version labels.
+Orderly Android close/destruction drains already-fenced queued profiler leases, joins its worker and
+emits `session_end`: `clean_end` proves writer closure, while `all_queries_retired: null` explicitly
+does not prove retirement of in-flight GPU queries. Force-stop/crash/kill normally omits this marker.
+The existing analyzer already flags absent session ends and preserves retained complete-window timing;
+missing closure is expected after force-stop, not evidence of invalid timestamps. Never synthesize an
+end marker or infer unobserved trailing frames from it. The old Odin P1/P2 captures both lack an end
+after final force-stop, so only their retained completed-window timing is established.
+
+Capacity model (not a new device-duration measurement): six original Thor S/D/B1 snapshots
+(`.scratch/bench/rpmode/thor/{S,D,B1}`, initial and `after-hateno`) contain 77 complete windows,
+463,121 per-ordinal pass rows and 11,736 window/key proxies after ordinal coalescing (39.5× fewer).
+The largest observed proxy population is 265/window. Serializing those coalesced legacy templates
+with an extra 256 bytes/row + 128 bytes/attachment for schema-3 metadata gives a peak 334,477 bytes/window.
+At 60 fps for 480 seconds, 700 bytes/new frame × 28,800 frames + 96 peak windows + 64 KiB metadata
+is 52,335,328 bytes (49.91 MiB). Schema 2 cannot recover actual schema-3 absolute/reference variants;
+allowing **2×** the modeled pass bytes gives 84,445,120 bytes (80.53 MiB), hence the 128 MiB default
+rather than a marginal 64 MiB. Arbitrary key/reference churn or raw/long-frame populations can exceed this model.
+
+Pass and selected `long_frame` rows require absolute `render_width`/`render_height`,
+`reference_width`/`reference_height`, and boolean `scene_relative`. Every attachment retains its slot, format,
+load/store and reduced `width_num`/`width_den`, `height_num`/`height_den`, plus absolute `width`/`height`.
+The analyzer checks that each rational exactly equals attachment dimension / reference dimension, not attachment
+dimension / pass area. References are the completed frame's largest depth+MRT render area (at least two active
+color slots), or the game-config fallback when no such scene is observed: `TOTK_RENDER_RES`, otherwise handheld
+1280×720 or docked 1600×900. References and attachment dimensions are positive uint32; render dimensions are
+positive uint32 for render scopes and may be paired 0/0 for nonrender scopes. Frame rows require
+`scene_width`/`scene_height`: the observed largest depth+MRT render area, or 0/0 when absent.
+
+Exact producer keys hash **absolute** render and attachment dimensions along with scope kind, formats,
+load/store, samples and shaders; changing scene size changes its exact key, but not a fixed shadow's key.
+Per-pass JSON retains the exact key/ordinal, absolute `render_width`/`render_height` and attachment `width`/`height`
+for driver joins. Both pass and family tables expose every contributing `areas` variant with its exact `keys`,
+absolute render/attachment dimensions, reference dimensions, attachment rationals and `scene_relative` flag.
+Multiple reference extents in one window are distinct observations, not duplicate/conflicting rows, and are
+preserved even when their absolute key is the same.
+
+Families ignore shader/key/ordinal but retain kind, samples, slots, formats, load/store and `scene_relative`.
+For `scene_relative=true` (depth+MRT geometry, or depth render areas equal to that frame's observed scene),
+families compare exact render/reference and attachment/reference ratios, merging matching DRS geometry and
+scene-sized depth prepasses across extents. A half-scene MRT remains distinct from a full-scene MRT, including
+when both occur in one frame. Fixed depth shadows, color-only passes and all other `scene_relative=false`
+scopes compare **absolute** render/attachment dimensions; two depth-only target sizes do not collapse together.
+Times and counters are **summed before dividing**, never averages of producer ratios or per-frame ratios.
+Unavailable statistics stay unavailable. Time/draw ratios use only complete-stat rows or explicitly matched
+statistics draws/time so their denominators match; partial-stat rows still contribute their available counters
+to counter-to-counter ratios. In sampled mode all-observed draws are never a duration denominator.
+
+The report includes measured/span/gap sums, absent frame IDs within the captured range, missing window summaries,
+complete missing window sequences, rotation eviction/absent files, absent end markers, pass/window sum mismatches,
+dropped/failed slots, partial windows and malformed/incomplete/duplicate/conflicting rows. `sessions` retains every
+header/end observation. Separate launch filenames remain separate observations; repeated rotation rows count once,
+while conflicts are excluded rather than choosing an arbitrary value. Dedup retains exact key, ordinal, reference
+dimensions and `scene_relative`, so compact rows do not merge distinct scene roles/references.
+Headers establish sequence 1 as the launch start; older headerless captures only prove interior window gaps.
+Missing trailing work after an unmarked exit cannot be inferred. A clean writer end is not a flush of pending queries.
+
+Invalid frame/window spans have `span_valid: false` and null `span_ms`/`gap_ms`; reasons, unavailable/invalid
+timestamp counters and raw forensic spans remain explicit. The analyzer excludes implausible older positive spans
+above 10,000 ms/frame even if the old producer reported success, and propagates invalid frame authority to its window.
+`timing` preserves measured sums and valid-span/gap subtotals; total span/gap stay null if that population contains
+invalid rows. Invalid timing is not zero GPU time. `rejected_spans` preserves raw values and source locations.
+
+For historical timing-only replay:
+`python3 tools/bench/gpuprof.py --legacy-span-replay 'capture/gpuprof-*.jsonl*' --json replay.json`.
+This explicit mode accepts schema-2/3 **frame/window timing only**, ignoring pass/long-frame rows and disabling
+pass/window sum comparisons. It flags implausible spans without reconstructing query availability/endpoints or
+claiming schema-3 attachment/reference semantics. Valid historical timing values remain unchanged.
+
+### Counterfactual d003f2d CPU frame-close replay
+
+```
+python3 tools/bench/gpuprof.py --frame-close-replay 'capture/gpuprof-*.jsonl*' --json replay.json
+```
+
+This option adds `frame_close_replay` (`totk-gpuprof-frame-close-replay/1`); it **does not alter ordinary
+analysis or rewrite inputs**. `coverage`, `timing`, `rejected_spans` and pass sums preserve original
+invalidity. The new section retains input SHA-256/byte counts, source locations and the complete original
+frame/window rows, exact `eligible_frame_ids`/`rejected_frame_ids` per stream and window, rejection
+reasons, and conditional `counterfactual_span_ms`/`counterfactual_gap_ms`. Text output also exposes
+the exact IDs and window decisions. It is incompatible with `--legacy-span-replay`, which omits the
+pass authority required here.
+Rows excluded by ordinary schema or launch-mode validation stay excluded: their source issues and
+malformed-row counts remain authoritative. Replay does not resurrect those rows or fabricate frame/window
+identities for them. Retained frames whose mandatory window summary was rejected stay unknown/rejected.
+
+The affected APK's `assets/build.txt` header must consistently identify **`d003f2db137c`** with matching
+build text/source, full mode and timestamp domain. Eligibility requires a complete canonical 300-frame
+window with all contiguous frame IDs and explicit zero unavailable/invalid/dropped/failed/statistics/
+output/background-lease counters. The then-nonexistent `background_dropped_closures` counter may be
+absent in this old build; a nonzero value still rejects. Only original `incomplete-records` frames with
+available uint-domain first/last GPU ticks, no wraps, matching header domain, matching forensic raw span,
+recomputed interval ≤10,000 ms, nonnegative full-mode gap and consistent frame/pass/window measured sums
+are eligible. Partial/missing windows, missing metadata, gaps, failures, real drops and corrupt timestamps
+remain rejected; absent authority is **unknown**, never invented. A bad window-wide failure counter
+rejects all its frames because its exact affected lease extent is not captured. A counterfactual window
+sum is emitted only if every frame is eligible. Sampled missing endpoints cannot be reconstructed.
+
+The source bug was that Android submitted the final slot before outer CPU present, leaving no command
+buffer for the old in-buffer frame-end marker. The following frame transition then applied the
+`incomplete-records` guard to normally CPU-closed work. The ordered CPU closure FIFO fixes this path;
+it does **not** remove missing-query/drop/incomplete-record guards. The old host fixture kept a command
+buffer open at present and therefore missed the Android ordering. Historical aggregates do not record
+individual lease/CPU-close events: even eligible replay results are **conditional on a CPU-closure-only
+hypothesis**, not proof of no unrecorded work. APK-header attribution and hashed capture bytes are not an
+independently measured APK hash. Keep original writer-end/query-retirement uncertainty. Never call these
+results device-corrected timings, a post-fix device verification, or a device performance improvement.
+
+
+`long_frame` tables describe over-threshold frames and retained-history diagnostics; they are never added to window
+totals or treated as an unbiased latency distribution. `TOTK_VK_GPU_PROFILE_LONG_FRAMES` bounds the history ring,
+**not** the number of over-threshold frames dumped; a zero threshold selects every valid frame. Exit 1 means
+malformed/conflicting rows; a partial final JSON line is a reported capture warning. Exit 2 means an I/O error.
+
+`tests/test_gpuprof.py` pins schema-3 dimensions/references, scene-relative and fixed-depth families, ratios,
+compact ordinal sentinel/dedup/statistics totals, capture-loss lifecycle metadata, legacy span replay, optional
+statistics, rotation and long-frame accounting without Vulkan. Sampled unit fixtures pin strict histogram/
+coverage validation, merged means/percentiles, zero-sample metadata, per-frame timestamp counts, interval
+thin warnings and optional per-window output, without changing full-mode output.
+The explicit CPU-close replay fixtures pin opt-in-only behavior, original invalidity/provenance, complete
+frame/pass/window consistency and rejection of missing build/domain/endpoint authority, gaps, true query
+failures, background losses, corrupt timestamps and negative full-mode gaps.
+The optional `GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs for
+modes 0/1/2/3, recorder workers 0/2, statistics on/off/unsupported, ordinal windows off/on, split-frame and
+unsent multi-frame reconciliation, direct pre uploads while main rendering is open, default row/byte reduction
+and bounded file rotation. Every rotated file must carry its header, and orderly fixture exit its writer-end marker.
+The `--sampling` fixture renders both stable extents in every frame so deterministic ordinal rotation is not
+aliased with alternating-frame keys. The acceptance matrix covers budgets **1/2 × workers 0/2 × stats 0/1**:
+all stable keys eventually sampled, all observed metadata retained, counters only on sampled passes,
+histogram/count consistency, and actual per-frame `2..2k+2` timestamp writes. It compares the same main-work
+authority with full mode using endpoint/domain checks and a generous software timing tolerance, **not**
+identical durations; full spans may also include pre work. Exact readback pixels and worker use remain required.
+`--sealed-present` adds 302 frames with three main submissions, two pre uploads, two readbacks and a
+present GPU scope per frame, all sealed before CPU present with no open command buffer. It alternates
+worker-already-consumed and real GPU-event-gated pending submissions. Full mode and SAMPLE budgets
+1/2 run with workers 0/2 and statistics 0/1; pass sums, actual timestamp counts and readback pixels remain
+authoritative. `--last-closed` requires the isolated final frame to publish after CPU close, before any
+next frame or shutdown flush. These are host regressions, not new Android-device measurements.
+`--unavailable-span` deliberately leaves a real span-end query in an unsubmitted command buffer;
+the existing submitted buffer's fence retires, but the unsubmitted end remains unavailable.
+The matrix requires null invalid frame/window spans, explicit unavailable counters and the orderly writer end,
+not fabricated query values or a zero-duration success.
+The color-only 64/128 scenario
+requires distinct absolute keys and families. Its `--areas` scenario covers changing depth+MRT scenes,
+scene-sized prepasses, a smaller MRT later in the same frame, fixed 360×360/128×128 depth targets, and a frame
+with no observed scene; all contributing absolute keys and reference variants remain available for joins.
+Build `vkgpuproftest` via `games/totk/android/Makefile`; it also builds the existing `vkdraw-seed`.
+Set `TOTK_SHADER_SEED_DIR` to that seed's absolute directory and select the host lavapipe loader as for `vkdrawtest`.
+The fixture verifies actual pixels and secondary recorder use; it does not establish Android overhead or speedup.
+Run host builds/matrices under `flock /home/agent/Projects/totk-android/.scratch/hosttest.lock`
+and `taskset -c 0-3 nice -n 10`; no Android device is needed.

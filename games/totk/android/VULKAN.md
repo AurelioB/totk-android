@@ -1436,10 +1436,188 @@ measurements, the ownership contract is:
   and secondary [WriteTimestamp2](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdWriteTimestamp2.html).
   The saved Thor probe and current device extension setup do not enumerate/enable maintenance7 or nested-command-buffer
   support; their availability is not inferred and the recorder does not depend on either extension.
-- **Diagnostics:** occlusion queries, pass dumps, pass profiling (including `TOTK_VK_GPU_PROFILE=1/2`),
-  `TOTK_VK_PASS_MERGE=1` and pass probes force the original single-thread path with a diagnostic log.
-  CPU split profiling continues to measure the walking thread; worker busy time and waits are reported
-  separately, not spuriously added into its exclusive categories.
+- **Diagnostics:** occlusion queries, pass dumps, `TOTK_VK_PASS_PROFILE`, `TOTK_VK_PASS_MERGE=1`
+  and pass probes force the original single-thread path with a diagnostic log. `TOTK_VK_GPU_PROFILE`
+  (default off) retains recorder workers and asynchronous assembly. Full mode
+  (`TOTK_VK_GPU_PROFILE_SAMPLE` absent/`0`) brackets every rendering pass part on its original primary,
+  from before BeginRendering to after EndRendering. All secondary chunks contribute to that one exact
+  bracket, not separately timed chunk approximations; an explicit pass split creates another pass part.
+  Sampled mode uses the same bracket only on selected parts. Empty passes and `REC_THREADS=0` use
+  the same timing authority when selected. Optional pipeline statistics use
+  independent begin/end queries inside each secondary and sum into the pass; no primary statistics query remains
+  active across ExecuteCommands, so recorder profiling does not require `inheritedQueries`. Inline passes keep
+  their primary statistics query. The walker allocates chunk queries before queueing, and the assembler uses
+  captured end handles/indices without consulting or waiting for the walking profiler.
+  Keep profiler mode fixed for worker-count A/Bs; CPU split profiling still measures only the walking thread,
+  with worker busy time and waits reported separately rather than added into its exclusive categories.
+- **Profiler CPU budget:** draw/pass hooks are O(1) in the number of draws, bound resources and
+  earlier passes: first draw hashes at most six bounded shader keys, later draws only increment
+  the counter, and pass begin captures at most ten attachments. There are no binding/registry scans,
+  prior-pass read searches, audit arrays/candidate checks, allocations or logs in these hooks.
+  The old speculative `LOAD-before-full-clear` / `STORE-no-later-observed-read` audit is removed,
+  not hidden behind sampling; static attachment operations and logical byte summaries remain,
+  computed from pass keys off the walker. Nested timing scopes preserve only their timing parent,
+  command buffer and secondary-query state.
+  One opt-in startup preparation creates sixteen query-slot leases on the dedicated `totk-gpuprof`
+  worker; startup may wait for readiness once. Thereafter the walker takes a prepared lease with
+  a short private O(1) mutex operation, without query resets, result reads, formatting or I/O.
+  Existing fence completion only detaches/enqueues the fenced lease and releases the game ring slot.
+  The profiler worker alone reads results without WAIT or polling, aggregates, formats, writes/logs,
+  resets queries and returns prepared leases. The bounded sixteen-lease FIFO never blocks the game
+  for output: no available lease means dropped profiler coverage, recorded by cumulative
+  `background_dropped_slots` and missing frame coverage. Its mutex is not the recorder-worker mutex.
+  CPU frame closure has its own bounded 256-entry FIFO under the same private background mutex:
+  `{frame, end_sequence}` is published at CPU present, independently of whether a command buffer
+  is still open. Every sealed submission, including one without a profiler lease, has an ordered
+  sequence; canceled, never-submitted leases do not advance it. The worker finalizes a ready closure
+  only after processing fenced leases through its end sequence, including closures arriving after
+  those leases were already consumed. Overflow increments cumulative `background_dropped_closures`;
+  the analyzer takes a per-launch maximum, warns and censors coverage, rather than hiding the loss.
+  The cumulative drop count is a per-launch maximum in analysis, not a sum of successive windows;
+  coverage stays explicitly censored rather than pretending skipped metadata was observed.
+  Worker placement reuses the seed/cache-writer policy: nice 10, the lowest clearly separated
+  inherited CPU-capacity tier when available, never widening the inherited affinity mask.
+  Actual placement and errors are logged once. Orderly close destroys only idle, already-fenced
+  query leases; still-in-flight work remains outside its retirement authority.
+- **Profiler coverage:** named `upload`, `transfer`, `post`, `upscale`, `present` and `framegen` scopes
+  cover backend-owned Vulkan commands; game compute dispatches retain their own records. In full mode,
+  slot envelopes start in pre (when present), include adopted immutable framegen primaries and every main
+  primary, and reconcile each frame's pass sum against its first-to-last GPU timestamp span. Sampled mode
+  instead has one whole-main-frame pair, excluding pre/slot envelopes, plus selected pass pairs.
+  JSONL `gap_ms` is the signed residual, not profiler overhead. In sampled mode it includes intentionally
+  untimed passes, but sampled pre work/overlap may make it negative; it is not total untimed work.
+  A frame boundary can split a still-open slot without forcing a submission; its GPU marker remains
+  supported. Android can instead seal/submit the final slot before CPU present. In full mode the
+  ordered CPU closure uses that slot's real envelope end, with **no extra GPU timestamp or submit**;
+  it does not need another frame to wake finalization. Frame rows expose `closure_source`
+  (`cpu-sealed`, `gpu-marker` or `missing-closure`) and `closure_sequence`; missing closure remains
+  invalid. Cross-frame pre uploads can execute before their recording frame's main work; such overlap
+  is surfaced by `reconciliation_failed`, never clamped away. External GL/QCOM/LSFG execution,
+  compositor work and scanout are outside Vulkan timestamp authority. Profiling requires
+  graphics/compute timestamps and hostQueryReset; query pools are host-reset only after their
+  existing slot fence, before either pre or main can use them.
+- **Profiler size identity (schema 3):** exact keys retain absolute renderArea/attachment dimensions for
+  driver-area joins. Each completed frame reports its largest depth+multi-color scene extent; pass attachment
+  fractions use that common reference, with the game resolution as an explicit no-scene fallback, not the pass area.
+  Analyzer families merge scene-relative MRTs and scene-sized depth prepasses through DRS; fixed depth targets
+  keep absolute families. Window rows preserve separate reference variants of the same absolute key.
+- **Compact profiler windows:** `TOTK_VK_GPU_PROFILE_ORDINALS=0` (default; only exact `1` enables it)
+  aggregates across frame ordinals by exact key + reference dimensions + `scene_relative`; ordinal `0`
+  is the all-ordinals sentinel, not a pass position. `=1` restores positive-ordinal window rows.
+  `[gpu-profile] window ordinals=0/1` proves the launch policy. Mode-2 raw split logs and mode-3
+  selected `long_frame` rows retain actual positive ordinals in either setting. Times, counts, absolute
+  areas and explicitly statistics-matched draws/time are still sums, not averages or synthetic zeros.
+- **Sampled profiler:** `TOTK_VK_GPU_PROFILE_SAMPLE=0` (including unset) leaves full profiling unchanged.
+  A strict integer `1`–`16` enables a per-frame budget `k`; start with **`GPU_PROFILE=1 SAMPLE=2 STATS=0`**
+  using the full `TOTK_VK_GPU_PROFILE_*` environment names. Selection rotates contiguous frame ordinals
+  deterministically using the preceding frame's observed pass count. Every observed key, draw count,
+  absolute area, scene reference and scene role remains available, including passes with zero samples.
+  Only selected passes get timestamp/statistics queries. Rotation is not random sampling: periodic key
+  churn or a short route can under-cover a key, so inspect coverage rather than assuming representativeness.
+  Each frame emits actual profiler-owned `vkCmdWriteTimestamp2` command `timestamp_count`, including
+  deferred ends after assembly, not the game's independent timestamp reports. It is at least the two
+  whole-main-frame endpoints and at most **`2k+2`**. There are no additional pre/slot timestamp pairs.
+  The whole pair uses completion-accurate `ALL_COMMANDS`, spanning main submissions through present.
+  When CPU present finds no open command buffer, SAMPLE must issue **one small marker-only main
+  submission** for the real end timestamp (the start was written earlier). This is an explicit extra
+  submission cost, not a per-slot end or CPU-time fallback; it keeps the **`2k+2`** write bound.
+  With an open command buffer the existing in-buffer end marker is used. The full-mode closure path
+  above adds neither a query nor a submission.
+  Frame/window `measured_ms` and pass `gpu_ms` sum valid sampled durations only; `gap_ms` is the residual.
+  `sampling` retains observed/sample counts, distinct observed/sampled frame counts and a 272-bin histogram;
+  `stats_valid` cannot exceed sampled count. No total is extrapolated to untimed observations.
+  Analyzer tables aggregate the whole input/measured interval by default; `--per-window` adds a diagnostic
+  window breakdown. Means divide sampled duration by sampled count. p50/p90/p99 are merged-histogram
+  **bucket upper bounds**, with eighth-octave spacing (at most about 9.1% quantization above 1 ns);
+  zero and sub-nanosecond durations occupy the first bucket. Thin coverage warns below 10 sampled frames
+  across the interval, not merely because a 300-frame window has three samples. There is no fixed
+  percentage gate: 15–30 samples/ordinal in 48 seconds can be useful even near 1% frame coverage.
+  Coverage fractions remain visible. Below 100 samples, p99 is flagged descriptive-only, not a reliable
+  stutter-tail estimate; histogram precision does not establish statistical confidence.
+  Overlapping family frame populations expose bounds rather than fabricated exact unions. A missing key
+  observation in a censored capture is not a zero-cost pass.
+- **Profiler capture lifecycle:** the default is 128 MiB per JSONL file × four files; compact windows
+  target a 6–8-minute pan without rotation, not a guaranteed duration for arbitrary pass counts/raw modes.
+  Each rotation repeats a schema-3 header with launch ID, APK `assets/build.txt` commit, package/versionCode
+  when available, whitelisted launch environment, effective profiling switches and Vulkan driver identity.
+  Exact APK/driver hashes must be joined from the capture artifacts; they are not invented in process.
+  Monotonic window sequences and rotation indices let the analyzer flag complete missing windows and
+  retention eviction. Orderly Android close/destruction drains only already-fenced queued leases,
+  joins the profiler worker and writes `session_end` under the writer lock; in-flight GPU query
+  retirement remains unknown (`all_queries_retired: null`). Force-stop/crash/kill normally has no
+  footer; the existing analyzer reports missing closure, not a fabricated end marker or GPU failure.
+  The footer also retains `pending_frame_closures`; zero pending CPU closures is not a guarantee
+  that all in-flight GPU work retired. The additive header `background_closures: 256` records the
+  closure FIFO capacity, independently of the sixteen query leases.
+  The explicit host option `gpuprof.py --frame-close-replay` adds conditional results only for
+  header-attributed d003f2d full-mode captures with complete contiguous windows, zero loss/failure
+  counters, available valid raw GPU endpoints/domain, bounded recomputed intervals, nonnegative gaps
+  and consistent frame/pass/window sums. Original invalid rows and ordinary totals remain untouched.
+  Missing authority stays unknown/rejected; this cannot establish device correction or performance.
+  The old host fixture kept a command buffer open at present and exercised the GPU-marker path,
+  missing Android's sealed-then-present ordering. The new host scenario covers both already-consumed
+  and not-yet-fenced submissions and an isolated final CPU closure, not new Android evidence.
+- **Invalid span authority:** timestamp reads request 64-bit values **and availability**, without WAIT;
+  an unavailable endpoint is never a zero-duration sample or silently replaced by a later endpoint.
+  Each retired slot captures its immutable device, queue, queue family, `timestampValidBits` and period.
+  Both endpoints and cross-slot adjacency must have the same domain. The renderer uses queue index zero
+  of its one graphics+compute family (`V.queue`) for pre/main/framegen command buffers; worker secondaries
+  inherit that submission, not a separate worker queue. Device/queue/domain changes invalidate a span.
+  Counters are masked to the family's valid bits before modular subtraction; a genuine short counter wrap
+  is accepted and counted. Modular arithmetic alone cannot distinguish a wrap from a backwards/stale
+  endpoint: every individual interval and whole frame must also be at most 10,000 ms.
+  This bound is a conservative corruption guard, **not** proof that available values have no driver fault.
+  Thor's 48-bit/52.0833320618-ns counter wraps after roughly 169.7 days; the old huge positive spans
+  were backwards endpoints misread as that wrap. Old files lack ticks/availability, so their original
+  driver/query failure cannot be reconstructed.
+  Frame/window `span_valid=false` makes `span_ms`/`gap_ms` null, with per-window unavailable/invalid
+  timestamp and invalid-span counts plus raw forensic endpoint fields retained. A valid span requires
+  every contributing endpoint/interval and complete records. Full mode also requires nonnegative
+  reconciliation within timestamp quantization tolerance; sampled negative residuals alone do not
+  invalidate main-frame authority. Windows retain `valid_span_ms`/`span_frames` separately if any frame is invalid.
+  The analyzer also rejects implausibly huge older positive spans despite an old success flag.
+  Explicit `--legacy-span-replay` accepts schema-2 frame/window timing only; it cannot recover missing
+  query availability or reinterpret old pass-area semantics. No mobile overhead benefit is claimed.
+- **Odin attribution correction (2026-11-05):** the fixed-order Hateno report
+  `.scratch/bench/rpmode/odin-overhead/report.md` for APK `716c122ff09b` has timestamps-only P1
+  at **21.55 fps / 43.750 ms recording / 36.6% GPU busy**, versus C0 at
+  **57.96 fps / 10.789 ms recording / 80.2% GPU busy**. Recording adds **32.961 ms/frame**,
+  and the GPU spends 91.12% of its clock residence at 660 MHz. These CPU observations and reduced
+  GPU feeding supersede the earlier GPU-dominant explanation of this collapse. Stats P2 adds only
+  0.55 ms recording and -0.15 fps versus P1 (inside the 0.51-fps control bracket); its independent
+  FPS cost is unresolved. Different timestamp/NVN GPU scopes, cache/compile contexts and fixed order
+  prevent a measured mechanism-by-mechanism split.
+  Before cutover, `vk_gpuprof_draw` scanned up to 2×160 texture/storage-image bindings per graphics
+  draw even on unselected passes; each live handle called `vk_treg_get` (`vk_res.c`), which took
+  `g_reg_mu` and copied a registry entry. `vk_gpuprof_read` then searched all earlier pass audit
+  records, while pass end appended/reallocated audit storage and present scanned/logged candidates.
+  This source identifies nonconstant CPU work, not a measurement that the audit alone cost 32.961 ms.
+  The removed liveness audit could not prove safe discards across frames/raw-memory consumers anyway.
+  Host CPU benchmarks and a new matched device A/B are separate acceptance evidence; this change
+  does not claim measured mobile recovery.
+- **Profiler cost is not passive:** in the inspected Turnip source
+  (`turnip/wt-rpmode/mesa/src/freedreno/vulkan/tu_query_pool.cc:2100–2144`), every
+  `ALL_COMMANDS` timestamp issues a WFI before reading the always-on counter; its comment explicitly
+  calls out CP stalling. Full profiling adds two such timestamps per timed pass/scope plus frame/slot
+  boundaries. Sampled mode reduces this to at most `2k+2` writes/frame; it does not make the remaining
+  writes free. Modes 2/3 do not reduce the selected query cost: mode 2 adds raw CPU logs, and mode 3 adds
+  history memory/output for selected long frames, retaining untimed pass metadata as well.
+  Statistics add query start/stop barriers per secondary chunk (or inline primary) of selected passes,
+  not merely once per aggregate pass. Turnip's `emit_begin_stat_query`/`emit_end_stat_query`
+  (`tu_query_pool.cc:1157–1222,1674–1733`) start/stop counters, WFI, snapshot all statistic registers,
+  then subtract/accumulate results with memory-write waits. In a tiled pass that draw stream can execute
+  repeatedly. Vertex-stage statistics explicitly disable concurrent binning for GMEM passes
+  (`tu_cmd_buffer.cc:3479–3486`); secondary draw streams replay per tile (`:3817,6524`).
+  These are real GPU instrumentation costs, not evidence that they dominate the observed Odin
+  FPS loss. Host query resets are CPU memory writes; retired result reads use no WAIT flag
+  (`tu_query_pool.cc:678–789,1075–1086`), so they do not intentionally add a new queue/fence wait.
+  Removing the CPU audit and moving reporting off the critical path does not remove these GPU barriers.
+  Always isolate profile-off, sampled timestamps-only, sampled statistics, then full profiling under
+  identical driver/TU_DEBUG settings. Sampled duration representativeness is conditional on the remaining
+  instrumentation **not serializing or otherwise changing GPU execution**; statistics still perturb the
+  passes actually sampled. Device A/Bs must compare GPU clock **time-in-state deltas over equal intervals**
+  with an unprofiled control, alongside fps, power, temperatures and thermal history. A single MHz reading
+  is not equivalent. Do not interpret any instrumented span as uninstrumented game performance.
 
 Pipeline handle selection deliberately remains on the walking thread in this cutover. `pipe_get`'s cold asynchronous
 misses skip draws; emitted draws immediately update cumulative synthetic samples, used by later reports and conditions.
@@ -1782,7 +1960,7 @@ are unique. Existing pipeline/dynamic guards already removed redundant calls, so
 All 0/2/3 baseline-vs-revised output files compare identically. Normal and TSan identity matrices pass at default,
 chunk 1, inline/chunk 512, leading chunks disabled, profile disabled, and linear-span/dedup/dynamic diagnostics off.
 The test-only API wrappers also run clean under TSan with recorder workers enabled. Direct
-`REC_THREADS=2 GPU_PROFILE=2` execution logs forced inline recording and passes the draw fixture.
+`REC_THREADS=2 GPU_PROFILE=2` execution in that pre-v2 test logged forced inline recording and passed the draw fixture; the v2 profiler above now retains workers.
 
 Inspected Mesa source anchors (relative to `src/`): `vulkan/runtime/vk_command_pool.c:141` (pool walk),
 `vulkan/runtime/vk_command_buffer.c:92` (implicit reset), `freedreno/vulkan/tu_cmd_buffer.cc:4371`
