@@ -1450,6 +1450,28 @@ measurements, the ownership contract is:
   captured end handles/indices without consulting or waiting for the walking profiler.
   Keep profiler mode fixed for worker-count A/Bs; CPU split profiling still measures only the walking thread,
   with worker busy time and waits reported separately rather than added into its exclusive categories.
+- **Profiler CPU budget:** draw/pass hooks are O(1) in the number of draws, bound resources and
+  earlier passes: first draw hashes at most six bounded shader keys, later draws only increment
+  the counter, and pass begin captures at most ten attachments. There are no binding/registry scans,
+  prior-pass read searches, audit arrays/candidate checks, allocations or logs in these hooks.
+  The old speculative `LOAD-before-full-clear` / `STORE-no-later-observed-read` audit is removed,
+  not hidden behind sampling; static attachment operations and logical byte summaries remain,
+  computed from pass keys off the walker. Nested timing scopes preserve only their timing parent,
+  command buffer and secondary-query state.
+  One opt-in startup preparation creates sixteen query-slot leases on the dedicated `totk-gpuprof`
+  worker; startup may wait for readiness once. Thereafter the walker takes a prepared lease with
+  a short private O(1) mutex operation, without query resets, result reads, formatting or I/O.
+  Existing fence completion only detaches/enqueues the fenced lease and releases the game ring slot.
+  The profiler worker alone reads results without WAIT or polling, aggregates, formats, writes/logs,
+  resets queries and returns prepared leases. The bounded sixteen-lease FIFO never blocks the game
+  for output: no available lease means dropped profiler coverage, recorded by cumulative
+  `background_dropped_slots` and missing frame coverage. Its mutex is not the recorder-worker mutex.
+  The cumulative drop count is a per-launch maximum in analysis, not a sum of successive windows;
+  coverage stays explicitly censored rather than pretending skipped metadata was observed.
+  Worker placement reuses the seed/cache-writer policy: nice 10, the lowest clearly separated
+  inherited CPU-capacity tier when available, never widening the inherited affinity mask.
+  Actual placement and errors are logged once. Orderly close destroys only idle, already-fenced
+  query leases; still-in-flight work remains outside its retirement authority.
 - **Profiler coverage:** named `upload`, `transfer`, `post`, `upscale`, `present` and `framegen` scopes
   cover backend-owned Vulkan commands; game compute dispatches retain their own records. In full mode,
   slot envelopes start in pre (when present), include adopted immutable framegen primaries and every main
@@ -1503,8 +1525,10 @@ measurements, the ownership contract is:
   when available, whitelisted launch environment, effective profiling switches and Vulkan driver identity.
   Exact APK/driver hashes must be joined from the capture artifacts; they are not invented in process.
   Monotonic window sequences and rotation indices let the analyzer flag complete missing windows and
-  retention eviction. Normal Android close/destruction writes `session_end` under the writer lock;
-  crash/kill has no fabricated end marker. A clean writer end does **not** claim all GPU queries retired.
+  retention eviction. Orderly Android close/destruction drains only already-fenced queued leases,
+  joins the profiler worker and writes `session_end` under the writer lock; in-flight GPU query
+  retirement remains unknown (`all_queries_retired: null`). Force-stop/crash/kill normally has no
+  footer; the existing analyzer reports missing closure, not a fabricated end marker or GPU failure.
 - **Invalid span authority:** timestamp reads request 64-bit values **and availability**, without WAIT;
   an unavailable endpoint is never a zero-duration sample or silently replaced by a later endpoint.
   Each retired slot captures its immutable device, queue, queue family, `timestampValidBits` and period.
@@ -1526,6 +1550,23 @@ measurements, the ownership contract is:
   The analyzer also rejects implausibly huge older positive spans despite an old success flag.
   Explicit `--legacy-span-replay` accepts schema-2 frame/window timing only; it cannot recover missing
   query availability or reinterpret old pass-area semantics. No mobile overhead benefit is claimed.
+- **Odin attribution correction (2026-11-05):** the fixed-order Hateno report
+  `.scratch/bench/rpmode/odin-overhead/report.md` for APK `716c122ff09b` has timestamps-only P1
+  at **21.55 fps / 43.750 ms recording / 36.6% GPU busy**, versus C0 at
+  **57.96 fps / 10.789 ms recording / 80.2% GPU busy**. Recording adds **32.961 ms/frame**,
+  and the GPU spends 91.12% of its clock residence at 660 MHz. These CPU observations and reduced
+  GPU feeding supersede the earlier GPU-dominant explanation of this collapse. Stats P2 adds only
+  0.55 ms recording and -0.15 fps versus P1 (inside the 0.51-fps control bracket); its independent
+  FPS cost is unresolved. Different timestamp/NVN GPU scopes, cache/compile contexts and fixed order
+  prevent a measured mechanism-by-mechanism split.
+  Before cutover, `vk_gpuprof_draw` scanned up to 2×160 texture/storage-image bindings per graphics
+  draw even on unselected passes; each live handle called `vk_treg_get` (`vk_res.c`), which took
+  `g_reg_mu` and copied a registry entry. `vk_gpuprof_read` then searched all earlier pass audit
+  records, while pass end appended/reallocated audit storage and present scanned/logged candidates.
+  This source identifies nonconstant CPU work, not a measurement that the audit alone cost 32.961 ms.
+  The removed liveness audit could not prove safe discards across frames/raw-memory consumers anyway.
+  Host CPU benchmarks and a new matched device A/B are separate acceptance evidence; this change
+  does not claim measured mobile recovery.
 - **Profiler cost is not passive:** in the inspected Turnip source
   (`turnip/wt-rpmode/mesa/src/freedreno/vulkan/tu_query_pool.cc:2100–2144`), every
   `ALL_COMMANDS` timestamp issues a WFI before reading the always-on counter; its comment explicitly
@@ -1539,10 +1580,10 @@ measurements, the ownership contract is:
   then subtract/accumulate results with memory-write waits. In a tiled pass that draw stream can execute
   repeatedly. Vertex-stage statistics explicitly disable concurrent binning for GMEM passes
   (`tu_cmd_buffer.cc:3479–3486`); secondary draw streams replay per tile (`:3817,6524`).
-  This is a plausible large GPU perturbation,
-  not a measured decomposition of the Odin slowdown. Host query resets are CPU memory writes; retired
-  result reads use no WAIT flag (`tu_query_pool.cc:678–789,1075–1086`), so they do not intentionally add
-  a new queue/fence wait. Lower-volume JSONL saves CPU/I/O only, not these GPU barriers.
+  These are real GPU instrumentation costs, not evidence that they dominate the observed Odin
+  FPS loss. Host query resets are CPU memory writes; retired result reads use no WAIT flag
+  (`tu_query_pool.cc:678–789,1075–1086`), so they do not intentionally add a new queue/fence wait.
+  Removing the CPU audit and moving reporting off the critical path does not remove these GPU barriers.
   Always isolate profile-off, sampled timestamps-only, sampled statistics, then full profiling under
   identical driver/TU_DEBUG settings. Sampled duration representativeness is conditional on the remaining
   instrumentation **not serializing or otherwise changing GPU execution**; statistics still perturb the

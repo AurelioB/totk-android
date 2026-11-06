@@ -3865,6 +3865,24 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 | `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
 | `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
 
+The timing profiler has no speculative LOAD-before-clear/STORE-without-observed-read audit.
+It retains static attachment load/store operations and logical byte estimates from pass keys.
+Its walking-thread draw hook does fixed work: count each draw and hash the bounded shader identities
+only on the first draw; pass begin copies at most ten attachments. Neither path scans bindings or
+earlier passes, locks/copies the texture registry, allocates or logs. A dedicated `totk-gpuprof`
+worker owns result reads, aggregation, JSONL/log output and query resets. Sixteen prepared leases
+bound its backlog; exhaustion drops profiling coverage, never waits for output on the game path.
+Preparation can wait once at opt-in startup, not per frame.
+
+**Odin overhead evidence:** `.scratch/bench/rpmode/odin-overhead/report.md` records the old
+`716c122ff09b` timestamps-only arm at 21.55 fps versus 57.96 fps control: recording rose
+10.789 → 43.750 ms/frame while GPU busy fell 80.2 → 36.6%. This is a large CPU-side
+instrumentation/feeding perturbation, not evidence that GPU timestamp WFI dominated the FPS loss.
+The Turnip timestamp WFI still exists; the benchmark does not isolate its cost from the old CPU
+audit/reporting costs. This source cutover is not a new device speedup measurement.
+Force-stop normally omits `session_end`; the existing analyzer reports that incomplete closure
+without inventing a footer or discarding retained complete-window timing (DEBUGGING.md).
+
 **Keep the GPU busy** (Graphics → Performance) turns on `TOTK_VK_SPLIT_PASS_DRAWS=512` and `TOTK_ADPF_GPU=1`
 together. It feeds smaller batches earlier and requests clocks that keep up; a little more GPU and CPU clock costs
 power and heat. On by default only on **Snapdragon 8 Elite-class** chips (Odin 3), independently of the preset.

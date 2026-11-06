@@ -100,7 +100,8 @@ def validate_sampled_timing(row):
     sampled = number(row, 'sampled_passes' if row['type'] == 'frame' else 'sample_count', True)
     if sampled > min(observed, budget * frames):
         raise ValueError('sample count exceeds observed passes or frame budget')
-    if not 2 * frames <= number(row, 'timestamp_count', True) <= (2 * budget + 2) * frames:
+    minimum_timestamps = 0 if row.get('span_valid') is False else 2 * frames
+    if not minimum_timestamps <= number(row, 'timestamp_count', True) <= (2 * budget + 2) * frames:
         raise ValueError('timestamp_count outside whole-frame/sample timestamp budget')
     if row.get('timing_scope') != 'main-frame':
         raise ValueError('sampled timing requires timing_scope=main-frame')
@@ -125,6 +126,8 @@ def validate(row):
             raise ValueError('header requires driver and env objects')
         if 'sample_budget' in row:
             sample_budget(row, minimum=0)
+        if 'background_slots' in row:
+            number(row, 'background_slots', True, 1)
         return row
     if kind == 'session_end':
         if not isinstance(row.get('launch_id'), str) or not row['launch_id']:
@@ -135,6 +138,8 @@ def validate(row):
             raise ValueError('session_end requires clean_end=true and nullable all_queries_retired')
         for key in ('last_frame', 'last_window_sequence', 'last_window_end', 'output_failures'):
             number(row, key, True)
+        if 'background_dropped_slots' in row:
+            number(row, 'background_dropped_slots', True)
         return row
     if kind not in ('window', 'pass', 'frame', 'long_frame'):
         raise ValueError('unknown row type')
@@ -165,7 +170,8 @@ def validate(row):
             raise ValueError('span_reason: expected nonempty string')
         number(row, 'dropped', True)
         for key in ('failed_slots', 'stats_failed_slots', 'frames', 'invalid_spans', 'span_frames',
-                    'unavailable_timestamps', 'invalid_timestamps', 'timestamp_wraps', 'output_failures'):
+                    'unavailable_timestamps', 'invalid_timestamps', 'timestamp_wraps', 'output_failures',
+                    'background_dropped_slots'):
             if key in row:
                 number(row, key, True)
         if 'sequence' in row:
@@ -577,11 +583,15 @@ def retention(observations, issues):
         output_failures = max((r.get('output_failures', 0) for r in rows), default=0)
         if output_failures:
             issues.append(f'{stream}: producer reports {output_failures} cumulative output failure(s)')
+        background_drops = max((r.get('background_dropped_slots', 0) for r in rows), default=0)
+        if background_drops:
+            issues.append(f'{stream}: profiler background backlog dropped {background_drops} slot(s); '
+                          'pass/frame coverage is incomplete, game recording was not blocked')
         sessions.append(dict(stream=stream, headers=headers, end=ends[0] if len(ends) == 1 else None,
                              clean_end=bool(len(ends) == 1 and len(launch_ids) == 1 and not header_conflict),
                              missing_windows=missing, rotation_evictions=evictions,
                              missing_rotation_files=missing_files, header_conflict=header_conflict,
-                             output_failures=output_failures,
+                             output_failures=output_failures, background_dropped_slots=background_drops,
                              leading_coverage_known=bool(headers), all_queries_retired=
                              ends[0].get('all_queries_retired') if len(ends) == 1 else None))
     return sessions
@@ -738,6 +748,7 @@ def analyze(paths, legacy_span_replay=False, per_window=False):
                                (o['stream'], o['row']['frame']) in invalid_frames) for o in by_type['frame'])
     rejected_windows = {r['source'] for r in rejected if r['type'] == 'window'}
     censored_windows = sum(bool(o['row']['dropped'] or o['row'].get('failed_slots') or o['row'].get('partial') or
+                                o['row'].get('background_dropped_slots') or
                                 o['source'] in rejected_windows) for o in by_type['window'])
     ordinal_mismatches = sum(
         'ordinals' in windows.get((o['stream'], o['row']['window_start'], o['row']['window_end']), {}) and
@@ -782,6 +793,7 @@ def analyze(paths, legacy_span_replay=False, per_window=False):
                      'streams_without_end': sum(not s['clean_end'] for s in sessions),
                      'header_conflicts': sum(s['header_conflict'] for s in sessions),
                      'output_failures': sum(s['output_failures'] for s in sessions),
+                     'background_dropped_slots': sum(s['background_dropped_slots'] for s in sessions),
                      'ordinal_metadata_mismatches': ordinal_mismatches,
                      'stats_missing': sum(r.get('sampling', {}).get('sample_count', r['count']) - r['stats_valid']
                                           for r in pass_rows),

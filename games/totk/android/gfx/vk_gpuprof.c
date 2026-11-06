@@ -3,6 +3,7 @@
    assembly never touches the walking thread's current pass. */
 #include "vk_int.h"
 #include "vk_gpuprof_time.h"
+#include "../../runtime/thread_place.h"
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -17,6 +18,7 @@
 #define GP_PRE_QUERY (GP_SPAN_BASE + GP_SEGMENTS * 2 + 1)
 #define GP_TIMESTAMPS (GP_PRE_QUERY + 1)
 #define GP_HISTOGRAM 272
+#define GP_BACKLOG 16
 enum { GP_IA_VERTICES, GP_IA_PRIMITIVES, GP_VS, GP_CLIP_INVOCATIONS, GP_CLIP_PRIMITIVES, GP_FS, GP_STATS };
 #define GP_STATS_MASK (VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT | \
     VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT | \
@@ -45,6 +47,7 @@ struct vk_gpuprof_slot {
     uint32_t n, dropped, ns, nt;
     uint64_t sealed;
     uint32_t nsegment, has_pre;
+    int discard;
     VkCommandBuffer pre_cb;
     gp_segment segment[GP_SEGMENTS];
     vk_gpuprof_timestamp span_ticks[GP_SEGMENTS * 2 + 1], pre_tick;
@@ -62,11 +65,6 @@ typedef struct {
     uint64_t sampled, observed_frames, sampled_frames, last_observed_frame, last_sampled_frame;
     uint64_t *histogram; /* window aggregates only, allocated only in sampled mode */
 } gp_group;
-typedef struct {
-    gp_key key;
-    uint64_t lo[10], hi[10];
-    uint32_t stored, read, load_dead;
-} gp_audit;
 
 int vk_gpuprof_on;
 static int stats_on, secondary_pass;
@@ -75,21 +73,16 @@ static uint64_t sample_cursor;
 static int sample_frame_started;
 static vk_gpuprof_slot *current;
 static gp_record *open_record;
-static gp_audit open_audit;
 static VkCommandBuffer open_cb;
 typedef struct {
-    gp_record *parent; gp_audit audit; VkCommandBuffer parent_cb, cb;
+    gp_record *parent; VkCommandBuffer parent_cb, cb;
     int secondary, skipped;
 } gp_scope;
 static gp_scope scopes[16];
 static unsigned scope_n, scope_overflow;
-static gp_audit *audit;
-static size_t audit_n, audit_cap;
 static uint64_t frame = 1;
 static uint32_t frame_instance;
-static uint64_t audit_load_passes, audit_store_passes, audit_load_ops, audit_store_ops;
-static uint64_t audit_overflow;
-/* Timing aggregates below are accessed ONLY by the completion thread. */
+/* Aggregation/query/output state below belongs ONLY to totk-gpuprof. */
 static gp_group groups[GP_GROUPS];
 static struct {
     uint64_t frame, dropped, unavailable_timestamps, invalid_timestamps, timestamp_wraps;
@@ -136,6 +129,25 @@ static int output_closed;
 static char output_launch[96], output_commit[80], output_package[256], output_build[256];
 static uint64_t output_version;
 static uint64_t report_end;
+/* A prepared query lease is never recycled until its existing GPU fence has
+   retired and the profiler worker has read it. Game completion only hands off
+   the lease: slow formatting/IO cannot hold up renderer slot reuse. */
+static pthread_mutex_t background_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t background_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t background_thread;
+static vk_gpuprof_slot *background_free[GP_BACKLOG], *background_queue[GP_BACKLOG];
+static unsigned background_nfree;
+static uint64_t background_head, background_tail;
+static int background_started, background_ready, background_active, background_stop, background_joining, background_joined;
+static _Atomic int background_closing;
+static _Atomic uint64_t background_dropped_slots, background_queued_slots, background_processed_slots;
+#ifdef TOTK_VK_TESTS
+static int background_paused;
+static uint64_t background_flush_requested, background_flush_done;
+#endif
+static void background_start(void);
+static void background_stop_and_join(void);
+static void background_enqueue(vk_gpuprof_slot **owner, int discard);
 static uint64_t env_u64(const char *name, uint64_t fallback, uint64_t minimum, uint64_t maximum) {
     const char *e = getenv(name); char *end = NULL;
     if (!e || !*e || *e == '-') return fallback;
@@ -213,10 +225,11 @@ static void output_init(void) {
     json_add(row, ",\"apk_sha256\":null,\"apk_sha256_reason\":\"not computed in process; join capture APK hash\","
         "\"profile\":%d,\"stats\":%s,\"ordinals\":%s,\"max_bytes\":%llu,\"retained_files\":4,"
         "\"window_frames\":%d,\"span_limit_ms\":%.0f,\"timestamp_bits\":%u,\"timestamp_period_ns\":%.9f,"
-        "\"sample_budget\":%u,\"driver\":{\"vendor_id\":%u,\"device_id\":%u,\"api_version\":%u,\"driver_version\":%u,\"device_name\":",
+        "\"sample_budget\":%u,\"background_slots\":%u,\"background_worker\":\"totk-gpuprof\","
+        "\"driver\":{\"vendor_id\":%u,\"device_id\":%u,\"api_version\":%u,\"driver_version\":%u,\"device_name\":",
         vk_gpuprof_on, stats_on ? "true" : "false", window_ordinals ? "true" : "false",
         (unsigned long long)output_limit, GP_WINDOW, VK_GPUPROF_MAX_FRAME_MS, V.timestamp_bits, V.props.limits.timestampPeriod,
-        sample_budget, V.props.vendorID, V.props.deviceID, V.props.apiVersion, V.props.driverVersion);
+        sample_budget, GP_BACKLOG, V.props.vendorID, V.props.deviceID, V.props.apiVersion, V.props.driverVersion);
     json_string(row, V.props.deviceName);
     json_add(row, ",\"requested_driver\":"); json_string(row, getenv("TOTK_VK_DRIVER"));
     json_add(row, ",\"binary_sha256\":null,\"binary_sha256_reason\":\"join captured driver artifact\"},\"env\":{");
@@ -278,17 +291,20 @@ static void output_window(const char *text, uint64_t sequence, uint64_t end) {
     if (output_file) fflush(output_file);
     pthread_mutex_unlock(&output_mu);
 }
-/* Orderly writer closure only: the frontend has not joined GPU completion.
-   Do not read completion-owner aggregates or pretend all queries retired. */
+/* Drain only already-fenced handed-off leases, then close the writer.
+   Still-in-flight GPU work remains unknown; force-stop cannot run this path. */
 void vk_gpuprof_shutdown(void) {
+    background_stop_and_join();
     pthread_mutex_lock(&output_mu);
     if (!output_closed && output_file) {
         gp_json row = {0};
         json_add(&row, "{\"schema\":3,\"type\":\"session_end\",\"launch_id\":"); json_string(&row, output_launch);
         json_add(&row, ",\"clean_end\":true,\"all_queries_retired\":null,\"last_frame\":%llu,"
-            "\"last_window_sequence\":%llu,\"last_window_end\":%llu,\"output_failures\":%llu}\n",
+            "\"last_window_sequence\":%llu,\"last_window_end\":%llu,\"output_failures\":%llu,"
+            "\"background_dropped_slots\":%llu}\n",
             (unsigned long long)output_last_frame, (unsigned long long)output_last_window,
-            (unsigned long long)output_last_window_end, (unsigned long long)atomic_load(&output_failures));
+            (unsigned long long)output_last_window_end, (unsigned long long)atomic_load(&output_failures),
+            (unsigned long long)atomic_load(&background_dropped_slots));
         output_row_locked(row.data);
         if (output_file) { fflush(output_file); fclose(output_file); output_file = NULL; }
     }
@@ -535,10 +551,12 @@ static void report(void) {
     if (window_invalid_spans) json_add(&summary, "\"span_ms\":null,\"gap_ms\":null,");
     else json_add(&summary, "\"span_ms\":%.9f,\"gap_ms\":%.9f,", window_span, window_gap);
     json_add(&summary, "\"dropped\":%llu,\"failed_slots\":%llu,\"stats_failed_slots\":%llu,"
-        "\"unavailable_timestamps\":%llu,\"invalid_timestamps\":%llu,\"invalid_spans\":%llu,\"output_failures\":%llu}\n",
+        "\"unavailable_timestamps\":%llu,\"invalid_timestamps\":%llu,\"invalid_spans\":%llu,\"output_failures\":%llu,"
+        "\"background_dropped_slots\":%llu}\n",
         (unsigned long long)dropped_records, (unsigned long long)failed_slots, (unsigned long long)stats_failures,
         (unsigned long long)window_unavailable_timestamps, (unsigned long long)window_invalid_timestamps,
-        (unsigned long long)window_invalid_spans, (unsigned long long)atomic_load(&output_failures));
+        (unsigned long long)window_invalid_spans, (unsigned long long)atomic_load(&output_failures),
+        (unsigned long long)atomic_load(&background_dropped_slots));
     output_window(summary.data, window + 1, report_end);
     if (sample_budget) LOGV("[gpu-profile sample] budget=%u sampled=%llu observed=%llu timestamps=%llu frames=%llu; pass sums are sampled only, not frame totals",
         sample_budget, (unsigned long long)window_sample_count, (unsigned long long)window_observed_passes,
@@ -715,7 +733,6 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
                 LOGV("[gpu-profile] schema=3 absolute pass keys; frame reference=largest depth+MRT, game fallback=%ux%u",
                     game_reference_w, game_reference_h);
             }
-            if (vk_gpuprof_on) output_init();
             if (vk_gpuprof_on == 3) {
                 long_frames = (uint32_t)env_u64("TOTK_VK_GPU_PROFILE_LONG_FRAMES", 8, 1, 64);
                 const char *threshold = getenv("TOTK_VK_GPU_PROFILE_LONG_MS"); char *end = NULL;
@@ -723,31 +740,25 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
                     double parsed = strtod(threshold, &end);
                     if (end && !*end && isfinite(parsed) && parsed >= 0 && parsed <= 60000) long_ms = parsed;
                 }
-                long_ring = calloc(long_frames, sizeof *long_ring);
-                if (!long_ring) DIE("GPU profiler long-frame ring allocation");
                 LOGV("[gpu-profile] long-frame mode threshold=%.3f ms retained-frames=%u (TOTK_VK_GPU_PROFILE_LONG_MS/LONG_FRAMES)",
                     long_ms, long_frames);
             }
+            if (vk_gpuprof_on) background_start();
         } else LOGV("[gpu-profile] disabled (TOTK_VK_GPU_PROFILE=%s; default=0)", e ? e : "unset");
     }
-    if (!vk_gpuprof_on) return;
-    if (!*slot) {
-        *slot = calloc(1, sizeof **slot); if (!*slot) DIE("GPU profiler slot allocation");
-        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GP_TIMESTAMPS};
-        VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &(*slot)->pool));
-        if (stats_on) {
-            qi.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS; qi.queryCount = GP_RECORDS;
-            qi.pipelineStatistics = GP_STATS_MASK;
-            VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &(*slot)->stats));
-        }
-    }
+    current = NULL;
+    if (!vk_gpuprof_on || atomic_load_explicit(&background_closing, memory_order_acquire)) { *slot = NULL; return; }
+    if (*slot) DIE("GPU profiler lease reused before completion/cancel handoff");
+    pthread_mutex_lock(&background_mu);
+    if (!background_stop && !atomic_load_explicit(&background_closing, memory_order_relaxed) && background_nfree)
+        *slot = background_free[--background_nfree];
+    pthread_mutex_unlock(&background_mu);
+    if (!*slot) { atomic_fetch_add_explicit(&background_dropped_slots, 1, memory_order_relaxed); return; }
     current = *slot; current->n = current->dropped = 0; current->sealed = 0;
     current->ns = current->nt = 0; current->has_pre = 0; current->pre_cb = VK_NULL_HANDLE;
+    current->discard = 0;
     current->nsegment = 1; current->segment[0] = (gp_segment){frame, 0, 0};
     current->domain = current_time_domain();
-    memset(current->timestamp_marks, 0, sizeof current->timestamp_marks);
-    vkResetQueryPool(V.dev, current->pool, 0, GP_TIMESTAMPS);
-    if (stats_on) vkResetQueryPool(V.dev, current->stats, 0, GP_RECORDS);
     if (sample_budget) sampled_frame_begin(cb);
     else vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE);
 }
@@ -763,8 +774,12 @@ void vk_gpuprof_slot_end(vk_gpuprof_slot *slot, VkCommandBuffer cb) {
     slot->segment[slot->nsegment - 1].last = slot->nsegment;
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot->pool, GP_SPAN_BASE + slot->nsegment);
 }
-void vk_gpuprof_slot_cancel(vk_gpuprof_slot *slot) {
-    if (current == slot) { current = NULL; open_record = NULL; scope_n = scope_overflow = 0; }
+void vk_gpuprof_slot_cancel(vk_gpuprof_slot **slot) {
+    if (current == *slot) {
+        if (sample_budget && current && current->segment[0].first_valid) sample_frame_started = 0;
+        current = NULL; open_record = NULL; scope_n = scope_overflow = 0;
+    }
+    background_enqueue(slot, 1);
 }
 static void frame_marker(VkCommandBuffer cb) {
     if (!current) return;
@@ -800,8 +815,7 @@ static void ingest_record(gp_record *r, double ms, int stats_valid, int sampled)
             (unsigned long long)r->frame, r->instance, sampled);
     }
 }
-void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
-    if (!slot) return;
+static void process_slot(vk_gpuprof_slot *slot) {
     const VkQueryResultFlags flags = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
     uint32_t timed = sample_budget ? slot->nt : slot->n;
     VkResult result = timed ? vkGetQueryPoolResults(V.dev, slot->pool, 0, timed * 2,
@@ -821,7 +835,11 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
     int slot_reported = 0;
     for (uint32_t s = 0; s < slot->nsegment; s++) {
         const gp_segment *segment = &slot->segment[s];
-        if (completed.frame && completed.frame != segment->frame) finish_frame();
+        if (completed.frame && completed.frame != segment->frame) {
+            /* A closed frame is retired below immediately. Crossing an open
+               one means a profiler lease/end marker was lost, not a short span. */
+            frame_time_failure(GP_TIME_INCOMPLETE); finish_frame();
+        }
         advance((segment->frame - 1) / GP_WINDOW);
         completed.frame = segment->frame;
         if (!s) {
@@ -882,9 +900,144 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
     }
     if (slot->sealed) advance(slot->sealed / GP_WINDOW);
 }
+static void background_prepare(vk_gpuprof_slot *slot) {
+    vkResetQueryPool(V.dev, slot->pool, 0, GP_TIMESTAMPS);
+    if (stats_on) vkResetQueryPool(V.dev, slot->stats, 0, GP_RECORDS);
+    memset(slot->timestamp_marks, 0, sizeof slot->timestamp_marks);
+}
+static void background_flush(void) {
+    if (!window_frames) return;
+    partial_report = 1; report_end = last_completed; report(); partial_report = 0;
+}
+static void *background_main(void *unused) {
+    (void)unused;
+    totk_thread_start("totk-gpuprof", NULL);
+#if defined(__linux__)
+    /* Same conservative background policy as pipeline-cache/seed IO: never
+       widen the inherited CPU mask and never contend at render priority. */
+    int nice_error = setpriority(PRIO_PROCESS, 0, 10) ? errno : 0, affinity_error = 0;
+    cpu_set_t allowed, preferred, actual; const char *source = "unavailable", *decision = "unchanged";
+    if (sched_getaffinity(0, sizeof allowed, &allowed)) affinity_error = errno;
+    else {
+        unsigned capacity[CPU_SETSIZE];
+        totk_thread_background_select("/sys/devices/system/cpu", &allowed, &preferred, capacity, &source, &decision);
+        if (!CPU_EQUAL(&preferred, &allowed) && sched_setaffinity(0, sizeof preferred, &preferred)) affinity_error = errno;
+    }
+    char mask[CPU_SETSIZE * 6];
+    if (sched_getaffinity(0, sizeof actual, &actual)) strcpy(mask, "?");
+    else totk_thread_mask_text(&actual, mask, sizeof mask);
+    errno = 0; int nice_value = getpriority(PRIO_PROCESS, 0), nice_get_error = errno;
+    LOGV("[gpu-profile] background placement nice=%d nice_set_errno=%d nice_get_errno=%d affinity=%s source=%s decision=%s affinity_errno=%d",
+        nice_value, nice_error, nice_get_error, mask, source, decision, affinity_error);
+#endif
+    if (long_frames) {
+        long_ring = calloc(long_frames, sizeof *long_ring);
+        if (!long_ring) DIE("GPU profiler long-frame ring allocation");
+    }
+    output_init();
+    for (unsigned i = 0; i < GP_BACKLOG; i++) {
+        vk_gpuprof_slot *slot = calloc(1, sizeof *slot);
+        if (!slot) DIE("GPU profiler lease allocation");
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GP_TIMESTAMPS};
+        VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &slot->pool));
+        if (stats_on) {
+            qi.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS; qi.queryCount = GP_RECORDS; qi.pipelineStatistics = GP_STATS_MASK;
+            VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &slot->stats));
+        }
+        background_prepare(slot); background_free[background_nfree++] = slot;
+    }
+    pthread_mutex_lock(&background_mu);
+    background_ready = 1;
+    pthread_cond_broadcast(&background_cv);
+    for (;;) {
+#ifdef TOTK_VK_TESTS
+        while (!background_stop && (background_paused ||
+            (background_head == background_tail && background_flush_done == background_flush_requested)))
+            pthread_cond_wait(&background_cv, &background_mu);
+#else
+        while (!background_stop && background_head == background_tail) pthread_cond_wait(&background_cv, &background_mu);
+#endif
+        if (background_head != background_tail) {
+            vk_gpuprof_slot *slot = background_queue[background_head++ % GP_BACKLOG];
+            background_active = 1;
+            pthread_mutex_unlock(&background_mu);
+            if (!slot->discard) process_slot(slot);
+            background_prepare(slot);
+            atomic_fetch_add_explicit(&background_processed_slots, 1, memory_order_relaxed);
+            pthread_mutex_lock(&background_mu);
+            background_free[background_nfree++] = slot; background_active = 0;
+            pthread_cond_broadcast(&background_cv);
+            continue;
+        }
+        if (background_stop) break;
+#ifdef TOTK_VK_TESTS
+        uint64_t request = background_flush_requested;
+        background_active = 1;
+        pthread_mutex_unlock(&background_mu);
+        background_flush();
+        pthread_mutex_lock(&background_mu);
+        background_active = 0; background_flush_done = request;
+        pthread_cond_broadcast(&background_cv);
+#endif
+    }
+    pthread_mutex_unlock(&background_mu);
+    background_flush();
+    /* Only idle leases are owned here. GPU work not yet handed off remains
+       deliberately outside shutdown authority and must not be destroyed. */
+    while (background_nfree) {
+        vk_gpuprof_slot *slot = background_free[--background_nfree];
+        if (slot->stats) vkDestroyQueryPool(V.dev, slot->stats, NULL);
+        vkDestroyQueryPool(V.dev, slot->pool, NULL); free(slot);
+    }
+    for (uint32_t i = 0; i < long_frames; i++) free(long_ring[i].pass);
+    free(long_ring); long_ring = NULL;
+    free(frame_pending.pass); frame_pending.pass = NULL;
+    return NULL;
+}
+static void background_start(void) {
+    pthread_mutex_lock(&background_mu);
+    if (!background_started && !atomic_load_explicit(&background_closing, memory_order_acquire)) {
+        background_started = 1;
+        int error = pthread_create(&background_thread, NULL, background_main, NULL);
+        if (error) DIE("GPU profiler thread creation failed: %d", error);
+    }
+    while (background_started && !background_ready) pthread_cond_wait(&background_cv, &background_mu);
+    pthread_mutex_unlock(&background_mu);
+}
+static void background_stop_and_join(void) {
+    atomic_store_explicit(&background_closing, 1, memory_order_release);
+    pthread_mutex_lock(&background_mu);
+    while (background_joining && !background_joined) pthread_cond_wait(&background_cv, &background_mu);
+    if (!background_started || background_joined) { pthread_mutex_unlock(&background_mu); return; }
+    background_joining = background_stop = 1;
+    pthread_cond_broadcast(&background_cv);
+    pthread_mutex_unlock(&background_mu);
+    pthread_join(background_thread, NULL);
+    pthread_mutex_lock(&background_mu);
+    background_joined = 1;
+    pthread_cond_broadcast(&background_cv);
+    pthread_mutex_unlock(&background_mu);
+}
+static void background_enqueue(vk_gpuprof_slot **owner, int discard) {
+    vk_gpuprof_slot *slot = *owner; *owner = NULL;
+    if (!slot) return;
+    slot->discard = discard;
+    pthread_mutex_lock(&background_mu);
+    if (!background_stop) {
+        if (background_tail - background_head == GP_BACKLOG) DIE("GPU profiler lease queue overflow");
+        background_queue[background_tail++ % GP_BACKLOG] = slot;
+        atomic_fetch_add_explicit(&background_queued_slots, 1, memory_order_relaxed);
+        pthread_cond_signal(&background_cv);
+    }
+    pthread_mutex_unlock(&background_mu);
+}
+void vk_gpuprof_slot_complete(vk_gpuprof_slot **slot) {
+    background_enqueue(slot, 0); /* only called AFTER the renderer's existing fence */
+}
 static void begin_record(VkCommandBuffer cb, int compute) {
-    open_record = NULL; memset(&open_audit, 0, sizeof open_audit);
-    if (!current || current->n == GP_RECORDS) { if (current) current->dropped++; audit_overflow++; return; }
+    open_record = NULL;
+    if (!current || current->n == GP_RECORDS) { if (current) current->dropped++; return; }
     sampled_frame_begin(cb);
     uint32_t index = current->n++;
     open_record = &current->rec[index]; memset(open_record, 0, sizeof *open_record);
@@ -913,17 +1066,6 @@ static void begin_record(VkCommandBuffer cb, int compute) {
         vkCmdBeginQuery(cb, current->stats, open_record->stats_q1 - 1, 0);
     }
 }
-void vk_gpuprof_read(uint64_t address, uint64_t size) {
-    if (!address || !size) return;
-    uint64_t end = size > UINT64_MAX - address ? UINT64_MAX : address + size;
-    for (size_t i = 0; i < audit_n; i++) {
-        uint32_t live = audit[i].stored & ~audit[i].read;
-        while (live) {
-            int j = __builtin_ctz(live); live &= live - 1;
-            if (audit[i].lo[j] < end && address < audit[i].hi[j]) audit[i].read |= 1u << j;
-        }
-    }
-}
 void vk_gpuprof_begin(VkCommandBuffer cb, const VkRenderingInfo *ri, const VkFormat formats[10],
                      const tex_t *const textures[10], const uint32_t widths[10], const uint32_t heights[10], uint32_t samples) {
     begin_record(cb, 0); if (!open_record) return;
@@ -932,40 +1074,24 @@ void vk_gpuprof_begin(VkCommandBuffer cb, const VkRenderingInfo *ri, const VkFor
     for (int j = 0; j < 10; j++) {
         const VkRenderingAttachmentInfo *a = j < 8 ? (j < (int)ri->colorAttachmentCount ? &ri->pColorAttachments[j] : NULL) : j == 8 ? ri->pDepthAttachment : ri->pStencilAttachment;
         if (!a || !a->imageView || !textures[j]) continue;
-        const tex_t *t = textures[j]; uint32_t bytes = texel_bytes(formats[j]);
+        uint32_t bytes = texel_bytes(formats[j]);
         /* Depth and stencil are distinct load/store operations: do not count a packed DS image twice. */
         if (j == 9) bytes = 1;
         else if (j == 8 && formats[j] == VK_FORMAT_D32_SFLOAT_S8_UINT) bytes = 4;
         else if (j == 8 && formats[j] == VK_FORMAT_D24_UNORM_S8_UINT) bytes = 3;
         k->a[j] = (gp_attachment){formats[j], widths[j], heights[j], a->loadOp, a->storeOp, bytes};
-        open_audit.lo[j] = (uint64_t)(uintptr_t)t->mem;
-        open_audit.hi[j] = open_audit.lo[j] + t->L.size;
-        if (a->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) vk_gpuprof_read(open_audit.lo[j], t->L.size);
-        if (a->storeOp == VK_ATTACHMENT_STORE_OP_STORE) open_audit.stored |= 1u << j;
     }
 }
 void vk_gpuprof_dispatch_begin(VkCommandBuffer cb) { begin_record(cb, 1); }
-void vk_gpuprof_draw(vk_shader *const shaders[6], int compute) {
+void vk_gpuprof_draw(vk_shader *const shaders[6]) {
     if (!open_record) return;
+    /* Fixed first-draw identity work; never inspect bound resources or earlier passes. */
     if (!open_record->draws) {
         uint64_t h = UINT64_C(14695981039346656037);
         for (int i = 0; i < 6; i++) if (shaders[i]) { h = hash_bytes(h, &i, sizeof i); h = hash_bytes(h, shaders[i]->key, strlen(shaders[i]->key) + 1); }
         open_record->key.shader = h;
     }
     open_record->draws++;
-    /* Conservatively regard every bound texture/storage image in the used stages as read. This
-       deliberately over-retains stores, including storage writes, whole mip chains and aliases. */
-    for (int st = 0; st < 6; st++) if (shaders[st] && (compute ? st == 5 : st < 2)) {
-        for (int j = 0; j < 160; j++) {
-            uint64_t handle = j < 128 ? S.tex[st][j] : S.img[st][j - 128]; if (!handle) continue;
-            vk_treg t; if (vk_treg_get((int)(handle & 0xfffff), &t)) vk_gpuprof_read((uint64_t)(uintptr_t)t.t.mem, t.t.L.size);
-            else for (size_t a = 0; a < audit_n; a++) audit[a].read = UINT32_MAX;
-        }
-    }
-}
-void vk_gpuprof_clear(uint32_t mask) {
-    if (!open_record || open_record->draws) return;
-    for (int j = 0; j < 10; j++) if ((mask >> j & 1) && open_record->key.a[j].format && open_record->key.a[j].load == VK_ATTACHMENT_LOAD_OP_LOAD) open_audit.load_dead |= 1u << j;
 }
 void vk_gpuprof_secondary(int enabled) { secondary_pass = enabled; }
 int vk_gpuprof_chunk_query(VkQueryPool *pool, uint32_t *query) {
@@ -991,11 +1117,6 @@ void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpupro
     open_record->reason = (uint32_t)reason; open_record->detail = detail;
     if (open_record->selected) *token = (vk_gpuprof_end_token){current->pool, current->stats,
         open_record->timestamp_q1, open_record->stats_q1, &open_record->timestamp_count};
-    if (!open_record->key.compute) {
-        if (audit_n == audit_cap) { audit_cap = audit_cap ? 2 * audit_cap : 256; audit = realloc(audit, audit_cap * sizeof *audit); if (!audit) DIE("GPU profiler audit allocation"); }
-        open_audit.key = open_record->key;
-        audit[audit_n++] = open_audit;
-    }
     open_record = NULL; open_cb = VK_NULL_HANDLE;
 }
 void vk_gpuprof_end(VkCommandBuffer cb, vk_pass_end_kind reason, uint32_t detail) {
@@ -1006,7 +1127,7 @@ void vk_gpuprof_end(VkCommandBuffer cb, vk_pass_end_kind reason, uint32_t detail
 void vk_gpuprof_scope_begin(VkCommandBuffer cb, const char *label) {
     if (scope_n == sizeof scopes / sizeof *scopes) { scope_overflow++; return; }
     gp_scope *scope = &scopes[scope_n++];
-    *scope = (gp_scope){.parent = open_record, .audit = open_audit, .parent_cb = open_cb,
+    *scope = (gp_scope){.parent = open_record, .parent_cb = open_cb,
         .cb = cb, .secondary = secondary_pass, .skipped = open_record && cb == open_cb};
     if (scope->skipped) return;
     static const char *const names[] = {"upload", "transfer", "post", "upscale", "present", "framegen"};
@@ -1019,31 +1140,11 @@ void vk_gpuprof_scope_end(VkCommandBuffer cb) {
     if (!scope_n) return;
     gp_scope *scope = &scopes[--scope_n];
     if (!scope->skipped) vk_gpuprof_end(cb, VK_PASS_END_OTHER, 0);
-    open_record = scope->parent; open_audit = scope->audit;
+    open_record = scope->parent;
     open_cb = scope->parent_cb; secondary_pass = scope->secondary;
 }
 static void present_at(VkCommandBuffer cb) {
     if (current) frame_marker(cb);
-    for (size_t i = 0; i < audit_n; i++) {
-        uint32_t unused = audit[i].stored & ~audit[i].read;
-        audit_load_passes += audit[i].load_dead != 0; audit_store_passes += unused != 0;
-        audit_load_ops += (uint32_t)__builtin_popcount(audit[i].load_dead); audit_store_ops += (uint32_t)__builtin_popcount(unused);
-        /* Bound candidate logging: retain counts for all passes, show at most 15 signatures/window. */
-        static uint64_t seen[15]; static unsigned ns;
-        if ((frame - 1) % GP_WINDOW == 0 && i == 0) ns = 0;
-        if (audit[i].load_dead || unused) {
-            uint64_t h = key_hash(&audit[i].key); unsigned k = 0; while (k < ns && seen[k] != h) k++;
-            if (k == ns && ns < 15) { seen[ns++] = h; LOGV("[gpu-profile audit] frame %llu sig=%016llx LOAD-before-full-clear=%#x STORE-no-later-observed-read=%#x (candidate only; cross-frame contents may be live)", (unsigned long long)frame, (unsigned long long)h, audit[i].load_dead, unused); }
-        }
-    }
-    audit_n = 0;
-    if (frame % GP_WINDOW == 0) {
-        LOGV("[gpu-profile audit] frames %llu-%llu: LOAD-before-full-clear %.2f passes %.2f ops/frame; STORE-no-later-observed-read %.2f passes %.2f ops/frame; candidates only, never changes load/store ops; dropped %llu",
-             (unsigned long long)(frame - GP_WINDOW + 1), (unsigned long long)frame,
-             audit_load_passes / (double)GP_WINDOW, audit_load_ops / (double)GP_WINDOW,
-             audit_store_passes / (double)GP_WINDOW, audit_store_ops / (double)GP_WINDOW, (unsigned long long)audit_overflow);
-        audit_load_passes = audit_store_passes = audit_load_ops = audit_store_ops = audit_overflow = 0;
-    }
     if (sample_budget) {
         sample_previous_passes = frame_instance;
         sample_cursor += sample_budget; sample_selected = 0;
@@ -1057,8 +1158,32 @@ void vk_gpuprof_test_frame(VkCommandBuffer cb) {
     if (!vk_gpuprof_on) return;
     present_at(cb);
 }
+void vk_gpuprof_test_wait(void) {
+    if (!vk_gpuprof_on) return;
+    pthread_mutex_lock(&background_mu);
+    while (!background_stop && (background_head != background_tail || background_active))
+        pthread_cond_wait(&background_cv, &background_mu);
+    pthread_mutex_unlock(&background_mu);
+}
+void vk_gpuprof_test_pause(int paused) {
+    pthread_mutex_lock(&background_mu);
+    background_paused = paused;
+    pthread_cond_broadcast(&background_cv);
+    pthread_mutex_unlock(&background_mu);
+}
+void vk_gpuprof_test_background(uint64_t counts[3]) {
+    counts[0] = atomic_load_explicit(&background_queued_slots, memory_order_relaxed);
+    counts[1] = atomic_load_explicit(&background_processed_slots, memory_order_relaxed);
+    counts[2] = atomic_load_explicit(&background_dropped_slots, memory_order_relaxed);
+}
 void vk_gpuprof_test_flush(void) {
-    if (!vk_gpuprof_on || !window_frames) return;
-    partial_report = 1; report_end = last_completed; report(); partial_report = 0;
+    if (!vk_gpuprof_on) return;
+    pthread_mutex_lock(&background_mu);
+    if (background_started && !background_stop) {
+        uint64_t request = ++background_flush_requested;
+        pthread_cond_broadcast(&background_cv);
+        while (background_flush_done != request) pthread_cond_wait(&background_cv, &background_mu);
+    }
+    pthread_mutex_unlock(&background_mu);
 }
 #endif

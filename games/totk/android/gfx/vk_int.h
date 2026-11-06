@@ -606,13 +606,13 @@ typedef enum {
 } vk_pass_end_kind;
 extern int vk_gpuprof_on;   /* initialized once at first slot; off hot paths are a single branch */
 void vk_gpuprof_identity(const char *commit, const char *package, uint64_t version, const char *build);
-void vk_gpuprof_shutdown(void); /* writer-only orderly end; no GPU retirement/join implied */
+void vk_gpuprof_shutdown(void); /* drains already-fenced profiler leases/joins writer; in-flight GPU queries stay unknown */
 void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb);
 void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot);
-void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot);   /* completion thread, AFTER the existing fence */
+void vk_gpuprof_slot_complete(vk_gpuprof_slot **slot); /* fence completion: detach/enqueue only; no query reads or IO */
 void vk_gpuprof_slot_pre(vk_gpuprof_slot *slot, VkCommandBuffer cb);
 void vk_gpuprof_slot_end(vk_gpuprof_slot *slot, VkCommandBuffer cb);
-void vk_gpuprof_slot_cancel(vk_gpuprof_slot *slot);
+void vk_gpuprof_slot_cancel(vk_gpuprof_slot **slot); /* discard unsubmitted lease off walker */
 void vk_gpuprof_scope_begin(VkCommandBuffer cb, const char *label);
 void vk_gpuprof_scope_end(VkCommandBuffer cb);
 void vk_gpuprof_begin(VkCommandBuffer cb, const VkRenderingInfo *ri, const VkFormat formats[10],
@@ -628,14 +628,15 @@ void vk_gpuprof_end_emit(VkCommandBuffer cb, const vk_gpuprof_end_token *token);
 VkQueryPipelineStatisticFlags vk_gpuprof_stats_mask(void);
 void vk_gpuprof_secondary(int enabled);
 int vk_gpuprof_chunk_query(VkQueryPool *pool, uint32_t *query);
-void vk_gpuprof_draw(vk_shader *const shaders[6], int compute);
+void vk_gpuprof_draw(vk_shader *const shaders[6]);
 void vk_gpuprof_dispatch_begin(VkCommandBuffer cb);
-void vk_gpuprof_clear(uint32_t mask);   /* proven full attachment clear, before any draw */
-void vk_gpuprof_read(uint64_t address, uint64_t size);
 void vk_gpuprof_present(void);   /* recording lock; no submission and no wait */
 #ifdef TOTK_VK_TESTS
 void vk_gpuprof_test_frame(VkCommandBuffer cb);
 void vk_gpuprof_test_flush(void);
+void vk_gpuprof_test_wait(void);
+void vk_gpuprof_test_pause(int paused);
+void vk_gpuprof_test_background(uint64_t counts[3]); /* enqueued, processed, dropped leases */
 #endif
 #define D16_SPEC_ID 9001
 typedef struct vk_prog vk_prog;

@@ -248,6 +248,23 @@ class Analyzer(unittest.TestCase):
         frames_only = self.analyze([header(), frame(frame=601)])
         self.assertEqual(frames_only['coverage']['missing_windows'], 2)
 
+    def test_background_backlog_is_explicit_without_fabricating_a_clean_end(self):
+        rows = [header(background_slots=16), window(background_dropped_slots=3),
+                window(window_start=301, window_end=600, background_dropped_slots=7)]
+        report = self.analyze(rows)
+        self.assertEqual(report['coverage']['background_dropped_slots'], 7, 'cumulative count is not summed')
+        self.assertEqual(report['coverage']['streams_without_end'], 1)
+        self.assertEqual(report['coverage']['censored_windows'], 2)
+        self.assertTrue(any('background backlog' in issue for issue in report['issues']))
+        ended = self.analyze(rows + [session_end(background_dropped_slots=9)])
+        self.assertEqual(ended['coverage']['background_dropped_slots'], 9, 'footer includes final pending drops')
+        self.assertEqual(ended['coverage']['streams_without_end'], 0)
+        self.assertIsNone(ended['sessions'][0]['all_queries_retired'])
+        for value in (-1, True, 0.5, '3'):
+            for row in (window(background_dropped_slots=value), session_end(background_dropped_slots=value)):
+                with self.subTest(value=value, row=row), self.assertRaises(ValueError):
+                    gpuprof.validate(row)
+
     def test_header_conflicts_and_invalid_lifecycle_fields_are_explicit(self):
         report = self.analyze([header(), header(rotation=1, ordinals=True), session_end()])
         self.assertEqual(report['coverage']['header_conflicts'], 1)
@@ -946,7 +963,7 @@ class Analyzer(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('GPUPROF_TEST_BIN'), 'set GPUPROF_TEST_BIN to run the real Vulkan fixture')
 class Lavapipe(unittest.TestCase):
     def launch(self, mode, workers, stats, *, unsupported=False, rotate=False, areas=False, ordinals=None,
-               unavailable_span=False, sampling=False, sample_budget=None):
+               unavailable_span=False, sampling=False, sample_budget=None, backpressure=False, cancel=False):
         binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
         self.assertTrue(binary.is_file(), f'no fixture binary: {binary}')
         seed = Path(os.environ.get('TOTK_SHADER_SEED_DIR', binary.parent / 'vkdraw-seed')).resolve()
@@ -973,6 +990,7 @@ class Lavapipe(unittest.TestCase):
             if unsupported:
                 env['GPUPROF_TEST_UNSUPPORTED'] = '1'
             arguments = (['--unavailable-span'] if unavailable_span else ['--areas'] if areas else
+                         ['--backpressure'] if backpressure else ['--cancel'] if cancel else
                          ['--sampling'] if sampling else ['--frames', '302'])
             result = subprocess.run([str(binary), *arguments], cwd=temporary, env=env,
                                     capture_output=True, text=True, timeout=180)
@@ -1003,6 +1021,8 @@ class Lavapipe(unittest.TestCase):
                 self.assertEqual(first['ordinals'], bool(ordinals))
                 self.assertEqual(first['max_bytes'], 4096 if rotate else 134217728)
                 self.assertEqual(first['span_limit_ms'], 10000)
+                self.assertEqual(first['background_slots'], 16)
+                self.assertEqual(first['background_worker'], 'totk-gpuprof')
                 if sample_budget:
                     self.assertEqual(first['sample_budget'], sample_budget)
                     self.assertEqual(first['env']['TOTK_VK_GPU_PROFILE_SAMPLE'], str(sample_budget))
@@ -1054,6 +1074,22 @@ class Lavapipe(unittest.TestCase):
                 self.assertEqual((frames, passes, draws), (3, 11, 0))
                 self.assertEqual(bool(enabled), bool(stats and supported and not unsupported))
                 self.check_areas(report, observations, result.stdout, bool(enabled))
+                return report
+            if backpressure:
+                self.assertEqual(frames, 42)
+                self.assertIn('gpuprof-backpressure frames=40 queued=16 processed=0', result.stdout)
+                self.assertGreater(report['coverage']['background_dropped_slots'], 0)
+                self.assertLess(report['coverage']['frame_rows'], frames)
+                self.assertGreater(report['coverage']['missing_frame_ids'], 0)
+                self.assertTrue(any('background backlog' in issue for issue in report['issues']))
+                return report
+            self.assertEqual(report['coverage']['background_dropped_slots'], 0, report['issues'])
+            if cancel:
+                self.assertEqual(frames, 6)
+                self.assertEqual(report['coverage']['frame_rows'], frames)
+                self.assertEqual(report['coverage']['invalid_frame_spans'], 0, report['issues'])
+                self.assertEqual(report['coverage']['failed_slots'], 0, report['issues'])
+                self.assertEqual(sum(g['count'] for g in report['passes'] if g['kind'] == 'render'), passes)
                 return report
             if rotate:
                 self.assertEqual({p.suffix for p in paths}, {'.jsonl', '.1', '.2', '.3'})
@@ -1115,6 +1151,18 @@ class Lavapipe(unittest.TestCase):
             else:
                 self.assertEqual(report['coverage']['long_frames'], 0)
             return report
+
+    def test_background_backlog_never_blocks_game_completion(self):
+        for workers in (0, 2):
+            for budget in (0, 2):
+                with self.subTest(workers=workers, budget=budget):
+                    self.launch(1, workers, 1, sample_budget=budget, backpressure=True)
+
+    def test_canceled_unsubmitted_leases_are_reset_off_walker_and_reused(self):
+        for workers in (0, 2):
+            for budget in (0, 2):
+                with self.subTest(workers=workers, budget=budget):
+                    self.launch(1, workers, 1, sample_budget=budget, cancel=True)
 
     def check_sampling(self, report, observations, frames, passes, draws, budget, stats_enabled, mode):
         rows = [o['row'] for o in observations]

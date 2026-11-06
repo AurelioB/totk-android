@@ -2102,7 +2102,7 @@ static void *completion_thread(void *arg) {
            Report before CPU post ops: their completion is not GPU finish. gpu_ns covers main buffers, not pre. */
         if (s->ft_frame && totk_ft_on()) totk_ft_slot_gpu(s->ft_frame, s->value, s->ft_gpu_done, gpu_ns);
         occl_complete(s);
-        if (vk_gpuprof_on) vk_gpuprof_slot_complete(s->gpuprof);
+        if (vk_gpuprof_on) vk_gpuprof_slot_complete(&s->gpuprof);
         if (!timing_valid) gpu_time_unavailable(s->guest_frame, "slot GPU bracket unavailable");
         vk_gpu_time_slot timing = {.guest_ns = s->guest_submit_ns, .raw_start_ns = raw_start_ns, .raw_end_ns = raw_end_ns};
         if (g_gpu_time_hardware && timing_valid && !g_gpu_time_uncertain)
@@ -2239,7 +2239,7 @@ void vk_submit_optional_cancel(void) {
     if (!g_cur || !g_optional_next || g_replay_pending || g_cur->adopted)
         DIE("invalid optional pre-submit cancellation");
     VKCHECK(vkEndCommandBuffer(g_cur->cb));
-    if (vk_gpuprof_on) vk_gpuprof_slot_cancel(g_cur->gpuprof);
+    if (vk_gpuprof_on) vk_gpuprof_slot_cancel(&g_cur->gpuprof);
     pthread_mutex_lock(&g_mu);
     g_cur->busy=g_optional_next->busy=0;
     g_cur=g_optional_next=NULL;
@@ -3323,7 +3323,6 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
       if ((vk_write_range_hit(dst, n) || vk_write_range_hit(src, n)) && nb++ < 4000)
           LOGV("[b2b] fp=%llu src=%#llx dst=%#llx bytes=%#llx src_nonzero=%zu", (unsigned long long)(&g_frame_pub ? g_frame_pub : 0), (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n,
                totk_texcopy_nonzero((const void *)(uintptr_t)src, (size_t)(n > (1u << 20) ? (1u << 20) : n))); }
-    if (vk_gpuprof_on) vk_gpuprof_read(src, n);
     VkBuffer sb, db; uint64_t so, dof;
     int ok = vk_resolve(src, n, &sb, &so) && vk_resolve(dst, n, &db, &dof);
     if (ub_private_on()) { vk_ub_touch(src, n); vk_ub_touch(dst, n); }
@@ -3751,7 +3750,6 @@ static void ub_flush_inner(uint64_t lo, uint64_t hi) {
 static void ub_flush(void) { VK_REC_DO(VK_REC_S_UNIFORM, ub_flush_inner(0, UINT64_MAX)); }
 static int ub_pending_physical(uint64_t addr, uint64_t n);
 void vk_ub_touch(uint64_t addr, uint64_t n) {   /* a non-uniform access: the updates it may see go to memory first */
-    if (vk_gpuprof_on) vk_gpuprof_read(addr, n);
     if (!g_ub_unflushed || !n) return;
     addr = ub_address(addr, n);
     if (ub_pending_physical(addr, n)) {

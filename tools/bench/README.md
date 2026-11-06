@@ -106,6 +106,24 @@ on instrumentation **not serializing or otherwise changing GPU execution**. Devi
 clock **time-in-state deltas** over equal intervals with an **unprofiled control**, plus fps, power and
 temperatures; a point MHz reading or lavapipe timing does not establish mobile overhead.
 
+The profiler's draw/pass CPU budget is O(1): count each draw, hash at most six bounded shader
+identities on the first draw, and capture at most ten attachment records at pass begin. It no longer
+scans texture/storage-image bindings, looks up/copies the texture registry, searches prior-pass reads,
+allocates audit arrays or logs liveness candidates, including on unselected passes. Static attachment
+LOAD/CLEAR/STORE/DONT_CARE operations and logical byte estimates remain pass-key-derived summaries,
+not a speculative liveness audit or hardware traffic counter. The dedicated `totk-gpuprof` worker
+owns query result reads, aggregation, formatting/output and resets; its sixteen prepared leases are
+bounded. One-time opt-in startup preparation can wait, but exhaustion during play drops coverage
+(`background_dropped_slots`, cumulative, plus missing frame coverage), never waits for profiler I/O.
+
+**Attribution correction:** `.scratch/bench/rpmode/odin-overhead/report.md` measured old APK
+`716c122ff09b` timestamps-only P1 at 21.55 fps versus 57.96 fps C0, recording
+43.750 versus 10.789 ms/frame, and GPU busy 36.6% versus 80.2%. The source's old per-draw
+2×160 binding scan, registry mutex/copy and all-prior-pass read audit are CPU overhead candidates;
+the report does not isolate each mechanism's cost. Turnip `ALL_COMMANDS` timestamps still issue
+WFI, but that source fact is **not** proof that GPU serialization dominated the observed FPS loss.
+No post-cutover device improvement is established by host timing or this source analysis.
+
 ### Identity, retention and full-mode accounting
 
 Windows now default to **one row per exact key + reference extent + scene role**, with `ordinal: 0`
@@ -122,8 +140,13 @@ package/versionCode when available, Vulkan device/driver identity, effective pro
 of requested launch environment values (null means unset, not necessarily an effective backend default).
 Host fixtures/missing APK metadata explicitly retain unavailable identity; no environment build string is trusted.
 Exact APK/driver artifact hashes must be joined from capture records, not inferred from version labels.
-Normal Android close/destruction emits `session_end`: `clean_end` proves writer closure, while
-`all_queries_retired: null` explicitly does not prove GPU completion. Crash/kill never fabricates this marker.
+Orderly Android close/destruction drains already-fenced queued profiler leases, joins its worker and
+emits `session_end`: `clean_end` proves writer closure, while `all_queries_retired: null` explicitly
+does not prove retirement of in-flight GPU queries. Force-stop/crash/kill normally omits this marker.
+The existing analyzer already flags absent session ends and preserves retained complete-window timing;
+missing closure is expected after force-stop, not evidence of invalid timestamps. Never synthesize an
+end marker or infer unobserved trailing frames from it. The old Odin P1/P2 captures both lack an end
+after final force-stop, so only their retained completed-window timing is established.
 
 Capacity model (not a new device-duration measurement): six original Thor S/D/B1 snapshots
 (`.scratch/bench/rpmode/thor/{S,D,B1}`, initial and `after-hateno`) contain 77 complete windows,

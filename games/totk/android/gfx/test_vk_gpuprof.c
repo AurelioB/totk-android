@@ -3,9 +3,16 @@
  * tests/test_gpuprof.py drives fresh processes for each launch-time switch.
  * The only profiler test hooks mark a frame (the ordinary present boundary,
  * without WSI) and flush a terminal partial window AFTER real fence retirement. */
+/* CPU measurement arm: --scaled [--frames N] [--textures 0..160]
+ * [--passes N] [--draws N]. Defaults: 302 frames, 180 real rendering passes
+ * and 2000 actual draws per frame, with 16 bound textures. Registry textures
+ * need not be consumed by salt37/38: the legacy profiler audits all bound handles.
+ * Replay, commit and fence-wait wall times are reported separately; this is
+ * a CPU-overhead fixture, not a game/device GPU-performance prediction. */
 #include "vk_int.h"
 #include "vk_record.h"
 #include "vk_gpuprof_time.h"
+#include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include <sys/mman.h>
 
 static unsigned checks, failures;
@@ -90,7 +97,7 @@ static void unavailable_query_contract(void) {
         "real unavailable query payload cannot form a valid span");
     vkDestroyQueryPool(V.dev, pool, NULL);
 }
-static uint8_t recording[16384];
+static uint8_t recording[2u << 20];
 static size_t used;
 static void op(uint32_t code, const void *payload, uint32_t bytes) {
     uint32_t size = (8 + bytes + 7) & ~7u;
@@ -109,10 +116,14 @@ static void shader_binary(unsigned stage, unsigned salt, uint8_t control[0x880],
     memcpy(control + 0x20, &header, 4); memcpy(control + 0x700, &bytes, 4);
     memcpy(control + 0x704, &bytes, 4); memcpy(control + 0x714, &stage, 4);
 }
+/* Correctness fixtures drain the independent profiler after the renderer's
+   fence. Scaled CPU measurements and the backlog regression must not do so. */
+static int wait_for_profiler = 1;
 static void wait_submission(uint64_t ticket) {
     int completed = ticket && mtl_wait(ticket, UINT64_C(5000000000));
     CHECK(completed, "real GPU fence retires before inspecting output or flushing profiler");
     if (!completed) { fflush(stderr); _Exit(1); }
+    if (wait_for_profiler) vk_gpuprof_test_wait();
 }
 static void submit(int frame_end) {
     op(OP_END, NULL, 0); mtl_sub_begin(); mtl_exec(recording); used = 0;
@@ -256,6 +267,61 @@ static int run_areas(uint8_t *memory, pool_t *gpu, int supported) {
     printf("gpuprof-areas frames=3 passes=11 draws=0 exact_keys=6 families=5 transfers=17\n");
     return finish_fixture(3, 11, 0, supported);
 }
+static uint64_t benchmark_ns(void) {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+static int run_scaled(uint8_t *memory, pool_t *pool, tex_t targets[2], prog_t *program,
+                      unsigned frames, unsigned passes, unsigned draws, unsigned textures, int supported) {
+    tex_t sampled[160] = {0};
+    uint8_t white[4 * 4 * 4]; memset(white, 255, sizeof white);
+    samp_par sampler = {.lod_max = 1000}; mtl_reg_samp(1, &sampler);
+    for (unsigned i = 0; i < textures; i++) {
+        tex_t *t = &sampled[i];
+        t->d = (nvn_texdesc){.target = 1, .format = 0x25, .width = 4, .height = 4, .depth = 1, .levels = 1};
+        nvn_tex_layout(&t->d, &t->L);
+        if (t->L.size > 0x1000) DIE("GPU profiler scaled fixture texture overflow");
+        t->mem = memory + 0x80000 + i * 0x1000; t->pool = pool; t->serial = 87000 + i;
+        CHECK(!nvn_swizzle(&t->d, 0, 0, white, 4 * 4, t->mem), "scaled bound texture has real swizzled backing");
+        mtl_reg_tex((int)i + 1, t, NULL);
+    }
+    /* Both stages are genuinely active. Fill the 128 fragment slots first,
+     * then vertex slots, using ordinary NVN replay payloads (32 per bind).
+     * Distinct registry entries and backing ranges exercise registry lookup
+     * and prior-pass auditing, not invalid handles or repeated dummy IDs. */
+    for (unsigned first = 0; first < textures;) {
+        unsigned stage_first = first < 128 ? first : first - 128;
+        unsigned count = textures - first; if (count > 32) count = 32;
+        p_bind_handles bind = {.stage = first < 128 ? 1 : 0, .first = (int)stage_first, .n = (int)count};
+        for (unsigned i = 0; i < count; i++) bind.h[i] = (first + i + 1) | (UINT64_C(1) << 20);
+        op(OP_BIND_TEX, &bind, sizeof bind); first += count;
+    }
+    for (unsigned pass = 0; pass < passes; pass++)
+        record_draws(&targets[pass & 1], program, memory, draws / passes + (pass < draws % passes));
+    record_readback(&targets[0], memory); record_readback(&targets[1], memory);
+    op(OP_END, NULL, 0);
+    const size_t tape_bytes = used;
+    uint64_t replay_ns = 0, commit_ns = 0, wait_ns = 0, elapsed_start = benchmark_ns();
+    for (unsigned frame = 0; frame < frames; frame++) {
+        memset(readback_bytes(&targets[0], memory), 0xc7, 64 * 64 * 4);
+        memset(readback_bytes(&targets[1], memory), 0xc7, 128 * 128 * 4);
+        uint64_t begin = benchmark_ns();
+        mtl_sub_begin(); mtl_exec(recording);
+        vk_end_rendering(); vk_gpuprof_test_frame(vk_cb());
+        uint64_t replay_end = benchmark_ns(), ticket = mtl_sub_commit(), commit_end = benchmark_ns();
+        wait_submission(ticket);
+        uint64_t wait_end = benchmark_ns();
+        replay_ns += replay_end - begin; commit_ns += commit_end - replay_end; wait_ns += wait_end - commit_end;
+        check_pixels(&targets[0], memory); check_pixels(&targets[1], memory);
+    }
+    used = 0;
+    printf("gpuprof-scaled frames=%u passes_per_frame=%u draws_per_frame=%u bound_textures=%u "
+        "tape_bytes=%zu replay_ns=%llu commit_ns=%llu wait_ns=%llu elapsed_ns=%llu\n",
+        frames, passes, draws, textures, tape_bytes, (unsigned long long)replay_ns,
+        (unsigned long long)commit_ns, (unsigned long long)wait_ns,
+        (unsigned long long)(benchmark_ns() - elapsed_start));
+    return finish_fixture(frames, frames * passes, frames * draws, supported);
+}
 static int run_unavailable_span(int supported) {
     /* Both command buffers are real. Only the first is submitted, so the
      * reserved frame/slot end queries must remain unavailable after its fence. */
@@ -282,35 +348,58 @@ static int run_unavailable_span(int supported) {
         .commandBufferInfoCount = 1, .pCommandBufferInfos = &command};
     VKCHECK(vkQueueSubmit2(V.queue, 1, &submit, fence));
     VKCHECK(vkWaitForFences(V.dev, 1, &fence, VK_TRUE, UINT64_C(5000000000)));
-    vk_rec_lock(); vk_gpuprof_slot_complete(slot); vk_rec_unlock();
+    vk_rec_lock(); vk_gpuprof_slot_complete(&slot); vk_rec_unlock();
     vkDestroyFence(V.dev, fence, NULL); vkDestroyCommandPool(V.dev, pool, NULL);
     printf("gpuprof-unavailable expected_frames=1 expected_invalid_spans=1\n");
     return finish_fixture(1, 0, 0, supported);
 }
 int main(int argc, char **argv) {
     timestamp_contract();
-    unsigned frames = 302;
+    unsigned frames = 302, passes = 180, draws = 2000, textures = 16;
     int areas = argc == 2 && !strcmp(argv[1], "--areas");
     int unavailable_span = argc == 2 && !strcmp(argv[1], "--unavailable-span");
     int sampling = argc == 2 && !strcmp(argv[1], "--sampling");
-    if (argc == 3 && !strcmp(argv[1], "--frames")) {
-        char *end; unsigned long value = strtoul(argv[2], &end, 10);
-        if (!*argv[2] || *end || !value || value > 10000) return 2;
-        frames = (unsigned)value;
-    } else if (argc != 1 && !areas && !unavailable_span && !sampling) return 2;
+    int scaled = argc > 1 && !strcmp(argv[1], "--scaled");
+    int backpressure = argc == 2 && !strcmp(argv[1], "--backpressure");
+    int cancel = argc == 2 && !strcmp(argv[1], "--cancel");
+    if (scaled || (argc == 3 && !strcmp(argv[1], "--frames"))) {
+        for (int i = scaled ? 2 : 1; i < argc; i += 2) {
+            if (i + 1 == argc) return 2;
+            char *end; unsigned long value = strtoul(argv[i + 1], &end, 10);
+            if (!*argv[i + 1] || *end || value > 10000) return 2;
+            if (!strcmp(argv[i], "--frames") && value) frames = (unsigned)value;
+            else if (scaled && !strcmp(argv[i], "--textures") && value <= 160) textures = (unsigned)value;
+            else if (scaled && !strcmp(argv[i], "--passes") && value >= 2 && value <= 1000) passes = (unsigned)value;
+            else if (scaled && !strcmp(argv[i], "--draws") && value) draws = (unsigned)value;
+            else return 2;
+        }
+        if (scaled && draws < passes) return 2;
+    } else if (argc != 1 && !areas && !unavailable_span && !sampling && !backpressure && !cancel) return 2;
     /* Force short secondary chunks so workers=2 tests a real parallel pass,
      * rather than merely checking an enabled worker setting on inline draws. */
-    setenv("TOTK_VK_REC_CHUNK_DRAWS", "1", 1); setenv("TOTK_VK_REC_LEAD_DRAWS", "1", 1);
+    setenv("TOTK_VK_REC_CHUNK_DRAWS", scaled ? "16" : "1", 1);
+    setenv("TOTK_VK_REC_LEAD_DRAWS", "1", 1);
     setenv("TOTK_VK_REC_INLINE_DRAWS", "0", 1); setenv("TOTK_VK_CHUNK_DRAWS", "0", 1);
     setenv("TOTK_POST_AA", "off", 1);
     const size_t bytes = 4u << 20;
     uint8_t *memory = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (memory == MAP_FAILED) { perror("gpuprof fixture mmap"); return 1; }
+    wait_for_profiler = !scaled && !backpressure;
     mtl_init();
     unavailable_query_contract();
     int supported = V.has_pipeline_statistics;
     if (getenv("GPUPROF_TEST_UNSUPPORTED")) V.has_pipeline_statistics = 0;
     if (unavailable_span) return run_unavailable_span(supported);
+    if (backpressure) { frames = 40; vk_gpuprof_test_pause(1); }
+    if (cancel) {
+        frames = 4;
+        for (unsigned i = 0; i < 32; i++) {
+            int opened = vk_submit_optional_begin();
+            CHECK(opened, "unsubmitted optional slot can be claimed for profiler lease cancellation");
+            if (opened) vk_submit_optional_cancel();
+            vk_gpuprof_test_wait();
+        }
+    }
     mtl_pool_add(memory, bytes);
     pool_t pool = {.mem = memory, .size = bytes,
         .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
@@ -339,6 +428,7 @@ int main(int argc, char **argv) {
         for (unsigned i = 0; i < 256; i++) uniform[i] = 1;
     }
     const float triangle[] = {-1, -1, 3, -1, -1, 3}; memcpy(memory + 0x20000, triangle, sizeof triangle);
+    if (scaled) return run_scaled(memory, &pool, targets, &programs[0], frames, passes, draws, textures, supported);
     unsigned expected_draws = 0, expected_passes = 0;
     for (unsigned frame = 0; frame < frames; frame++) {
         /* Sampling needs stable keys at every frame ordinal, not one key on
@@ -361,6 +451,14 @@ int main(int argc, char **argv) {
         submit(1);
         check_pixels(target, memory);
         if (sampling) check_pixels(&targets[0], memory);
+    }
+    if (backpressure) {
+        uint64_t counts[3]; vk_gpuprof_test_background(counts);
+        CHECK(counts[0] == 16 && counts[1] == 0 && counts[2] > 0,
+            "walker and GPU completion progress while all bounded profiler leases are paused");
+        printf("gpuprof-backpressure frames=%u queued=%llu processed=%llu dropped=%llu\n",
+            frames, (unsigned long long)counts[0], (unsigned long long)counts[1], (unsigned long long)counts[2]);
+        vk_gpuprof_test_pause(0); vk_gpuprof_test_wait(); wait_for_profiler = 1;
     }
     /* Record a genuine pre upload while the main render record is OPEN. The
      * uploader must restore that parent rather than losing its timestamp/key/

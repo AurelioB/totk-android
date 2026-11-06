@@ -3399,7 +3399,6 @@ static void clear_color(const p_clear_color *c) {
     if ((c->mask & 0xf) != 0xf) RED(4, "colour clear with channel mask %#x: cleared whole (masked clears not done yet)", c->mask);
     g_pops.clears_inpass++;
     begin_rendering(0);
-    if (vk_gpuprof_on && full && (c->mask & 15) == 15) vk_gpuprof_clear(1u << c->index);
     VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)c->index, v};
     VkClearRect cr = {clear_rect(), 0, 1};
     if (cr.rect.extent.width && cr.rect.extent.height) {
@@ -3432,8 +3431,6 @@ static void clear_ds(const p_clear_ds *c) {
     VkClearRect cr = {clear_rect(), 0, 1};
     if (cr.rect.extent.width && cr.rect.extent.height) {
         if (as & VK_IMAGE_ASPECT_DEPTH_BIT) g_clear_inline_d++;
-        if (vk_gpuprof_on && full && (!sm || sm == 255))
-            vk_gpuprof_clear((as & VK_IMAGE_ASPECT_DEPTH_BIT ? 1u << 8 : 0) | (as & VK_IMAGE_ASPECT_STENCIL_BIT ? 1u << 9 : 0));
         if (R.secondary) vk_record_clear(&ca, &cr); else vkCmdClearAttachments(vk_cb(), 1, &ca, 1, &cr);
         if (pso_life_active() && full && (!sm || sm == 255)) PL.depth_clear |= as;
         for (unsigned bit = VK_IMAGE_ASPECT_DEPTH_BIT; bit <= VK_IMAGE_ASPECT_STENCIL_BIT; bit <<= 1)
@@ -5944,7 +5941,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         R.feedback_unknown |= feedback.unknown;
         if (R.feedback_armed) { R.feedback_continued++; R.feedback_armed=0; }
     }
-    if (vk_gpuprof_on) vk_gpuprof_draw(sh, 0);
+    if (vk_gpuprof_on) vk_gpuprof_draw(sh);
     g_samples_cum += (uint64_t)count * inst;
     pd_draw(prim, count, inst, di ? di->itype + 1 : 0, sh);
     if (PP.open >= 0 && S.has_vp) { pp_rec *pr = &PP.rec[PP.open]; uint32_t vw = (uint32_t)fabsf(S.vp[0][2]), vh = (uint32_t)fabsf(S.vp[0][3]); if (vw > pr->vpw) pr->vpw = vw; if (vh > pr->vph) pr->vph = vh; }
@@ -5982,7 +5979,7 @@ static void dispatch(const p_dispatch *dp) {
     } else bind_stage(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, sh[5], 5, grid);
     pd_dispatch(sh[5], grid);
     int pi = pp_begin(cb, 1);
-    if (vk_gpuprof_on) { vk_gpuprof_dispatch_begin(cb); vk_gpuprof_draw(sh, 1); }
+    if (vk_gpuprof_on) { vk_gpuprof_dispatch_begin(cb); vk_gpuprof_draw(sh); }
     vkCmdDispatch(cb, grid[0], grid[1], grid[2]);
     shader_xlate_first_command(sh[5], "dispatch");
     if (vk_fg_extract_active && grid[0] && grid[1] && grid[2]) fg_extract_compute(sh);
@@ -6138,7 +6135,6 @@ static void copy_t2b(const p_copy_b2t *c) {   /* texture -> buffer */
     vk_end_rendering_at(VK_PASS_END_COPY, OP_COPY_T2B);
     vk_tex_native_read(x);
     if (trace) vk_texcopy_image("CopyTextureToBuffer", "src", c->tex, x);
-    if (vk_gpuprof_on) vk_gpuprof_read((uint64_t)(uintptr_t)c->tex->mem, c->tex->L.size);
     VkCommandBuffer cb = vk_cb(); vk_barrier_all(cb);
     if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     VkBufferImageCopy r = {.bufferOffset = o, .bufferRowLength = (uint32_t)(row / bpb * bw), .bufferImageHeight = (uint32_t)(rows * bh),
@@ -6190,7 +6186,6 @@ static void copy_t2t(const p_copy_t2t *c) {   /* texture -> texture: same size a
         vk_texcopy_image("CopyTextureToTexture", "src", c->src, s);
         vk_texcopy_image("CopyTextureToTexture", "dst", c->dst, d);
     }
-    if (vk_gpuprof_on) vk_gpuprof_read((uint64_t)(uintptr_t)c->src->mem, c->src->L.size);
     VkCommandBuffer cb = vk_cb(); vk_barrier_all(cb);
     if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     int same = c->sr.width == c->dr.width && c->sr.height == c->dr.height && (c->sr.depth ? c->sr.depth : 1) == (c->dr.depth ? c->dr.depth : 1) && s3 == d3;
@@ -10435,10 +10430,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         vk_canvas_image window=vk_tex_canvas_identity(vk_tex_get(t),0,0);
         vk_canvas_present(&window);
     }
-    if (vk_gpuprof_on) {
-        vk_end_rendering_at(VK_PASS_END_PRESENT, 0);
-        if (t) vk_gpuprof_read((uint64_t)(uintptr_t)t->mem, t->L.size);
-    }
+    if (vk_gpuprof_on) vk_end_rendering_at(VK_PASS_END_PRESENT, 0);
 #ifdef TOTK_ANDROID_APP
     int fg_requested=fg_extract_requested_config();
     vk_fg_present_begin(t);
