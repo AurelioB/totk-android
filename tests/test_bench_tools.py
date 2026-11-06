@@ -20,6 +20,7 @@ import abtest  # noqa: E402
 import benchlib  # noqa: E402
 import check_baselines  # noqa: E402
 import ledger  # noqa: E402
+import sampler  # noqa: E402
 
 BASELINE = benchlib.BENCH_DOCS / 'baseline-1.0.0.json'
 # A Thor snapshot as `bench_input.sh freqs` prints it (no cap below the hardware maximum).
@@ -288,6 +289,45 @@ def ab_log(windows, ctl):
 
 
 class Pacing(unittest.TestCase):
+    def test_bimodal_arms_do_not_turn_mean_changes_into_speed_verdicts(self):
+        base = {'windows': 12, 'fps_mean': 50, 'fps_steady': 57, 'dip_windows': 3,
+                'dip_time_fraction': 0.3, 'frames_near33': 200}
+        per, verdict = benchlib.scene_verdicts(base, dict(base, fps_mean=55))
+        self.assertEqual(verdict, 'same')
+        self.assertEqual(per['fps_mean'][1], 'better')  # informational only
+        self.assertEqual(benchlib.scene_verdicts(base, dict(base, fps_steady=59))[1], 'better')
+        self.assertEqual(benchlib.scene_verdicts(base, dict(base, fps_steady=55))[1], 'worse')
+        self.assertEqual(benchlib.scene_verdicts(base, dict(base, dip_time_fraction=0.35))[1], 'same')
+        self.assertEqual(benchlib.scene_verdicts(base, dict(base, fps_mean=58, dip_time_fraction=0.1))[1],
+                         'verdict confounded by dips')
+        self.assertEqual(benchlib.scene_verdicts(dict(base, fps_steady=None), base)[1], 'inconclusive')
+        self.assertEqual(benchlib.scene_verdicts({'fps_mean': 57}, base)[1], 'inconclusive')
+
+    def test_paired_bimodal_arms_and_cli_report_confounding(self):
+        ref, arm = InSessionAB.records([[1, 57, 57, 17, 34, 40, 10, 0, 0]] * 2,
+                                      [[1, 57, 57, 17, 34, 40, 10, 0, 0]] * 2)
+        for record in (ref, arm):
+            for s in [record['summary']] + [b['summary'] for b in record['blocks']]:
+                s.update(fps_steady=57, dip_time_fraction=0.1, dip_windows=0, frames_near33=0)
+        arm['summary'].update(fps_mean=40, dip_time_fraction=0.4)
+        per = {key: abtest.metric_verdict(key, ref, arm) for key in analyze.AB_METRICS}
+        self.assertEqual(per['dip_time_fraction'][3], 'same')  # pairs alone miss the pooled mismatch
+        self.assertEqual(abtest.arm_verdict(per, ref, arm), 'verdict confounded by dips')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'ab.json'
+            path.write_text(json.dumps({'runs': [{'device': 'odin', 'scene': 'hateno', 'ab': {
+                'windows': {'assigned': 4, 'straddling': 0, 'unlabelled': 0}, 'arms': {'A': ref, 'B': arm}}}]}))
+            result = run(BENCH / 'abtest.py', path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('arm B vs A: verdict confounded by dips', result.stdout)
+        self.assertIn('fps steady', result.stdout)
+        self.assertIn('dip time fraction', result.stdout)
+        arm['summary']['dip_time_fraction'] = 0.1
+        for b in arm['blocks']:
+            b['summary']['dip_time_fraction'] = 0.4
+        per = {key: abtest.metric_verdict(key, ref, arm) for key in analyze.AB_METRICS}
+        self.assertEqual(abtest.arm_verdict(per, ref, arm), 'verdict confounded by dips')
+
     def test_cumulative_draw_counter_differences_and_reset(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / 'totk.log'
@@ -734,6 +774,120 @@ class RootShell(unittest.TestCase):
             self.assertEqual(dev.rootsh('stop').returncode, 0)
             self.assertFalse((dev.dir / 'totk-rootsh-x.sock').exists())
             self.assertIn(b'not running', dev.rootsh('status').stdout)
+
+
+class PanMeasurement(unittest.TestCase):
+    def test_long_default_and_repeats_keep_independent_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'pan.sh').write_text((BENCH / 'pan.sh').read_text())
+            scripts = {
+                'adb': '#!/bin/sh\nexit 0\n',
+                'bench_input.sh': '#!/bin/sh\necho "input $*" >> "$CALLS"\ncase "$*" in *freqs) echo "cpu0=0:1:2:2";; esac\n',
+                'sleep': '#!/bin/sh\necho "sleep $*" >> "$CALLS"\n',
+                'date': '#!/bin/sh\nn=$(cat "$CLOCK" 2>/dev/null); n=$(( ${n:-100} + 1 )); echo "$n" > "$CLOCK"; echo "$n"\n',
+                'python3': '#!/bin/sh\necho "python $*" >> "$CALLS"\n'
+                           'case "$1" in *rootsh.py) case "$*" in *settings.env*) echo 1;; '
+                           '*) n=$(cat "$FRAME" 2>/dev/null); n=$(( ${n:-0} + 300 )); '
+                           'echo "$n" > "$FRAME"; echo "至帧 $n";; esac;; esac\n',
+            }
+            for name, content in scripts.items():
+                (d / name).write_text(content)
+                (d / name).chmod(0o755)
+            env = dict(os.environ, PATH=str(d) + os.pathsep + os.environ['PATH'], CALLS=str(d / 'calls'),
+                       CLOCK=str(d / 'clock'), FRAME=str(d / 'frame'))
+            common = ['sh', str(d / 'pan.sh'), '-s', 'fake', '--device', 'odin', '--scene', 'hateno',
+                      '--target-fps', '60', '--no-shot', '--event', '/fake', '--display', '0']
+            result = subprocess.run(common + ['--out', str(d / 'long')], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((d / 'calls').read_text().count('sleep 72\n'), 2)
+            (d / 'calls').write_text('')
+            result = subprocess.run(common + ['--seconds', '48', '--repeat', '3', '--out', str(d / 'repeats')],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = (d / 'repeats/pans.txt').read_text().splitlines()
+            self.assertEqual(len(rows), 3)
+            identities = [dict(t.split('=', 1) for t in row.split()[2:]) for row in rows]
+            self.assertEqual(len({r['T0'] for r in identities}), 3)
+            self.assertTrue(all(r['TARGET_FPS'] == '60' for r in identities))
+            calls = (d / 'calls').read_text()
+            self.assertEqual(calls.count('sleep 24\n'), 6)
+            self.assertEqual(calls.count('--boundary start'), 3)
+            self.assertEqual(calls.count('--boundary end'), 3)
+            self.assertEqual(len((d / 'repeats/freqs.txt').read_text().splitlines()), 6)
+            # Existing callers (including ab.sh) omit --target-fps: infer the live 60 preset, never stamp 30.
+            index = common.index('--target-fps')
+            auto = common[:index] + common[index + 2:]
+            (d / 'calls').write_text('')
+            result = subprocess.run(auto + ['--out', str(d / 'auto')], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('TARGET_FPS=60', (d / 'auto/pans.txt').read_text())
+            self.assertEqual((d / 'calls').read_text().count('sleep 72\n'), 2)
+
+
+class GpuResidency(unittest.TestCase):
+    SOURCE = '/sys/class/kgsl/kgsl-3d0/devfreq/trans_stat'
+
+    @staticmethod
+    def trans_stat(high, low):
+        # Kernel uses fixed 10-character columns: adjacent 10-digit frequencies have no separating whitespace.
+        return ('     From  :   To\n           :11000000001050000000   time(ms)\n'
+                f'*1100000000:         0        80 {high:10d}\n'
+                f' 1050000000:        90         0 {low:10d}\nTotal transition : 170\n')
+
+    def record(self, boundary, high, low):
+        return {'schema': sampler.GPU_SNAPSHOT_SCHEMA, 'device': 'odin', 'scene': 'hateno', 'T0': 100,
+                'boundary': boundary, 'serial_sha256': 'a' * 64, 'boot_id': 'boot', 'status': 'ok',
+                'source': self.SOURCE, 'reset_count': '0', 'uptime_start': 1 if boundary == 'start' else 50,
+                'uptime_end': 2 if boundary == 'start' else 51, 'raw': self.trans_stat(high, low)}
+
+    def test_trans_stat_uses_residency_column_not_transitions(self):
+        parsed = sampler.parse_gpu_time_in_state(self.trans_stat(1000, 2000), self.SOURCE)
+        self.assertEqual(parsed['counters'], {1100000000: 1000, 1050000000: 2000})
+        self.assertEqual(parsed['counter_unit'], 'ms')
+        a, b = self.record('start', 1000, 2000), self.record('end', 1300, 2100)
+        delta = sampler.gpu_residency_delta(a, b)
+        self.assertEqual(delta['deltas'], {1100000000: 300, 1050000000: 100})
+        self.assertEqual(delta['fractions'], {1100000000: 0.75, 1050000000: 0.25})
+        self.assertEqual(delta['counter_kind'], 'residency')
+        for broken in (dict(b, raw=self.trans_stat(999, 2100)), dict(b, boot_id='reboot'),
+                       dict(b, reset_count='1'), dict(b, uptime_start=0), dict(b, status='error')):
+            with self.subTest(broken=broken):
+                with self.assertRaises(ValueError):
+                    sampler.gpu_residency_delta(a, broken)
+        with self.assertRaises(ValueError):
+            sampler.gpu_residency_delta(None, b)
+
+    def test_clock_stats_vector_is_active_time_not_wall_residency(self):
+        parsed = sampler.parse_gpu_time_in_state('100 300\n', '/sys/class/kgsl/kgsl-3d0/gpu_clock_stats',
+                                                 '660000000 734000000')
+        self.assertEqual(parsed['counters'], {660000000: 100, 734000000: 300})
+        self.assertEqual(parsed['counter_kind'], 'active')
+        self.assertEqual(parsed['counter_unit'], 'unknown')
+        with self.assertRaises(ValueError):
+            sampler.parse_gpu_time_in_state('100 300', '/sys/class/kgsl/kgsl-3d0/gpu_clock_stats')
+
+    def test_analyzer_reports_per_pan_residency_and_battery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'logs').mkdir()
+            (d / 'logs/odin.log').write_text(ab_log({600: (57, 20, 10, 0)}, []))
+            (d / 'pans.txt').write_text('odin hateno F0=0 F1=600 T0=100 T1=120 V=16000 TARGET_FPS=60\n')
+            (d / 'samples-odin.txt').write_text('101 f=300 ac=0 usb=1 level=82 caps= 1/1\n')
+            path = d / sampler.GPU_SNAPSHOT_FILE
+            records = [self.record('start', 1000, 2000), self.record('end', 1300, 2100)]
+            path.write_text(''.join(json.dumps(r) + '\n' for r in records))
+            self.assertEqual(set(sampler.parse_gpu_snapshots(path)), {('odin', 100)})
+            result = run(BENCH / 'analyze.py', d, '--json', d / 'result.json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads((d / 'result.json').read_text())['runs'][0]
+            path.write_text(json.dumps(records[0]) + '\n' + json.dumps(records[0]) + '\n')
+            with self.assertRaises(ValueError):
+                sampler.parse_gpu_snapshots(path)
+        self.assertEqual(record['pans'][0]['gpu_residency']['fractions']['1100000000'], 0.75)
+        self.assertEqual(record['pans'][0]['battery'], [{'epoch': 101, 'ac': 0, 'usb': 1, 'level': 82}])
+        self.assertIn('1100 MHz 75.00%', result.stdout)
+        self.assertIn('only 1 complete windows', result.stdout)
 
 
 class MemorySampling(unittest.TestCase):

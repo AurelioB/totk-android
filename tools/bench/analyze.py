@@ -33,6 +33,7 @@ import argparse, collections, datetime, json, os, re, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchlib import SCHEMA, caps_of_limits, device_signature, guard_output, parse_freq_tokens, sig_caps_text  # noqa: E402
+from sampler import GPU_SNAPSHOT_FILE, gpu_residency_delta, parse_gpu_snapshots  # noqa: E402
 
 METHOD_SUMMARY = ('Default profile per device (no totk.env). Save loaded from the in-game Load list, ~55 s settle, then the '
                   'right stick held at {stick} (right, then left) via sendevent on the controller node. Only the runtime\'s own '
@@ -283,6 +284,10 @@ def print_arms(ab):
         print(f'  arm {arm}: {len(a["blocks"])} blocks, {s["windows"]} windows: fps {fmt(s["fps_mean"])}, p50 '
               f'{fmt(s["p50_ms_median"])} ms, p95 max {fmt(s["p95_ms_max"])} ms, GPU {fmt(s["gpu_ms_mean"])} ms, '
               f'>50 ms {s["over50_total"]} ({fmt(block_metric(s, "over50_total"))}/window)')
+        if s.get('pacing_windows'):
+            print(f'    steady fps {fmt(s.get("fps_steady"))}; dip windows {s["dip_windows"]}/{s["pacing_windows"]}; '
+                  f'dip time fraction {fmt(s["dip_time_fraction"])}; ~33 ms frames {fmt(s["frames_near33"])}; '
+                  f'time-weighted mean fps {fmt(s["fps_time_mean"])}')
         for b in a['blocks']:
             m = b['metrics']
             print(f'    block {b["block"] if b["block"] is not None else "?"} (gen {b["gen"]}, from frame {b["frame"]}, '
@@ -333,7 +338,7 @@ def parse_sample_rows(path):
             if s.isdigit() and m.isdigit():
                 caps.append((int(s), int(m)))
         row = {'t': t, 'f': num('f'), 'cpu': num('cpu'), 'gpu': num('gpu'), 'cool': num('cool'), 'tpl': num('tpl'),
-               'gcap': num('gcap'), 'caps': caps}
+               'gcap': num('gcap'), 'caps': caps, 'ac': num('ac'), 'usb': num('usb'), 'level': num('level')}
         for key, *_ in MEMORY_FIELDS:
             row[key] = real(key) if key in d else None
         parts = [row[k] for k in ('kgk', 'kgm', 'kgi') if row[k] is not None]
@@ -522,6 +527,10 @@ def main():
 
     runs, table = [], []
     freqs = parse_freqs(os.path.join(out, 'freqs.txt'))
+    try:
+        gpu_snapshots = parse_gpu_snapshots(os.path.join(out, GPU_SNAPSHOT_FILE))
+    except ValueError as exc:
+        sys.exit(f'invalid GPU snapshots: {exc}')
     for dev in order:
         timing, gpu, fps, stut, longf, info = logs[dev]
         for scene in scenes:
@@ -530,12 +539,13 @@ def main():
                 continue
             print(f'\n## {dev} / {scene}')
             print('window          fps    p50    p95    max   GPU ms  long>=25  long>=45  over33/over50(stutter line)')
-            windows, thermal, all_rows = [], [], []
+            windows, thermal, all_rows, pan_residencies, batteries, targets = [], [], [], [], [], []
             samples = parse_sample_rows(os.path.join(out, f'samples-{dev}.txt'))
             for kv in plist:
                 f0, f1 = kv['F0'], kv['F1']
                 preset = devices[dev]['settings_env'].get('TOTK_FPS60')
                 target = a.target_fps or kv.get('TARGET_FPS') or (60 if preset == '1' else 30 if preset == '0' else None)
+                targets.append(target)
                 for f in sorted(x for x in timing if f0 + 600 <= x <= f1):
                     lf = [x for x in longf if f - 300 < x[0] <= f]
                     st = stut.get(f)
@@ -552,6 +562,20 @@ def main():
                           f'near33={w["frames_near33"]} ({w["pacing_source"]}) '
                           f'draws/frame={w["draws_per_frame"] if w["draws_per_frame"] is not None else "-"}')
                 rows = parse_samples(None, kv['T0'], kv['T1'], samples)
+                pair = gpu_snapshots.get((dev, kv['T0']), {})
+                try:
+                    residency = {'status': 'ok', **gpu_residency_delta(pair.get('start'), pair.get('end'))}
+                except ValueError as exc:
+                    residency = {'status': 'unavailable', 'reason': str(exc)}
+                pan_residencies.append(residency)
+                if residency['status'] == 'ok':
+                    label = 'active-clock frequency distribution' if residency['counter_kind'] == 'active' else 'residency'
+                    print(f'  GPU {label}: ' + ', '.join(f'{hz / 1e6:g} MHz {100 * fraction:.2f}%'
+                          for hz, fraction in residency['fractions'].items()) +
+                          f' (counter unit {residency["counter_unit"]}; source {residency["source"]})')
+                else:
+                    print(f'  GPU residency unavailable: {residency["reason"]}')
+                batteries.append([{'epoch': r['t'], **{k: r[k] for k in ('ac', 'usb', 'level')}} for r in rows])
                 all_rows += rows
                 if rows:
                     capped = sorted({c for r in rows for c in r['caps'] if c[0] != c[1]})
@@ -583,6 +607,9 @@ def main():
                       f'{" (lower bound / incomplete coverage)" if summary["frames_near33_lower_bound"] else ""}')
             else:
                 caveats.append(f'{dev}/{scene}: pacing target unknown; use --target-fps or collect settings.env.')
+            if 60 in targets and len(windows) < 12:
+                caveats.append(f'{dev}/{scene}: only {len(windows)} complete windows at target 60; require >=12, '
+                               'use pan.sh --target-fps 60 (144 s default) or repeat longer pans.')
             ab = None
             if a.arms:
                 ab = arm_analysis(windows, parse_ctl(os.path.join(out, 'logs', f'{dev}.log')), a.guard_frames)
@@ -598,8 +625,9 @@ def main():
             runs.append({'device': dev, 'scene': scene,
                          'pans': [{'start_frame': kv['F0'], 'end_frame': kv['F1'], 'start_utc': utc(kv['T0']),
                                    'end_utc': utc(kv['T1']), 'stick_value': kv['V'],
-                                   'freq_limits': {'start': s.get('start'), 'end': s.get('end')}}
-                                  for kv, s in zip(plist, snaps)],
+                                   'freq_limits': {'start': s.get('start'), 'end': s.get('end')},
+                                   'target_fps': target, 'gpu_residency': residency, 'battery': battery}
+                                  for kv, s, target, residency, battery in zip(plist, snaps, targets, pan_residencies, batteries)],
                          'freq_stable': stable, 'freq_changes': changes,
                          'summary': summary, 'windows': windows, 'thermal': thermal,
                          **({'memory': memory} if memory else {}), **({'ab': ab} if ab else {})})

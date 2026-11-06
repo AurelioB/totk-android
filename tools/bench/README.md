@@ -18,7 +18,7 @@ Common options: `-s <serial>` (adb serial), `--device <label>` (a short name use
 | Script | Use |
 |---|---|
 | `bench_input.sh -s <serial> [--event /dev/input/eventN] [--display <id>] <action>` | `press <A\|B\|X\|Y\|L\|R\|PLUS\|MINUS\|UP\|DOWN\|LEFT\|RIGHT> [ms]`, `rstick <x> [y]` (`rstick 0` releases), `shot <file>`, `log`, `detect`, `freqs` (the frequency limits as one line: `cpuN=<cpus>:<scaling_min>:<scaling_max>:<cpuinfo_max>` kHz per cpufreq policy, `gpu_maxclk`, `gpu_freqs`, `gpu_devfreq_max`, GPU power levels). Auto-detects the controller node (`getevent -p`: ABS_Z/ABS_RZ + BTN_SOUTH) and the first display (`dumpsys SurfaceFlinger --display-id`). |
-| `pan.sh -s <serial> --device <label> --scene <label> --seconds N [--value 16000] [--first right\|left] [--no-shot] --out <dir>` | Steady pan: stick right for N/2 s, left for N/2 s (`--first left`: the other way round), so the view returns. Appends `<device> <scene> F0= F1= T0= T1= V= D=` to `<dir>/pans.txt` and the frequency limits before / after the pan to `<dir>/freqs.txt`; after releasing the stick (outside the measured windows) a screenshot in `<dir>/shots/` unless `--no-shot`. The game must be running. |
+| `pan.sh -s <serial> --device <label> --scene <label> [--target-fps 30\|60] [--seconds N] [--repeat N] [--value 16000] [--first right\|left] [--no-shot] --out <dir>` | Return pan: stick right for half the time then left (`--first left`: reverse). Defaults to 48 s at 30 target, 144 s at 60 target. Records frame/time/frequency boundaries and exact GPU cumulative snapshots per pan, then optional screenshot outside motion. |
 | `rootsh.py -s <serial> run [-c <script>] \| status \| stop` | The serial's persistent root shell: a host-side broker holding one `adb shell su -c sh`, started by the first `run`, ended by `stop`, after 30 idle minutes or when the device goes. `run` executes the script (default: stdin) in its own `sh -c` and passes its stdout, stderr and status through (124: no answer in time, 125: no root shell). The shell pins itself to the slowest cpufreq cluster (`status` prints the cores). |
 | `live.sh -s <serial> set KEY=VALUE \| unset KEY \| mark <text>...` | Live switches (APP.md *Live switches*): appends the lines to `<game>/totk.ctl` in one write (one generation at the next presented frame) and prints the game's `[totk-ctl]` answer (a mark's acknowledgement, refusals); exit 3 when a mark is not acknowledged, 4 when a line was refused. |
 | `ab.sh -s <serial> --device <label> --scene <label> --arms 'A:<lines>;B:<lines>' [--order ABBAABBA] [--pan-seconds 30] [--settle 15] --out <dir>` | In-session A/B in one loaded scene: per block, the arm's lines plus `mark ab arm=<X> block=<n> scene=<scene> direction=<right\|left>` (live.sh), a settle, a pan (direction alternating). Writes `<dir>/arms.txt` with the direction recorded. |
@@ -61,6 +61,32 @@ Draws are a **cumulative** backend counter: `draws_per_frame` uses consecutive 3
 missing intermediate samples have no rate (null); the next complete monotonic pair resumes measurement.
 `draws_per_frame_mean` and `draws_windows` report the mean and coverage over usable windows.
 
+### Long pans and exact GPU residency
+
+The target defaults to the active preset (`settings.env`, then developer `totk.env` override); `--target-fps`
+overrides detection. Unknown targets use 48 s and omit target metadata rather than incorrectly labelling a 60 run.
+For 60-target measurements use `pan.sh --target-fps 60 --out "$OUT" ...`: the default is a continuous **144 s**
+pan (72 s each direction), long enough for >=12 complete 300-frame windows even during 30-interval stretches.
+`--seconds N` explicitly chooses another length; `--repeat N` runs back-to-back return pans, each with independent
+boundaries. `--target-fps 60 --seconds 48 --repeat 3` is the recommended shorter-camera-cycle alternative.
+Keep at least 12 **included** windows per session/arm; the analyzer warns for shorter 60-target scene records.
+If a prolonged slowdown leaves fewer, lengthen/repeat rather than accepting a short run. Use the same duration,
+cycle length and direction schedule in both arms; explicit `ab.sh --pan-seconds 144` keeps its own block schedule.
+
+Every pan invokes `sampler.py --gpu-snapshot` just before and after motion via the persistent root shell, storing raw
+cumulative counters in `gpu-time-in-state.jsonl`. The first supported source is KGSL/devfreq `trans_stat`, then the
+KGSL `gpu_clock_stats` equivalent (or devfreq `time_in_state`). `analyze.py` reports each pan's frequency counter
+deltas and fractions, not a histogram of 3-second instantaneous clock samples. `trans_stat` uses the final residency
+column, never its transition matrix; fixed-width concatenated headers are supported. Counter units are preserved
+(`time(ms)` means milliseconds; an unspecified unit stays unknown), and frequencies are Hz.
+KGSL `gpu_clock_stats` is a vector in `gpu_available_frequencies` order and counts **active clock time**: its fractions
+are an active-frequency distribution, not wall-time residency. Boundary reads bracket the pan but include small
+host/control latency; timestamps/uptimes and raw text remain available for that audit.
+Missing/failed snapshots, source/frequency/unit/boot changes, resets and non-advancing counters produce explicit
+unavailable residency, never fake zeroes. Older logs without these snapshots cannot recover exact residency.
+Sampler rows add `ac` / `usb` (online 0/1) and `level` (battery percent), null when unavailable; pan JSON retains
+those timestamped rows so different charging states are visible rather than inferred from thermals.
+
 Example (one device, one scene; placeholders in `<>`):
 
 ```sh
@@ -68,7 +94,7 @@ OUT=.scratch/bench/<run-name>
 tools/bench/bench_input.sh -s <serial> freqs                               # the caps you are about to measure
 tools/bench/collect.sh -s <serial> --device <label> --out $OUT --mark     # after the scene settled
 python3 tools/bench/sampler.py -s <serial> --device <label> --out $OUT &  # keep running for the whole session
-tools/bench/pan.sh -s <serial> --device <label> --scene hateno --seconds 48 --out $OUT
+tools/bench/pan.sh -s <serial> --device <label> --scene hateno --target-fps 60 --seconds 48 --repeat 3 --out $OUT
 kill %1                                                                    # stop the sampler
 tools/bench/collect.sh -s <serial> --device <label> --out $OUT
 python3 tools/bench/analyze.py $OUT --commit <sha> --json $OUT/result.json

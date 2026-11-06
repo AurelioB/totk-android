@@ -131,10 +131,14 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
 8. **Start the sampler** (first scene; it runs for the whole session):
    `python3 tools/bench/sampler.py -s <serial> --device <label> --out $OUT &` (note its PID if you run the next steps
    from another shell).
-9. **Pan**: `tools/bench/pan.sh -s <serial> --device <label> --scene <hateno|lookout|rotsumamu> --seconds 48 --out $OUT`
-   (right stick at 16000 of 32767, right then left; 48 s gives at least 4 full windows at 30 fps). It also records the
-   frequency limits just before and after the pan in `$OUT/freqs.txt`. Look at the screenshot it takes after releasing
-   the stick in `$OUT/shots/`. Repeat steps 5–6 and 9 for the other scenes.
+9. **Pan**: `tools/bench/pan.sh -s <serial> --device <label> --scene <hateno|lookout|rotsumamu> --target-fps 60 --out $OUT`
+   for a 60 preset (default **144 s**, half each direction). The recommended short-cycle alternative is
+   `--target-fps 60 --seconds 48 --repeat 3`: three back-to-back return pans. Require >=12 included 300-frame windows
+   per session/arm, even if it enters 30-interval stretches; lengthen/repeat if the analyzer warns of fewer. For a 30
+   preset use `--target-fps 30` (default 48 s). Keep the duration/cycle/direction schedule identical in both arms.
+   Each pan records frequency limits and raw cumulative GPU counter snapshots immediately before/after motion
+   (`freqs.txt`, `gpu-time-in-state.jsonl`), then takes a screenshot outside the measured motion. Check `$OUT/shots/`.
+   Repeat steps 5–6 and 9 for the other scenes; the sampler stays running across repeated pans.
 10. **Stop the sampler** (`kill %1` in the same shell, else `kill <pid>`, or Ctrl-C; it removes its device loop) and
     **collect**: `tools/bench/collect.sh -s <serial> --device <label> --out $OUT`. It must report 0 GPU/SMMU fault
     lines and 0 "device lost"; investigate otherwise.
@@ -169,6 +173,11 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
   (`[长帧]`) come from `totk.log`; temperatures, cooling states, GPU `thermal_pwrlevel` and cpufreq limits from the
   sampler over each pan; the frequency limits (per cluster `related_cpus`, `scaling_min/max`, `cpuinfo_max`; GPU cap,
   hardware maximum and power levels) from `freqs.txt` (`freq_limits` per pan, `freq_stable` per run).
+  Exact per-pan GPU residency comes from boundary differences of `trans_stat`'s final time column, never its
+  transition matrix or an instantaneous-clock histogram. The KGSL `gpu_clock_stats` alternative counts active time
+  in available-frequency order, so is labelled active-clock distribution, not full wall residency. Counter units
+  and raw snapshots are retained; absent/failed/reset/mismatched counters are unavailable, not zero.
+  Sampler `ac`, `usb`, `level` fields (online 0/1, battery percent) are retained per pan with timestamps.
 - Read **steady fps, dip-window count, dip time fraction, ~33 ms frame count, and mean fps separately**. At a 60 target,
   >=60/300 frames in 29–37.5 ms makes a dip window (complete durations, else complete fence histogram); without full
   frame evidence the fallback is fps <50. At 30 target the fallback is <25; normal ~33 ms pacing is not a dip.
