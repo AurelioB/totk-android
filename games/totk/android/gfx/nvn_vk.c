@@ -528,6 +528,7 @@ void vk_rec_profile_present(uint64_t frame) {
 static PFN_vkGetInstanceProcAddr gipa;
 static PFN_vkGetCalibratedTimestampsEXT g_calibrated_timestamps;
 static int g_gpu_time_hardware;
+static int g_gpu_time_fps_median;
 static void ts_clock_init(void);
 enum { POOLS_HOST = 1, POOLS_EXPORT, POOLS_HEAP };
 static int g_pool_mode; static const char *g_pool_mode_name;
@@ -898,6 +899,10 @@ static void vk_init_once(void) {
              "default latency; TOTK_GPU_TIME=hardware opts in") :
          g_gpu_time_hardware || !strcmp(gpu_time, "latency") ? "explicit" :
              "unknown value; retaining latency");
+    g_gpu_time_fps_median = g_gpu_time_hardware &&
+        vk_gpu_time_fps_median_enabled(getenv("TOTK_GPU_TIME_FPS_MEDIAN"));
+    LOGV("[fps-policy] TOTK_GPU_TIME_FPS_MEDIAN=%d: FPS END consumer only, median of three unique valid reports; hardware required",
+         g_gpu_time_fps_median);
     ts_clock_init();
     size_t pc_size; void *pc_data = vk_pcache_load(pcache_path(), &pc_size, 1);
     VkPipelineCacheCreateInfo pcc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = pc_size, .pInitialData = pc_data};
@@ -1661,6 +1666,9 @@ static int g_gpu_time_uncertain;
 static vk_gpu_time_samples g_gpu_time_samples; /* publication and FPS reads under g_mu */
 enum { GC_SAMPLES, GC_REBASED, GC_INVALID, GC_WITHHELD, GC_COUNT };
 static uint64_t g_gpu_controller_stats[GC_COUNT]; /* g_mu, not the completion-only stats */
+static vk_gpu_time_fps_filter g_gpu_fps_filter; /* g_mu, optional FPS-only policy */
+static uint64_t g_gpu_fps_filter_reads, g_gpu_fps_filter_changed;
+static uint64_t g_gpu_fps_filter_before, g_gpu_fps_filter_after;
 int vk_gpu_time_hardware(void) { return g_gpu_time_hardware; }
 uint64_t vk_gpu_time_controller_end(uint64_t addr, uint64_t timestamp, uint64_t origin) {
     int valid, rebased;
@@ -1670,6 +1678,15 @@ uint64_t vk_gpu_time_controller_end(uint64_t addr, uint64_t timestamp, uint64_t 
     g_gpu_controller_stats[GC_REBASED] += rebased;
     g_gpu_controller_stats[GC_INVALID] += !valid;
     g_gpu_controller_stats[GC_WITHHELD] += !valid;
+    if (g_gpu_time_fps_median) {
+        uint64_t work = end - origin;
+        uint64_t filtered = vk_gpu_time_fps_median(&g_gpu_fps_filter, addr, timestamp, work, valid);
+        g_gpu_fps_filter_reads++;
+        g_gpu_fps_filter_changed += work != filtered;
+        g_gpu_fps_filter_before += work;
+        g_gpu_fps_filter_after += filtered;
+        end = origin + filtered;
+    }
     pthread_mutex_unlock(&g_mu);
     /* The listener converts ns back to ticks before subtracting. Round UP here
        so a held input, including initial zero, survives that round trip exactly. */
@@ -1693,8 +1710,11 @@ static uint64_t g_gpu_time_stats[GT_COUNT]; /* completion-owned */
 static uint64_t g_gpu_time_published[GT_COUNT]; /* snapshot under existing g_mu */
 static void gpu_time_stats(uint64_t frame) {
     uint64_t v[GT_COUNT], c[GC_COUNT]; static uint64_t previous[GT_COUNT], previous_controller[GC_COUNT];
+    uint64_t filter[4]; static uint64_t previous_filter[4];
     pthread_mutex_lock(&g_mu);
     memcpy(v, g_gpu_time_published, sizeof v); memcpy(c, g_gpu_controller_stats, sizeof c);
+    filter[0] = g_gpu_fps_filter_reads; filter[1] = g_gpu_fps_filter_changed;
+    filter[2] = g_gpu_fps_filter_before; filter[3] = g_gpu_fps_filter_after;
     pthread_mutex_unlock(&g_mu);
     for (unsigned i = 0; i < GT_COUNT; i++) { uint64_t current = v[i]; v[i] -= previous[i]; previous[i] = current; }
     for (unsigned i = 0; i < GC_COUNT; i++) { uint64_t current = c[i]; c[i] -= previous_controller[i]; previous_controller[i] = current; }
@@ -1707,6 +1727,15 @@ static void gpu_time_stats(uint64_t frame) {
          (unsigned long long)v[GT_WORK_COUNT], (unsigned long long)v[GT_FALLBACK],
          (unsigned long long)v[GT_MONOTONIC], (unsigned long long)c[GC_SAMPLES],
          (unsigned long long)c[GC_REBASED], (unsigned long long)c[GC_INVALID], (unsigned long long)c[GC_WITHHELD]);
+    if (g_gpu_time_fps_median) {
+        for (unsigned i = 0; i < 4; i++) {
+            uint64_t current = filter[i]; filter[i] -= previous_filter[i]; previous_filter[i] = current;
+        }
+        LOGV("[fps-policy] GPU FPS median frame %llu: %llu reads, %llu changed; raw/filtered avg %.3f/%.3f ms",
+             (unsigned long long)frame, (unsigned long long)filter[0], (unsigned long long)filter[1],
+             filter[0] ? filter[2] / (19200.0 * filter[0]) : 0,
+             filter[0] ? filter[3] / (19200.0 * filter[0]) : 0);
+    }
 }
 /* Before any real submission or completion worker exists, bracket three tiny
    empty timestamp submissions with the SAME clock provider as the timer gates.

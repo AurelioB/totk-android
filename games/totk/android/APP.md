@@ -3976,6 +3976,42 @@ Stored `min/max=2/3` with FPS60 enabled is **expected**: the patch changes compa
 instructions, not those configuration words. Native emulation explicitly checks that interval 1 is
 selected while the stored words remain 2/3; seeing 2/3 is not evidence that the patch is absent.
 
+**Odin dip experiments (both startup-only and default off):**
+`TOTK_FPS60_HYSTERESIS=1` requires FPS60/v143 and changes three guarded controller loads:
+over-limit 6 (raise on the seventh consecutive over-budget decision, versus native limit 2/third),
+cooldown reload 2 versus native 6. Work/bias math, min/max, freeze, listener veto and interval setter
+remain native; fixed experiment limits replace configuration overrides, while logged `limits` remain stored words.
+Compare interval-2 frame/time share and episode length, not only mean fps; shorter cooldown can increase chatter,
+and tolerating late work can produce missed-display judder. No 60 interval is forced under sustained overload.
+
+`TOTK_GPU_TIME_FPS_MEDIAN=1` requires `TOTK_GPU_TIME=hardware` and filters only the two known FPS END
+consumers with a three-unique-report median (no synthetic warmup zeros; duplicate reads do not advance it).
+Invalid reports hold the last filtered work; DRS/absolute timestamps/raw GPU profiling are unchanged.
+Startup logs the effective mode and `[fps-policy] GPU FPS median frame` reports raw/filtered means and changed reads.
+An isolated spike is rejected, but a sustained rise passes on its second sample; recovery also needs two samples.
+This is a controller-noise experiment, **not** evidence that hardware timings are wrong, and cannot fix CPU-triggered dips.
+
+The existing `[fps-policy]` decision logs distinguish these causes: on Odin shadow A2,
+frame 7302 drops with CPU/GPU 14.063/18.584 ms and recovers at 7470 (168 interval-2 frames);
+frame 8555 drops with 19.587/12.875 ms and recovers at 8694 (139 frames).
+At frame 7500 the hardware producer means are 14.403/11.561 ms before/after removal,
+with zero fallback/clamps/invalid/withheld samples; the mean cannot disprove a transient over-budget input.
+The ~33-ms cadence is a game policy result, not a shader-compile count or raw GPU busy duration.
+Setters and 300-frame summaries do not retain all preceding inputs, so the native three-late rule comes from
+instruction emulation, not an invented per-frame trace. Boot/scripted-camera floors must be excluded from pans.
+
+Device qualification: use the same release APK, Recommended60 preset, 60-Hz panel, GPU busy On,
+Hateno save/view, warmed seed, fixed resolution/DRS and recording threads. Fresh launch each arm:
+control `TOTK_FPS60_HYSTERESIS=0 TOTK_GPU_TIME_FPS_MEDIAN=0`; then hysteresis-only `1/0`;
+then median-only `0/1`, each interleaved ABBA for at least three 180-second stationary/pan repetitions.
+Keep `TOTK_GPU_TIME=hardware`, `TOTK_FPS_AUTO=0`, `TOTK_FRAMEGEN=0` and thermal/ADPF settings identical.
+Require the switch startup logs, controller=sys+0x200, zero hardware fallback/invalid/withheld, and no cutscene floor.
+Join every drop/recovery decision to immutable interval-1/2 cadence, CPU/GPU scores and GPU FPS median summaries;
+report interval-2 frame share, wall-time share and extra-refresh tax separately, plus p95/p99/>50ms,
+physical GPU ms/DRS, CPU/GPU clocks, power and temperature. Reject apparent fps gains with worse missed-refresh
+tails, altered time/physics, freeze/veto violations, sustained report withholding or rising thermal cost.
+Only test `1/1` after each independent arm qualifies; no device result is claimed by these host experiments.
+
 **Thermal frame step (Android, opt-in):** `TOTK_THERMAL_STEP=1` (default `0`, startup-only)
 raises the v143 FPS60 controller's minimum result to two 60-Hz ticks when the running interval is one
 and thermal status reaches SEVERE (3), or the 10-second headroom forecast reaches 1.0.
