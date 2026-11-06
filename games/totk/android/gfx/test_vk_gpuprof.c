@@ -400,6 +400,14 @@ static int run_sealed_present(uint8_t *memory, tex_t targets[2], prog_t programs
         DIE("GPU profiler real present fixture requires Vulkan host event entrypoints");
     VkEventCreateInfo info = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
     VKCHECK(create_event(V.dev, &info, NULL, &gate.event));
+    VkCommandPool cancel_pool;
+    VkCommandPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, .queueFamilyIndex = V.qfam};
+    VKCHECK(vkCreateCommandPool(V.dev, &pool_info, NULL, &cancel_pool));
+    VkCommandBuffer cancel_cb;
+    VkCommandBufferAllocateInfo allocate = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = cancel_pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VKCHECK(vkAllocateCommandBuffers(V.dev, &allocate, &cancel_cb));
     const char *sampling = getenv("TOTK_VK_GPU_PROFILE_SAMPLE");
     unsigned completed_closes = 0, pending_closes = 0, pre_uploads = 0;
     uint64_t initial_ticket = mtl_last_fence(), marker_submissions = 0;
@@ -466,6 +474,7 @@ static int run_sealed_present(uint8_t *memory, tex_t targets[2], prog_t programs
             for (unsigned i = 0; i < 64; i++) bad += present[i] != 0x24680000u + frame;
             CHECK(!bad, "shutdown fence drain preserves real present GPU results");
             destroy_event(V.dev, gate.event, NULL);
+            vkDestroyCommandPool(V.dev, cancel_pool, NULL);
             pthread_cond_destroy(&gate.cv); pthread_mutex_destroy(&gate.mu);
             return finish_fixture(1, 2, 4, supported);
         }
@@ -477,12 +486,23 @@ static int run_sealed_present(uint8_t *memory, tex_t targets[2], prog_t programs
                 VKCHECK(gate.set_event(V.dev, gate.event));
                 DIE("GPU profiler present gate thread failed: %d", result);
             }
-            /* An unsubmitted canceled lease reaches the worker before the
-             * older GPU-blocked slot, but must not advance its fenced frontier. */
+            /* Exercise profiler lease cancellation independently of optional
+             * renderer admission: that API deliberately trylocks g_mu and may
+             * reject transient submit/completion contention despite free slots.
+             * This real CB is never submitted; its canceled lease must reach
+             * the reporter before the older GPU-blocked submitted lease. */
+            VKCHECK(vkResetCommandPool(V.dev, cancel_pool, 0));
+            VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+            VKCHECK(vkBeginCommandBuffer(cancel_cb, &begin));
+            vk_gpuprof_slot *cancelled = NULL;
             vk_rec_lock();
-            int opened = vk_submit_optional_begin();
-            CHECK(opened, "pending sealed frame permits an unrelated optional lease cancellation");
-            if (opened) vk_submit_optional_cancel();
+            vk_gpuprof_slot_begin(&cancelled, cancel_cb);
+            CHECK(!vk_gpuprof_on || cancelled,
+                "pending sealed frame acquires a real independent profiler lease for cancellation");
+            VKCHECK(vkEndCommandBuffer(cancel_cb));
+            vk_gpuprof_slot_cancel(&cancelled);
+            CHECK(!cancelled, "unsubmitted profiler lease cancellation transfers its ownership");
             vk_rec_unlock();
             vk_gpuprof_test_wait();
             CHECK(!mtl_wait(final_ticket, 0), "discarded optional lease cannot complete the older GPU fence");
@@ -528,6 +548,7 @@ static int run_sealed_present(uint8_t *memory, tex_t targets[2], prog_t programs
         frames, (unsigned long long)(submissions - marker_submissions), pre_uploads, completed_closes,
         pending_closes, (unsigned long long)marker_submissions);
     destroy_event(V.dev, gate.event, NULL);
+    vkDestroyCommandPool(V.dev, cancel_pool, NULL);
     pthread_cond_destroy(&gate.cv); pthread_mutex_destroy(&gate.mu);
     return finish_fixture(frames, frames * 2, frames * 4, supported);
 }

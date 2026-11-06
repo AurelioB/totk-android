@@ -1578,6 +1578,11 @@ measurements, the ownership contract is:
   The old host fixture kept a command buffer open at present and exercised the GPU-marker path,
   missing Android's sealed-then-present ordering. The new host scenario covers both already-consumed
   and not-yet-fenced submissions and an isolated final CPU closure, not new Android evidence.
+  Each GPU-blocked close also acquires/cancels a profiler lease on a real independent, never-submitted
+  command buffer, and requires the exact cancellation count in the footer. It does not assume
+  optional renderer admission succeeds: that API deliberately uses a nonblocking mutex trylock
+  and may reject submit/completion contention even with free slots. The separate `--cancel` case
+  retains optional-slot cancellation integration coverage.
   The host `--shutdown-inflight` scenario enters shutdown with a verifiably unsignalled real GPU fence
   and no prior profiler flush; its modes 1/3 × workers 0/2 × stats 0/1 × SAMPLE 0/2 matrix requires
   complete frame output and zero outstanding lease/query counts after shutdown, not merely writer closure.

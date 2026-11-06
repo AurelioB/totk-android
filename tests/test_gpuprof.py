@@ -1632,6 +1632,8 @@ class Lavapipe(unittest.TestCase):
                 f'gpuprof-sealed-present frames={frames} main_submissions={frames * 3} pre_uploads={frames * 2} '
                 f'completed_closes={(frames + 1) // 2} pending_closes={frames // 2} '
                 f'marker_submissions={frames if budget else 0} last_closed_before_flush=1', stdout)
+            self.assertEqual(report['sessions'][0]['end']['query_retirement']['leases_cancelled'],
+                             frames // 2, 'every GPU-blocked close must cancel its independent lease')
         self.assertEqual((passes, draws), (frames * 2, frames * 4))
         rows = [o['row'] for o in observations]
         frame_rows = [r for r in rows if r['type'] == 'frame']
