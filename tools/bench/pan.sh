@@ -1,11 +1,14 @@
 #!/bin/sh
-# pan.sh -s <serial> --device <label> --scene <label> --seconds N [--value 16000] [--first right|left] [--no-shot]
-#        --out <dir> [--event /dev/input/eventN] [--display <id>] [--package <pkg>] [--game-dir <dir>]
+# pan.sh -s <serial> --device <label> --scene <label> --out <dir> [--target-fps 30|60] [--seconds N] [--repeat N]
+#        [--value 16000] [--first right|left] [--no-shot] [--event /dev/input/eventN] [--display <id>]
+#        [--package <pkg>] [--game-dir <dir>]
 #
 # Steady horizontal camera pan: the right stick held at --value (of 32767) to the right for the first half of the time,
-# then to the left for the second half (--first left: left, then right), then released, so the view returns. Appends one
-# line to <out>/pans.txt:
-#   <device> <scene> F0=<last finished frame window before> F1=<after> T0=<epoch s> T1=<epoch s> V=<value> D=<1|-1>
+# then to the left for the second half (--first left: left, then right), then released, so the view returns.
+# Defaults: target 30, 48 seconds; --target-fps 60 uses one continuous 144-second pan to retain at least twelve complete
+# 300-frame windows even near 30 fps. --seconds overrides either duration; --repeat runs N pans without another settle.
+# Appends one line per pan to <out>/pans.txt (TARGET_FPS lets the analyzer warn when fewer than twelve windows survive):
+#   <device> <scene> F0=<before> F1=<after> T0=<epoch s> T1=<epoch s> V=<value> D=<1|-1> TARGET_FPS=<30|60>
 # (D: 1 right first, -1 left first) and two lines to <out>/freqs.txt, the frequency limits (`bench_input.sh freqs`)
 # just before and just after the pan, plus raw cumulative GPU counters at both boundaries in gpu-time-in-state.jsonl:
 #   <device> <scene> T0=<epoch s> start|end <cpuN=... gpu_...>
@@ -15,16 +18,19 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,/^set -u/{ /^set -u/d; s/^# \{0,1\}//; p; }' "$0" >&2; exit 2; }
 die() { echo "pan: $*" >&2; exit 1; }
 
 SER=""; DEV=""; SCENE=""; SECS=""; V=16000; FIRST=right; OUT=""; EV=""; DISP=""; PKG=com.aure.totk; GAME=""; SHOT=1
+TARGET_FPS=30; REPEAT=1
 while [ $# -gt 0 ]; do
   case $1 in
     -s) SER=${2:?}; shift 2 ;;
     --device) DEV=${2:?}; shift 2 ;;
     --scene) SCENE=${2:?}; shift 2 ;;
     --seconds) SECS=${2:?}; shift 2 ;;
+    --target-fps) TARGET_FPS=${2:?}; shift 2 ;;
+    --repeat) REPEAT=${2:?}; shift 2 ;;
     --value) V=${2:?}; shift 2 ;;
     --first) FIRST=${2:?}; shift 2 ;;
     --no-shot) SHOT=""; shift ;;
@@ -37,7 +43,14 @@ while [ $# -gt 0 ]; do
     *) die "unknown argument $1" ;;
   esac
 done
-[ -n "$SER" ] && [ -n "$DEV" ] && [ -n "$SCENE" ] && [ -n "$SECS" ] && [ -n "$OUT" ] || usage
+[ -n "$SER" ] && [ -n "$DEV" ] && [ -n "$SCENE" ] && [ -n "$OUT" ] || usage
+case $TARGET_FPS in 30) [ -n "$SECS" ] || SECS=48 ;; 60) [ -n "$SECS" ] || SECS=144 ;; *) die "--target-fps: 30 or 60" ;; esac
+case $REPEAT in ''|*[!0-9]*) die "--repeat: a positive integer" ;; esac
+[ "$REPEAT" -gt 0 ] || die "--repeat: a positive integer"
+HALF=$(awk -v seconds="$SECS" 'BEGIN {
+  if (seconds !~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ || seconds <= 0) exit 1
+  print seconds / 2
+}') || die "--seconds: a positive number"
 case $DEV$SCENE in *[!A-Za-z0-9_-]*) die "--device / --scene: letters, digits, _ and - only" ;; esac
 case $FIRST in right) D=1 ;; left) D=-1 ;; *) die "--first: right or left" ;; esac
 [ -n "$GAME" ] || GAME=/data/user/0/$PKG/files/game
@@ -58,23 +71,30 @@ gpu_snapshot() {
     echo "pan: GPU $1 snapshot unavailable (see gpu-time-in-state.jsonl)" >&2
 }
 
-F0=$(lastf) || die "no '至帧 N' timing line in $LOG yet (has the game rendered 300 frames?)"
 mkdir -p "$OUT/shots"
 trap 'input rstick 0' EXIT
 trap 'exit 130' INT TERM
-FS=$(input freqs) || die "cannot read the frequency limits"
-T0=$(date +%s)
-gpu_snapshot start
-input rstick "$((D * V))"
-sleep "$(awk "BEGIN { print $SECS / 2 }")"
-input rstick "$((-D * V))"
-sleep "$(awk "BEGIN { print $SECS / 2 }")"
-F1=$(lastf)
-T1=$(date +%s)
-gpu_snapshot end
-FE=$(input freqs) || echo "pan: cannot read the frequency limits after the pan" >&2
-input rstick 0
-[ -z "$SHOT" ] || input shot "$OUT/shots/$DEV-$SCENE-pan-$T0.png" >/dev/null || echo "pan: screenshot failed (continuing)" >&2
+I=1; PREV_T0=0
+while [ "$I" -le "$REPEAT" ]; do
+  F0=$(lastf) || die "no '至帧 N' timing line in $LOG yet (has the game rendered 300 frames?)"
+  FS=$(input freqs) || die "cannot read the frequency limits"
+  T0=$(date +%s)
+  # Keep epoch-second identities distinct even for explicit subsecond repeats.
+  while [ "$T0" -le "$PREV_T0" ]; do sleep 1; T0=$(date +%s); done
+  PREV_T0=$T0
+  gpu_snapshot start
+  input rstick "$((D * V))" || die "cannot start the camera pan"
+  sleep "$HALF" || die "camera pan sleep interrupted"
+  input rstick "$((-D * V))" || die "cannot reverse the camera pan"
+  sleep "$HALF" || die "camera pan sleep interrupted"
+  F1=$(lastf) || die "cannot read the final frame boundary"
+  T1=$(date +%s)
+  gpu_snapshot end
+  input rstick 0 || die "cannot release the camera pan"
+  FE=$(input freqs) || echo "pan: cannot read the frequency limits after the pan" >&2
+  printf '%s\n' "$DEV $SCENE T0=$T0 start $FS" "$DEV $SCENE T0=$T0 end $FE" >> "$OUT/freqs.txt"
+  echo "$DEV $SCENE F0=$F0 F1=$F1 T0=$T0 T1=$T1 V=$V D=$D TARGET_FPS=$TARGET_FPS" | tee -a "$OUT/pans.txt"
+  [ -z "$SHOT" ] || input shot "$OUT/shots/$DEV-$SCENE-pan-$T0.png" >/dev/null || echo "pan: screenshot failed (continuing)" >&2
+  I=$((I + 1))
+done
 trap - EXIT
-printf '%s\n' "$DEV $SCENE T0=$T0 start $FS" "$DEV $SCENE T0=$T0 end $FE" >> "$OUT/freqs.txt"
-echo "$DEV $SCENE F0=$F0 F1=$F1 T0=$T0 T1=$T1 V=$V D=$D" | tee -a "$OUT/pans.txt"
