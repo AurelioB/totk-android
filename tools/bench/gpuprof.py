@@ -22,6 +22,9 @@ STATS = ('ia_vertices', 'ia_primitives', 'vs_invocations', 'clipping_invocations
          'clipping_primitives', 'fs_invocations')
 ATTACHMENT = ('slot', 'format', 'width', 'height', 'load', 'store')
 ATTACHMENT_RATIOS = ('width_num', 'width_den', 'height_num', 'height_den')
+RETIREMENT_COUNTS = ('leases_acquired', 'leases_submitted', 'leases_retired', 'leases_cancelled',
+                     'leases_outstanding', 'queries_submitted', 'queries_retired', 'queries_cancelled',
+                     'queries_outstanding')
 REFERENCE = ('reference_width', 'reference_height', 'scene_relative')
 UINT32_MAX = (1 << 32) - 1
 WINDOW_FRAMES = 300
@@ -108,6 +111,26 @@ def validate_sampled_timing(row):
         raise ValueError('sampled timing requires timing_scope=main-frame')
 
 
+def validate_query_retirement(row):
+    retirement = row['query_retirement']
+    if not isinstance(retirement, dict):
+        raise ValueError('query_retirement: expected object')
+    for key in RETIREMENT_COUNTS:
+        number(retirement, key, True)
+    acquired, submitted, retired, cancelled, outstanding = (
+        retirement[f'leases_{key}'] for key in ('acquired', 'submitted', 'retired', 'cancelled', 'outstanding'))
+    if acquired != retired + cancelled + outstanding:
+        raise ValueError('query_retirement: acquired leases must equal retired + cancelled + outstanding')
+    if not retired <= submitted <= acquired - cancelled:
+        raise ValueError('query_retirement: submitted leases must include retired leases and exclude cancelled leases')
+    if retirement['queries_outstanding'] != retirement['queries_submitted'] - retirement['queries_retired']:
+        raise ValueError('query_retirement: outstanding queries must equal submitted - retired')
+    all_retired = row['all_queries_retired']
+    if not isinstance(all_retired, bool) or all_retired != (
+            outstanding == 0 and retirement['queries_outstanding'] == 0):
+        raise ValueError('query_retirement: all_queries_retired must be boolean and match outstanding counts')
+
+
 def validate(row):
     """Reject malformed v3 rows; preserve additive producer metadata verbatim."""
     if not isinstance(row, dict) or type(row.get('schema')) is not int or row['schema'] != 3:
@@ -135,10 +158,14 @@ def validate(row):
     if kind == 'session_end':
         if not isinstance(row.get('launch_id'), str) or not row['launch_id']:
             raise ValueError('launch_id: expected nonempty string')
-        retired = row.get('all_queries_retired')
-        if row.get('clean_end') is not True or 'all_queries_retired' not in row or (
-                retired is not None and not isinstance(retired, bool)):
-            raise ValueError('session_end requires clean_end=true and nullable all_queries_retired')
+        if row.get('clean_end') is not True or 'all_queries_retired' not in row:
+            raise ValueError('session_end requires clean_end=true and all_queries_retired')
+        if 'query_retirement' in row:
+            validate_query_retirement(row)
+        elif row['all_queries_retired'] is not None:
+            raise ValueError('session_end without query_retirement requires historical all_queries_retired=null')
+        if 'query_drain_timed_out' in row and not isinstance(row['query_drain_timed_out'], bool):
+            raise ValueError('query_drain_timed_out: expected boolean')
         for key in ('last_frame', 'last_window_sequence', 'last_window_end', 'output_failures'):
             number(row, key, True)
         if 'background_dropped_slots' in row:
@@ -603,9 +630,11 @@ def retention(observations, issues):
                              missing_rotation_files=missing_files, header_conflict=header_conflict,
                              output_failures=output_failures, background_dropped_slots=background_drops,
                              background_dropped_closures=closure_drops,
+                             query_drain_timed_out=ends[0].get('query_drain_timed_out') if len(ends) == 1 else None,
                              pending_frame_closures=ends[0].get('pending_frame_closures') if len(ends) == 1 else None,
                              leading_coverage_known=bool(headers), all_queries_retired=
-                             ends[0].get('all_queries_retired') if len(ends) == 1 else None))
+                             ends[0].get('all_queries_retired') if len(ends) == 1 else None,
+                             query_retirement=ends[0].get('query_retirement') if len(ends) == 1 else None))
     return sessions
 
 
@@ -1033,7 +1062,11 @@ def analyze(paths, legacy_span_replay=False, per_window=False, frame_close_repla
                   'Scene-relative layouts use exact scene-reference ratios; other layouts use absolute dimensions. '
                   'All contributing exact keys, absolute areas and scene-reference variants remain in areas. '
                   'Long-frame rows are threshold-selected, not a complete frame population. Window/frame timing '
-                  'are separate views, never added together. Orderly writer end does not prove GPU query retirement. '
+                  'are separate views, never added together. clean_end proves writer closure only; '
+                  'all_queries_retired is independently checked against lease/query retirement counts. '
+                  'Historical footers without counts leave retirement unknown. Retired leases have fenced '
+                  'results read/attempted; retired queries require available results (successful statistics reads). '
+                  'Counts cover activated query instances, not reserved pools or individual statistics counters. '
                   'Spans above 10000 ms/frame are rejected even if an older producer reported reconciliation success. '
                   'Legacy replay reads frame/window timing only; it cannot reconstruct query availability, original '
                   'endpoints or schema-3 attachment/reference semantics.',
@@ -1108,6 +1141,15 @@ def render(report, out=sys.stdout):
     print('# GPU profile schema 3', file=out)
     print(report['method'], file=out)
     print('Coverage: ' + ' '.join(f'{k}={v}' for k, v in report['coverage'].items()), file=out)
+    for session in report['sessions']:
+        retired = session['all_queries_retired']
+        timed_out = session['query_drain_timed_out']
+        print(f'Session: {session["stream"]} clean_end={str(session["clean_end"]).lower()} '
+              f'all_queries_retired={"unknown" if retired is None else str(retired).lower()} '
+              f'query_drain_timed_out={"unknown" if timed_out is None else str(timed_out).lower()}', file=out)
+        retirement = session['query_retirement']
+        print('  query_retirement: ' + ('unknown (no accounting footer)' if retirement is None else
+              ' '.join(f'{key}={retirement[key]}' for key in RETIREMENT_COUNTS)), file=out)
     for kind, timing in report['timing'].items():
         print(f'{kind} timing sums: ' + ' '.join(f'{k}={fmt(v)}' for k, v in timing.items()), file=out)
     if 'frame_close_replay' in report:

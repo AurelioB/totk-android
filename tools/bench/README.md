@@ -152,9 +152,36 @@ package/versionCode when available, Vulkan device/driver identity, effective pro
 of requested launch environment values (null means unset, not necessarily an effective backend default).
 Host fixtures/missing APK metadata explicitly retain unavailable identity; no environment build string is trusted.
 Exact APK/driver artifact hashes must be joined from capture records, not inferred from version labels.
-Orderly Android close/destruction drains already-fenced queued profiler leases, joins its worker and
-emits `session_end`: `clean_end` proves writer closure, while `all_queries_retired: null` explicitly
-does not prove retirement of in-flight GPU queries. Force-stop/crash/kill normally omits this marker.
+Orderly Android close/destruction stops new renderer-work admission, flushes/drains renderer GPU work,
+then drains/joins the profiler reporter before emitting `session_end` and closing the writer.
+`clean_end` records writer success independently of query retirement. New footers always carry boolean
+`all_queries_retired` and a `query_retirement` object with nonnegative integer fields:
+
+| Field | Meaning |
+| --- | --- |
+| `leases_acquired` | Prepared leases taken for recordings during this launch. |
+| `leases_submitted` | Acquired leases attached to submitted work; excludes cancelled recordings. |
+| `leases_retired` | Fenced leases whose results have been read/attempted. |
+| `leases_cancelled` | Acquired leases abandoned without submission. |
+| `leases_outstanding` | Acquired leases neither retired nor cancelled. |
+| `queries_submitted` | Activated timestamp/statistics query instances in submitted work. |
+| `queries_retired` | Submitted query instances with available read results (successful statistics reads). |
+| `queries_cancelled` | Activated queries in abandoned, never-submitted recordings. |
+| `queries_outstanding` | Submitted query instances not retired, including unavailable results. |
+
+Queries count activated instances, not reserved whole-pool capacity or six statistics counters per query.
+The analyzer requires `leases_acquired = leases_retired + leases_cancelled + leases_outstanding`,
+`leases_retired <= leases_submitted <= leases_acquired - leases_cancelled` and
+`queries_outstanding = queries_submitted - queries_retired`. `all_queries_retired` is true iff both
+outstanding counts are zero. A retired lease does not guarantee all its query results were available;
+clean writer closure can coexist with false retirement. `sessions` JSON and rendered text retain the
+counts and retirement status independently from `clean_end`. Historical footers without `query_retirement`
+and with nullable `all_queries_retired: null` remain readable as unknown, without fabricated counts.
+Force-stop/crash/kill normally omits this marker.
+Enabled GPU draining uses one two-second budget. The additive boolean `query_drain_timed_out` records
+expiry; uncompleted leases and unread queries remain outstanding. Analysis retains/renders the flag
+separately, or unknown when absent historically. Profiling-off shutdown remains a no-op without renderer
+flush/GPU wait, not a new synchronization point.
 The existing analyzer already flags absent session ends and preserves retained complete-window timing;
 missing closure is expected after force-stop, not evidence of invalid timestamps. Never synthesize an
 end marker or infer unobserved trailing frames from it. The old Odin P1/P2 captures both lack an end
@@ -266,8 +293,9 @@ totals or treated as an unbiased latency distribution. `TOTK_VK_GPU_PROFILE_LONG
 malformed/conflicting rows; a partial final JSON line is a reported capture warning. Exit 2 means an I/O error.
 
 `tests/test_gpuprof.py` pins schema-3 dimensions/references, scene-relative and fixed-depth families, ratios,
-compact ordinal sentinel/dedup/statistics totals, capture-loss lifecycle metadata, legacy span replay, optional
-statistics, rotation and long-frame accounting without Vulkan. Sampled unit fixtures pin strict histogram/
+compact ordinal sentinel/dedup/statistics totals, capture-loss lifecycle metadata, strict retirement-count/
+boolean consistency, clean-writer/retirement independence, historical unknown footers, legacy span replay,
+optional statistics, rotation and long-frame accounting without Vulkan. Sampled unit fixtures pin strict histogram/
 coverage validation, merged means/percentiles, zero-sample metadata, per-frame timestamp counts, interval
 thin warnings and optional per-window output, without changing full-mode output.
 The explicit CPU-close replay fixtures pin opt-in-only behavior, original invalidity/provenance, complete
@@ -289,10 +317,23 @@ worker-already-consumed and real GPU-event-gated pending submissions. Full mode 
 1/2 run with workers 0/2 and statistics 0/1; pass sums, actual timestamp counts and readback pixels remain
 authoritative. `--last-closed` requires the isolated final frame to publish after CPU close, before any
 next frame or shutdown flush. These are host regressions, not new Android-device measurements.
+`--shutdown-inflight` exercises the same real one-frame sealed-present work with its final event-gated
+submission verifiably pending when shutdown starts. A separate host thread releases the GPU event;
+there is no profiler flush before shutdown. Modes **1/3 × workers 0/2 × stats 0/1 × SAMPLE 0/2** require
+the pending-before/drained-after fixture marker, complete frame/pass output, zero pending CPU closures,
+true `all_queries_retired` and exact acquired=submitted=retired lease accounting with no cancellations.
+Every fresh fixture footer must carry retirement counts; the cancellation scenario must count abandoned
+leases and their activated queries separately from submitted work.
+Profiling-off runs require that pending work to remain undrained by the shutdown no-op and emit no
+profiler file. `--shutdown-timeout` instead holds the event for three seconds, beyond the enabled
+two-second GPU-drain budget. Workers 0/2 × SAMPLE 0/2 require the still-pending marker, a clean writer end,
+`query_drain_timed_out=true`, false retirement and positive outstanding lease/query counts; incomplete
+final frame output is not fabricated into a successful completion.
 `--unavailable-span` deliberately leaves a real span-end query in an unsubmitted command buffer;
 the existing submitted buffer's fence retires, but the unsubmitted end remains unavailable.
-The matrix requires null invalid frame/window spans, explicit unavailable counters and the orderly writer end,
-not fabricated query values or a zero-duration success.
+The matrix requires null invalid frame/window spans, explicit unavailable counters and the orderly writer end
+with `all_queries_retired=false` and positive outstanding queries, not fabricated query values or a
+zero-duration success.
 The color-only 64/128 scenario
 requires distinct absolute keys and families. Its `--areas` scenario covers changing depth+MRT scenes,
 scene-sized prepasses, a smaller MRT later in the same frame, fixed 360×360/128×128 depth targets, and a frame

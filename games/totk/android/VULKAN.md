@@ -1477,8 +1477,8 @@ measurements, the ownership contract is:
   coverage stays explicitly censored rather than pretending skipped metadata was observed.
   Worker placement reuses the seed/cache-writer policy: nice 10, the lowest clearly separated
   inherited CPU-capacity tier when available, never widening the inherited affinity mask.
-  Actual placement and errors are logged once. Orderly close destroys only idle, already-fenced
-  query leases; still-in-flight work remains outside its retirement authority.
+  Actual placement and errors are logged once. Orderly close first stops new renderer-work admission
+  and flushes/drains renderer GPU work, then drains the profiler reporter before closing its writer.
 - **Profiler coverage:** named `upload`, `transfer`, `post`, `upscale`, `present` and `framegen` scopes
   cover backend-owned Vulkan commands; game compute dispatches retain their own records. In full mode,
   slot envelopes start in pre (when present), include adopted immutable framegen primaries and every main
@@ -1542,13 +1542,28 @@ measurements, the ownership contract is:
   when available, whitelisted launch environment, effective profiling switches and Vulkan driver identity.
   Exact APK/driver hashes must be joined from the capture artifacts; they are not invented in process.
   Monotonic window sequences and rotation indices let the analyzer flag complete missing windows and
-  retention eviction. Orderly Android close/destruction drains only already-fenced queued leases,
-  joins the profiler worker and writes `session_end` under the writer lock; in-flight GPU query
-  retirement remains unknown (`all_queries_retired: null`). Force-stop/crash/kill normally has no
-  footer; the existing analyzer reports missing closure, not a fabricated end marker or GPU failure.
-  The footer also retains `pending_frame_closures`; zero pending CPU closures is not a guarantee
-  that all in-flight GPU work retired. The additive header `background_closures: 256` records the
+  retention eviction. Orderly Android close/destruction stops new renderer-work admission, flushes/drains
+  renderer GPU work (including submissions still in flight at shutdown entry), then drains/joins the
+  profiler reporter and writes `session_end` under the writer lock. `clean_end` reports successful writer
+  closure independently of retirement. New footers always carry boolean `all_queries_retired` and
+  `query_retirement`: nonnegative integer `leases_acquired`, `leases_submitted`, `leases_retired`,
+  `leases_cancelled`, `leases_outstanding`, `queries_submitted`, `queries_retired`, `queries_cancelled`
+  and `queries_outstanding`. Acquired leases equal retired + cancelled + outstanding; submitted leases
+  include retired leases and exclude cancelled ones. Outstanding queries equal submitted minus retired;
+  `all_queries_retired` is true iff both outstanding counts are zero. Retired leases have fenced results
+  read/attempted; retired queries require available results (successful statistics reads), so unavailable
+  queries can remain outstanding even after every lease was processed. Counts cover activated timestamp/
+  statistics query instances, not pool capacity or the six statistics counter values. Cancelled counts
+  describe activated queries/leases in abandoned, never-submitted recordings, not submitted work.
+  Historical footers without `query_retirement` retain nullable `all_queries_retired: null` as unknown.
+  Force-stop/crash/kill normally has no footer; the analyzer reports missing closure, not a fabricated
+  end marker or GPU failure. The footer also retains `pending_frame_closures`; zero pending CPU closures
+  alone does not establish query retirement. The additive header `background_closures: 256` records the
   closure FIFO capacity, independently of the sixteen query leases.
+  Enabled GPU draining has one two-second budget. On expiry, `query_drain_timed_out: true` accompanies
+  the retirement accounting; uncompleted leases and unread queries remain outstanding rather than
+  being fabricated as retired. The additive timeout field is boolean when present; old footers without
+  it remain unknown in analysis. Profiling-off shutdown is a no-op and does not flush or wait for GPU work.
   The explicit host option `gpuprof.py --frame-close-replay` adds conditional results only for
   header-attributed d003f2d full-mode captures with complete contiguous windows, zero loss/failure
   counters, available valid raw GPU endpoints/domain, bounded recomputed intervals, nonnegative gaps
@@ -1557,6 +1572,12 @@ measurements, the ownership contract is:
   The old host fixture kept a command buffer open at present and exercised the GPU-marker path,
   missing Android's sealed-then-present ordering. The new host scenario covers both already-consumed
   and not-yet-fenced submissions and an isolated final CPU closure, not new Android evidence.
+  The host `--shutdown-inflight` scenario enters shutdown with a verifiably unsignalled real GPU fence
+  and no prior profiler flush; its modes 1/3 × workers 0/2 × stats 0/1 × SAMPLE 0/2 matrix requires
+  complete frame output and zero outstanding lease/query counts after shutdown, not merely writer closure.
+  Profiling-off runs require that same pending work to remain undrained by the shutdown no-op.
+  `--shutdown-timeout` holds the real event beyond the two-second drain budget; workers 0/2 and SAMPLE
+  0/2 require a clean writer end with timeout=true, false retirement and positive outstanding counts.
 - **Invalid span authority:** timestamp reads request 64-bit values **and availability**, without WAIT;
   an unavailable endpoint is never a zero-duration sample or silently replaced by a later endpoint.
   Each retired slot captures its immutable device, queue, queue family, `timestampValidBits` and period.

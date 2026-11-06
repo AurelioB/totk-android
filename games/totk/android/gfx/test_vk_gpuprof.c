@@ -344,7 +344,7 @@ typedef struct {
     PFN_vkSetEvent set_event;
     pthread_mutex_t mu;
     pthread_cond_t cv;
-    int release, timed_out;
+    int release, timed_out, shutdown_timeout;
 } present_gate;
 static void *release_present_gate(void *opaque) {
     present_gate *gate = opaque;
@@ -356,6 +356,13 @@ static void *release_present_gate(void *opaque) {
         if (result) DIE("GPU profiler present gate wait failed: %d", result);
     }
     pthread_mutex_unlock(&gate->mu);
+    VKCHECK(gate->set_event(V.dev, gate->event));
+    return NULL;
+}
+static void *release_shutdown_gate(void *opaque) {
+    present_gate *gate = opaque;
+    struct timespec delay = gate->shutdown_timeout ? (struct timespec){3, 0} : (struct timespec){0, 100000000};
+    while (nanosleep(&delay, &delay) && errno == EINTR) {}
     VKCHECK(gate->set_event(V.dev, gate->event));
     return NULL;
 }
@@ -375,7 +382,7 @@ static int published_frame(unsigned number) {
     return found;
 }
 static int run_sealed_present(uint8_t *memory, tex_t targets[2], prog_t programs[2],
-                              unsigned frames, int supported) {
+                              unsigned frames, int supported, int shutdown_inflight) {
     const char *kind, *why, *driver = getenv("TOTK_VK_DRIVER");
     if (driver && (!*driver || !strcmp(driver, "system"))) driver = NULL;
     PFN_vkGetInstanceProcAddr gipa = vk_load_driver(driver, &kind, &why);
@@ -421,7 +428,7 @@ static int run_sealed_present(uint8_t *memory, tex_t targets[2], prog_t programs
             CHECK(!bad, "sealed-present pre upload executes without losing its open main parent");
             check_pixels(&targets[part], memory);
         }
-        int pending = frame & 1;
+        int pending = shutdown_inflight || (frame & 1);
         vk_rec_lock();
         VkCommandBuffer cb = vk_cb();
         VkBuffer buffer; VkDeviceSize offset;
@@ -440,6 +447,28 @@ static int run_sealed_present(uint8_t *memory, tex_t targets[2], prog_t programs
         CHECK(!context[6], "backend present seals the last main command buffer before the CPU hook");
         vk_rec_unlock();
         pthread_t releaser;
+        if (shutdown_inflight) {
+            gate.shutdown_timeout = shutdown_inflight == 2;
+            vk_rec_lock(); vk_gpuprof_present(); vk_rec_unlock();
+            uint64_t last = mtl_last_fence();
+            int was_pending = !mtl_wait(final_ticket, 0);
+            CHECK(was_pending, "normal shutdown begins with actual event-gated GPU work in flight");
+            int result = pthread_create(&releaser, NULL, release_shutdown_gate, &gate);
+            if (result) { VKCHECK(gate.set_event(V.dev, gate.event)); DIE("shutdown gate thread: %d", result); }
+            vk_gpuprof_shutdown(); /* no prior profiler flush or fence wait */
+            int drained = mtl_wait(last, 0);
+            CHECK(drained == !!(vk_gpuprof_on && !gate.shutdown_timeout),
+                "enabled shutdown drains GPU work, timeout/off shutdown leaves it outstanding");
+            printf("gpuprof-shutdown-inflight pending_before=%d drained_after=%d\n", was_pending, drained);
+            pthread_join(releaser, NULL);
+            CHECK(mtl_wait(last, UINT64_C(5000000000)), "released shutdown fixture work eventually retires");
+            unsigned bad = 0;
+            for (unsigned i = 0; i < 64; i++) bad += present[i] != 0x24680000u + frame;
+            CHECK(!bad, "shutdown fence drain preserves real present GPU results");
+            destroy_event(V.dev, gate.event, NULL);
+            pthread_cond_destroy(&gate.cv); pthread_mutex_destroy(&gate.mu);
+            return finish_fixture(1, 2, 4, supported);
+        }
         if (pending) {
             CHECK(!mtl_wait(final_ticket, 0), "CPU close precedes real GPU completion of event-gated final submission");
             gate.release = gate.timed_out = 0;
@@ -544,6 +573,8 @@ int main(int argc, char **argv) {
     int cancel = argc == 2 && !strcmp(argv[1], "--cancel");
     int sealed_present = argc == 2 && !strcmp(argv[1], "--sealed-present");
     int last_closed = argc == 2 && !strcmp(argv[1], "--last-closed");
+    int shutdown_inflight = argc == 2 && !strcmp(argv[1], "--shutdown-inflight") ? 1 :
+        argc == 2 && !strcmp(argv[1], "--shutdown-timeout") ? 2 : 0;
     if (scaled || (argc == 3 && !strcmp(argv[1], "--frames"))) {
         for (int i = scaled ? 2 : 1; i < argc; i += 2) {
             if (i + 1 == argc) return 2;
@@ -557,7 +588,7 @@ int main(int argc, char **argv) {
         }
         if (scaled && draws < passes) return 2;
     } else if (argc != 1 && !areas && !unavailable_span && !sampling && !backpressure && !cancel &&
-               !sealed_present && !last_closed) return 2;
+               !sealed_present && !last_closed && !shutdown_inflight) return 2;
     /* Force short secondary chunks so workers=2 tests a real parallel pass,
      * rather than merely checking an enabled worker setting on inline draws. */
     setenv("TOTK_VK_REC_CHUNK_DRAWS", scaled ? "16" : "1", 1);
@@ -612,7 +643,9 @@ int main(int argc, char **argv) {
     }
     const float triangle[] = {-1, -1, 3, -1, -1, 3}; memcpy(memory + 0x20000, triangle, sizeof triangle);
     if (scaled) return run_scaled(memory, &pool, targets, &programs[0], frames, passes, draws, textures, supported);
-    if (sealed_present || last_closed) return run_sealed_present(memory, targets, programs, last_closed ? 1 : 302, supported);
+    if (sealed_present || last_closed || shutdown_inflight)
+        return run_sealed_present(memory, targets, programs, last_closed || shutdown_inflight ? 1 : 302,
+                                  supported, shutdown_inflight);
     unsigned expected_draws = 0, expected_passes = 0;
     for (unsigned frame = 0; frame < frames; frame++) {
         /* Sampling needs stable keys at every frame ordinal, not one key on
