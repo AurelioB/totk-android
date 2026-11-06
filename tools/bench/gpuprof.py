@@ -8,6 +8,7 @@ Long-frame rows are a separate, selected population and never added to windows.
 """
 import argparse
 import glob
+import hashlib
 from fractions import Fraction
 import json
 import math
@@ -128,6 +129,8 @@ def validate(row):
             sample_budget(row, minimum=0)
         if 'background_slots' in row:
             number(row, 'background_slots', True, 1)
+        if 'background_closures' in row:
+            number(row, 'background_closures', True, 1)
         return row
     if kind == 'session_end':
         if not isinstance(row.get('launch_id'), str) or not row['launch_id']:
@@ -140,6 +143,9 @@ def validate(row):
             number(row, key, True)
         if 'background_dropped_slots' in row:
             number(row, 'background_dropped_slots', True)
+        for key in ('background_dropped_closures', 'pending_frame_closures'):
+            if key in row:
+                number(row, key, True)
         return row
     if kind not in ('window', 'pass', 'frame', 'long_frame'):
         raise ValueError('unknown row type')
@@ -171,7 +177,7 @@ def validate(row):
         number(row, 'dropped', True)
         for key in ('failed_slots', 'stats_failed_slots', 'frames', 'invalid_spans', 'span_frames',
                     'unavailable_timestamps', 'invalid_timestamps', 'timestamp_wraps', 'output_failures',
-                    'background_dropped_slots'):
+                    'background_dropped_slots', 'background_dropped_closures'):
             if key in row:
                 number(row, key, True)
         if 'sequence' in row:
@@ -587,11 +593,17 @@ def retention(observations, issues):
         if background_drops:
             issues.append(f'{stream}: profiler background backlog dropped {background_drops} slot(s); '
                           'pass/frame coverage is incomplete, game recording was not blocked')
+        closure_drops = max((r.get('background_dropped_closures', 0) for r in rows), default=0)
+        if closure_drops:
+            issues.append(f'{stream}: profiler CPU-closure backlog dropped {closure_drops} closure(s); '
+                          'frame coverage is incomplete, game recording was not blocked')
         sessions.append(dict(stream=stream, headers=headers, end=ends[0] if len(ends) == 1 else None,
                              clean_end=bool(len(ends) == 1 and len(launch_ids) == 1 and not header_conflict),
                              missing_windows=missing, rotation_evictions=evictions,
                              missing_rotation_files=missing_files, header_conflict=header_conflict,
                              output_failures=output_failures, background_dropped_slots=background_drops,
+                             background_dropped_closures=closure_drops,
+                             pending_frame_closures=ends[0].get('pending_frame_closures') if len(ends) == 1 else None,
                              leading_coverage_known=bool(headers), all_queries_retired=
                              ends[0].get('all_queries_retired') if len(ends) == 1 else None))
     return sessions
@@ -719,7 +731,215 @@ def warn_p99(groups, label, issues):
                 'not a reliable stutter-tail estimate')
 
 
-def analyze(paths, legacy_span_replay=False, per_window=False):
+def replay_zero_reasons(row, keys, prefix):
+    """Missing old authority is unknown, never an implicit zero."""
+    return [f'{prefix}-{key}-nonzero' if key in row else f'unknown-{prefix}-{key}'
+            for key in keys if type(row.get(key)) is not int or row[key] != 0]
+
+
+def frame_close_interval(row, header):
+    """Recompute only unwrapped, explicitly available full-mode GPU endpoints."""
+    reasons = replay_zero_reasons(
+        row, ('unavailable_timestamps', 'invalid_timestamps', 'timestamp_wraps', 'dropped'), 'frame')
+    if row.get('span_valid') is not False or row.get('span_reason') != 'incomplete-records':
+        reasons.append('not-incomplete-records-only')
+    if row.get('reconciliation_failed') is not True:
+        reasons.append('unknown-original-reconciliation')
+    if row.get('sample_budget', 0):
+        reasons.append('sampled-endpoint-not-reconstructible')
+    for key in ('failed_slots', 'stats_failed_slots', 'output_failures', 'background_dropped_slots',
+                'background_dropped_closures', 'long_dropped'):
+        if row.get(key, 0) != 0:
+            reasons.append(f'frame-{key}-nonzero')
+    try:
+        first, last = (number(row, key, True) for key in ('first_tick', 'last_tick'))
+        bits = int(number(row, 'timestamp_bits', True, 1))
+        period = number(row, 'timestamp_period', minimum=0)
+        queue_family = number(row, 'queue_family', True)
+        raw = number(row, 'raw_span_ms')
+    except ValueError as error:
+        return None, None, sorted(set([*reasons, f'unknown-endpoint-authority: {error}']))
+    if bits > 64 or period <= 0 or queue_family > UINT32_MAX or first >= 1 << bits or last >= 1 << bits:
+        return None, None, sorted(set([*reasons, 'invalid-timestamp-domain']))
+    if (bits != header.get('timestamp_bits') or
+            not math.isclose(period, header.get('timestamp_period_ns', 0), rel_tol=1e-9, abs_tol=1e-9)):
+        reasons.append('timestamp-domain-header-mismatch')
+    # Do not reinterpret a backwards/corrupt timestamp as a possible counter wrap.
+    if last < first:
+        return None, None, sorted(set([*reasons, 'backwards-or-wrapped-endpoints']))
+    span = (last - first) * period / 1e6
+    if not math.isfinite(span) or span > min(SPAN_LIMIT_MS, header.get('span_limit_ms', SPAN_LIMIT_MS)):
+        reasons.append('implausible-timestamp')
+    if not math.isclose(raw, span, rel_tol=1e-9, abs_tol=1e-6):
+        reasons.append('raw-span-endpoint-mismatch')
+    gap = span - row['measured_ms']
+    if gap < 0:
+        reasons.append('negative-full-mode-gap')
+    return span, gap, sorted(set(reasons))
+
+
+def frame_close_replay_report(paths, by_type, counts, sessions):
+    """A conditional historical experiment, never replacement timing authority."""
+    frames, windows, streams = [], [], []
+    input_reasons = [f'unknown-input-{key}' for key in (
+        'malformed_rows', 'truncated_rows', 'conflicting_rows') if counts[key]]
+    for session in sessions:
+        stream = session['stream']
+        headers = [o for o in by_type['header'] if o['stream'] == stream]
+        authority_reasons = list(input_reasons)
+        header = headers[0]['row'] if headers else {}
+        if not headers:
+            authority_reasons.append('unknown-build-header')
+        if session['header_conflict']:
+            authority_reasons.append('conflicting-build-headers')
+        commit = header.get('build_commit')
+        asset = header.get('build_asset')
+        if (not isinstance(commit, str) or not re.fullmatch(r'd003f2db137c[0-9a-f]{0,28}', commit) or
+                not isinstance(asset, str) or asset.strip() != f'commit {commit}' or
+                header.get('build_identity_source') != 'apk:assets/build.txt' or
+                header.get('build_identity_reason') is not None):
+            authority_reasons.append('unknown-d003f2d-build-authority')
+        if header.get('sample_budget') != 0:
+            authority_reasons.append('not-authenticated-full-mode')
+        if header.get('window_frames') != WINDOW_FRAMES:
+            authority_reasons.append('unknown-window-size')
+        try:
+            bits = number(header, 'timestamp_bits', True, 1)
+            period = number(header, 'timestamp_period_ns')
+            if bits > 64 or period <= 0:
+                raise ValueError('invalid timestamp domain')
+        except ValueError:
+            authority_reasons.append('unknown-header-timestamp-domain')
+        # Footer failures have no frame-local extent, so they cannot be assigned away.
+        end = session['end'] or {}
+        if end.get('output_failures') or end.get('background_dropped_slots') or end.get('background_dropped_closures'):
+            authority_reasons.append('session-end-reports-loss')
+        if end and end['launch_id'] != header.get('launch_id'):
+            authority_reasons.append('inconsistent-session-launch')
+        stream_frames = sorted((o for o in by_type['frame'] if o['stream'] == stream),
+                               key=lambda o: o['row']['frame'])
+        indexed = {o['row']['frame']: o for o in stream_frames}
+        stream_windows = sorted((o for o in by_type['window'] if o['stream'] == stream),
+                                key=lambda o: o['row']['window_start'])
+        contexts = {}
+        for observation in stream_windows:
+            row = observation['row']
+            start, stop = row['window_start'], row['window_end']
+            local = [o for frame, o in indexed.items() if start <= frame <= stop]
+            local.sort(key=lambda o: o['row']['frame'])
+            ids = [o['row']['frame'] for o in local]
+            reasons = list(authority_reasons)
+            if (stop - start + 1 != WINDOW_FRAMES or (start - 1) % WINDOW_FRAMES or
+                    row.get('frames') != WINDOW_FRAMES or row.get('partial') is not False or
+                    row.get('sequence') != (start - 1) // WINDOW_FRAMES + 1):
+                reasons.append('incomplete-or-noncanonical-window')
+            missing = (sorted(set(range(start, stop + 1)) - set(ids))
+                       if stop - start + 1 == WINDOW_FRAMES else [])
+            if missing:
+                reasons.append('missing-frame-ids')
+            if row.get('sample_budget', 0):
+                reasons.append('sampled-window-not-reconstructible')
+            reasons.extend(replay_zero_reasons(row, (
+                'dropped', 'failed_slots', 'stats_failed_slots', 'unavailable_timestamps',
+                'invalid_timestamps', 'output_failures', 'background_dropped_slots'), 'window'))
+            # This additive counter did not exist in the affected d003f2d producer.
+            if row.get('background_dropped_closures', 0) != 0:
+                reasons.append('window-background_dropped_closures-nonzero')
+            if len({o['row']['queue_family'] for o in local if type(o['row'].get('queue_family')) is int}) > 1:
+                reasons.append('mixed-queue-domains')
+            invalid = sum(o['row'].get('span_valid') is False for o in local)
+            if row.get('invalid_spans') != invalid or row.get('span_frames') != len(local) - invalid:
+                reasons.append('window-span-count-mismatch')
+            valid_rows = [o['row'] for o in local if o['row'].get('span_valid') is not False]
+            for key, frame_key in (('valid_span_ms', 'span_ms'), ('valid_gap_ms', 'gap_ms')):
+                if key not in row or not math.isclose(
+                        row[key], math.fsum(r[frame_key] for r in valid_rows), abs_tol=0.01, rel_tol=1e-5):
+                    reasons.append(f'window-{key}-mismatch')
+            pass_rows = [o['row'] for o in by_type['pass'] if o['stream'] == stream and
+                         o['row']['window_start'] == start and o['row']['window_end'] == stop]
+            measured = math.fsum(o['row']['measured_ms'] for o in local)
+            pass_measured = math.fsum(r['gpu_ms'] for r in pass_rows)
+            if not pass_rows:
+                reasons.append('unknown-pass-coverage')
+            if not math.isclose(measured, row['measured_ms'], abs_tol=0.01, rel_tol=1e-5):
+                reasons.append('frame-window-measured-mismatch')
+            if not math.isclose(pass_measured, row['measured_ms'], abs_tol=0.01, rel_tol=1e-5):
+                reasons.append('pass-window-measured-mismatch')
+            if any(bool(r['ordinal']) != row.get('ordinals') for r in pass_rows):
+                reasons.append('pass-window-ordinal-mismatch')
+            context = dict(stream=stream, source=observation['source'], window_start=start, window_end=stop,
+                           original=row, reasons=sorted(set(reasons)), missing_frame_ids=missing,
+                           frame_measured_ms=measured, pass_measured_ms=pass_measured, frame_results=[])
+            windows.append(context)
+            for frame in ids:
+                contexts.setdefault(frame, []).append(context)
+        stream_results = []
+        for observation in stream_frames:
+            row = observation['row']
+            matching = contexts.get(row['frame'], [])
+            reasons = list(authority_reasons)
+            span = gap = None
+            if len(matching) != 1:
+                reasons.append('unknown-window-summary' if not matching else 'overlapping-window-summaries')
+            else:
+                reasons.extend(matching[0]['reasons'])
+            # Invalid/missing header domains are not safe arguments to arithmetic.
+            if 'unknown-header-timestamp-domain' not in authority_reasons:
+                span, gap, interval_reasons = frame_close_interval(row, header)
+                reasons.extend(interval_reasons)
+            result = dict(stream=stream, source=observation['source'], frame=row['frame'], original=row,
+                          eligible=not reasons, reasons=sorted(set(reasons)),
+                          window_start=matching[0]['window_start'] if len(matching) == 1 else None,
+                          window_end=matching[0]['window_end'] if len(matching) == 1 else None,
+                          counterfactual_span_ms=span if not reasons else None,
+                          counterfactual_gap_ms=gap if not reasons else None)
+            frames.append(result)
+            stream_results.append(result)
+            for context in matching:
+                context['frame_results'].append(result)
+        stream_window_results = [w for w in windows if w['stream'] == stream]
+        for context in stream_window_results:
+            results = context.pop('frame_results')
+            context['eligible_frame_ids'] = [r['frame'] for r in results if r['eligible']]
+            context['rejected_frame_ids'] = [r['frame'] for r in results if not r['eligible']]
+            if context['rejected_frame_ids']:
+                context['reasons'] = sorted(set([*context['reasons'], 'contains-rejected-frames']))
+            context['eligible'] = not context['reasons'] and len(results) == WINDOW_FRAMES
+            context['counterfactual_span_ms'] = (
+                math.fsum(r['counterfactual_span_ms'] for r in results) if context['eligible'] else None)
+            context['counterfactual_gap_ms'] = (
+                context['counterfactual_span_ms'] - context['original']['measured_ms'] if context['eligible'] else None)
+        streams.append(dict(
+            stream=stream, header_sources=[o['source'] for o in headers],
+            authority_reasons=sorted(set(authority_reasons)),
+            eligible_frame_ids=[r['frame'] for r in stream_results if r['eligible']],
+            rejected_frame_ids=[r['frame'] for r in stream_results if not r['eligible']],
+            eligible_windows=[[w['window_start'], w['window_end']] for w in stream_window_results if w['eligible']],
+            rejected_windows=[[w['window_start'], w['window_end']] for w in stream_window_results if not w['eligible']]))
+    provenance = []
+    for path in paths:
+        digest = hashlib.sha256()
+        with path.open('rb') as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b''):
+                digest.update(chunk)
+        provenance.append(dict(path=str(path), sha256=digest.hexdigest(), bytes=path.stat().st_size))
+    return dict(
+        schema='totk-gpuprof-frame-close-replay/1', mode='counterfactual-only', device_correction_verified=False,
+        affected_build='d003f2db137c', files=provenance, streams=streams, frames=frames, windows=windows,
+        method='Conditional CPU-closure-only replay of authenticated d003f2d full-mode captures. '
+               'Eligibility is not proof of missing CPU closure versus unrecorded work: individual lease/closure '
+               'events were not captured. Require complete contiguous 300-frame windows, explicit zero loss/query/'
+               'failure counters, available unwrapped GPU endpoints with matching header domain, bounded '
+               'recomputed raw span, nonnegative full-mode gap and frame/pass/window sum consistency. '
+               'Missing authority is rejected/unknown, never assumed zero (except the then-nonexistent '
+               'background_dropped_closures field). No sampled endpoint is fabricated. Original rows, invalidity, '
+               'ordinary analysis, capture closure/retirement uncertainty and measured pass sums remain unchanged. '
+               'No device rerun or post-fix device correctness/performance measurement is implied.')
+
+
+def analyze(paths, legacy_span_replay=False, per_window=False, frame_close_replay=False):
+    if legacy_span_replay and frame_close_replay:
+        raise ValueError('frame-close replay requires schema-3 pass/window authority, not legacy timing-only replay')
     paths = inputs(paths)
     observations, counts, issues = load(paths, legacy_span_replay)
     by_type = {kind: [] for kind in ('header', 'session_end', 'window', 'pass', 'frame', 'long_frame')}
@@ -748,7 +968,7 @@ def analyze(paths, legacy_span_replay=False, per_window=False):
                                (o['stream'], o['row']['frame']) in invalid_frames) for o in by_type['frame'])
     rejected_windows = {r['source'] for r in rejected if r['type'] == 'window'}
     censored_windows = sum(bool(o['row']['dropped'] or o['row'].get('failed_slots') or o['row'].get('partial') or
-                                o['row'].get('background_dropped_slots') or
+                                o['row'].get('background_dropped_slots') or o['row'].get('background_dropped_closures') or
                                 o['source'] in rejected_windows) for o in by_type['window'])
     ordinal_mismatches = sum(
         'ordinals' in windows.get((o['stream'], o['row']['window_start'], o['row']['window_end']), {}) and
@@ -794,6 +1014,7 @@ def analyze(paths, legacy_span_replay=False, per_window=False):
                      'header_conflicts': sum(s['header_conflict'] for s in sessions),
                      'output_failures': sum(s['output_failures'] for s in sessions),
                      'background_dropped_slots': sum(s['background_dropped_slots'] for s in sessions),
+                     'background_dropped_closures': sum(s['background_dropped_closures'] for s in sessions),
                      'ordinal_metadata_mismatches': ordinal_mismatches,
                      'stats_missing': sum(r.get('sampling', {}).get('sample_count', r['count']) - r['stats_valid']
                                           for r in pass_rows),
@@ -841,6 +1062,8 @@ def analyze(paths, legacy_span_replay=False, per_window=False):
             dict(stream=stream, window_start=start, window_end=end,
                  passes=aggregate(rows), families=aggregate(rows, True))
             for (stream, start, end), rows in sorted(grouped.items())]
+    if frame_close_replay:
+        report['frame_close_replay'] = frame_close_replay_report(paths, by_type, counts, sessions)
     return report
 
 
@@ -887,6 +1110,21 @@ def render(report, out=sys.stdout):
     print('Coverage: ' + ' '.join(f'{k}={v}' for k, v in report['coverage'].items()), file=out)
     for kind, timing in report['timing'].items():
         print(f'{kind} timing sums: ' + ' '.join(f'{k}={fmt(v)}' for k, v in timing.items()), file=out)
+    if 'frame_close_replay' in report:
+        replay = report['frame_close_replay']
+        print('\n## Counterfactual d003f2d CPU frame-close replay (NOT device correction)', file=out)
+        print(replay['method'], file=out)
+        for stream in replay['streams']:
+            print('Replay stream: ' + json.dumps(stream, sort_keys=True), file=out)
+        rejected = {}
+        for frame in replay['frames']:
+            if not frame['eligible']:
+                rejected.setdefault((frame['stream'], tuple(frame['reasons'])), []).append(frame['frame'])
+        for (stream, reasons), frame_ids in sorted(rejected.items()):
+            print('Replay rejected frames: ' + json.dumps(
+                dict(stream=stream, reasons=reasons, frame_ids=frame_ids), sort_keys=True), file=out)
+        for window in replay['windows']:
+            print('Replay window: ' + json.dumps(window, sort_keys=True), file=out)
     if 'sampling' in report:
         sampling = report['sampling']
         print('Sampling: ' + ' '.join(f'{key}={value}' for key, value in sampling.items() if key != 'frames'), file=out)
@@ -913,9 +1151,11 @@ def main(argv=None):
                         help='accept schema-2 frame/window timing only; do not reinterpret old pass areas')
     parser.add_argument('--per-window', action='store_true',
                         help='add window-local pass/family views; default aggregates the whole input interval')
+    parser.add_argument('--frame-close-replay', action='store_true',
+                        help='add strict counterfactual d003f2d CPU-closure replay; original invalidity is unchanged')
     args = parser.parse_args(argv)
     try:
-        report = analyze(args.inputs, args.legacy_span_replay, args.per_window)
+        report = analyze(args.inputs, args.legacy_span_replay, args.per_window, args.frame_close_replay)
         if args.json:
             text = json.dumps(report, indent=2, allow_nan=False) + '\n'
             if args.json == '-':

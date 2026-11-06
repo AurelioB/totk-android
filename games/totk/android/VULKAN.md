@@ -1466,6 +1466,13 @@ measurements, the ownership contract is:
   resets queries and returns prepared leases. The bounded sixteen-lease FIFO never blocks the game
   for output: no available lease means dropped profiler coverage, recorded by cumulative
   `background_dropped_slots` and missing frame coverage. Its mutex is not the recorder-worker mutex.
+  CPU frame closure has its own bounded 256-entry FIFO under the same private background mutex:
+  `{frame, end_sequence}` is published at CPU present, independently of whether a command buffer
+  is still open. Every sealed submission, including one without a profiler lease, has an ordered
+  sequence; canceled, never-submitted leases do not advance it. The worker finalizes a ready closure
+  only after processing fenced leases through its end sequence, including closures arriving after
+  those leases were already consumed. Overflow increments cumulative `background_dropped_closures`;
+  the analyzer takes a per-launch maximum, warns and censors coverage, rather than hiding the loss.
   The cumulative drop count is a per-launch maximum in analysis, not a sum of successive windows;
   coverage stays explicitly censored rather than pretending skipped metadata was observed.
   Worker placement reuses the seed/cache-writer policy: nice 10, the lowest clearly separated
@@ -1479,11 +1486,16 @@ measurements, the ownership contract is:
   instead has one whole-main-frame pair, excluding pre/slot envelopes, plus selected pass pairs.
   JSONL `gap_ms` is the signed residual, not profiler overhead. In sampled mode it includes intentionally
   untimed passes, but sampled pre work/overlap may make it negative; it is not total untimed work.
-  Frame boundaries after post/present can split a still-open slot without forcing a submission. Cross-frame
-  pre uploads can execute before their recording frame's main work; such overlap is surfaced by
-  `reconciliation_failed`, never clamped away. External GL/QCOM/LSFG execution, compositor work and scanout
-  are outside Vulkan timestamp authority. Profiling requires graphics/compute timestamps and hostQueryReset;
-  query pools are host-reset only after their existing slot fence, before either pre or main can use them.
+  A frame boundary can split a still-open slot without forcing a submission; its GPU marker remains
+  supported. Android can instead seal/submit the final slot before CPU present. In full mode the
+  ordered CPU closure uses that slot's real envelope end, with **no extra GPU timestamp or submit**;
+  it does not need another frame to wake finalization. Frame rows expose `closure_source`
+  (`cpu-sealed`, `gpu-marker` or `missing-closure`) and `closure_sequence`; missing closure remains
+  invalid. Cross-frame pre uploads can execute before their recording frame's main work; such overlap
+  is surfaced by `reconciliation_failed`, never clamped away. External GL/QCOM/LSFG execution,
+  compositor work and scanout are outside Vulkan timestamp authority. Profiling requires
+  graphics/compute timestamps and hostQueryReset; query pools are host-reset only after their
+  existing slot fence, before either pre or main can use them.
 - **Profiler size identity (schema 3):** exact keys retain absolute renderArea/attachment dimensions for
   driver-area joins. Each completed frame reports its largest depth+multi-color scene extent; pass attachment
   fractions use that common reference, with the game resolution as an explicit no-scene fallback, not the pass area.
@@ -1506,6 +1518,11 @@ measurements, the ownership contract is:
   deferred ends after assembly, not the game's independent timestamp reports. It is at least the two
   whole-main-frame endpoints and at most **`2k+2`**. There are no additional pre/slot timestamp pairs.
   The whole pair uses completion-accurate `ALL_COMMANDS`, spanning main submissions through present.
+  When CPU present finds no open command buffer, SAMPLE must issue **one small marker-only main
+  submission** for the real end timestamp (the start was written earlier). This is an explicit extra
+  submission cost, not a per-slot end or CPU-time fallback; it keeps the **`2k+2`** write bound.
+  With an open command buffer the existing in-buffer end marker is used. The full-mode closure path
+  above adds neither a query nor a submission.
   Frame/window `measured_ms` and pass `gpu_ms` sum valid sampled durations only; `gap_ms` is the residual.
   `sampling` retains observed/sample counts, distinct observed/sampled frame counts and a 272-bin histogram;
   `stats_valid` cannot exceed sampled count. No total is extrapolated to untimed observations.
@@ -1529,6 +1546,17 @@ measurements, the ownership contract is:
   joins the profiler worker and writes `session_end` under the writer lock; in-flight GPU query
   retirement remains unknown (`all_queries_retired: null`). Force-stop/crash/kill normally has no
   footer; the existing analyzer reports missing closure, not a fabricated end marker or GPU failure.
+  The footer also retains `pending_frame_closures`; zero pending CPU closures is not a guarantee
+  that all in-flight GPU work retired. The additive header `background_closures: 256` records the
+  closure FIFO capacity, independently of the sixteen query leases.
+  The explicit host option `gpuprof.py --frame-close-replay` adds conditional results only for
+  header-attributed d003f2d full-mode captures with complete contiguous windows, zero loss/failure
+  counters, available valid raw GPU endpoints/domain, bounded recomputed intervals, nonnegative gaps
+  and consistent frame/pass/window sums. Original invalid rows and ordinary totals remain untouched.
+  Missing authority stays unknown/rejected; this cannot establish device correction or performance.
+  The old host fixture kept a command buffer open at present and exercised the GPU-marker path,
+  missing Android's sealed-then-present ordering. The new host scenario covers both already-consumed
+  and not-yet-fenced submissions and an isolated final CPU closure, not new Android evidence.
 - **Invalid span authority:** timestamp reads request 64-bit values **and availability**, without WAIT;
   an unavailable endpoint is never a zero-duration sample or silently replaced by a later endpoint.
   Each retired slot captures its immutable device, queue, queue family, `timestampValidBits` and period.

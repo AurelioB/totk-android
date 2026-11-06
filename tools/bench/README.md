@@ -93,6 +93,11 @@ ends but excluding the game's independent timestamp reports: at least the whole-
 `report.sampling.frames` retains each frame's actual count and bound; timing summaries include the sum,
 min/max and bound totals. The whole-main-frame pair remains completion-accurate `ALL_COMMANDS`,
 without pre/slot envelopes; full-mode spans can include pre work and are not interchangeable.
+If Android has already sealed/submitted the final command buffer when CPU present runs, SAMPLE adds
+**one small marker-only main submission** for the actual end timestamp; the start was recorded earlier.
+The extra submission has explicit cost even though the timestamp bound is still `2k+2`. An open command
+buffer retains the existing in-buffer marker. Full mode uses its last slot's real envelope end with no
+additional GPU query or submission. Neither mode substitutes a CPU timestamp or a per-slot sample end.
 Sampled frame/window `measured_ms` sums sampled durations; signed `gap_ms` includes intentionally untimed
 work but may be negative when sampled pre work precedes the main span or scopes overlap. It is not total
 untimed work. A negative sampled residual alone is not span failure; full-mode reconciliation is unchanged.
@@ -115,6 +120,13 @@ not a speculative liveness audit or hardware traffic counter. The dedicated `tot
 owns query result reads, aggregation, formatting/output and resets; its sixteen prepared leases are
 bounded. One-time opt-in startup preparation can wait, but exhaustion during play drops coverage
 (`background_dropped_slots`, cumulative, plus missing frame coverage), never waits for profiler I/O.
+CPU present has an independent ordered closure FIFO (256 entries, header `background_closures`).
+Its `{frame, end_sequence}` events finalize only after the worker has processed all fenced leases through
+the sealed submission sequence, including closures published after those leases were consumed.
+This handles Android's sealed-then-present ordering and the last frame without needing a next-frame marker.
+Cumulative `background_dropped_closures` records closure overflow separately from lease drops; both are
+per-launch maxima in analysis, warn and censor coverage. Footer `pending_frame_closures` is retained;
+zero pending CPU events does not prove all GPU queries retired.
 
 **Attribution correction:** `.scratch/bench/rpmode/odin-overhead/report.md` measured old APK
 `716c122ff09b` timestamps-only P1 at 21.55 fps versus 57.96 fps C0, recording
@@ -208,6 +220,46 @@ This explicit mode accepts schema-2/3 **frame/window timing only**, ignoring pas
 pass/window sum comparisons. It flags implausible spans without reconstructing query availability/endpoints or
 claiming schema-3 attachment/reference semantics. Valid historical timing values remain unchanged.
 
+### Counterfactual d003f2d CPU frame-close replay
+
+```
+python3 tools/bench/gpuprof.py --frame-close-replay 'capture/gpuprof-*.jsonl*' --json replay.json
+```
+
+This option adds `frame_close_replay` (`totk-gpuprof-frame-close-replay/1`); it **does not alter ordinary
+analysis or rewrite inputs**. `coverage`, `timing`, `rejected_spans` and pass sums preserve original
+invalidity. The new section retains input SHA-256/byte counts, source locations and the complete original
+frame/window rows, exact `eligible_frame_ids`/`rejected_frame_ids` per stream and window, rejection
+reasons, and conditional `counterfactual_span_ms`/`counterfactual_gap_ms`. Text output also exposes
+the exact IDs and window decisions. It is incompatible with `--legacy-span-replay`, which omits the
+pass authority required here.
+Rows excluded by ordinary schema or launch-mode validation stay excluded: their source issues and
+malformed-row counts remain authoritative. Replay does not resurrect those rows or fabricate frame/window
+identities for them. Retained frames whose mandatory window summary was rejected stay unknown/rejected.
+
+The affected APK's `assets/build.txt` header must consistently identify **`d003f2db137c`** with matching
+build text/source, full mode and timestamp domain. Eligibility requires a complete canonical 300-frame
+window with all contiguous frame IDs and explicit zero unavailable/invalid/dropped/failed/statistics/
+output/background-lease counters. The then-nonexistent `background_dropped_closures` counter may be
+absent in this old build; a nonzero value still rejects. Only original `incomplete-records` frames with
+available uint-domain first/last GPU ticks, no wraps, matching header domain, matching forensic raw span,
+recomputed interval ≤10,000 ms, nonnegative full-mode gap and consistent frame/pass/window measured sums
+are eligible. Partial/missing windows, missing metadata, gaps, failures, real drops and corrupt timestamps
+remain rejected; absent authority is **unknown**, never invented. A bad window-wide failure counter
+rejects all its frames because its exact affected lease extent is not captured. A counterfactual window
+sum is emitted only if every frame is eligible. Sampled missing endpoints cannot be reconstructed.
+
+The source bug was that Android submitted the final slot before outer CPU present, leaving no command
+buffer for the old in-buffer frame-end marker. The following frame transition then applied the
+`incomplete-records` guard to normally CPU-closed work. The ordered CPU closure FIFO fixes this path;
+it does **not** remove missing-query/drop/incomplete-record guards. The old host fixture kept a command
+buffer open at present and therefore missed the Android ordering. Historical aggregates do not record
+individual lease/CPU-close events: even eligible replay results are **conditional on a CPU-closure-only
+hypothesis**, not proof of no unrecorded work. APK-header attribution and hashed capture bytes are not an
+independently measured APK hash. Keep original writer-end/query-retirement uncertainty. Never call these
+results device-corrected timings, a post-fix device verification, or a device performance improvement.
+
+
 `long_frame` tables describe over-threshold frames and retained-history diagnostics; they are never added to window
 totals or treated as an unbiased latency distribution. `TOTK_VK_GPU_PROFILE_LONG_FRAMES` bounds the history ring,
 **not** the number of over-threshold frames dumped; a zero threshold selects every valid frame. Exit 1 means
@@ -218,6 +270,9 @@ compact ordinal sentinel/dedup/statistics totals, capture-loss lifecycle metadat
 statistics, rotation and long-frame accounting without Vulkan. Sampled unit fixtures pin strict histogram/
 coverage validation, merged means/percentiles, zero-sample metadata, per-frame timestamp counts, interval
 thin warnings and optional per-window output, without changing full-mode output.
+The explicit CPU-close replay fixtures pin opt-in-only behavior, original invalidity/provenance, complete
+frame/pass/window consistency and rejection of missing build/domain/endpoint authority, gaps, true query
+failures, background losses, corrupt timestamps and negative full-mode gaps.
 The optional `GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs for
 modes 0/1/2/3, recorder workers 0/2, statistics on/off/unsupported, ordinal windows off/on, split-frame and
 unsent multi-frame reconciliation, direct pre uploads while main rendering is open, default row/byte reduction
@@ -228,6 +283,12 @@ all stable keys eventually sampled, all observed metadata retained, counters onl
 histogram/count consistency, and actual per-frame `2..2k+2` timestamp writes. It compares the same main-work
 authority with full mode using endpoint/domain checks and a generous software timing tolerance, **not**
 identical durations; full spans may also include pre work. Exact readback pixels and worker use remain required.
+`--sealed-present` adds 302 frames with three main submissions, two pre uploads, two readbacks and a
+present GPU scope per frame, all sealed before CPU present with no open command buffer. It alternates
+worker-already-consumed and real GPU-event-gated pending submissions. Full mode and SAMPLE budgets
+1/2 run with workers 0/2 and statistics 0/1; pass sums, actual timestamp counts and readback pixels remain
+authoritative. `--last-closed` requires the isolated final frame to publish after CPU close, before any
+next frame or shutdown flush. These are host regressions, not new Android-device measurements.
 `--unavailable-span` deliberately leaves a real span-end query in an unsubmitted command buffer;
 the existing submitted buffer's fence retires, but the unsubmitted end remains unavailable.
 The matrix requires null invalid frame/window spans, explicit unavailable counters and the orderly writer end,

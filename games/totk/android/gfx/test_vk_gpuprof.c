@@ -1,8 +1,9 @@
 /* GPU profiler integration fixture: real NVN replay, recorder workers and Vulkan
  * timestamps/statistics, no game/device/WSI. Build vkgpuproftest and vkdraw-seed;
  * tests/test_gpuprof.py drives fresh processes for each launch-time switch.
- * The only profiler test hooks mark a frame (the ordinary present boundary,
- * without WSI) and flush a terminal partial window AFTER real fence retirement. */
+ * Existing fixtures keep an in-buffer frame marker. --sealed-present instead
+ * calls the production CPU present hook AFTER the final real submission, as
+ * Android does; --last-closed checks its wakeup before any terminal flush. */
 /* CPU measurement arm: --scaled [--frames N] [--textures 0..160]
  * [--passes N] [--draws N]. Defaults: 302 frames, 180 real rendering passes
  * and 2000 actual draws per frame, with 16 bound textures. Registry textures
@@ -12,7 +13,10 @@
 #include "vk_int.h"
 #include "vk_record.h"
 #include "vk_gpuprof_time.h"
+#include "vk_load.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
+#include <errno.h>
+#include <glob.h>
 #include <sys/mman.h>
 
 static unsigned checks, failures;
@@ -177,12 +181,22 @@ static int finish_fixture(unsigned frames, unsigned passes, unsigned draws, int 
         "statistics are available only when requested and supported");
     if (workers && draws) {
         uint64_t leases[4]; vk_record_test_leases(leases);
-        CHECK(leases[1] && leases[2], "parallel recorder secondary leases are actually used and returned");
+        CHECK(leases[1], "parallel recorder secondary leases are actually used for real draws");
+        /* GPU retirement publishes returns to each recording owner; recycling
+         * happens on that owner's next job, not on the fence-waiting thread.
+         * The terminal single-frame case deliberately has no such next job. */
+        if (frames > 1) CHECK(leases[2], "subsequent frames recycle fenced secondary leases on their recording owners");
     }
     vk_rec_lock(); vk_gpuprof_test_flush(); vk_rec_unlock();
     vk_gpuprof_shutdown();
     vk_gpuprof_shutdown(); /* normal teardown is idempotent */
-    vk_rec_lock(); vk_gpuprof_test_flush(); vk_rec_unlock(); /* late rows cannot follow session_end */
+    vk_rec_lock();
+    uint64_t before = mtl_last_fence(), context[8];
+    vk_gpuprof_present();
+    CHECK(mtl_last_fence() == before, "late CPU present after shutdown never submits sampled marker work");
+    vk_record_test_guest_context(context);
+    CHECK(!context[6], "late CPU present after shutdown leaves no open command buffer");
+    vk_gpuprof_test_flush(); vk_rec_unlock(); /* late rows cannot follow session_end */
     printf("gpuprof-fixture frames=%u passes=%u draws=%u mode=%d workers=%d stats_supported=%d stats_enabled=%d checks=%u failures=%u\n",
         frames, passes, draws, mode, workers, supported,
         !!vk_gpuprof_stats_mask(), checks, failures);
@@ -322,6 +336,172 @@ static int run_scaled(uint8_t *memory, pool_t *pool, tex_t targets[2], prog_t *p
         (unsigned long long)(benchmark_ns() - elapsed_start));
     return finish_fixture(frames, frames * passes, frames * draws, supported);
 }
+/* A host event holds actual GPU work, not query availability or profiler
+ * counters. The watchdog releases it even if a broken present hook waits for
+ * the GPU, so that regression fails a CHECK rather than hanging teardown. */
+typedef struct {
+    VkEvent event;
+    PFN_vkSetEvent set_event;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int release, timed_out;
+} present_gate;
+static void *release_present_gate(void *opaque) {
+    present_gate *gate = opaque;
+    struct timespec deadline; clock_gettime(CLOCK_REALTIME, &deadline); deadline.tv_sec += 2;
+    pthread_mutex_lock(&gate->mu);
+    while (!gate->release) {
+        int result = pthread_cond_timedwait(&gate->cv, &gate->mu, &deadline);
+        if (result == ETIMEDOUT) { gate->timed_out = 1; break; }
+        if (result) DIE("GPU profiler present gate wait failed: %d", result);
+    }
+    pthread_mutex_unlock(&gate->mu);
+    VKCHECK(gate->set_event(V.dev, gate->event));
+    return NULL;
+}
+static int published_frame(unsigned number) {
+    glob_t paths = {0};
+    if (glob("gpuprof-*.jsonl", 0, NULL, &paths)) { globfree(&paths); return 0; }
+    int found = 0;
+    char expected[64]; snprintf(expected, sizeof expected, "\"type\":\"frame\",\"frame\":%u,", number);
+    for (size_t i = 0; i < paths.gl_pathc; i++) {
+        FILE *file = fopen(paths.gl_pathv[i], "r");
+        if (!file) continue;
+        char *line = NULL; size_t capacity = 0;
+        while (getline(&line, &capacity, file) >= 0) found |= strstr(line, expected) != NULL;
+        free(line); fclose(file);
+    }
+    globfree(&paths);
+    return found;
+}
+static int run_sealed_present(uint8_t *memory, tex_t targets[2], prog_t programs[2],
+                              unsigned frames, int supported) {
+    const char *kind, *why, *driver = getenv("TOTK_VK_DRIVER");
+    if (driver && (!*driver || !strcmp(driver, "system"))) driver = NULL;
+    PFN_vkGetInstanceProcAddr gipa = vk_load_driver(driver, &kind, &why);
+    if (!gipa) DIE("Vulkan event fixture driver: %s", why);
+    PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)gipa(V.inst, "vkGetDeviceProcAddr");
+    if (!vkGetDeviceProcAddr) DIE("Vulkan event fixture requires device entrypoint lookup");
+    PFN_vkCreateEvent create_event = (PFN_vkCreateEvent)vkGetDeviceProcAddr(V.dev, "vkCreateEvent");
+    PFN_vkDestroyEvent destroy_event = (PFN_vkDestroyEvent)vkGetDeviceProcAddr(V.dev, "vkDestroyEvent");
+    PFN_vkResetEvent reset_event = (PFN_vkResetEvent)vkGetDeviceProcAddr(V.dev, "vkResetEvent");
+    PFN_vkCmdWaitEvents wait_events = (PFN_vkCmdWaitEvents)vkGetDeviceProcAddr(V.dev, "vkCmdWaitEvents");
+    present_gate gate = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER,
+        .set_event = (PFN_vkSetEvent)vkGetDeviceProcAddr(V.dev, "vkSetEvent")};
+    if (!create_event || !destroy_event || !reset_event || !wait_events || !gate.set_event)
+        DIE("GPU profiler real present fixture requires Vulkan host event entrypoints");
+    VkEventCreateInfo info = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    VKCHECK(create_event(V.dev, &info, NULL, &gate.event));
+    const char *sampling = getenv("TOTK_VK_GPU_PROFILE_SAMPLE");
+    unsigned completed_closes = 0, pending_closes = 0, pre_uploads = 0;
+    uint64_t initial_ticket = mtl_last_fence(), marker_submissions = 0;
+    for (unsigned frame = 0; frame < frames; frame++) {
+        /* Two independently fenced main submissions, each with genuine pre
+         * upload work nested while its main rendering record is still open.
+         * The final backend-only submission is deliberately NOT a new frame. */
+        for (unsigned part = 0; part < 2; part++) {
+            memset(readback_bytes(&targets[part], memory), 0xc7, (64u << part) * (64u << part) * 4);
+            record_draws(&targets[part], &programs[frame & 1], memory, part ? 3 : 1);
+            op(OP_END, NULL, 0); mtl_sub_begin(); mtl_exec(recording); used = 0;
+            VkBuffer buffer; VkDeviceSize offset;
+            uint32_t *upload = vk_transient(256, 256, &buffer, &offset);
+            memset(upload, 0, 256);
+            VkCommandBuffer pre = vk_pre_cb();
+            if (vk_gpuprof_on) vk_gpuprof_scope_begin(pre, "upload");
+            uint32_t pattern = 0x13570000u + frame * 2 + part;
+            vkCmdFillBuffer(pre, buffer, offset, 256, pattern);
+            pre_uploads++;
+            if (vk_gpuprof_on) vk_gpuprof_scope_end(pre);
+            record_readback(&targets[part], memory);
+            op(OP_END, NULL, 0); mtl_exec(recording); used = 0;
+            wait_submission(mtl_sub_commit());
+            unsigned bad = 0;
+            for (unsigned i = 0; i < 64; i++) bad += upload[i] != pattern;
+            CHECK(!bad, "sealed-present pre upload executes without losing its open main parent");
+            check_pixels(&targets[part], memory);
+        }
+        int pending = frame & 1;
+        vk_rec_lock();
+        VkCommandBuffer cb = vk_cb();
+        VkBuffer buffer; VkDeviceSize offset;
+        uint32_t *present = vk_transient(256, 256, &buffer, &offset);
+        memset(present, 0, 256);
+        if (pending) {
+            VKCHECK(reset_event(V.dev, gate.event));
+            wait_events(cb, 1, &gate.event, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, NULL, 0, NULL, 0, NULL);
+        }
+        if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "present");
+        vkCmdFillBuffer(cb, buffer, offset, 256, 0x24680000u + frame);
+        if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
+        uint64_t final_ticket = vk_submit_now(), context[8];
+        vk_record_test_guest_context(context);
+        CHECK(!context[6], "backend present seals the last main command buffer before the CPU hook");
+        vk_rec_unlock();
+        pthread_t releaser;
+        if (pending) {
+            CHECK(!mtl_wait(final_ticket, 0), "CPU close precedes real GPU completion of event-gated final submission");
+            gate.release = gate.timed_out = 0;
+            int result = pthread_create(&releaser, NULL, release_present_gate, &gate);
+            if (result) {
+                VKCHECK(gate.set_event(V.dev, gate.event));
+                DIE("GPU profiler present gate thread failed: %d", result);
+            }
+            /* An unsubmitted canceled lease reaches the worker before the
+             * older GPU-blocked slot, but must not advance its fenced frontier. */
+            vk_rec_lock();
+            int opened = vk_submit_optional_begin();
+            CHECK(opened, "pending sealed frame permits an unrelated optional lease cancellation");
+            if (opened) vk_submit_optional_cancel();
+            vk_rec_unlock();
+            vk_gpuprof_test_wait();
+            CHECK(!mtl_wait(final_ticket, 0), "discarded optional lease cannot complete the older GPU fence");
+            pending_closes++;
+        } else {
+            wait_submission(final_ticket);
+            uint64_t counts[3]; vk_gpuprof_test_background(counts);
+            CHECK(counts[0] == counts[1] && !counts[2],
+                "fast profiler consumes every fenced lease BEFORE CPU frame closure");
+            completed_closes++;
+        }
+        vk_rec_lock();
+        uint64_t before = mtl_last_fence();
+        vk_gpuprof_present(); /* current == NULL: production Android ordering */
+        uint64_t after = mtl_last_fence();
+        /* slot_begin initializes the opt-in profiler lazily, so its effective
+         * mode is authoritative only after the real submissions above. */
+        int sampled = vk_gpuprof_on && sampling && atoi(sampling) > 0;
+        CHECK(after == before + sampled,
+            "sealed CPU present submits no full-mode work and exactly one sampled end-marker slot");
+        marker_submissions += after - before;
+        vk_record_test_guest_context(context);
+        CHECK(!context[6], "CPU present leaves no unsubmitted marker or open main command buffer");
+        vk_rec_unlock();
+        if (pending) {
+            pthread_mutex_lock(&gate.mu); gate.release = 1;
+            pthread_cond_signal(&gate.cv); pthread_mutex_unlock(&gate.mu);
+            pthread_join(releaser, NULL);
+            CHECK(!gate.timed_out, "CPU frame closure returns without waiting for event-gated GPU work");
+        }
+        wait_submission(after);
+        unsigned bad = 0;
+        for (unsigned i = 0; i < 64; i++) bad += present[i] != 0x24680000u + frame;
+        CHECK(!bad, "backend present scope measures actual GPU work with fence-visible results");
+    }
+    /* No new frame, profiler test flush, shutdown, or fabricated marker can
+     * make this row appear: the CPU closure itself must wake the worker. */
+    if (vk_gpuprof_on) CHECK(published_frame(frames),
+        "last CPU-closed frame is published before next-frame recording or terminal flush");
+    uint64_t submissions = mtl_last_fence() - initial_ticket;
+    printf("gpuprof-sealed-present frames=%u main_submissions=%llu pre_uploads=%u completed_closes=%u "
+        "pending_closes=%u marker_submissions=%llu last_closed_before_flush=1\n",
+        frames, (unsigned long long)(submissions - marker_submissions), pre_uploads, completed_closes,
+        pending_closes, (unsigned long long)marker_submissions);
+    destroy_event(V.dev, gate.event, NULL);
+    pthread_cond_destroy(&gate.cv); pthread_mutex_destroy(&gate.mu);
+    return finish_fixture(frames, frames * 2, frames * 4, supported);
+}
 static int run_unavailable_span(int supported) {
     /* Both command buffers are real. Only the first is submitted, so the
      * reserved frame/slot end queries must remain unavailable after its fence. */
@@ -362,6 +542,8 @@ int main(int argc, char **argv) {
     int scaled = argc > 1 && !strcmp(argv[1], "--scaled");
     int backpressure = argc == 2 && !strcmp(argv[1], "--backpressure");
     int cancel = argc == 2 && !strcmp(argv[1], "--cancel");
+    int sealed_present = argc == 2 && !strcmp(argv[1], "--sealed-present");
+    int last_closed = argc == 2 && !strcmp(argv[1], "--last-closed");
     if (scaled || (argc == 3 && !strcmp(argv[1], "--frames"))) {
         for (int i = scaled ? 2 : 1; i < argc; i += 2) {
             if (i + 1 == argc) return 2;
@@ -374,7 +556,8 @@ int main(int argc, char **argv) {
             else return 2;
         }
         if (scaled && draws < passes) return 2;
-    } else if (argc != 1 && !areas && !unavailable_span && !sampling && !backpressure && !cancel) return 2;
+    } else if (argc != 1 && !areas && !unavailable_span && !sampling && !backpressure && !cancel &&
+               !sealed_present && !last_closed) return 2;
     /* Force short secondary chunks so workers=2 tests a real parallel pass,
      * rather than merely checking an enabled worker setting on inline draws. */
     setenv("TOTK_VK_REC_CHUNK_DRAWS", scaled ? "16" : "1", 1);
@@ -429,6 +612,7 @@ int main(int argc, char **argv) {
     }
     const float triangle[] = {-1, -1, 3, -1, -1, 3}; memcpy(memory + 0x20000, triangle, sizeof triangle);
     if (scaled) return run_scaled(memory, &pool, targets, &programs[0], frames, passes, draws, textures, supported);
+    if (sealed_present || last_closed) return run_sealed_present(memory, targets, programs, last_closed ? 1 : 302, supported);
     unsigned expected_draws = 0, expected_passes = 0;
     for (unsigned frame = 0; frame < frames; frame++) {
         /* Sampling needs stable keys at every frame ordinal, not one key on

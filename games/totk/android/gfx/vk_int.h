@@ -608,7 +608,7 @@ extern int vk_gpuprof_on;   /* initialized once at first slot; off hot paths are
 void vk_gpuprof_identity(const char *commit, const char *package, uint64_t version, const char *build);
 void vk_gpuprof_shutdown(void); /* drains already-fenced profiler leases/joins writer; in-flight GPU queries stay unknown */
 void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb);
-void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot);
+void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot); /* advances submission sequence even for a dropped/null lease */
 void vk_gpuprof_slot_complete(vk_gpuprof_slot **slot); /* fence completion: detach/enqueue only; no query reads or IO */
 void vk_gpuprof_slot_pre(vk_gpuprof_slot *slot, VkCommandBuffer cb);
 void vk_gpuprof_slot_end(vk_gpuprof_slot *slot, VkCommandBuffer cb);
@@ -630,7 +630,7 @@ void vk_gpuprof_secondary(int enabled);
 int vk_gpuprof_chunk_query(VkQueryPool *pool, uint32_t *query);
 void vk_gpuprof_draw(vk_shader *const shaders[6]);
 void vk_gpuprof_dispatch_begin(VkCommandBuffer cb);
-void vk_gpuprof_present(void);   /* recording lock; no submission and no wait */
+void vk_gpuprof_present(void); /* recording lock; CPU closure; sampled sealed-CB path submits one end-marker slot */
 #ifdef TOTK_VK_TESTS
 void vk_gpuprof_test_frame(VkCommandBuffer cb);
 void vk_gpuprof_test_flush(void);

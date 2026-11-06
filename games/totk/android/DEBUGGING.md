@@ -1767,10 +1767,19 @@ game ring slot; it does not read queries or report inline. The profiler worker o
 without WAIT or polling, aggregation, JSONL/log output, query resets and lease return. Its bounded
 sixteen-lease FIFO does not share the recorder-worker mutex. No free lease drops profiler coverage
 (`background_dropped_slots`, cumulative, and missing frame coverage), never blocks the game for I/O.
-The profiler adds no per-frame fence wait or submission; timestamp/statistics commands can still
+CPU present independently publishes `{frame, end_sequence}` to a bounded 256-entry closure FIFO under
+the private background mutex. The worker finalizes only after all fenced leases through that sequence
+have been processed, including when they were consumed before CPU present. This supports Android's
+sealed-then-present path without depending on the next frame. Full mode uses the last slot's actual
+envelope end with **no extra GPU query, submission or per-frame fence wait**. With an open command buffer,
+the existing in-buffer GPU marker remains supported. If SAMPLE present finds no open command buffer,
+it issues **one small marker-only main submission** for the real frame-end timestamp: this extra submit
+has explicit cost even though the actual timestamp bound remains `2k+2`. No endpoint comes from CPU time.
+Closure overflow is explicit cumulative `background_dropped_closures`, separate from dropped query leases;
+analysis uses the maximum per launch and marks coverage censored. Timestamp/statistics commands can still
 serialize GPU work. A frame boundary closes an outstanding rendering instance for timing attribution.
-Results/reports can arrive several frames late; a 300-frame report waits until an existing completed
-submission proves that window has ended. An idle renderer need not immediately print its final partial window.
+Results/reports can arrive several frames late; a 300-frame report waits for fenced work and its ordered
+CPU closure. The footer exposes `pending_frame_closures`, not a guarantee of GPU-query retirement.
 
 Read `[gpu-profile] frames A-B` for summed measured render/compute ms/frame, actual LOAD,
 CLEAR, STORE and DONT_CARE-store attachment operations/frame and logical attachment load/store
@@ -1840,6 +1849,27 @@ valid-span subtotals and forensic raw spans separate, never sums absurd positive
 For historical schema-2 captures, `gpuprof.py --legacy-span-replay` reads only frame/window timing:
 it flags implausible spans and propagates invalid frame authority to windows without claiming to
 reconstruct query availability/endpoints or schema-3 attachment areas.
+
+For the d003f2d **CPU frame-close bug only**:
+`python3 tools/bench/gpuprof.py --frame-close-replay 'capture/gpuprof-*.jsonl*' --json replay.json`.
+Android's `present_window` submitted the last slot before outer CPU present, leaving no open command
+buffer for the old GPU marker. The next-frame transition then mislabeled otherwise complete full-mode
+records `incomplete-records`. The old host fixture called present with a buffer open and missed this
+ordering. The new `--sealed-present` fixture exercises multiple submissions, pre uploads, present scopes
+and readbacks before CPU close, with both worker-already-consumed and real GPU-gated pending paths;
+`--last-closed` requires the final frame to publish without a following frame or shutdown flush.
+
+Replay is an explicit **counterfactual**, not a corrected device capture. It adds
+`frame_close_replay` with original rows/provenance, exact eligible/rejected frame IDs and windows,
+rejection reasons and conditional span/gap sums. Ordinary `rejected_spans`, invalid counts and null
+totals remain unchanged. Eligibility requires consistent APK-build headers identifying d003f2d, a complete
+contiguous 300-frame window, explicit zero unavailable/invalid/dropped/failed/background counters, valid
+available unwrapped raw ticks/domain matching the header, a bounded recomputed raw interval, nonnegative
+full-mode gap and consistent frame/pass/window sums. Missing authority and incomplete tails stay
+unknown/rejected. Corrupt timestamps and real query/background losses are never relabeled; sampled
+endpoints are not reconstructed. Aggregate records cannot prove there was no unrecorded lease loss,
+so even eligible results are conditional on the CPU-closure-only hypothesis. No device rerun or post-fix
+correctness/performance result is implied. This mode cannot be combined with timing-only legacy replay.
 
 Analyzer families normalize depth+MRT layouts and scene-sized depth-only prepasses against this
 reference (`scene_relative=true`). Thus a G-buffer and its depth prepass remain one family each

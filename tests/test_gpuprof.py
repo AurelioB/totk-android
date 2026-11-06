@@ -265,6 +265,29 @@ class Analyzer(unittest.TestCase):
                 with self.subTest(value=value, row=row), self.assertRaises(ValueError):
                     gpuprof.validate(row)
 
+    def test_cpu_closure_backlog_and_pending_footer_remain_explicit(self):
+        rows = [header(background_closures=256), window(background_dropped_closures=2),
+                window(window_start=301, window_end=600, background_dropped_closures=5),
+                session_end(last_frame=600, last_window_sequence=2, last_window_end=600,
+                            background_dropped_closures=7, pending_frame_closures=3)]
+        report = self.analyze(rows)
+        self.assertEqual(report['coverage']['background_dropped_closures'], 7,
+                         'cumulative closure loss is a per-launch maximum, never summed or repaired')
+        self.assertEqual(report['sessions'][0]['background_dropped_closures'], 7)
+        self.assertEqual(report['sessions'][0]['pending_frame_closures'], 3)
+        self.assertEqual(report['coverage']['censored_windows'], 2)
+        self.assertIsNone(report['sessions'][0]['all_queries_retired'])
+        self.assertIsNone(self.analyze([header(), session_end()])['sessions'][0]['pending_frame_closures'])
+        for value in (-1, True, 0.5, '3'):
+            for row in (window(background_dropped_closures=value),
+                        session_end(background_dropped_closures=value),
+                        session_end(pending_frame_closures=value)):
+                with self.subTest(value=value, row=row), self.assertRaises(ValueError):
+                    gpuprof.validate(row)
+        for value in (0, -1, True, 0.5, '256'):
+            with self.subTest(capacity=value), self.assertRaises(ValueError):
+                gpuprof.validate(header(background_closures=value))
+
     def test_header_conflicts_and_invalid_lifecycle_fields_are_explicit(self):
         report = self.analyze([header(), header(rotation=1, ordinals=True), session_end()])
         self.assertEqual(report['coverage']['header_conflicts'], 1)
@@ -959,11 +982,250 @@ class Analyzer(unittest.TestCase):
         self.assertEqual(report['passes'][0]['ns_per_draw'], 1e6)
         self.assertEqual(report['coverage']['window_sum_mismatches'], 0)
 
+    def frame_close_rows(self):
+        """A complete old full-mode window; no post-fix closure event is invented."""
+        commit = 'd003f2db137c'
+        identity = header(build_commit=commit, build_asset=f'commit {commit}\n',
+                          build_identity_source='apk:assets/build.txt', build_identity_reason=None,
+                          sample_budget=0, timestamp_bits=48, timestamp_period_ns=1)
+        members = [frame(frame=n, span_ms=None, gap_ms=None, raw_span_ms=12,
+                         span_valid=False, span_reason='incomplete-records', reconciliation_failed=True,
+                         first_tick=n * 20000000, last_tick=n * 20000000 + 12000000,
+                         timestamp_bits=48, timestamp_period=1, queue_family=0,
+                         unavailable_timestamps=0, invalid_timestamps=0, timestamp_wraps=0)
+                   for n in range(1, 301)]
+        summary = window(sequence=1, ordinals=False, span_valid=False, span_ms=None, gap_ms=None,
+                         measured_ms=3000, invalid_spans=300, span_frames=0,
+                         valid_span_ms=0, valid_gap_ms=0, unavailable_timestamps=0, invalid_timestamps=0,
+                         output_failures=0, background_dropped_slots=0)
+        passes = pass_row(ordinal=0, count=300, draws=3000, gpu_ms=3000, stats_valid=0)
+        passes.pop('stats')
+        return [identity, *members, summary, passes, session_end(background_dropped_slots=0)]
+
+    def frame_close_replay(self, rows):
+        return gpuprof.analyze([self.file('gpuprof-frame-close.jsonl', rows)], frame_close_replay=True)
+
+    def test_frame_close_replay_is_opt_in_counterfactual_and_preserves_original_authority(self):
+        rows = self.frame_close_rows()
+        path = self.file('gpuprof-frame-close.jsonl', rows)
+        before = path.read_bytes()
+        ordinary = gpuprof.analyze([path])
+        report = gpuprof.analyze([path], frame_close_replay=True)
+        replay = report.pop('frame_close_replay')
+        self.assertEqual(report, ordinary, 'opt-in replay must not silently repair ordinary timing or coverage')
+        self.assertEqual(path.read_bytes(), before, 'original capture is never rewritten')
+        self.assertEqual(replay['schema'], 'totk-gpuprof-frame-close-replay/1')
+        self.assertEqual(replay['mode'], 'counterfactual-only')
+        self.assertFalse(replay['device_correction_verified'])
+        self.assertEqual(len(replay['files'][0]['sha256']), 64)
+        self.assertEqual(replay['files'][0]['bytes'], len(before))
+        self.assertEqual(replay['streams'][0]['eligible_frame_ids'], list(range(1, 301)))
+        self.assertEqual(replay['streams'][0]['rejected_frame_ids'], [])
+        self.assertEqual(replay['streams'][0]['eligible_windows'], [[1, 300]])
+        self.assertEqual(replay['windows'][0]['eligible_frame_ids'], list(range(1, 301)))
+        self.assertEqual(replay['windows'][0]['counterfactual_span_ms'], 3600)
+        self.assertEqual(replay['windows'][0]['counterfactual_gap_ms'], 600)
+        self.assertEqual(replay['windows'][0]['frame_measured_ms'], 3000)
+        self.assertEqual(replay['windows'][0]['pass_measured_ms'], 3000)
+        for result, original in zip(replay['frames'], rows[1:301]):
+            self.assertTrue(result['eligible'])
+            self.assertEqual(result['original'], original)
+            self.assertFalse(result['original']['span_valid'])
+            self.assertEqual(result['original']['span_reason'], 'incomplete-records')
+            self.assertEqual(result['counterfactual_span_ms'], 12)
+            self.assertEqual(result['counterfactual_gap_ms'], 2)
+        self.assertEqual(report['coverage']['invalid_frame_spans'], 300)
+        self.assertEqual(report['coverage']['invalid_window_spans'], 1)
+        self.assertIsNone(report['timing']['frame']['span_ms'])
+        self.assertEqual(report['timing']['frame']['measured_ms'], 3000)
+        self.assertEqual(report['passes'][0]['gpu_ms'], 3000)
+        self.assertIsNone(report['sessions'][0]['all_queries_retired'])
+        with self.assertRaises(ValueError):
+            gpuprof.analyze([path], legacy_span_replay=True, frame_close_replay=True)
+
+    def test_frame_close_replay_requires_authenticated_build_and_header_domain(self):
+        for change, reason in (
+                ({'build_commit': None}, 'unknown-d003f2d-build-authority'),
+                ({'build_asset': 'commit another-build\n'}, 'unknown-d003f2d-build-authority'),
+                ({'build_identity_source': 'filename'}, 'unknown-d003f2d-build-authority'),
+                ({'build_identity_reason': 'unavailable'}, 'unknown-d003f2d-build-authority'),
+                ({'sample_budget': 1}, 'not-authenticated-full-mode'),
+                ({'timestamp_period_ns': 0}, 'unknown-header-timestamp-domain')):
+            with self.subTest(change=change):
+                rows = self.frame_close_rows()
+                rows[0].update(change)
+                report = self.frame_close_replay(rows)
+                replay = report['frame_close_replay']
+                self.assertEqual(replay['streams'][0]['eligible_frame_ids'], [])
+                self.assertIn(reason, replay['streams'][0]['authority_reasons'])
+                if change.get('sample_budget') == 1:
+                    # The sampled header contradicts every full-mode data row.
+                    # Ordinary validation excludes them before replay; do not
+                    # manufacture frame identities from rejected observations.
+                    self.assertEqual(report['coverage']['malformed_rows'], 302)
+                    self.assertEqual(replay['streams'][0]['rejected_frame_ids'], [])
+                    self.assertEqual(replay['frames'], [])
+                    self.assertEqual(replay['windows'], [])
+                    self.assertIn('unknown-input-malformed_rows', replay['streams'][0]['authority_reasons'])
+                else:
+                    self.assertEqual(replay['streams'][0]['rejected_frame_ids'], list(range(1, 301)))
+                    self.assertFalse(replay['windows'][0]['eligible'])
+        rows = self.frame_close_rows()[1:]
+        replay = self.frame_close_replay(rows)['frame_close_replay']
+        self.assertIn('unknown-build-header', replay['streams'][0]['authority_reasons'])
+        self.assertEqual(replay['streams'][0]['eligible_frame_ids'], [])
+        rows = self.frame_close_rows()
+        rows[1]['schema'] = 2
+        replay = self.frame_close_replay(rows)['frame_close_replay']
+        self.assertEqual(replay['streams'][0]['eligible_frame_ids'], [])
+        self.assertIn('unknown-input-malformed_rows', replay['streams'][0]['authority_reasons'])
+
+    def test_frame_close_replay_never_corrects_missing_corrupt_or_genuinely_invalid_endpoints(self):
+        cases = [
+            ('first_tick', None, 'unknown-endpoint-authority'),
+            ('last_tick', None, 'unknown-endpoint-authority'),
+            ('timestamp_bits', None, 'unknown-endpoint-authority'),
+            ('timestamp_period', None, 'unknown-endpoint-authority'),
+            ('queue_family', None, 'unknown-endpoint-authority'),
+            ('raw_span_ms', None, 'unknown-endpoint-authority'),
+            ('timestamp_period', 2, 'timestamp-domain-header-mismatch'),
+            ('timestamp_bits', 47, 'timestamp-domain-header-mismatch'),
+            ('first_tick', 1 << 48, 'invalid-timestamp-domain'),
+            ('last_tick', 19999999, 'backwards-or-wrapped-endpoints'),
+            ('last_tick', 10021000000, 'implausible-timestamp'),
+            ('raw_span_ms', 13, 'raw-span-endpoint-mismatch'),
+            ('last_tick', 29000000, 'negative-full-mode-gap'),
+            ('unavailable_timestamps', 1, 'frame-unavailable_timestamps-nonzero'),
+            ('invalid_timestamps', 1, 'frame-invalid_timestamps-nonzero'),
+            ('timestamp_wraps', 1, 'frame-timestamp_wraps-nonzero'),
+            ('dropped', 1, 'frame-dropped-nonzero'),
+            ('span_reason', 'unavailable-timestamp', 'not-incomplete-records-only'),
+            ('reconciliation_failed', False, 'unknown-original-reconciliation'),
+            ('failed_slots', 1, 'frame-failed_slots-nonzero'),
+            ('stats_failed_slots', 1, 'frame-stats_failed_slots-nonzero'),
+            ('output_failures', 1, 'frame-output_failures-nonzero'),
+            ('background_dropped_slots', 1, 'frame-background_dropped_slots-nonzero'),
+            ('background_dropped_closures', 1, 'frame-background_dropped_closures-nonzero'),
+        ]
+        for key, value, reason in cases:
+            with self.subTest(key=key, value=value):
+                rows = self.frame_close_rows()
+                if value is None:
+                    rows[1].pop(key)
+                else:
+                    rows[1][key] = value
+                replay = self.frame_close_replay(rows)['frame_close_replay']
+                first = replay['frames'][0]
+                self.assertEqual(first['frame'], 1)
+                self.assertFalse(first['eligible'])
+                self.assertTrue(any(reason in result for result in first['reasons']), first['reasons'])
+                self.assertIsNone(first['counterfactual_span_ms'])
+                self.assertEqual(replay['streams'][0]['eligible_frame_ids'], list(range(2, 301)))
+                self.assertEqual(replay['streams'][0]['rejected_frame_ids'], [1])
+                self.assertFalse(replay['windows'][0]['eligible'])
+                self.assertIn('contains-rejected-frames', replay['windows'][0]['reasons'])
+
+    def test_frame_close_replay_requires_explicit_zero_window_loss_and_complete_sums(self):
+        for key in ('dropped', 'failed_slots', 'stats_failed_slots', 'unavailable_timestamps',
+                    'invalid_timestamps', 'output_failures', 'background_dropped_slots',
+                    'background_dropped_closures'):
+            for missing in (False, True):
+                if missing and key == 'background_dropped_closures':
+                    continue  # This counter did not exist in d003f2d; the documented sole exception.
+                with self.subTest(key=key, missing=missing):
+                    rows = self.frame_close_rows()
+                    if missing:
+                        rows[301].pop(key)
+                    else:
+                        rows[301][key] = 1
+                    report = self.frame_close_replay(rows)
+                    replay = report['frame_close_replay']
+                    self.assertEqual(replay['streams'][0]['eligible_frame_ids'], [])
+                    if missing and key == 'dropped':
+                        # dropped is mandatory in the ordinary schema: its
+                        # absence removes the summary, not merely its authority.
+                        self.assertEqual(report['coverage']['malformed_rows'], 1)
+                        self.assertEqual(replay['windows'], [])
+                        self.assertEqual(replay['streams'][0]['rejected_frame_ids'], list(range(1, 301)))
+                        self.assertIn('unknown-input-malformed_rows', replay['streams'][0]['authority_reasons'])
+                        for result in replay['frames']:
+                            self.assertIn('unknown-window-summary', result['reasons'])
+                    else:
+                        self.assertFalse(replay['windows'][0]['eligible'])
+                        reason = f'unknown-window-{key}' if missing else f'window-{key}-nonzero'
+                        self.assertIn(reason, replay['windows'][0]['reasons'])
+        for key, value, reason in (
+                ('partial', True, 'incomplete-or-noncanonical-window'),
+                ('frames', 299, 'incomplete-or-noncanonical-window'),
+                ('invalid_spans', 299, 'window-span-count-mismatch'),
+                ('valid_span_ms', 1, 'window-valid_span_ms-mismatch'),
+                ('valid_gap_ms', 1, 'window-valid_gap_ms-mismatch'),
+                ('measured_ms', 3001, 'frame-window-measured-mismatch')):
+            with self.subTest(key=key):
+                rows = self.frame_close_rows()
+                rows[301][key] = value
+                replay = self.frame_close_replay(rows)['frame_close_replay']
+                self.assertIn(reason, replay['windows'][0]['reasons'])
+                self.assertEqual(replay['streams'][0]['eligible_frame_ids'], [])
+        rows = self.frame_close_rows()
+        rows[302]['gpu_ms'] = 2999
+        replay = self.frame_close_replay(rows)['frame_close_replay']
+        self.assertIn('pass-window-measured-mismatch', replay['windows'][0]['reasons'])
+        rows = self.frame_close_rows()
+        del rows[302]
+        replay = self.frame_close_replay(rows)['frame_close_replay']
+        self.assertIn('unknown-pass-coverage', replay['windows'][0]['reasons'])
+
+    def test_frame_close_replay_rejects_missing_frames_uncovered_tail_and_footer_loss(self):
+        rows = self.frame_close_rows()
+        del rows[150]
+        replay = self.frame_close_replay(rows)['frame_close_replay']
+        self.assertEqual(replay['windows'][0]['missing_frame_ids'], [150])
+        self.assertIn('missing-frame-ids', replay['windows'][0]['reasons'])
+        self.assertEqual(replay['streams'][0]['eligible_frame_ids'], [])
+        rows = self.frame_close_rows()
+        tail = dict(rows[300], frame=301)
+        rows.insert(301, tail)
+        replay = self.frame_close_replay(rows)['frame_close_replay']
+        self.assertEqual(replay['streams'][0]['eligible_frame_ids'], list(range(1, 301)))
+        self.assertEqual(replay['streams'][0]['rejected_frame_ids'], [301])
+        self.assertIn('unknown-window-summary', replay['frames'][-1]['reasons'])
+        for key in ('output_failures', 'background_dropped_slots', 'background_dropped_closures'):
+            with self.subTest(footer_loss=key):
+                rows = self.frame_close_rows()
+                rows[-1][key] = 1
+                replay = self.frame_close_replay(rows)['frame_close_replay']
+                self.assertEqual(replay['streams'][0]['eligible_frame_ids'], [])
+                self.assertIn('session-end-reports-loss', replay['streams'][0]['authority_reasons'])
+
+    def test_frame_close_replay_rejects_malformed_queue_domains_without_exception(self):
+        for value in (-1, 1.5, True, [], {}, gpuprof.UINT32_MAX + 1):
+            with self.subTest(queue_family=value):
+                rows = self.frame_close_rows()
+                rows[1]['queue_family'] = value
+                replay = self.frame_close_replay(rows)['frame_close_replay']
+                self.assertIn(1, replay['streams'][0]['rejected_frame_ids'])
+                self.assertFalse(replay['frames'][0]['eligible'])
+                self.assertTrue(any('endpoint-authority' in reason or 'invalid-timestamp-domain' in reason
+                                    for reason in replay['frames'][0]['reasons']))
+                self.assertFalse(replay['windows'][0]['eligible'])
+        rows = self.frame_close_rows()
+        rows[0]['build_asset'] = None
+        replay = self.frame_close_replay(rows)['frame_close_replay']
+        self.assertEqual(replay['streams'][0]['eligible_frame_ids'], [])
+        self.assertIn('unknown-d003f2d-build-authority', replay['streams'][0]['authority_reasons'])
+        rows = self.frame_close_rows()
+        rows[-1]['launch_id'] = 'unrelated-capture'
+        replay = self.frame_close_replay(rows)['frame_close_replay']
+        self.assertEqual(replay['streams'][0]['eligible_frame_ids'], [])
+        self.assertIn('inconsistent-session-launch', replay['streams'][0]['authority_reasons'])
+
 
 @unittest.skipUnless(os.environ.get('GPUPROF_TEST_BIN'), 'set GPUPROF_TEST_BIN to run the real Vulkan fixture')
 class Lavapipe(unittest.TestCase):
     def launch(self, mode, workers, stats, *, unsupported=False, rotate=False, areas=False, ordinals=None,
-               unavailable_span=False, sampling=False, sample_budget=None, backpressure=False, cancel=False):
+               unavailable_span=False, sampling=False, sample_budget=None, backpressure=False, cancel=False,
+               sealed_present=False, last_closed=False):
         binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
         self.assertTrue(binary.is_file(), f'no fixture binary: {binary}')
         seed = Path(os.environ.get('TOTK_SHADER_SEED_DIR', binary.parent / 'vkdraw-seed')).resolve()
@@ -977,7 +1239,7 @@ class Lavapipe(unittest.TestCase):
             # Isolate launch policy from a developer's shell diagnostics.
             for key in ('TOTK_VK_OCCLUSION', 'TOTK_VK_PASS_DUMP', 'TOTK_VK_PASS_PROFILE', 'TOTK_VK_PASSPROBE',
                         'TOTK_VK_PASS_MERGE', 'GPUPROF_TEST_UNSUPPORTED', 'TOTK_VK_OFF', 'TOTK_VK_WRITEBACK',
-                        'TOTK_FRAME_LAG', 'TOTK_VK_LAG_CAPTURE'):
+                        'TOTK_FRAME_LAG', 'TOTK_VK_LAG_CAPTURE', 'TOTK_VK_SYNC'):
                 env.pop(key, None)
             env.pop('TOTK_VK_GPU_PROFILE_ORDINALS', None)
             env.pop('TOTK_VK_GPU_PROFILE_SAMPLE', None)
@@ -991,6 +1253,7 @@ class Lavapipe(unittest.TestCase):
                 env['GPUPROF_TEST_UNSUPPORTED'] = '1'
             arguments = (['--unavailable-span'] if unavailable_span else ['--areas'] if areas else
                          ['--backpressure'] if backpressure else ['--cancel'] if cancel else
+                         ['--sealed-present'] if sealed_present else ['--last-closed'] if last_closed else
                          ['--sampling'] if sampling else ['--frames', '302'])
             result = subprocess.run([str(binary), *arguments], cwd=temporary, env=env,
                                     capture_output=True, text=True, timeout=180)
@@ -1016,13 +1279,18 @@ class Lavapipe(unittest.TestCase):
             report['_fixture_output_bytes'] = sum(path.stat().st_size for path in paths)
             report['_fixture_rows'] = [o['row'] for o in observations]
             for path in paths:
-                first = json.loads(path.read_text(encoding='utf-8').splitlines()[0])
+                file_rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+                first = file_rows[0]
+                for index, row in enumerate(file_rows):
+                    if row['type'] == 'session_end':
+                        self.assertEqual(index, len(file_rows) - 1, 'late CPU present cannot emit rows after session_end')
                 self.assertEqual(first['type'], 'header', 'every rotated file must carry its launch identity')
                 self.assertEqual(first['ordinals'], bool(ordinals))
                 self.assertEqual(first['max_bytes'], 4096 if rotate else 134217728)
                 self.assertEqual(first['span_limit_ms'], 10000)
                 self.assertEqual(first['background_slots'], 16)
                 self.assertEqual(first['background_worker'], 'totk-gpuprof')
+                self.assertEqual(first['background_closures'], 256)
                 if sample_budget:
                     self.assertEqual(first['sample_budget'], sample_budget)
                     self.assertEqual(first['env']['TOTK_VK_GPU_PROFILE_SAMPLE'], str(sample_budget))
@@ -1082,8 +1350,20 @@ class Lavapipe(unittest.TestCase):
                 self.assertLess(report['coverage']['frame_rows'], frames)
                 self.assertGreater(report['coverage']['missing_frame_ids'], 0)
                 self.assertTrue(any('background backlog' in issue for issue in report['issues']))
+                self.assertGreater(report['coverage']['invalid_frame_spans'] + report['coverage']['missing_frame_ids'], 0,
+                                   'actual backlog loss must not be reclassified as an ordinary CPU-closed frame')
+                self.assertTrue(any(not row['span_valid'] or row['dropped'] for row in report['_fixture_rows']
+                                    if row['type'] == 'frame') or report['coverage']['missing_frame_ids'])
                 return report
             self.assertEqual(report['coverage']['background_dropped_slots'], 0, report['issues'])
+            self.assertEqual(report['coverage']['background_dropped_closures'], 0, report['issues'])
+            self.assertEqual(report['sessions'][0]['end']['pending_frame_closures'], 0)
+            if sealed_present or last_closed:
+                self.assertEqual(frames, 1 if last_closed else 302)
+                self.assertEqual(bool(enabled), bool(stats and supported and not unsupported))
+                self.check_sealed_present(report, observations, result.stdout, frames, passes, draws,
+                                          sample_budget or 0, bool(enabled))
+                return report
             if cancel:
                 self.assertEqual(frames, 6)
                 self.assertEqual(report['coverage']['frame_rows'], frames)
@@ -1151,6 +1431,107 @@ class Lavapipe(unittest.TestCase):
             else:
                 self.assertEqual(report['coverage']['long_frames'], 0)
             return report
+
+    def check_sealed_present(self, report, observations, stdout, frames, passes, draws, budget, stats_enabled):
+        self.assertIn(
+            f'gpuprof-sealed-present frames={frames} main_submissions={frames * 3} pre_uploads={frames * 2} '
+            f'completed_closes={(frames + 1) // 2} pending_closes={frames // 2} '
+            f'marker_submissions={frames if budget else 0} last_closed_before_flush=1', stdout)
+        self.assertEqual((passes, draws), (frames * 2, frames * 4))
+        rows = [o['row'] for o in observations]
+        frame_rows = [r for r in rows if r['type'] == 'frame']
+        pass_rows = [r for r in rows if r['type'] == 'pass']
+        windows = [r for r in rows if r['type'] == 'window']
+        self.assertEqual([r['frame'] for r in frame_rows], list(range(1, frames + 1)))
+        self.assertEqual(len(windows), (frames + 299) // 300)
+        for field in ('missing_frame_ids', 'reconciliation_failures', 'dropped', 'failed_slots',
+                      'stats_failed_slots', 'invalid_frame_spans', 'invalid_window_spans',
+                      'unavailable_timestamps', 'invalid_timestamps', 'window_sum_mismatches',
+                      'background_dropped_slots', 'background_dropped_closures'):
+            self.assertEqual(report['coverage'][field], 0, (field, report['issues']))
+        self.assertEqual(report['sessions'][0]['end']['last_frame'], frames)
+        self.assertEqual(report['sessions'][0]['end']['last_window_end'], frames)
+        self.assertEqual({kind: sum(r['count'] for r in pass_rows if r['kind'] == kind)
+                          for kind in ('render', 'upload', 'transfer', 'present')},
+                         dict(render=frames * 2, upload=frames * 2, transfer=frames * 2, present=frames))
+        self.assertEqual(sum(r['draws'] for r in pass_rows), draws)
+        self.assertEqual({(r['render_width'], r['render_height']) for r in pass_rows if r['kind'] == 'render'},
+                         {(64, 64), (128, 128)})
+        sequence = 0
+        for row in frame_rows:
+            self.assertTrue(row['span_valid'], row)
+            self.assertFalse(row['reconciliation_failed'])
+            self.assertGreater(row['span_ms'], 0)
+            self.assertEqual(row['unavailable_timestamps'], 0)
+            self.assertEqual(row['invalid_timestamps'], 0)
+            self.assertEqual(row['closure_source'], 'gpu-marker' if budget else 'cpu-sealed')
+            self.assertGreater(row['closure_sequence'], sequence)
+            sequence = row['closure_sequence']
+            ticks = (row['last_tick'] - row['first_tick']) & ((1 << row['timestamp_bits']) - 1)
+            self.assertAlmostEqual(row['span_ms'], ticks * row['timestamp_period'] / 1e6, delta=0.000002)
+            self.assertAlmostEqual(row['gap_ms'], row['span_ms'] - row['measured_ms'], delta=0.000002)
+            if budget:
+                self.assertEqual(row['sample_budget'], budget)
+                self.assertEqual(row['timing_scope'], 'main-frame')
+                self.assertEqual(row['observed_passes'], 7)
+                self.assertLessEqual(row['sampled_passes'], budget)
+                self.assertEqual(row['timestamp_count'], 2 * row['sampled_passes'] + 2,
+                                 'count actual profiler timestamp commands, not pool capacity or queue submits')
+                self.assertLessEqual(row['timestamp_count'], 2 * budget + 2)
+            else:
+                self.assertGreaterEqual(row['gap_ms'], -0.000002)
+        for row in windows:
+            members = [r for r in frame_rows if row['window_start'] <= r['frame'] <= row['window_end']]
+            aggregates = [r for r in pass_rows if r['window_start'] == row['window_start']]
+            self.assertTrue(row['span_valid'])
+            self.assertEqual(row['frames'], len(members))
+            self.assertEqual(row['invalid_spans'], 0)
+            self.assertAlmostEqual(row['measured_ms'], math.fsum(r['measured_ms'] for r in members), delta=0.00001)
+            self.assertAlmostEqual(row['measured_ms'], math.fsum(r['gpu_ms'] for r in aggregates), delta=0.00001,
+                                   msg='all actual pre/render/transfer/present pass sums retain the same authority')
+            self.assertAlmostEqual(row['span_ms'], math.fsum(r['span_ms'] for r in members), delta=0.00001)
+            if budget:
+                self.assertEqual(row['timestamp_count'], sum(r['timestamp_count'] for r in members))
+                self.assertEqual(row['observed_passes'], sum(r['count'] for r in aggregates))
+                self.assertEqual(row['sample_count'], sum(r['sampling']['sample_count'] for r in aggregates))
+        for row in pass_rows:
+            timed = row['sampling']['sample_count'] if budget else row['count']
+            valid_stats = timed if stats_enabled and row['kind'] == 'render' else 0
+            self.assertEqual(row['stats_valid'], valid_stats)
+            self.assertEqual('stats' in row, bool(valid_stats))
+            if valid_stats:
+                stats_draws = row['stats_draws'] if budget else row['draws']
+                self.assertEqual(row['stats']['ia_vertices'], stats_draws * 3)
+                self.assertEqual(row['stats']['ia_primitives'], stats_draws)
+                self.assertGreater(row['stats']['fs_invocations'], 0)
+        self.assertAlmostEqual(report['timing']['window']['measured_ms'],
+                               report['timing']['frame']['measured_ms'], delta=0.00001)
+
+    def test_sealed_present_full_and_sampled_workers_statistics(self):
+        fields = ('key', 'kind', 'count', 'draws', 'window_start', 'window_end', 'ordinal',
+                  'render_width', 'render_height', 'reference_width', 'reference_height',
+                  'scene_relative', 'shader', 'samples', 'attachments')
+        def metadata(report):
+            return {json.dumps({key: row[key] for key in fields}, sort_keys=True)
+                    for row in report['_fixture_rows'] if row['type'] == 'pass'}
+        reference = None
+        for workers in (0, 2):
+            for stats in (0, 1):
+                for budget in (0, 1, 2):
+                    with self.subTest(workers=workers, stats=stats, budget=budget):
+                        report = self.launch(1, workers, stats, sealed_present=True, sample_budget=budget)
+                        observed = metadata(report)
+                        if reference is None:
+                            reference = observed
+                        self.assertEqual(observed, reference,
+                                         'CPU closure, workers and sampling cannot change observed pass authority')
+
+    def test_last_closed_frame_publishes_without_next_frame_or_terminal_flush(self):
+        for workers in (0, 2):
+            for stats in (0, 1):
+                for budget in (0, 1, 2):
+                    with self.subTest(workers=workers, stats=stats, budget=budget):
+                        self.launch(1, workers, stats, last_closed=True, sample_budget=budget)
 
     def test_background_backlog_never_blocks_game_completion(self):
         for workers in (0, 2):

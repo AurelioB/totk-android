@@ -19,6 +19,7 @@
 #define GP_TIMESTAMPS (GP_PRE_QUERY + 1)
 #define GP_HISTOGRAM 272
 #define GP_BACKLOG 16
+#define GP_CLOSURES 256
 enum { GP_IA_VERTICES, GP_IA_PRIMITIVES, GP_VS, GP_CLIP_INVOCATIONS, GP_CLIP_PRIMITIVES, GP_FS, GP_STATS };
 #define GP_STATS_MASK (VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT | \
     VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT | \
@@ -45,7 +46,7 @@ typedef struct {
 struct vk_gpuprof_slot {
     VkQueryPool pool, stats;
     uint32_t n, dropped, ns, nt;
-    uint64_t sealed;
+    uint64_t sealed, sequence;
     uint32_t nsegment, has_pre;
     int discard;
     VkCommandBuffer pre_cb;
@@ -82,11 +83,14 @@ static gp_scope scopes[16];
 static unsigned scope_n, scope_overflow;
 static uint64_t frame = 1;
 static uint32_t frame_instance;
+static uint64_t recording_sequence; /* increments only at actual slot seal, never cancellation */
 /* Aggregation/query/output state below belongs ONLY to totk-gpuprof. */
 static gp_group groups[GP_GROUPS];
 static struct {
     uint64_t frame, dropped, unavailable_timestamps, invalid_timestamps, timestamp_wraps;
     uint64_t timestamp_count, observed_passes, sampled_passes;
+    uint64_t closure_sequence;
+    const char *closure_source;
     vk_gpuprof_timestamp first, last;
     vk_gpuprof_time_domain first_domain, last_domain;
     vk_gpuprof_time_status status;
@@ -138,9 +142,13 @@ static pthread_t background_thread;
 static vk_gpuprof_slot *background_free[GP_BACKLOG], *background_queue[GP_BACKLOG];
 static unsigned background_nfree;
 static uint64_t background_head, background_tail;
+typedef struct { uint64_t frame, sequence; } gp_closure;
+static gp_closure background_closures[GP_CLOSURES];
+static uint64_t background_close_head, background_close_tail, background_processed_sequence;
 static int background_started, background_ready, background_active, background_stop, background_joining, background_joined;
 static _Atomic int background_closing;
 static _Atomic uint64_t background_dropped_slots, background_queued_slots, background_processed_slots;
+static _Atomic uint64_t background_dropped_closures;
 #ifdef TOTK_VK_TESTS
 static int background_paused;
 static uint64_t background_flush_requested, background_flush_done;
@@ -225,11 +233,11 @@ static void output_init(void) {
     json_add(row, ",\"apk_sha256\":null,\"apk_sha256_reason\":\"not computed in process; join capture APK hash\","
         "\"profile\":%d,\"stats\":%s,\"ordinals\":%s,\"max_bytes\":%llu,\"retained_files\":4,"
         "\"window_frames\":%d,\"span_limit_ms\":%.0f,\"timestamp_bits\":%u,\"timestamp_period_ns\":%.9f,"
-        "\"sample_budget\":%u,\"background_slots\":%u,\"background_worker\":\"totk-gpuprof\","
+        "\"sample_budget\":%u,\"background_slots\":%u,\"background_closures\":%u,\"background_worker\":\"totk-gpuprof\","
         "\"driver\":{\"vendor_id\":%u,\"device_id\":%u,\"api_version\":%u,\"driver_version\":%u,\"device_name\":",
         vk_gpuprof_on, stats_on ? "true" : "false", window_ordinals ? "true" : "false",
         (unsigned long long)output_limit, GP_WINDOW, VK_GPUPROF_MAX_FRAME_MS, V.timestamp_bits, V.props.limits.timestampPeriod,
-        sample_budget, GP_BACKLOG, V.props.vendorID, V.props.deviceID, V.props.apiVersion, V.props.driverVersion);
+        sample_budget, GP_BACKLOG, GP_CLOSURES, V.props.vendorID, V.props.deviceID, V.props.apiVersion, V.props.driverVersion);
     json_string(row, V.props.deviceName);
     json_add(row, ",\"requested_driver\":"); json_string(row, getenv("TOTK_VK_DRIVER"));
     json_add(row, ",\"binary_sha256\":null,\"binary_sha256_reason\":\"join captured driver artifact\"},\"env\":{");
@@ -295,16 +303,20 @@ static void output_window(const char *text, uint64_t sequence, uint64_t end) {
    Still-in-flight GPU work remains unknown; force-stop cannot run this path. */
 void vk_gpuprof_shutdown(void) {
     background_stop_and_join();
+    pthread_mutex_lock(&background_mu);
+    uint64_t pending_closures = background_close_tail - background_close_head;
+    pthread_mutex_unlock(&background_mu);
     pthread_mutex_lock(&output_mu);
     if (!output_closed && output_file) {
         gp_json row = {0};
         json_add(&row, "{\"schema\":3,\"type\":\"session_end\",\"launch_id\":"); json_string(&row, output_launch);
         json_add(&row, ",\"clean_end\":true,\"all_queries_retired\":null,\"last_frame\":%llu,"
             "\"last_window_sequence\":%llu,\"last_window_end\":%llu,\"output_failures\":%llu,"
-            "\"background_dropped_slots\":%llu}\n",
+            "\"background_dropped_slots\":%llu,\"background_dropped_closures\":%llu,\"pending_frame_closures\":%llu}\n",
             (unsigned long long)output_last_frame, (unsigned long long)output_last_window,
             (unsigned long long)output_last_window_end, (unsigned long long)atomic_load(&output_failures),
-            (unsigned long long)atomic_load(&background_dropped_slots));
+            (unsigned long long)atomic_load(&background_dropped_slots),
+            (unsigned long long)atomic_load(&background_dropped_closures), (unsigned long long)pending_closures);
         output_row_locked(row.data);
         if (output_file) { fflush(output_file); fclose(output_file); output_file = NULL; }
     }
@@ -552,11 +564,12 @@ static void report(void) {
     else json_add(&summary, "\"span_ms\":%.9f,\"gap_ms\":%.9f,", window_span, window_gap);
     json_add(&summary, "\"dropped\":%llu,\"failed_slots\":%llu,\"stats_failed_slots\":%llu,"
         "\"unavailable_timestamps\":%llu,\"invalid_timestamps\":%llu,\"invalid_spans\":%llu,\"output_failures\":%llu,"
-        "\"background_dropped_slots\":%llu}\n",
+        "\"background_dropped_slots\":%llu,\"background_dropped_closures\":%llu}\n",
         (unsigned long long)dropped_records, (unsigned long long)failed_slots, (unsigned long long)stats_failures,
         (unsigned long long)window_unavailable_timestamps, (unsigned long long)window_invalid_timestamps,
         (unsigned long long)window_invalid_spans, (unsigned long long)atomic_load(&output_failures),
-        (unsigned long long)atomic_load(&background_dropped_slots));
+        (unsigned long long)atomic_load(&background_dropped_slots),
+        (unsigned long long)atomic_load(&background_dropped_closures));
     output_window(summary.data, window + 1, report_end);
     if (sample_budget) LOGV("[gpu-profile sample] budget=%u sampled=%llu observed=%llu timestamps=%llu frames=%llu; pass sums are sampled only, not frame totals",
         sample_budget, (unsigned long long)window_sample_count, (unsigned long long)window_observed_passes,
@@ -678,6 +691,9 @@ static void finish_frame(void) {
         completed.first_domain.valid_bits, completed.first_domain.period_ns, completed.first_domain.queue_family,
         (unsigned long long)completed.dropped, valid ? "false" : "true", (unsigned long long)long_dropped,
         completed.scene_w, completed.scene_h);
+    json_add(&row, ",\"closure_source\":\"%s\",\"closure_sequence\":%llu",
+        completed.closure_source ? completed.closure_source : "missing-closure",
+        (unsigned long long)completed.closure_sequence);
     if (sample_budget) {
         json_add(&row, ",\"sample_budget\":%u,\"sampled_passes\":%llu,\"observed_passes\":%llu,"
             "\"timestamp_count\":%llu,\"timing_scope\":\"main-frame\"",
@@ -756,7 +772,7 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
     if (!*slot) { atomic_fetch_add_explicit(&background_dropped_slots, 1, memory_order_relaxed); return; }
     current = *slot; current->n = current->dropped = 0; current->sealed = 0;
     current->ns = current->nt = 0; current->has_pre = 0; current->pre_cb = VK_NULL_HANDLE;
-    current->discard = 0;
+    current->discard = 0; current->sequence = 0;
     current->nsegment = 1; current->segment[0] = (gp_segment){frame, 0, 0};
     current->domain = current_time_domain();
     if (sample_budget) sampled_frame_begin(cb);
@@ -796,8 +812,9 @@ static void frame_marker(VkCommandBuffer cb) {
     current->nsegment++;
 }
 void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot) {
-    if (!slot) return;
-    slot->sealed = frame - 1; current = NULL;
+    uint64_t sequence = ++recording_sequence;
+    if (slot) { slot->sequence = sequence; slot->sealed = frame - 1; }
+    current = NULL;
 }
 static void ingest_record(gp_record *r, double ms, int stats_valid, int sampled) {
     completed.measured += ms;
@@ -836,8 +853,9 @@ static void process_slot(vk_gpuprof_slot *slot) {
     for (uint32_t s = 0; s < slot->nsegment; s++) {
         const gp_segment *segment = &slot->segment[s];
         if (completed.frame && completed.frame != segment->frame) {
-            /* A closed frame is retired below immediately. Crossing an open
-               one means a profiler lease/end marker was lost, not a short span. */
+            /* Ready CPU closures are consumed before later-frame leases.
+               Reaching this transition still open means missing closure/data,
+               not authority to manufacture a short whole-frame span. */
             frame_time_failure(GP_TIME_INCOMPLETE); finish_frame();
         }
         advance((segment->frame - 1) / GP_WINDOW);
@@ -845,6 +863,7 @@ static void process_slot(vk_gpuprof_slot *slot) {
         if (!s) {
             completed.dropped += slot->dropped; dropped_records += slot->dropped;
             stats_failures += sr != VK_SUCCESS;
+            if (slot->sequence > background_processed_sequence + 1) frame_time_failure(GP_TIME_INCOMPLETE);
         }
         uint32_t first_query = !s && slot->has_pre ? GP_PRE_QUERY : GP_SPAN_BASE + segment->first;
         VkResult first_result = !s && slot->has_pre ? pre_result : span_result;
@@ -896,9 +915,28 @@ static void process_slot(vk_gpuprof_slot *slot) {
             ingest_record(r, pass_time.ms, r->stats_count && !r->stats_invalid && sr == VK_SUCCESS, 1);
         }
         if (slot_failed && !slot_reported) { failed_slots++; slot_reported = 1; }
-        if (segment->frame <= slot->sealed) finish_frame();
+        if (segment->frame <= slot->sealed) {
+            completed.closure_source = "gpu-marker"; completed.closure_sequence = slot->sequence; finish_frame();
+        }
     }
     if (slot->sealed) advance(slot->sealed / GP_WINDOW);
+}
+/* CPU present can happen after the final command buffer was already sealed.
+   Its immutable end sequence is authority for when the worker may retire that
+   frame; a recording-thread watermark alone would race outstanding leases. */
+static int background_closure_ready(void) { /* background_mu held */
+    return background_close_head != background_close_tail &&
+        background_closures[background_close_head % GP_CLOSURES].sequence <= background_processed_sequence;
+}
+static void complete_closure(gp_closure close) {
+    if (close.frame <= last_completed || completed.frame > close.frame) return;
+    if (completed.frame && completed.frame < close.frame) {
+        frame_time_failure(GP_TIME_INCOMPLETE); finish_frame();
+    }
+    completed.frame = close.frame;
+    completed.closure_source = "cpu-sealed"; completed.closure_sequence = close.sequence;
+    finish_frame();
+    advance(close.frame / GP_WINDOW);
 }
 static void background_prepare(vk_gpuprof_slot *slot) {
     vkResetQueryPool(V.dev, slot->pool, 0, GP_TIMESTAMPS);
@@ -953,11 +991,22 @@ static void *background_main(void *unused) {
     for (;;) {
 #ifdef TOTK_VK_TESTS
         while (!background_stop && (background_paused ||
-            (background_head == background_tail && background_flush_done == background_flush_requested)))
+            (background_head == background_tail && !background_closure_ready() &&
+             background_flush_done == background_flush_requested)))
             pthread_cond_wait(&background_cv, &background_mu);
 #else
-        while (!background_stop && background_head == background_tail) pthread_cond_wait(&background_cv, &background_mu);
+        while (!background_stop && background_head == background_tail && !background_closure_ready())
+            pthread_cond_wait(&background_cv, &background_mu);
 #endif
+        if (background_closure_ready()) {
+            gp_closure close = background_closures[background_close_head++ % GP_CLOSURES];
+            background_active = 1;
+            pthread_mutex_unlock(&background_mu);
+            complete_closure(close);
+            pthread_mutex_lock(&background_mu);
+            background_active = 0; pthread_cond_broadcast(&background_cv);
+            continue;
+        }
         if (background_head != background_tail) {
             vk_gpuprof_slot *slot = background_queue[background_head++ % GP_BACKLOG];
             background_active = 1;
@@ -966,6 +1015,7 @@ static void *background_main(void *unused) {
             background_prepare(slot);
             atomic_fetch_add_explicit(&background_processed_slots, 1, memory_order_relaxed);
             pthread_mutex_lock(&background_mu);
+            if (!slot->discard) background_processed_sequence = slot->sequence;
             background_free[background_nfree++] = slot; background_active = 0;
             pthread_cond_broadcast(&background_cv);
             continue;
@@ -1145,6 +1195,17 @@ void vk_gpuprof_scope_end(VkCommandBuffer cb) {
 }
 static void present_at(VkCommandBuffer cb) {
     if (current) frame_marker(cb);
+    pthread_mutex_lock(&background_mu);
+    if (!background_stop) {
+        if (background_close_tail - background_close_head == GP_CLOSURES)
+            atomic_fetch_add_explicit(&background_dropped_closures, 1, memory_order_relaxed);
+        else {
+            background_closures[background_close_tail++ % GP_CLOSURES] =
+                (gp_closure){frame, recording_sequence + !!cb};
+            pthread_cond_signal(&background_cv);
+        }
+    }
+    pthread_mutex_unlock(&background_mu);
     if (sample_budget) {
         sample_previous_passes = frame_instance;
         sample_cursor += sample_budget; sample_selected = 0;
@@ -1152,16 +1213,31 @@ static void present_at(VkCommandBuffer cb) {
     frame++;
     frame_instance = 0;
 }
-void vk_gpuprof_present(void) { present_at(current ? vk_cb() : VK_NULL_HANDLE); }
+void vk_gpuprof_present(void) {
+    if (!vk_gpuprof_on || atomic_load_explicit(&background_closing, memory_order_acquire)) return;
+    if (!current) {
+        if (sample_budget) {
+            /* A sealed final submission cannot accept the one sampled-frame
+               end timestamp. Submit one marker-only buffer, not per-slot ends
+               or a CPU-time surrogate. No new pass/stat query is introduced. */
+            VkCommandBuffer cb = vk_cb();
+            if (current) { present_at(cb); (void)vk_submit_now(); return; }
+        }
+        /* Also seal any unprofiled open slot after lease exhaustion before
+           publishing a CPU closure. Usually Android present already did this. */
+        if (atomic_load_explicit(&background_dropped_slots, memory_order_relaxed)) (void)vk_submit_now();
+        present_at(VK_NULL_HANDLE);
+    } else present_at(vk_cb());
+}
 #ifdef TOTK_VK_TESTS
 void vk_gpuprof_test_frame(VkCommandBuffer cb) {
-    if (!vk_gpuprof_on) return;
+    if (!vk_gpuprof_on || atomic_load_explicit(&background_closing, memory_order_acquire)) return;
     present_at(cb);
 }
 void vk_gpuprof_test_wait(void) {
     if (!vk_gpuprof_on) return;
     pthread_mutex_lock(&background_mu);
-    while (!background_stop && (background_head != background_tail || background_active))
+    while (!background_stop && (background_head != background_tail || background_active || background_closure_ready()))
         pthread_cond_wait(&background_cv, &background_mu);
     pthread_mutex_unlock(&background_mu);
 }
