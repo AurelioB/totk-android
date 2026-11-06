@@ -4000,14 +4000,25 @@ The ~33-ms cadence is a game policy result, not a shader-compile count or raw GP
 Setters and 300-frame summaries do not retain all preceding inputs, so the native three-late rule comes from
 instruction emulation, not an invented per-frame trace. Boot/scripted-camera floors must be excluded from pans.
 
+The pacing-aware analyzer classifies a 60-target window as a dip when at least 60/300 measured intervals
+are 29..37.5 ms (otherwise it uses a clearly labelled incomplete-coverage fps fallback). Its Odin shadow
+re-analysis retains 31 windows per arm: A/B each have seven dip windows, taking 29.31/29.45% of measured
+window time, with 1,348/1,331 near-33-ms frames. Steady fps is 57.35/57.52 versus time-weighted
+52.29/52.36 overall: avoiding those windows could recover about 5 fps, not evidence of faster steady rendering.
+That **dip-window time fraction** is distinct from interval-2 frame share/time and extra-refresh tax.
+Near-33 cadence can also include missed refreshes at interval 1; do not identify every such frame as a controller drop.
+
 Device qualification: use the same release APK, Recommended60 preset, 60-Hz panel, GPU busy On,
 Hateno save/view, warmed seed, fixed resolution/DRS and recording threads. Fresh launch each arm:
 control `TOTK_FPS60_HYSTERESIS=0 TOTK_GPU_TIME_FPS_MEDIAN=0`; then hysteresis-only `1/0`;
-then median-only `0/1`, each interleaved ABBA for at least three 180-second stationary/pan repetitions.
+then median-only `0/1`, each interleaved ABBA. For every fresh launch run the existing
+`tools/bench/pan.sh -s <odin-serial> --device odin --scene hateno --out <arm-dir> --target-fps 60 --repeat 3`;
+retain all three pans, with the script's target-aware duration and settle, then analyze with the pacing-aware
+`tools/bench/analyze.py`. Compare `dip_time_fraction` and `fps_steady` separately; mean fps is informational.
 Keep `TOTK_GPU_TIME=hardware`, `TOTK_FPS_AUTO=0`, `TOTK_FRAMEGEN=0` and thermal/ADPF settings identical.
 Require the switch startup logs, controller=sys+0x200, zero hardware fallback/invalid/withheld, and no cutscene floor.
 Join every drop/recovery decision to immutable interval-1/2 cadence, CPU/GPU scores and GPU FPS median summaries;
-report interval-2 frame share, wall-time share and extra-refresh tax separately, plus p95/p99/>50ms,
+report the analyzer's dip-window fraction/steady fps alongside interval-2 frame/time share and extra-refresh tax, plus p95/p99/>50ms,
 physical GPU ms/DRS, CPU/GPU clocks, power and temperature. Reject apparent fps gains with worse missed-refresh
 tails, altered time/physics, freeze/veto violations, sustained report withholding or rising thermal cost.
 Only test `1/1` after each independent arm qualifies; no device result is claimed by these host experiments.
