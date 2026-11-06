@@ -5,8 +5,9 @@
 #
 # Steady horizontal camera pan: the right stick held at --value (of 32767) to the right for the first half of the time,
 # then to the left for the second half (--first left: left, then right), then released, so the view returns.
-# Defaults: target 30, 48 seconds; --target-fps 60 uses one continuous 144-second pan to retain at least twelve complete
-# 300-frame windows even near 30 fps. --seconds overrides either duration; --repeat runs N pans without another settle.
+# Defaults: infer the preset target (settings.env plus totk.env override); 30 uses 48 seconds and 60 uses 144 seconds
+# to retain twelve complete windows even near 30 fps. Unknown target uses 48 seconds without claiming a pacing target.
+# --target-fps overrides detection; --seconds overrides duration; --repeat runs N pans without another settle.
 # Appends one line per pan to <out>/pans.txt (TARGET_FPS lets the analyzer warn when fewer than twelve windows survive):
 #   <device> <scene> F0=<before> F1=<after> T0=<epoch s> T1=<epoch s> V=<value> D=<1|-1> TARGET_FPS=<30|60>
 # (D: 1 right first, -1 left first) and two lines to <out>/freqs.txt, the frequency limits (`bench_input.sh freqs`)
@@ -22,7 +23,7 @@ usage() { sed -n '2,/^set -u/{ /^set -u/d; s/^# \{0,1\}//; p; }' "$0" >&2; exit 
 die() { echo "pan: $*" >&2; exit 1; }
 
 SER=""; DEV=""; SCENE=""; SECS=""; V=16000; FIRST=right; OUT=""; EV=""; DISP=""; PKG=com.aure.totk; GAME=""; SHOT=1
-TARGET_FPS=30; REPEAT=1
+TARGET_FPS=""; REPEAT=1
 while [ $# -gt 0 ]; do
   case $1 in
     -s) SER=${2:?}; shift 2 ;;
@@ -44,17 +45,23 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$SER" ] && [ -n "$DEV" ] && [ -n "$SCENE" ] && [ -n "$OUT" ] || usage
-case $TARGET_FPS in 30) [ -n "$SECS" ] || SECS=48 ;; 60) [ -n "$SECS" ] || SECS=144 ;; *) die "--target-fps: 30 or 60" ;; esac
+case $TARGET_FPS in ''|30|60) ;; *) die "--target-fps: 30 or 60" ;; esac
 case $REPEAT in ''|*[!0-9]*) die "--repeat: a positive integer" ;; esac
 [ "$REPEAT" -gt 0 ] || die "--repeat: a positive integer"
-HALF=$(awk -v seconds="$SECS" 'BEGIN {
-  if (seconds !~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ || seconds <= 0) exit 1
-  print seconds / 2
-}') || die "--seconds: a positive number"
 case $DEV$SCENE in *[!A-Za-z0-9_-]*) die "--device / --scene: letters, digits, _ and - only" ;; esac
 case $FIRST in right) D=1 ;; left) D=-1 ;; *) die "--first: right or left" ;; esac
 [ -n "$GAME" ] || GAME=/data/user/0/$PKG/files/game
 LOG=$GAME/totk.log
+if [ -z "$TARGET_FPS" ]; then
+  PRESET=$(python3 "$HERE/rootsh.py" -s "$SER" run -c \
+    "cat /data/user/0/$PKG/files/settings.env $GAME/totk.env 2>/dev/null | grep '^TOTK_FPS60=' | tail -n1 | cut -d= -f2" | tr -d '\r')
+  case $PRESET in 1) TARGET_FPS=60 ;; 0) TARGET_FPS=30 ;; esac
+fi
+[ -n "$SECS" ] || { if [ "$TARGET_FPS" = 60 ]; then SECS=144; else SECS=48; fi; }
+HALF=$(awk -v seconds="$SECS" 'BEGIN {
+  if (seconds !~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ || seconds <= 0) exit 1
+  print seconds / 2
+}') || die "--seconds: a positive number"
 
 adb -s "$SER" shell pidof "$PKG" >/dev/null 2>&1 || die "$PKG is not running on $SER: start the game and load the scene first"
 if [ -z "$EV" ] || [ -z "$DISP" ]; then
@@ -93,7 +100,7 @@ while [ "$I" -le "$REPEAT" ]; do
   input rstick 0 || die "cannot release the camera pan"
   FE=$(input freqs) || echo "pan: cannot read the frequency limits after the pan" >&2
   printf '%s\n' "$DEV $SCENE T0=$T0 start $FS" "$DEV $SCENE T0=$T0 end $FE" >> "$OUT/freqs.txt"
-  echo "$DEV $SCENE F0=$F0 F1=$F1 T0=$T0 T1=$T1 V=$V D=$D TARGET_FPS=$TARGET_FPS" | tee -a "$OUT/pans.txt"
+  echo "$DEV $SCENE F0=$F0 F1=$F1 T0=$T0 T1=$T1 V=$V D=$D${TARGET_FPS:+ TARGET_FPS=$TARGET_FPS}" | tee -a "$OUT/pans.txt"
   [ -z "$SHOT" ] || input shot "$OUT/shots/$DEV-$SCENE-pan-$T0.png" >/dev/null || echo "pan: screenshot failed (continuing)" >&2
   I=$((I + 1))
 done
