@@ -108,25 +108,34 @@ def parse_gpu_time_in_state(text, source, frequencies=None):
         counters[freq] = count
 
     if name == 'trans_stat':
-        headers = []
+        header, rows = None, []
         for line in text.splitlines():
             if m := re.search(r'\btime\s*\(([^)]+)\)\s*$', line, re.I):
-                cols = line[:m.start()].strip().lstrip(':').split()
-                if headers or not cols or not all(c.isdigit() for c in cols):
+                prefix = line[:m.start()].strip()
+                if header is not None or not re.fullmatch(r':[\d\s]+', prefix):
                     raise ValueError('invalid trans_stat frequency header')
-                headers = [int(c) for c in cols]
-                if len(set(headers)) != len(headers):
-                    raise ValueError('duplicate trans_stat header frequency')
+                header = prefix[1:].strip()
                 unit = m[1].strip()
-            elif m := re.fullmatch(r'\s*\*?\s*(\d+)\s*:\s*([\d\s]+)', line):
-                values = [int(v) for v in m[2].split()]
-                if not headers or len(values) != len(headers) + 1:
-                    raise ValueError('incomplete trans_stat row')
-                add(int(m[1]), values[-1])
+            elif m := re.fullmatch(r'\s*\*?\s*(\d+)\s*:([\d \t]+)', line):
+                rows.append((int(m[1]), m[2]))
             elif re.match(r'\s*\*?\s*\d', line):
                 raise ValueError('malformed trans_stat row')
-        if not headers or set(counters) != set(headers):
+        if header is None or not rows:
             raise ValueError('missing trans_stat time-in-state rows')
+        freqs = [freq for freq, _ in rows]
+        # The kernel prints %10lu with no separator: adjacent GHz frequencies
+        # occupy all ten columns and must not be treated as one integer.
+        if ([int(v) for v in header.split()] != freqs
+                and header != ''.join(f'{freq:10d}' for freq in freqs).strip()):
+            raise ValueError('mismatched trans_stat header frequencies')
+        for freq, values in rows:
+            cols = values.split()
+            if len(cols) != len(rows) + 1:
+                cols = [values[i * 10:(i + 1) * 10].strip() for i in range(len(rows))]
+                cols.append(values[len(rows) * 10:].strip())
+            if len(cols) != len(rows) + 1 or not all(c.isdigit() for c in cols):
+                raise ValueError('incomplete trans_stat row')
+            add(freq, int(cols[-1]))
     elif name == 'gpu_clock_stats':
         values = text.split()
         freqs = frequencies.split() if isinstance(frequencies, str) else []
