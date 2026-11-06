@@ -6,6 +6,13 @@
 #define GP_RECORDS 2048
 #define GP_GROUPS 16384
 #define GP_WINDOW 300
+enum { GP_IA_VERTICES, GP_IA_PRIMITIVES, GP_VS, GP_CLIP_INVOCATIONS, GP_CLIP_PRIMITIVES, GP_FS, GP_STATS };
+#define GP_STATS_MASK (VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT | \
+    VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT | \
+    VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT | \
+    VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT | \
+    VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT | \
+    VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)
 
 typedef struct { uint32_t format, w, h, load, store, bytes; } gp_attachment;
 typedef struct {
@@ -14,7 +21,7 @@ typedef struct {
     uint32_t w, h, samples, colors, bucket, compute;
 } gp_key;
 typedef struct {
-    gp_key key; uint64_t frame, fragments;
+    gp_key key; uint64_t frame, counters[GP_STATS];
     uint32_t draws, instance, reason, detail, stats_q1, stats_count, stats_invalid;
 } gp_record;
 struct vk_gpuprof_slot {
@@ -23,10 +30,13 @@ struct vk_gpuprof_slot {
     uint64_t sealed;
     gp_record rec[GP_RECORDS];
     uint64_t ticks[GP_RECORDS * 2];
-    uint64_t fragments[GP_RECORDS];
+    uint64_t counters[GP_RECORDS][GP_STATS];
     uint32_t stats_owner[GP_RECORDS];
 };
-typedef struct { gp_key key; uint64_t hash, count, draws, fragments, stats_count; double ms; } gp_group;
+typedef struct {
+    gp_key key; uint64_t hash, count, draws, counters[GP_STATS], stats_count, stats_draws;
+    double ms, stats_ms;
+} gp_group;
 typedef struct {
     gp_key key;
     uint64_t lo[10], hi[10];
@@ -112,14 +122,20 @@ static void report(void) {
              i + 1, (unsigned long long)g->hash, k->compute ? "compute" : "render", k->w, k->h, k->samples, k->colors, k->bucket,
              (unsigned long long)k->shader, g->ms / GP_WINDOW, total_ms ? 100 * g->ms / total_ms : 0,
              g->count / (double)GP_WINDOW, g->draws / (double)GP_WINDOW, attachments);
-        LOGV("[gpu-profile scale] sig=%016llx: %.2f draws/instance, %.1f ns/draw (whole pass); fragment-stats %s valid=%llu/%llu invocations=%.0f/frame %.0f/instance %.3f ns/invocation (whole pass)",
+        LOGV("[gpu-profile scale] sig=%016llx: %.2f draws/instance, %.1f ns/draw (whole pass); geometry-stats %s valid=%llu/%llu IA-vertices=%.0f IA-primitives=%.0f VS=%.0f clipping-invocations=%.0f clipping-primitives=%.0f fragments=%.0f/frame; %.2f verts/draw %.2f prims/draw %.3f fragments/prim %.3f ns/vertex %.3f ns/primitive",
              (unsigned long long)g->hash, g->count ? g->draws / (double)g->count : 0, g->draws ? g->ms * 1e6 / g->draws : 0,
              stats_on ? "on" : "off", (unsigned long long)g->stats_count, (unsigned long long)g->count,
-             g->fragments / (double)GP_WINDOW, g->stats_count ? g->fragments / (double)g->stats_count : 0, g->fragments ? g->ms * 1e6 / g->fragments : 0);
+             g->counters[0] / (double)GP_WINDOW, g->counters[1] / (double)GP_WINDOW, g->counters[2] / (double)GP_WINDOW,
+             g->counters[3] / (double)GP_WINDOW, g->counters[4] / (double)GP_WINDOW, g->counters[5] / (double)GP_WINDOW,
+             g->stats_draws ? g->counters[0] / (double)g->stats_draws : 0,
+             g->stats_draws ? g->counters[1] / (double)g->stats_draws : 0,
+             g->counters[1] ? g->counters[5] / (double)g->counters[1] : 0,
+             g->counters[0] ? g->stats_ms * 1e6 / g->counters[0] : 0,
+             g->counters[1] ? g->stats_ms * 1e6 / g->counters[1] : 0);
     }
     memset(groups, 0, sizeof groups);
     total_records = dropped_records = failed_slots = loads = clears = stores = discards = 0;
-    if (stats_on) LOGV("[gpu-profile scale] fragment-stat failed slots=%llu; counts are implementation-defined invocations, not covered pixels", (unsigned long long)stats_failures);
+    if (stats_on) LOGV("[gpu-profile scale] pipeline-stat failed slots=%llu; counts are implementation-defined invocations, not covered pixels", (unsigned long long)stats_failures);
     stats_failures = 0;
     load_bytes = store_bytes = unknown_bytes = 0; total_ms = render_ms = compute_ms = 0;
 }
@@ -137,7 +153,7 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
             const char *se = getenv("TOTK_VK_GPU_PROFILE_STATS");
             int requested = se && !strcmp(se, "1");
             stats_on = vk_gpuprof_on && requested && V.has_pipeline_statistics;
-            if (requested) LOGV("[gpu-profile] fragment-invocation statistics %s (pipelineStatisticsQuery=%d; TOTK_VK_GPU_PROFILE_STATS=1)", stats_on ? "on" : "unavailable", V.has_pipeline_statistics);
+            if (requested) LOGV("[gpu-profile] geometry+fragment statistics %s (pipelineStatisticsQuery=%d; TOTK_VK_GPU_PROFILE_STATS=1)", stats_on ? "on" : "unavailable", V.has_pipeline_statistics);
         }
     }
     if (!vk_gpuprof_on) return;
@@ -147,7 +163,7 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
         VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &(*slot)->pool));
         if (stats_on) {
             qi.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS; qi.queryCount = GP_RECORDS;
-            qi.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+            qi.pipelineStatistics = GP_STATS_MASK;
             VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &(*slot)->stats));
         }
     }
@@ -165,10 +181,11 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
     VkResult result = slot->n ? vkGetQueryPoolResults(V.dev, slot->pool, 0, slot->n * 2,
         slot->n * 2 * sizeof(uint64_t), slot->ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) : VK_SUCCESS;
     VkResult sr = stats_on && slot->ns ? vkGetQueryPoolResults(V.dev, slot->stats, 0, slot->ns,
-        slot->ns * sizeof(uint64_t), slot->fragments, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) : VK_SUCCESS;
+        slot->ns * sizeof slot->counters[0], slot->counters, sizeof slot->counters[0], VK_QUERY_RESULT_64_BIT) : VK_SUCCESS;
     stats_failures += sr != VK_SUCCESS;
     for (uint32_t q = 0; sr == VK_SUCCESS && q < slot->ns; q++)
-        slot->rec[slot->stats_owner[q]].fragments += slot->fragments[q];
+        for (unsigned st = 0; st < GP_STATS; st++)
+            slot->rec[slot->stats_owner[q]].counters[st] += slot->counters[q][st];
     for (uint32_t i = 0; i < slot->n; i++) {
         gp_record *r = &slot->rec[i]; advance((r->frame - 1) / GP_WINDOW);
         if (result) continue;
@@ -199,7 +216,8 @@ void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot) {
         gp_group *g = &groups[at]; if (!g->count) { g->key = r->key; g->hash = hash; }
         g->count++; g->draws += r->draws; g->ms += ms;
         if (r->stats_count && !r->stats_invalid && sr == VK_SUCCESS) {
-            g->fragments += r->fragments; g->stats_count++;
+            for (unsigned st = 0; st < GP_STATS; st++) g->counters[st] += r->counters[st];
+            g->stats_count++; g->stats_draws += r->draws; g->stats_ms += ms;
         }
     }
     dropped_records += slot->dropped; failed_slots += result != VK_SUCCESS;
@@ -282,7 +300,7 @@ int vk_gpuprof_chunk_query(VkQueryPool *pool, uint32_t *query) {
     return 1;
 }
 VkQueryPipelineStatisticFlags vk_gpuprof_stats_mask(void) {
-    return stats_on ? VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT : 0;
+    return stats_on ? GP_STATS_MASK : 0;
 }
 void vk_gpuprof_end_emit(VkCommandBuffer cb, const vk_gpuprof_end_token *token) {
     if (!token->pool) return;

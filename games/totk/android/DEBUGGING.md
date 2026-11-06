@@ -1781,6 +1781,13 @@ window; `dropped` and `failed-slots` must both be zero for complete timing cover
 When off, there are no profiling query pools, allocations, timestamps or audit scans;
 draw/access hooks are a single disabled branch. Diagnostic-on CPU cost is not negligible.
 
+`TOTK_VK_GPU_PROFILE_STATS=1` requests input-assembly vertices/primitives, vertex-shader
+invocations, clipping invocations/primitives and fragment invocations when the device
+supports pipeline statistics (default off). Worker chunks own disjoint queries inside
+their secondaries; the completed pass sums those queries without requiring inherited
+queries. Ratios use only statistics-valid passes: vertices/draw, primitives/draw,
+fragments/primitive and whole-pass ns/vertex or ns/primitive are not isolated shader costs.
+
 `[gpu-profile audit]` is observation only, never a load/store optimization:
 
 - `LOAD-before-full-clear` counts passes/attachment ops loaded and then demonstrably fully
