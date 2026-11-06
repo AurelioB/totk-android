@@ -9,6 +9,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 - Add opt-in rooted-device CPU profiling with NDK simpleperf frame-pointer stacks,
   exact-build symbol checks, shell-accessible staging, and verified perf-control restoration.
   Per-thread period-weighted self/inclusive reports separate walker, recorder, submit and game CPU.
+- Give newly linked `libtotk.so` a SHA-1 GNU build ID retained in the packaged library,
+  so native profiles can identify matching unstripped symbols without relying on source revision alone.
 
 ### Runtime
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).

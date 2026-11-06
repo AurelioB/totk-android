@@ -190,9 +190,9 @@ $(OUT)/totk-native: $(RUNTIME_O) $(GFX_O)
 
 # libtotk.map: only ANativeActivity_onCreate and the companion's JNI_OnLoad are exported, so the runtime's symbols bind
 # inside the library.
-$(OUT)/libtotk.so: $(RUNTIME_O) $(GFX_O) $(TOTK)/android/libtotk.map
+$(OUT)/libtotk.so: $(RUNTIME_O) $(GFX_O) $(TOTK)/android/libtotk.map $(TOTK)/android/Makefile
 	@rm -f $(OBJ)/rt/frontend_android.c.o; $(CC) $(WARN) $(COMMON) -c $(TOTK)/runtime/frontend_android.c -o $(OBJ)/rt/frontend_android.c.o   # the build time in the log is this link's
-	$(CC) -shared $(PGO_LDFLAGS) -Wl,--version-script=$(TOTK)/android/libtotk.map -Wl,--no-undefined -Wl,-soname,libtotk.so -o $@ $(RUNTIME_O) $(GFX_O) $(OPUS_LIB) $(VPX_LIB) $(PLATFORM_LIBS) -landroid
+	$(CC) -shared $(PGO_LDFLAGS) -Wl,--build-id=sha1 -Wl,--version-script=$(TOTK)/android/libtotk.map -Wl,--no-undefined -Wl,-soname,libtotk.so -o $@ $(RUNTIME_O) $(GFX_O) $(OPUS_LIB) $(VPX_LIB) $(PLATFORM_LIBS) -landroid
 	@echo "built $@ ($(TARGET), $(VERSION), GPU $(GPU), app$(if $(PGO_ID), PGO $(PGO_ID)))"
 # The app's libdl_android.so (android/apk/dl_android_stub.c): what the Vulkan driver's system dependencies get instead of
 # the platform's linker-namespace API.
