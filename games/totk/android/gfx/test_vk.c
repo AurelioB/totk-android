@@ -303,7 +303,8 @@ static void lag_native_guard_liveness(uint8_t *base) {
             d->vertex[0].lag_reason = NVN_DIRTY_LAG_READONLY | NVN_DIRTY_LAG_COLD;
             d->count = 0; d->instances = 1; d->base_instance = 0;
             vk_record_draw_commit();
-            CHECK(vk_record_pass_end(primary, NULL), "bind-only recorder pass is parked for worker assembly");
+            int parked = vk_gpuprof_on ? vk_record_pass_end_profiled(primary, NULL) : vk_record_pass_end(primary);
+            CHECK(parked, "bind-only recorder pass is parked for worker assembly");
             (void)vk_record_next_primary();
         }
         VkBufferCopy copy = {.srcOffset = offset, .size = 256};

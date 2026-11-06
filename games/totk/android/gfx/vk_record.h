@@ -111,8 +111,12 @@ VkDescriptorUpdateTemplate vk_record_template(VkDescriptorSetLayout layout, cons
 void vk_record_draw_commit(void);
 void vk_record_draw_abort(void);
 void vk_record_pass_flush(void); /* walking owner: dispatch final chunk before closing profiler CPU bookkeeping */
-/* Captures the optional profiler end token; emits it after EndRendering on this exact primary, now or at assembly. */
-int vk_record_pass_end(VkCommandBuffer primary, const vk_gpuprof_end_token *profile_end); /* 1: parked; 0: empty pass ended */
+/* Caller selects the entry with cached vk_gpuprof_on; both return 1: parked, 0: empty pass ended.
+   Distinct entries leave the disabled core free of token/switch lifetimes across chunk dispatch. */
+int vk_record_pass_end(VkCommandBuffer primary);
+/* Enabled profiler only: captures the optional end token and emits it after EndRendering on this exact primary,
+   now or at assembly. Use this entry even for a NULL token when profiling is enabled. */
+int vk_record_pass_end_profiled(VkCommandBuffer primary, const vk_gpuprof_end_token *profile_end);
 void vk_record_slot_seal(unsigned slot); /* walking owner detaches immutable pending primaries and flushes queued chunks */
 void vk_record_assemble(unsigned slot, int background); /* sole slot-pool owner, before QueueSubmit */
 void vk_record_walk_wait(uint64_t ns); /* walking-only join of actual queue publication */

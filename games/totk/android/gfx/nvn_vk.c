@@ -5977,6 +5977,22 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     if (blocked) { HK_ADD(gwaits, 1); HK_ADD(gwait_ns, host_now_ns() - w0); }
     return ok;
 }
+int vk_gpuprof_renderer_drain(uint64_t timeout_ns) {
+    uint64_t start = host_now_ns();
+    struct timespec deadline; clock_gettime(CLOCK_REALTIME, &deadline);
+    uint64_t ns = (uint64_t)deadline.tv_nsec + timeout_ns;
+    deadline.tv_sec += (time_t)(ns / UINT64_C(1000000000));
+    deadline.tv_nsec = (long)(ns % UINT64_C(1000000000));
+    pthread_once(&g_rec_once, rec_mu_init);
+    if (pthread_mutex_timedlock(&g_rec_mu, &deadline)) return 0;
+    /* Enter the normal recursive owner bookkeeping after bounded admission. */
+    vk_rec_lock();
+    pthread_mutex_unlock(&g_rec_mu);
+    uint64_t ticket = vk_submit_now();
+    vk_rec_unlock();
+    uint64_t elapsed = host_now_ns() - start;
+    return mtl_wait(ticket, elapsed < timeout_ns ? timeout_ns - elapsed : 0);
+}
 void mtl_finish(void) { HK_ADD(idle_fin, 1); if (ub_private_on()) vk_flush_wait(); else vk_gpu_idle(); }
 void mtl_drain(void) { if (ub_private_on()) vk_flush_wait(); else vk_gpu_idle(); }
 uint64_t gpu_stat_submits(void) { return g_stat_sub; }

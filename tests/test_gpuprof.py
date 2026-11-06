@@ -91,6 +91,14 @@ def session_end(**changes):
     return row
 
 
+def query_retirement(**changes):
+    row = dict(leases_acquired=5, leases_submitted=3, leases_retired=3, leases_cancelled=2,
+               leases_outstanding=0, queries_submitted=12, queries_retired=12, queries_cancelled=6,
+               queries_outstanding=0)
+    row.update(changes)
+    return row
+
+
 def sampled_pass(durations=(0.001024, 0.004096), *, observed_count=20, observed_frames=20,
                  sampled_frames=None, budget=2, stats=False, **changes):
     histogram = [0] * 272
@@ -296,6 +304,143 @@ class Analyzer(unittest.TestCase):
                     window(sequence=2), session_end(clean_end=False)):
             with self.subTest(row=row), self.assertRaises(ValueError):
                 gpuprof.validate(row)
+
+    def test_query_retirement_true_reports_counts_separately_from_writer_closure(self):
+        counts = query_retirement()
+        footer = session_end(all_queries_retired=True, query_retirement=counts)
+        self.assertIs(gpuprof.validate(footer), footer)
+        report = self.analyze([header(), window(), footer])
+        session = report['sessions'][0]
+        self.assertTrue(session['clean_end'])
+        self.assertIs(session['all_queries_retired'], True)
+        self.assertEqual(session['query_retirement'], counts)
+        self.assertEqual(session['end']['query_retirement'], counts)
+        self.assertEqual(report['coverage']['streams_without_end'], 0)
+        text = io.StringIO()
+        gpuprof.render(report, text)
+        self.assertIn('clean_end=true all_queries_retired=true', text.getvalue())
+        for key, value in counts.items():
+            self.assertIn(f'{key}={value}', text.getvalue())
+        for empty in (dict.fromkeys(gpuprof.RETIREMENT_COUNTS, 0),
+                      query_retirement(leases_acquired=2, leases_submitted=0, leases_retired=0,
+                                       queries_submitted=0, queries_retired=0)):
+            with self.subTest(counts=empty):
+                self.assertIs(gpuprof.validate(session_end(
+                    all_queries_retired=True, query_retirement=empty))['all_queries_retired'], True)
+
+    def test_query_retirement_false_does_not_make_a_clean_writer_end_incomplete(self):
+        cases = (
+            # A submitted lease still has fenced results to process.
+            query_retirement(leases_acquired=6, leases_submitted=4, leases_outstanding=1,
+                             queries_submitted=14, queries_outstanding=2),
+            # An acquired recording has not been submitted or cancelled.
+            query_retirement(leases_acquired=6, leases_outstanding=1),
+            # Fenced lease results were attempted, but a query result was unavailable.
+            query_retirement(queries_retired=11, queries_outstanding=1),
+        )
+        for counts in cases:
+            with self.subTest(counts=counts):
+                report = self.analyze([header(), window(), session_end(
+                    all_queries_retired=False, query_retirement=counts)])
+                session = report['sessions'][0]
+                self.assertTrue(session['clean_end'])
+                self.assertIs(session['all_queries_retired'], False)
+                self.assertEqual(session['query_retirement'], counts)
+                self.assertEqual(report['coverage']['malformed_rows'], 0, report['issues'])
+                self.assertEqual(report['coverage']['streams_without_end'], 0)
+                text = io.StringIO()
+                gpuprof.render(report, text)
+                self.assertIn('clean_end=true all_queries_retired=false', text.getvalue())
+                self.assertIn(f'queries_outstanding={counts["queries_outstanding"]}', text.getvalue())
+
+    def test_historical_nullable_retirement_is_unknown_without_fabricated_counts(self):
+        footer = session_end()
+        self.assertIs(gpuprof.validate(footer), footer)
+        for rows, clean in (([header(), window(), footer], True), ([header(), window()], False)):
+            with self.subTest(clean=clean):
+                report = self.analyze(rows)
+                session = report['sessions'][0]
+                self.assertEqual(session['clean_end'], clean)
+                self.assertIsNone(session['all_queries_retired'])
+                self.assertIsNone(session['query_retirement'])
+                self.assertIsNone(session['query_drain_timed_out'])
+                if clean:
+                    self.assertNotIn('query_retirement', session['end'])
+                text = io.StringIO()
+                gpuprof.render(report, text)
+                self.assertIn('all_queries_retired=unknown', text.getvalue())
+                self.assertIn('query_retirement: unknown (no accounting footer)', text.getvalue())
+                self.assertNotIn('queries_outstanding=0', text.getvalue())
+
+    def test_query_retirement_rejects_invalid_objects_fields_and_boolean(self):
+        for value in (None, False, [], 0, 'counts'):
+            with self.subTest(object=value), self.assertRaises(ValueError):
+                gpuprof.validate(session_end(all_queries_retired=True, query_retirement=value))
+        for key in gpuprof.RETIREMENT_COUNTS:
+            for value in (-1, True, 0.5, '3', None):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    gpuprof.validate(session_end(all_queries_retired=True,
+                                                query_retirement=query_retirement(**{key: value})))
+            missing = query_retirement()
+            del missing[key]
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                gpuprof.validate(session_end(all_queries_retired=True, query_retirement=missing))
+        for value in (None, 0, 1, 'true', 'false'):
+            with self.subTest(boolean=value), self.assertRaises(ValueError):
+                gpuprof.validate(session_end(all_queries_retired=value, query_retirement=query_retirement()))
+        missing_boolean = session_end(query_retirement=query_retirement())
+        del missing_boolean['all_queries_retired']
+        with self.assertRaises(ValueError):
+            gpuprof.validate(missing_boolean)
+        for value in (True, False, 0, 'true'):
+            with self.subTest(missing_counts=value), self.assertRaises(ValueError):
+                gpuprof.validate(session_end(all_queries_retired=value))
+
+    def test_query_retirement_rejects_inconsistent_accounting_and_boolean(self):
+        inconsistent = (
+            query_retirement(leases_acquired=6),
+            query_retirement(leases_acquired=6, leases_retired=4),
+            query_retirement(leases_submitted=4),  # Would submit a cancelled lease.
+            query_retirement(queries_submitted=11),
+            query_retirement(queries_retired=13),
+            query_retirement(queries_outstanding=1),
+        )
+        for counts in inconsistent:
+            with self.subTest(counts=counts), self.assertRaises(ValueError):
+                gpuprof.validate(session_end(all_queries_retired=True, query_retirement=counts))
+        for retired, counts in ((False, query_retirement()),
+                                (True, query_retirement(leases_acquired=6, leases_outstanding=1)),
+                                (True, query_retirement(queries_retired=11, queries_outstanding=1))):
+            with self.subTest(retired=retired, counts=counts), self.assertRaises(ValueError):
+                gpuprof.validate(session_end(all_queries_retired=retired, query_retirement=counts))
+        report = self.analyze([header(), window(), session_end(
+            all_queries_retired=True, query_retirement=query_retirement(queries_retired=11, queries_outstanding=1))])
+        self.assertEqual(report['coverage']['malformed_rows'], 1)
+        self.assertEqual(report['coverage']['streams_without_end'], 1)
+        self.assertIsNone(report['sessions'][0]['all_queries_retired'])
+        self.assertIsNone(report['sessions'][0]['query_retirement'])
+
+    def test_query_drain_timeout_is_boolean_and_keeps_outstanding_accounting(self):
+        counts = query_retirement(leases_acquired=6, leases_submitted=4, leases_outstanding=1,
+                                  queries_submitted=14, queries_outstanding=2)
+        report = self.analyze([header(), window(), session_end(
+            all_queries_retired=False, query_retirement=counts, query_drain_timed_out=True)])
+        session = report['sessions'][0]
+        self.assertTrue(session['clean_end'])
+        self.assertIs(session['query_drain_timed_out'], True)
+        self.assertIs(session['all_queries_retired'], False)
+        self.assertEqual(session['query_retirement'], counts)
+        text = io.StringIO()
+        gpuprof.render(report, text)
+        self.assertIn('query_drain_timed_out=true', text.getvalue())
+        self.assertIn('leases_outstanding=1', text.getvalue())
+        self.assertIs(gpuprof.validate(session_end(
+            all_queries_retired=True, query_retirement=query_retirement(),
+            query_drain_timed_out=False))['query_drain_timed_out'], False)
+        for value in (None, 0, 1, 'true', [], {}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                gpuprof.validate(session_end(all_queries_retired=False, query_retirement=counts,
+                                            query_drain_timed_out=value))
 
     def test_invalid_span_fields_require_explicit_nulls_not_missing_or_numeric_time(self):
         invalid = frame(span_valid=False, span_ms=None, gap_ms=None)
@@ -1225,7 +1370,7 @@ class Analyzer(unittest.TestCase):
 class Lavapipe(unittest.TestCase):
     def launch(self, mode, workers, stats, *, unsupported=False, rotate=False, areas=False, ordinals=None,
                unavailable_span=False, sampling=False, sample_budget=None, backpressure=False, cancel=False,
-               sealed_present=False, last_closed=False):
+               sealed_present=False, last_closed=False, shutdown_inflight=False, shutdown_timeout=False):
         binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
         self.assertTrue(binary.is_file(), f'no fixture binary: {binary}')
         seed = Path(os.environ.get('TOTK_SHADER_SEED_DIR', binary.parent / 'vkdraw-seed')).resolve()
@@ -1254,6 +1399,8 @@ class Lavapipe(unittest.TestCase):
             arguments = (['--unavailable-span'] if unavailable_span else ['--areas'] if areas else
                          ['--backpressure'] if backpressure else ['--cancel'] if cancel else
                          ['--sealed-present'] if sealed_present else ['--last-closed'] if last_closed else
+                         ['--shutdown-timeout'] if shutdown_timeout else
+                         ['--shutdown-inflight'] if shutdown_inflight else
                          ['--sampling'] if sampling else ['--frames', '302'])
             result = subprocess.run([str(binary), *arguments], cwd=temporary, env=env,
                                     capture_output=True, text=True, timeout=180)
@@ -1265,6 +1412,9 @@ class Lavapipe(unittest.TestCase):
             paths = sorted(Path(temporary).glob('gpuprof-*.jsonl*'))
             if not mode:
                 self.assertEqual(paths, [], 'off mode must not create a profiler output file')
+                if shutdown_inflight or shutdown_timeout:
+                    self.assertEqual((frames, passes, draws), (1, 2, 4))
+                    self.assertIn('gpuprof-shutdown-inflight pending_before=1 drained_after=0', result.stdout)
                 return None
             self.assertTrue(paths, result.stdout + result.stderr)
             report = gpuprof.analyze(paths)
@@ -1275,7 +1425,38 @@ class Lavapipe(unittest.TestCase):
             self.assertIn(f'window ordinals={int(bool(ordinals))}', result.stderr)
             self.assertEqual(report['coverage']['ordinal_metadata_mismatches'], 0)
             self.assertEqual(report['coverage']['streams_without_end'], 0)
-            self.assertIsNone(report['sessions'][0]['all_queries_retired'])
+            self.assertEqual(len(report['sessions']), 1)
+            session = report['sessions'][0]
+            self.assertTrue(session['clean_end'])
+            self.assertIs(session['all_queries_retired'], not (unavailable_span or shutdown_timeout))
+            self.assertIs(session['query_drain_timed_out'], shutdown_timeout)
+            retirement = session['query_retirement']
+            self.assertIsInstance(retirement, dict, 'new fixture footers must carry retirement accounting')
+            for key in gpuprof.RETIREMENT_COUNTS:
+                self.assertIs(type(retirement[key]), int, key)
+                self.assertGreaterEqual(retirement[key], 0, key)
+            self.assertEqual(retirement['leases_acquired'], retirement['leases_retired'] +
+                             retirement['leases_cancelled'] + retirement['leases_outstanding'])
+            self.assertGreaterEqual(retirement['leases_submitted'], retirement['leases_retired'])
+            self.assertLessEqual(retirement['leases_submitted'],
+                                 retirement['leases_acquired'] - retirement['leases_cancelled'])
+            if shutdown_timeout:
+                self.assertGreater(retirement['leases_outstanding'], 0)
+                self.assertGreater(retirement['leases_submitted'], retirement['leases_retired'])
+            else:
+                self.assertEqual(retirement['leases_submitted'], retirement['leases_retired'])
+                self.assertEqual(retirement['leases_outstanding'], 0)
+            self.assertGreater(retirement['leases_submitted'], 0)
+            self.assertGreater(retirement['queries_submitted'], 0)
+            self.assertEqual(retirement['queries_outstanding'],
+                             retirement['queries_submitted'] - retirement['queries_retired'])
+            if unavailable_span or shutdown_timeout:
+                self.assertGreater(retirement['queries_outstanding'], 0)
+            else:
+                self.assertEqual(retirement['queries_outstanding'], 0)
+            if cancel:
+                self.assertGreater(retirement['leases_cancelled'], 0)
+                self.assertGreater(retirement['queries_cancelled'], 0)
             report['_fixture_output_bytes'] = sum(path.stat().st_size for path in paths)
             report['_fixture_rows'] = [o['row'] for o in observations]
             for path in paths:
@@ -1317,6 +1498,12 @@ class Lavapipe(unittest.TestCase):
                 elif row['type'] == 'window':
                     self.assertEqual(row['ordinals'], bool(ordinals))
                     self.assertEqual(row['sequence'], (row['window_start'] - 1) // 300 + 1)
+            if shutdown_timeout:
+                self.assertEqual((frames, passes, draws), (1, 2, 4))
+                self.assertIn('gpuprof-shutdown-inflight pending_before=1 drained_after=0', result.stdout)
+                self.assertEqual(retirement['leases_cancelled'], 0)
+                self.assertEqual(retirement['queries_cancelled'], 0)
+                return report
             if unavailable_span:
                 self.assertEqual(frames, 1)
                 frame_rows = [o['row'] for o in observations if o['row']['type'] == 'frame']
@@ -1358,11 +1545,15 @@ class Lavapipe(unittest.TestCase):
             self.assertEqual(report['coverage']['background_dropped_slots'], 0, report['issues'])
             self.assertEqual(report['coverage']['background_dropped_closures'], 0, report['issues'])
             self.assertEqual(report['sessions'][0]['end']['pending_frame_closures'], 0)
-            if sealed_present or last_closed:
-                self.assertEqual(frames, 1 if last_closed else 302)
+            if sealed_present or last_closed or shutdown_inflight:
+                self.assertEqual(frames, 1 if last_closed or shutdown_inflight else 302)
                 self.assertEqual(bool(enabled), bool(stats and supported and not unsupported))
                 self.check_sealed_present(report, observations, result.stdout, frames, passes, draws,
-                                          sample_budget or 0, bool(enabled))
+                                          sample_budget or 0, bool(enabled), shutdown_inflight=shutdown_inflight)
+                if shutdown_inflight:
+                    self.assertEqual(retirement['leases_cancelled'], 0)
+                    self.assertEqual(retirement['queries_cancelled'], 0)
+                    self.assertEqual(report['coverage']['long_frames'], frames if mode == 3 else 0)
                 return report
             if cancel:
                 self.assertEqual(frames, 6)
@@ -1432,11 +1623,15 @@ class Lavapipe(unittest.TestCase):
                 self.assertEqual(report['coverage']['long_frames'], 0)
             return report
 
-    def check_sealed_present(self, report, observations, stdout, frames, passes, draws, budget, stats_enabled):
-        self.assertIn(
-            f'gpuprof-sealed-present frames={frames} main_submissions={frames * 3} pre_uploads={frames * 2} '
-            f'completed_closes={(frames + 1) // 2} pending_closes={frames // 2} '
-            f'marker_submissions={frames if budget else 0} last_closed_before_flush=1', stdout)
+    def check_sealed_present(self, report, observations, stdout, frames, passes, draws, budget, stats_enabled,
+                             *, shutdown_inflight=False):
+        if shutdown_inflight:
+            self.assertIn('gpuprof-shutdown-inflight pending_before=1 drained_after=1', stdout)
+        else:
+            self.assertIn(
+                f'gpuprof-sealed-present frames={frames} main_submissions={frames * 3} pre_uploads={frames * 2} '
+                f'completed_closes={(frames + 1) // 2} pending_closes={frames // 2} '
+                f'marker_submissions={frames if budget else 0} last_closed_before_flush=1', stdout)
         self.assertEqual((passes, draws), (frames * 2, frames * 4))
         rows = [o['row'] for o in observations]
         frame_rows = [r for r in rows if r['type'] == 'frame']
@@ -1532,6 +1727,29 @@ class Lavapipe(unittest.TestCase):
                 for budget in (0, 1, 2):
                     with self.subTest(workers=workers, stats=stats, budget=budget):
                         self.launch(1, workers, stats, last_closed=True, sample_budget=budget)
+
+    def test_shutdown_drains_genuinely_inflight_gpu_work_before_closing_writer(self):
+        for mode in (1, 3):
+            for workers in (0, 2):
+                for stats in (0, 1):
+                    for budget in (0, 2):
+                        with self.subTest(mode=mode, workers=workers, stats=stats, budget=budget):
+                            report = self.launch(mode, workers, stats, shutdown_inflight=True, sample_budget=budget)
+                            retirement = report['sessions'][0]['query_retirement']
+                            self.assertEqual(retirement['leases_acquired'], retirement['leases_submitted'])
+                            self.assertEqual(retirement['queries_submitted'], retirement['queries_retired'])
+
+    def test_disabled_shutdown_does_not_wait_for_pending_renderer_work(self):
+        for workers in (0, 2):
+            for budget in (0, 2):
+                with self.subTest(workers=workers, budget=budget):
+                    self.launch(0, workers, 1, shutdown_inflight=True, sample_budget=budget)
+
+    def test_shutdown_timeout_preserves_unretired_work_in_clean_footer(self):
+        for workers in (0, 2):
+            for budget in (0, 2):
+                with self.subTest(workers=workers, budget=budget):
+                    self.launch(1, workers, 1, shutdown_timeout=True, sample_budget=budget)
 
     def test_background_backlog_never_blocks_game_completion(self):
         for workers in (0, 2):

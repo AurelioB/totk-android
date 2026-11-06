@@ -3858,7 +3858,7 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 | `TOTK_VK_GPU_PROFILE_SAMPLE` | `0` (full profiling unchanged) | With `GPU_PROFILE=1/2/3`, a strict positive integer `1`–`16` limits timestamped/statistics-enabled pass parts per frame; recommended **`2`**, initially with stats off. Deterministic ordinal rotation retains all observed keys, draws and scene metadata. Each frame also has one completion-accurate whole-main-frame timestamp pair; actual profiler-owned `vkCmdWriteTimestamp2` `timestamp_count` (including deferred assembly ends, excluding independent game reports) is at most `2k+2`, without pre/slot envelopes. If Android has already submitted the final command buffer before CPU present, SAMPLE adds **one small marker-only main submission** for the real end timestamp; the query-count bound still holds, but that extra submission has explicit cost. Pass `gpu_ms` is sampled-only, never an extrapolated total. Use the analyzer's whole-interval coverage, sampled mean and histogram percentiles; absent/`0` keeps the old full mode. |
 | `TOTK_VK_GPU_PROFILE_STATS` | `0` (off) | `1` adds six pipeline counters when supported: IA vertices/primitives, VS invocations, clipping invocations/primitives and fragment invocations. Secondary-chunk queries sum into their pass; missing counters are absent, not fabricated zeros. In sampled mode only selected passes get queries; those queries still perturb sampled passes, so sampled durations are representative only if instrumentation does not serialize/change the GPU workload. Device A/Bs must compare GPU clock time-in-state against an unprofiled control, not only instantaneous MHz. |
 | `TOTK_VK_GPU_PROFILE_ORDINALS` | `0` (off) | `1` restores per-ordinal window aggregates; every other value uses compact ordinal-`0` aggregates. Read once at launch and logged as `[gpu-profile] window ordinals=0/1`. Raw mode-2 split logs and mode-3 `long_frame` rows always keep their actual positive frame ordinals. Compare row counts/JSONL bytes with the same route and profile/stats settings; not a measured device-cost reduction. |
-| `TOTK_VK_GPU_PROFILE_MAX_BYTES` | `134217728` (128 MiB) | Maximum bytes per JSONL file (4096–1073741824); rotate complete rows through `.1`, `.2`, `.3`, retaining at most four bounded files per launch. Each file repeats launch/build/package/config/driver metadata. Window sequences and rotation indices expose missing/evicted coverage; normal app close writes a writer-end marker, not a GPU-retirement guarantee. |
+| `TOTK_VK_GPU_PROFILE_MAX_BYTES` | `134217728` (128 MiB) | Maximum bytes per JSONL file (4096–1073741824); rotate complete rows through `.1`, `.2`, `.3`, retaining at most four bounded files per launch. Each file repeats launch/build/package/config/driver metadata. Window sequences and rotation indices expose missing/evicted coverage; normal app close writes writer success and independent query-retirement accounting in `session_end`. |
 | `TOTK_VK_GPU_PROFILE_LONG_MS` | `50` | Mode `3` dumps every frame with a valid Vulkan GPU span strictly above this threshold (0–60000 ms; decimal values allowed). Each `long_frame` pass row names its frame and positive ordinal. Invalid frame spans/gaps are null with reasons/counters, not usable timing; measured pass sums remain separate. |
 | `TOTK_VK_GPU_PROFILE_LONG_FRAMES` | `8` | Mode `3` retains 1–64 frames of raw pass timings, bounded at 16,384 records per retained frame. This controls history memory, not a dump quota: every threshold crossing is emitted, subject only to explicit drops and JSONL rotation. |
 | `TOTK_VK_REC_WAKE_BATCH` | `0` (off) | `1`: the walker wakes a parked recorder worker only when none is already on its way; a worker that leaves work queued wakes the next. `n ≥ 2`: also an idle worker polls the queue for up to `n` µs before parking (try 50 and 200). Startup logs the value; `recorder wakes/frame: walker … worker-chained … polled hits … parks …` every 300 presents counts the futex wakes. Live (see Live switches). |
@@ -3887,6 +3887,20 @@ consumed them before CPU present. Full mode uses the final slot's real envelope 
 or submission. SAMPLE needs the marker-only submission described above when no command buffer remains;
 an open command buffer retains its in-buffer marker. Closure overflow is explicit cumulative
 `background_dropped_closures`, separate from dropped leases; neither is silently repaired.
+
+Orderly close stops admission of new renderer work, flushes/drains renderer GPU work, then drains the
+profiler reporter before closing its writer. New `session_end` rows carry boolean `all_queries_retired`
+and a `query_retirement` object with acquired/submitted/retired/cancelled/outstanding lease counts and
+submitted/retired/cancelled/outstanding query counts. Queries count activated timestamp/statistics query
+instances, not reserved pools or the six statistics counters. A retired lease has had its fenced results
+read/attempted; only available query results (successful statistics reads) retire queries. Cancelled
+recordings were never submitted. `all_queries_retired` is true exactly when both outstanding counts are
+zero; `clean_end` records writer success independently. Historical footers without accounting retain
+`all_queries_retired: null` as unknown, not assumed retirement.
+The enabled GPU drain has one two-second budget; `query_drain_timed_out: true` records expiry and
+outstanding counts retain unretired work rather than claiming completion. Profiling-off shutdown is
+a no-op: it does not flush renderer work or wait for the GPU.
+
 `gpuprof.py --frame-close-replay` is an opt-in **counterfactual-only** analysis of header-attributed d003f2d
 full-mode captures, not device correction: it preserves original invalidity and rejects missing authority,
 corrupt/unavailable timestamps, actual drops/failures, gaps and inconsistent sums (tools/bench/README.md).

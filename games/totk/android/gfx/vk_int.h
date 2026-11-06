@@ -606,7 +606,8 @@ typedef enum {
 } vk_pass_end_kind;
 extern int vk_gpuprof_on;   /* initialized once at first slot; off hot paths are a single branch */
 void vk_gpuprof_identity(const char *commit, const char *package, uint64_t version, const char *build);
-void vk_gpuprof_shutdown(void); /* drains already-fenced profiler leases/joins writer; in-flight GPU queries stay unknown */
+void vk_gpuprof_shutdown(void); /* off: no-op; enabled: bounded renderer drain, reporter join, explicit retirement */
+int vk_gpuprof_renderer_drain(uint64_t timeout_ns); /* normal-close-only bounded recorder admission/fence wait */
 void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb);
 void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot); /* advances submission sequence even for a dropped/null lease */
 void vk_gpuprof_slot_complete(vk_gpuprof_slot **slot); /* fence completion: detach/enqueue only; no query reads or IO */

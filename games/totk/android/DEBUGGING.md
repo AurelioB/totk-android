@@ -1836,13 +1836,36 @@ IDs/name/version. Exact APK SHA-256 is unavailable in process; join the separate
 Header rotation indices and window `sequence` identify missing complete windows/evicted files, even
 when no surviving frame reveals the gap. Keep all four files when collecting a launch.
 
-Orderly Android close/activity destruction drains only already-fenced queued profiler leases, joins
-the worker, writes `session_end` under the output writer mutex and rejects late writes.
-`clean_end=true` proves orderly **writer** closure, not retirement of in-flight GPU queries
-(`all_queries_retired=null`). Force-stop normally omits the footer, as do crash/kill/incomplete captures.
-The existing analyzer already reports missing closure and retains completed-window timing without
-synthesizing an end marker. Both Odin P1/P2 overhead captures lack an end after final force-stop;
-their retained complete windows remain usable, but full-launch closure/query retirement is unknown.
+Orderly Android close/activity destruction stops admission of new renderer work, flushes/drains renderer
+GPU work, then drains/joins the profiler reporter before writing `session_end` under the output writer
+mutex and rejecting late writes. `clean_end=true` records successful **writer** closure independently
+of query retirement. New footers require boolean `all_queries_retired` plus `query_retirement` counts:
+`leases_acquired`, `leases_submitted`, `leases_retired`, `leases_cancelled`, `leases_outstanding`,
+`queries_submitted`, `queries_retired`, `queries_cancelled`, `queries_outstanding`.
+Acquired leases equal retired + cancelled + outstanding; retired leases are submitted, and cancelled
+recordings are never submitted. Outstanding queries equal submitted minus retired. All counts are
+nonnegative integers; `all_queries_retired` is true iff both outstanding counts are zero.
+A retired lease means its fenced results were read/attempted, not that every result was available:
+only available timestamps and successful statistics reads retire queries. Queries count activated
+timestamp/statistics instances, not reserved pool slots or individual statistics counters; cancelled
+queries were activated in abandoned recordings. Thus a clean writer end can truthfully report false
+retirement, including unavailable queries left outstanding after all lease reads were attempted.
+The analyzer preserves these counts in `sessions` and renders them separately from writer closure.
+Historical footers without `query_retirement` and with `all_queries_retired=null` remain readable as
+unknown; no counts are fabricated. Force-stop normally omits the footer, as do crash/kill/incomplete
+captures. The analyzer reports missing closure and retains completed-window timing without synthesizing
+an end marker. Both Odin P1/P2 overhead captures lack an end after final force-stop; their retained
+complete windows remain usable, but full-launch closure/query retirement is unknown.
+The real Vulkan `--shutdown-inflight` host fixture enters shutdown with an unsignalled event-gated GPU
+submission and no prior profiler flush. Its modes 1/3 × workers 0/2 × stats 0/1 × SAMPLE 0/2 coverage
+requires the GPU drain, reporter drain, complete final frame and true retirement footer. It is not
+Android-device validation or a performance measurement.
+Enabled GPU draining has one two-second budget. If it expires, `query_drain_timed_out=true` and positive
+outstanding counts expose unread/unretired work; a later GPU completion does not rewrite the footer.
+The additive timeout flag is boolean when present, unknown for historical footers that omit it.
+The `--shutdown-timeout` host scenario holds its real event beyond that budget and requires a clean writer
+end with false retirement, not a fabricated complete final frame. Profiling-off `--shutdown-inflight`
+requires pending work to remain undrained: disabled shutdown does not flush or wait for renderer GPU work.
 Invalid/unavailable timestamps or implausible (>10,000 ms/frame) spans produce `span_valid=false`,
 null span/gap and explicit reasons/counters; measured pass sums are not replaced. The analyzer keeps
 valid-span subtotals and forensic raw spans separate, never sums absurd positive spans as real GPU time.

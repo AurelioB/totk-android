@@ -45,7 +45,7 @@ typedef struct {
 } gp_segment;
 struct vk_gpuprof_slot {
     VkQueryPool pool, stats;
-    uint32_t n, dropped, ns, nt;
+    uint32_t n, dropped, ns, nt, span_writes;
     uint64_t sealed, sequence;
     uint32_t nsegment, has_pre;
     int discard;
@@ -149,6 +149,10 @@ static int background_started, background_ready, background_active, background_s
 static _Atomic int background_closing;
 static _Atomic uint64_t background_dropped_slots, background_queued_slots, background_processed_slots;
 static _Atomic uint64_t background_dropped_closures;
+static _Atomic uint64_t leases_acquired, leases_submitted, leases_retired, leases_cancelled;
+static _Atomic uint64_t queries_submitted, queries_retired, queries_cancelled;
+static pthread_mutex_t shutdown_mu = PTHREAD_MUTEX_INITIALIZER;
+static int query_drain_timed_out;
 #ifdef TOTK_VK_TESTS
 static int background_paused;
 static uint64_t background_flush_requested, background_flush_done;
@@ -299,9 +303,14 @@ static void output_window(const char *text, uint64_t sequence, uint64_t end) {
     if (output_file) fflush(output_file);
     pthread_mutex_unlock(&output_mu);
 }
-/* Drain only already-fenced handed-off leases, then close the writer.
-   Still-in-flight GPU work remains unknown; force-stop cannot run this path. */
+/* Normal close seals/waits renderer work before stopping the reporter. Force-stop
+   cannot run this path. Result availability remains independent of fence completion. */
 void vk_gpuprof_shutdown(void) {
+    if (!vk_gpuprof_on) return; /* no profiler admission, locking or wait on the default path */
+    pthread_mutex_lock(&shutdown_mu);
+    if (output_closed) { pthread_mutex_unlock(&shutdown_mu); return; }
+    atomic_store_explicit(&background_closing, 1, memory_order_release);
+    query_drain_timed_out = !vk_gpuprof_renderer_drain(UINT64_C(2000000000));
     background_stop_and_join();
     pthread_mutex_lock(&background_mu);
     uint64_t pending_closures = background_close_tail - background_close_head;
@@ -310,18 +319,33 @@ void vk_gpuprof_shutdown(void) {
     if (!output_closed && output_file) {
         gp_json row = {0};
         json_add(&row, "{\"schema\":3,\"type\":\"session_end\",\"launch_id\":"); json_string(&row, output_launch);
-        json_add(&row, ",\"clean_end\":true,\"all_queries_retired\":null,\"last_frame\":%llu,"
+        uint64_t acquired = atomic_load(&leases_acquired), submitted = atomic_load(&leases_submitted);
+        uint64_t retired = atomic_load(&leases_retired), cancelled = atomic_load(&leases_cancelled);
+        uint64_t outstanding = acquired - retired - cancelled;
+        uint64_t qs = atomic_load(&queries_submitted), qr = atomic_load(&queries_retired);
+        uint64_t qc = atomic_load(&queries_cancelled), qo = qs - qr;
+        json_add(&row, ",\"clean_end\":true,\"all_queries_retired\":%s,\"last_frame\":%llu,"
             "\"last_window_sequence\":%llu,\"last_window_end\":%llu,\"output_failures\":%llu,"
-            "\"background_dropped_slots\":%llu,\"background_dropped_closures\":%llu,\"pending_frame_closures\":%llu}\n",
+            "\"background_dropped_slots\":%llu,\"background_dropped_closures\":%llu,\"pending_frame_closures\":%llu,"
+            "\"query_drain_timed_out\":%s,"
+            "\"query_retirement\":{\"leases_acquired\":%llu,\"leases_submitted\":%llu,\"leases_retired\":%llu,"
+            "\"leases_cancelled\":%llu,\"leases_outstanding\":%llu,\"queries_submitted\":%llu,"
+            "\"queries_retired\":%llu,\"queries_cancelled\":%llu,\"queries_outstanding\":%llu}}\n",
+            !outstanding && !qo ? "true" : "false",
             (unsigned long long)output_last_frame, (unsigned long long)output_last_window,
             (unsigned long long)output_last_window_end, (unsigned long long)atomic_load(&output_failures),
             (unsigned long long)atomic_load(&background_dropped_slots),
-            (unsigned long long)atomic_load(&background_dropped_closures), (unsigned long long)pending_closures);
+            (unsigned long long)atomic_load(&background_dropped_closures), (unsigned long long)pending_closures,
+            query_drain_timed_out ? "true" : "false",
+            (unsigned long long)acquired, (unsigned long long)submitted, (unsigned long long)retired,
+            (unsigned long long)cancelled, (unsigned long long)outstanding,
+            (unsigned long long)qs, (unsigned long long)qr, (unsigned long long)qc, (unsigned long long)qo);
         output_row_locked(row.data);
         if (output_file) { fflush(output_file); fclose(output_file); output_file = NULL; }
     }
     output_closed = 1;
     pthread_mutex_unlock(&output_mu);
+    pthread_mutex_unlock(&shutdown_mu);
 }
 static const char *kind_name(const gp_key *key) {
     static const char *const kinds[] = {"render", "compute", "upload", "transfer", "post", "upscale", "present", "framegen"};
@@ -715,6 +739,7 @@ static void sampled_frame_begin(VkCommandBuffer cb) {
     if (!sample_budget || sample_frame_started || !current || cb == current->pre_cb) return;
     gp_segment *segment = &current->segment[current->nsegment - 1];
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE + segment->first);
+    current->span_writes++;
     segment->first_valid = 1; segment->timestamp_count++; sample_frame_started = 1;
 }
 void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
@@ -771,12 +796,17 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
     pthread_mutex_unlock(&background_mu);
     if (!*slot) { atomic_fetch_add_explicit(&background_dropped_slots, 1, memory_order_relaxed); return; }
     current = *slot; current->n = current->dropped = 0; current->sealed = 0;
+    atomic_fetch_add_explicit(&leases_acquired, 1, memory_order_relaxed);
+    current->span_writes = 0;
     current->ns = current->nt = 0; current->has_pre = 0; current->pre_cb = VK_NULL_HANDLE;
     current->discard = 0; current->sequence = 0;
     current->nsegment = 1; current->segment[0] = (gp_segment){frame, 0, 0};
     current->domain = current_time_domain();
     if (sample_budget) sampled_frame_begin(cb);
-    else vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE);
+    else {
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE);
+        current->span_writes++;
+    }
 }
 void vk_gpuprof_slot_pre(vk_gpuprof_slot *slot, VkCommandBuffer cb) {
     if (!slot) return;
@@ -784,11 +814,16 @@ void vk_gpuprof_slot_pre(vk_gpuprof_slot *slot, VkCommandBuffer cb) {
     if (sample_budget) return;
     slot->has_pre = 1;
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot->pool, GP_PRE_QUERY);
+    slot->span_writes++;
 }
 void vk_gpuprof_slot_end(vk_gpuprof_slot *slot, VkCommandBuffer cb) {
     if (!slot || sample_budget) return;
     slot->segment[slot->nsegment - 1].last = slot->nsegment;
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot->pool, GP_SPAN_BASE + slot->nsegment);
+    slot->span_writes++;
+    /* Renderer seals before appending the final envelope command; standalone
+       fixtures may append it before seal. Count each ordering exactly once. */
+    if (slot->sequence) atomic_fetch_add_explicit(&queries_submitted, 1, memory_order_relaxed);
 }
 void vk_gpuprof_slot_cancel(vk_gpuprof_slot **slot) {
     if (current == *slot) {
@@ -804,6 +839,7 @@ static void frame_marker(VkCommandBuffer cb) {
     sampled_frame_begin(cb);
     uint32_t query = sample_budget ? marker * 2 - 1 : marker;
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pool, GP_SPAN_BASE + query);
+    current->span_writes++;
     current->segment[marker - 1].last = query;
     current->segment[marker - 1].last_valid = 1; current->segment[marker - 1].timestamp_count++;
     current->segment[marker] = (gp_segment){.frame = frame + 1,
@@ -811,9 +847,17 @@ static void frame_marker(VkCommandBuffer cb) {
     if (sample_budget) sample_frame_started = 0;
     current->nsegment++;
 }
+/* Activated query instances, not unused pool capacity or individual counters. */
+static uint64_t slot_queries(const vk_gpuprof_slot *slot) {
+    return (uint64_t)(sample_budget ? slot->nt : slot->n) * 2 + slot->span_writes + slot->ns;
+}
 void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot) {
     uint64_t sequence = ++recording_sequence;
-    if (slot) { slot->sequence = sequence; slot->sealed = frame - 1; }
+    if (slot) {
+        slot->sequence = sequence; slot->sealed = frame - 1;
+        atomic_fetch_add_explicit(&leases_submitted, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&queries_submitted, slot_queries(slot), memory_order_relaxed);
+    }
     current = NULL;
 }
 static void ingest_record(gp_record *r, double ms, int stats_valid, int sampled) {
@@ -847,6 +891,14 @@ static void process_slot(vk_gpuprof_slot *slot) {
     for (uint32_t q = 0; sr == VK_SUCCESS && q < slot->ns; q++)
         for (unsigned st = 0; st < GP_STATS; st++)
             slot->rec[slot->stats_owner[q]].counters[st] += slot->counters[q][st];
+    uint64_t read_queries = sr == VK_SUCCESS ? slot->ns : 0;
+    if (query_readable(result)) for (uint32_t q = 0; q < timed * 2; q++)
+        read_queries += !!slot->ticks[q].available;
+    if (query_readable(span_result)) for (uint32_t q = 0; q < spans; q++)
+        read_queries += !!slot->span_ticks[q].available;
+    if (slot->has_pre && query_readable(pre_result)) read_queries += !!slot->pre_tick.available;
+    atomic_fetch_add_explicit(&queries_retired, read_queries, memory_order_relaxed);
+    atomic_fetch_add_explicit(&leases_retired, 1, memory_order_relaxed);
     int slot_failed = sample_budget ? !query_readable(result) || !query_readable(span_result) :
         result != VK_SUCCESS || span_result != VK_SUCCESS || pre_result != VK_SUCCESS;
     int slot_reported = 0;
@@ -1072,6 +1124,10 @@ static void background_stop_and_join(void) {
 static void background_enqueue(vk_gpuprof_slot **owner, int discard) {
     vk_gpuprof_slot *slot = *owner; *owner = NULL;
     if (!slot) return;
+    if (discard) {
+        atomic_fetch_add_explicit(&leases_cancelled, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&queries_cancelled, slot_queries(slot), memory_order_relaxed);
+    }
     slot->discard = discard;
     pthread_mutex_lock(&background_mu);
     if (!background_stop) {
