@@ -6,6 +6,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <limits.h>
+#include <math.h>
 
 #define GP_RECORDS 2048
 #define GP_GROUPS 16384
@@ -85,6 +86,14 @@ static struct {
 static uint64_t last_completed, window_frames;
 static double window_span, window_gap;
 static int partial_report;
+typedef struct {
+    uint64_t frame, dropped; uint32_t n, capacity;
+    double span_ms, measured_ms, gap_ms;
+    gp_group *pass;
+} gp_long_frame;
+static gp_long_frame *long_ring;
+static uint32_t long_frames;
+static double long_ms = 50;
 static uint64_t window, total_records, dropped_records, failed_slots, loads, clears, stores, discards;
 static uint64_t stats_failures;
 static uint64_t load_bytes, store_bytes, unknown_bytes;
@@ -158,10 +167,12 @@ static const char *kind_name(const gp_key *key) {
 static void output_pass(const gp_group *g, const char *type, uint64_t pass_frame) {
     const gp_key *k = &g->key;
     gp_json row = {0};
+    uint64_t start = pass_frame ? (pass_frame - 1) / GP_WINDOW * GP_WINDOW + 1 : window * GP_WINDOW + 1;
+    uint64_t end = pass_frame ? start + GP_WINDOW - 1 : report_end;
     json_add(&row, "{\"schema\":2,\"type\":\"%s\",\"window_start\":%llu,\"window_end\":%llu,"
         "\"key\":\"%016llx\",\"kind\":\"%s\",\"ordinal\":%u,\"samples\":%u,\"shader\":\"%016llx\","
         "\"gpu_ms\":%.9f,\"count\":%llu,\"draws\":%llu,\"stats_valid\":%llu",
-        type, (unsigned long long)(window * GP_WINDOW + 1), (unsigned long long)report_end,
+        type, (unsigned long long)start, (unsigned long long)end,
         (unsigned long long)g->hash, kind_name(k), g->ordinal, k->samples, (unsigned long long)k->shader,
         g->ms, (unsigned long long)g->count, (unsigned long long)g->draws, (unsigned long long)g->stats_count);
     if (pass_frame) json_add(&row, ",\"frame\":%llu", (unsigned long long)pass_frame);
@@ -222,6 +233,37 @@ static int key_equal(const gp_key *a, const gp_key *b) {
             x->height_den != y->height_den || x->load != y->load || x->store != y->store) return 0;
     }
     return 1;
+}
+static void long_capture(const gp_record *r, double ms, int stats_valid) {
+    if (!long_ring) return;
+    gp_long_frame *f = &long_ring[r->frame % long_frames];
+    if (f->frame != r->frame) { f->frame = r->frame; f->n = 0; f->dropped = 0; }
+    if (f->n == GP_GROUPS) { f->dropped++; return; }
+    if (f->n == f->capacity) {
+        uint32_t capacity = f->capacity ? f->capacity * 2 : 256;
+        gp_group *passes = realloc(f->pass, capacity * sizeof *passes);
+        if (!passes) { f->dropped++; return; }
+        f->pass = passes; f->capacity = capacity;
+    }
+    gp_group *g = &f->pass[f->n++];
+    *g = (gp_group){.key = r->key, .hash = key_hash(&r->key), .ordinal = r->instance,
+        .count = 1, .draws = r->draws, .ms = ms};
+    if (stats_valid) {
+        memcpy(g->counters, r->counters, sizeof g->counters);
+        g->stats_count = 1; g->stats_draws = r->draws; g->stats_ms = ms;
+    }
+}
+static uint64_t long_finish(uint64_t number, double span, double measured, double gap) {
+    if (!long_ring) return 0;
+    gp_long_frame *f = &long_ring[number % long_frames];
+    if (f->frame != number) return 0;
+    f->span_ms = span; f->measured_ms = measured; f->gap_ms = gap;
+    if (span > long_ms) {
+        for (uint32_t i = 0; i < f->n; i++) output_pass(&f->pass[i], "long_frame", number);
+        LOGV("[gpu-profile long] frame=%llu span=%.3f measured=%.3f gap=%.3f passes=%u dropped=%llu threshold=%.3f ms",
+            (unsigned long long)number, span, measured, gap, f->n, (unsigned long long)f->dropped, long_ms);
+    }
+    return f->dropped;
 }
 /* Core VkFormat families are contiguous. Use the VIEW format, not guest storage: a BC
    texture can have an uncompressed attachment view and depth formats can be substituted. */
@@ -316,11 +358,12 @@ static void finish_frame(void) {
     double gap = span - completed.measured;
     double epsilon = V.props.limits.timestampPeriod * (GP_RECORDS * 2.0 + 2) / 1e6;
     int failed = completed.failed || completed.dropped || !completed.has_ticks || gap < -epsilon;
+    uint64_t long_dropped = long_finish(completed.frame, span, completed.measured, gap);
     gp_json row = {0};
     json_add(&row, "{\"schema\":2,\"type\":\"frame\",\"frame\":%llu,\"span_ms\":%.9f,"
-        "\"measured_ms\":%.9f,\"gap_ms\":%.9f,\"dropped\":%llu,\"reconciliation_failed\":%s}\n",
+        "\"measured_ms\":%.9f,\"gap_ms\":%.9f,\"dropped\":%llu,\"reconciliation_failed\":%s,\"long_dropped\":%llu}\n",
         (unsigned long long)completed.frame, span, completed.measured, gap,
-        (unsigned long long)completed.dropped, failed ? "true" : "false");
+        (unsigned long long)completed.dropped, failed ? "true" : "false", (unsigned long long)long_dropped);
     output_row(row.data);
     if (output_file) fflush(output_file);
     window_span += span; window_gap += gap; window_frames++;
@@ -333,7 +376,7 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
     if (!initialized) {
         initialized = 1;
         const char *e = getenv("TOTK_VK_GPU_PROFILE");
-        if (e && (!strcmp(e, "1") || !strcmp(e, "2"))) {
+        if (e && (!strcmp(e, "1") || !strcmp(e, "2") || !strcmp(e, "3"))) {
             vk_gpuprof_on = V.has_host_query_reset && V.timestamp_bits && V.props.limits.timestampComputeAndGraphics && V.props.limits.timestampPeriod > 0 ? atoi(e) : 0;
             LOGV("[gpu-profile] %s (TOTK_VK_GPU_PROFILE=%s); 300-frame windows, exact primary pass parts; recorder workers supported",
                  vk_gpuprof_on ? "enabled" : "unavailable: graphics+compute timestamps or hostQueryReset missing", e);
@@ -342,7 +385,19 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
             stats_on = vk_gpuprof_on && requested && V.has_pipeline_statistics;
             if (requested) LOGV("[gpu-profile] geometry+fragment statistics %s (pipelineStatisticsQuery=%d; TOTK_VK_GPU_PROFILE_STATS=1)", stats_on ? "on" : "unavailable", V.has_pipeline_statistics);
             if (vk_gpuprof_on) output_init();
-        }
+            if (vk_gpuprof_on == 3) {
+                long_frames = (uint32_t)env_u64("TOTK_VK_GPU_PROFILE_LONG_FRAMES", 8, 1, 64);
+                const char *threshold = getenv("TOTK_VK_GPU_PROFILE_LONG_MS"); char *end = NULL;
+                if (threshold && *threshold) {
+                    double parsed = strtod(threshold, &end);
+                    if (end && !*end && isfinite(parsed) && parsed >= 0 && parsed <= 60000) long_ms = parsed;
+                }
+                long_ring = calloc(long_frames, sizeof *long_ring);
+                if (!long_ring) DIE("GPU profiler long-frame ring allocation");
+                LOGV("[gpu-profile] long-frame mode threshold=%.3f ms retained-frames=%u (TOTK_VK_GPU_PROFILE_LONG_MS/LONG_FRAMES)",
+                    long_ms, long_frames);
+            }
+        } else LOGV("[gpu-profile] disabled (TOTK_VK_GPU_PROFILE=%s; default=0)", e ? e : "unset");
     }
     if (!vk_gpuprof_on) return;
     if (!*slot) {
@@ -390,6 +445,7 @@ void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot) {
 }
 static void ingest_record(gp_record *r, double ms, int stats_valid) {
     completed.measured += ms;
+    long_capture(r, ms, stats_valid);
     total_records++; total_ms += ms;
     if (r->key.compute == 1) compute_ms += ms;
     else if (!r->key.compute) render_ms += ms;
