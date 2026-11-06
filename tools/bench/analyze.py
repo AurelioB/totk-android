@@ -59,17 +59,20 @@ CTL_RE = re.compile(r'\[totk-ctl\] gen=(\d+) frame=(\d+) (applied|mark)(?: (.*))
 GUARD_FRAMES = 2
 # Block metrics compared by abtest.py (rates per window).
 AB_METRICS = ('fps_steady', 'dip_time_fraction', 'fps_mean', 'fps_min', 'p50_ms_median', 'p95_ms_max', 'max_ms', 'gpu_ms_mean', 'over50_total', 'long_ge45_total')
+PRESENT_BIN_LABELS = ('<12.5', '12.5-20.9', '20.9-29', '29-37.5', '37.5-45.8', '>=45.8')
 
 
 def parse_log(path):
     timing, gpu, fps, stut, longf, info = {}, {}, {}, {}, [], {}
     frame_ms, near33, draw_samples = {}, {}, []
     last_window = None
+    recording, present_stats, present_bins, traces = {}, {}, {}, {}
     for line in open(path, encoding='utf-8', errors='replace'):
         if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):
             timing[int(m[1])] = tuple(float(x) for x in m.groups()[1:])
         if m := re.search(r'\[nvn-vk\] frame (\d+), per frame: recording ([\d.]+) ms, waiting for the GPU ([\d.]+) ms, GPU ([\d.]+) ms', line):
             gpu[int(m[1])] = float(m[4])
+            recording[int(m[1])] = float(m[2])
         if m := re.search(r'\[nvn-vk\] frame (\d+): ([\d.]+) fps over the last 300', line):
             fps[int(m[1])] = float(m[2])
             last_window = int(m[1])
@@ -82,9 +85,13 @@ def parse_log(path):
             frame_ms[int(m[1])] = float(m[3])
         if m := re.search(r'\[frame-tl late\] frame=(\d+).*?\bgame_iv=([\d.]+)', line):
             frame_ms.setdefault(int(m[1]), float(m[2]))
+        if last_window is not None and 'window present-fence cadence,' in line:
+            if m := re.search(r'p50/p95/p99=([\d.]+)/([\d.]+)/([\d.]+)ms', line):
+                present_stats[last_window] = {'present_p95_ms': float(m[2]), 'present_p99_ms': float(m[3])}
         if last_window is not None and (m := re.search(
                 r'window present-fence interval bins ms \[<12.5,12.5-20.9,20.9-29,29-37.5,37.5-45.8,>=45.8\]: all=(\d+)/(\d+)/(\d+)/(\d+)/(\d+)/(\d+)', line)):
             bins = [int(x) for x in m.groups()]
+            present_bins[last_window] = bins
             if sum(bins) == 300:
                 near33[last_window] = bins[3]
         if 'game_version' not in info and (m := re.search(r'^\[totk\] game version (\S+)', line)):
@@ -95,10 +102,76 @@ def parse_log(path):
             info['settings'] = dict(kv.split('=', 1) for kv in m[1].split() if '=' in kv)
         if 'device lost' in line.lower():
             info['device_lost'] = info.get('device_lost', 0) + 1
+        if '[present-trace]' in line:
+            fields = dict(re.findall(r'(\w+)=(\S+)', line))
+            keys = ('id', 'generation', 'source_frame', 'display_ns')
+            if all(fields.get(k, '').isdigit() for k in keys):
+                row = {k: int(fields[k]) for k in keys}
+                key = row['generation'], row['id']
+                # Identical duplicate delivery is harmless; conflicting identities cannot establish an interval.
+                traces[key] = row if key not in traces or traces[key] == row else None
     info['frame_ms'], info['near33'] = frame_ms, near33
     info['draw_rates'] = cumulative_draw_rates(draw_samples)
+    info.update(recording=recording, present_stats=present_stats, present_bins=present_bins,
+                present_intervals=present_trace_intervals(traces))
     return timing, gpu, fps, stut, longf, info
 
+
+
+def present_trace_intervals(traces):
+    """Join immutable transaction IDs, never callback order or missing/reversed/generation-boundary timestamps."""
+    intervals = []
+    for (generation, identifier), row in sorted(traces.items()):
+        previous = traces.get((generation, identifier - 1))
+        if (row and previous and previous['display_ns'] > 0 and row['display_ns'] > previous['display_ns']
+                and row['source_frame'] >= previous['source_frame']):
+            intervals.append({'frames': [previous['source_frame'], row['source_frame']],
+                              'interval_ns': row['display_ns'] - previous['display_ns']})
+    return intervals
+
+
+def presentation_of(start, end, info):
+    return {**info.get('present_stats', {}).get(end, {}),
+            'recording_ms': info.get('recording', {}).get(end),
+            'present_interval_bins': info.get('present_bins', {}).get(end),
+            'present_intervals_ns': [p['interval_ns'] for p in info.get('present_intervals', [])
+                                     if start - 1 <= p['frames'][0] and start <= p['frames'][1] <= end]}
+
+
+def presentation_summary(windows):
+    bins = [w['present_interval_bins'] for w in windows if w.get('present_interval_bins') is not None]
+    counts = [sum(b[i] for b in bins) for i in range(6)] if bins else None
+    total = sum(counts) if counts is not None else 0
+    intervals = [ns for w in windows for ns in w.get('present_intervals_ns', [])]
+    hits = sum(16_700_000 < ns < 30_000_000 for ns in intervals)
+    recording = [w['recording_ms'] for w in windows if w.get('recording_ms') is not None]
+    return {'recording_ms_mean': round(sum(recording) / len(recording), 3) if recording else None,
+            'recording_windows': len(recording),
+            'present_p95_ms_max': mx(w.get('present_p95_ms') for w in windows),
+            'present_p99_ms_max': mx(w.get('present_p99_ms') for w in windows),
+            'present_quantile_windows': sum(w.get('present_p95_ms') is not None for w in windows),
+            'present_interval_bin_labels_ms': list(PRESENT_BIN_LABELS),
+            'present_interval_bin_counts': counts,
+            'present_interval_bin_shares': [c / total for c in counts] if total else None,
+            'present_interval_pairs': total, 'present_histogram_windows': len(bins),
+            'present_judder_proxy_fraction': counts[2] / total if total else None,
+            'present_judder_exact_fraction': hits / len(intervals) if intervals else None,
+            'present_judder_exact_hits': hits, 'present_judder_exact_pairs': len(intervals)}
+
+
+def print_presentation(summary, prefix='  '):
+    fmt = lambda value: '-' if value is None else f'{value:.3f}'
+    print(f'{prefix}presentation: recording mean {fmt(summary["recording_ms_mean"])} ms; '
+          f'fence p95/p99 window maxima {fmt(summary["present_p95_ms_max"])}/'
+          f'{fmt(summary["present_p99_ms_max"])} ms ({summary["present_quantile_windows"]} windows)')
+    shares = summary['present_interval_bin_shares']
+    print(f'{prefix}present bin shares: ' + (', '.join(f'{label} ms {share * 100:.2f}%'
+          for label, share in zip(PRESENT_BIN_LABELS, shares)) if shares is not None else 'unavailable') +
+          f'; judder proxy (20.9-29 ms) {fmt(summary["present_judder_proxy_fraction"])} '
+          f'({summary["present_interval_pairs"]} observed pairs)')
+    print(f'{prefix}exact judder (>16.7 & <30 ms): {fmt(summary["present_judder_exact_fraction"])} '
+          f'({summary["present_judder_exact_hits"]}/{summary["present_judder_exact_pairs"]} valid traced pairs; '
+          'framework fences, not hardware scanout)')
 
 
 def cumulative_draw_rates(samples):
@@ -211,6 +284,7 @@ def summarize(windows, thermal=()):
     return {
         'windows': len(windows),
         **pacing,
+        **presentation_summary(windows),
         'fps_min': min(vals('fps'), default=None), 'fps_max': max(vals('fps'), default=None),
         'fps_mean': round(sum(vals('fps')) / len(vals('fps')), 2) if vals('fps') else None,
         'draws_per_frame_mean': round(sum(vals('draws_per_frame')) / len(vals('draws_per_frame')), 2)
@@ -288,6 +362,7 @@ def print_arms(ab):
             print(f'    steady fps {fmt(s.get("fps_steady"))}; dip windows {s["dip_windows"]}/{s["pacing_windows"]}; '
                   f'dip time fraction {fmt(s["dip_time_fraction"])}; ~33 ms frames {fmt(s["frames_near33"])}; '
                   f'time-weighted mean fps {fmt(s["fps_time_mean"])}')
+        print_presentation(s, '    ')
         for b in a['blocks']:
             m = b['metrics']
             print(f'    block {b["block"] if b["block"] is not None else "?"} (gen {b["gen"]}, from frame {b["frame"]}, '
@@ -539,13 +614,14 @@ def main():
                 continue
             print(f'\n## {dev} / {scene}')
             print('window          fps    p50    p95    max   GPU ms  long>=25  long>=45  over33/over50(stutter line)')
-            windows, thermal, all_rows, pan_residencies, batteries, targets = [], [], [], [], [], []
+            windows, thermal, all_rows, pan_residencies, batteries, targets, pan_summaries = [], [], [], [], [], [], []
             samples = parse_sample_rows(os.path.join(out, f'samples-{dev}.txt'))
             for kv in plist:
                 f0, f1 = kv['F0'], kv['F1']
                 preset = devices[dev]['settings_env'].get('TOTK_FPS60')
                 target = a.target_fps or kv.get('TARGET_FPS') or (60 if preset == '1' else 30 if preset == '0' else None)
                 targets.append(target)
+                pan_window_start = len(windows)
                 for f in sorted(x for x in timing if f0 + 600 <= x <= f1):
                     lf = [x for x in longf if f - 300 < x[0] <= f]
                     st = stut.get(f)
@@ -554,6 +630,7 @@ def main():
                          'long_ge45': sum(x[1] >= 45 for x in lf), 'over33': st[0] if st else None,
                          'over50': st[2] if st else None, 'draws_per_frame': info['draw_rates'].get(f)}
                     w.update(pacing_of(f, w['fps'], target, info))
+                    w.update(presentation_of(f - 299, f, info))
                     windows.append(w)
                     print(f'{f-299:>6}-{f:<6} {w["fps"] or 0:5.1f} {w["p50_ms"]:6.2f} {w["p95_ms"]:6.2f} {w["max_ms"]:6.1f} '
                           f'{w["gpu_ms"] if w["gpu_ms"] is not None else float("nan"):7.1f}  {w["long_ge25"]:>6}    '
@@ -592,6 +669,10 @@ def main():
                           f'cpufreq scaling_max<cpuinfo_max: {[f"{s}/{m}" for s, m in capped] or "none"} ({len(rows)} samples)')
                 else:
                     print(f'  no samples over the pan {utc(kv["T0"])} .. {utc(kv["T1"])}')
+                pan_summary = summarize(windows[pan_window_start:])
+                pan_summaries.append(pan_summary)
+                print(f'  pan T0={kv["T0"]}:')
+                print_presentation(pan_summary, '    ')
             for w in windows:
                 if m := window_memory(w['frames'][1], samples):
                     w['memory'] = m
@@ -599,6 +680,7 @@ def main():
             if memory:
                 print('  memory / pressure (worst over the windows): ' + ', '.join(f'{k} {v}' for k, v in memory.items()))
             summary = summarize(windows, thermal)
+            print_presentation(summary)
             if summary.get('pacing_windows'):
                 steady = summary['fps_steady']
                 print(f'  pacing: steady fps {steady if steady is not None else "-"}; mean fps {summary["fps_mean"]} '
@@ -626,8 +708,10 @@ def main():
                          'pans': [{'start_frame': kv['F0'], 'end_frame': kv['F1'], 'start_utc': utc(kv['T0']),
                                    'end_utc': utc(kv['T1']), 'stick_value': kv['V'],
                                    'freq_limits': {'start': s.get('start'), 'end': s.get('end')},
-                                   'target_fps': target, 'gpu_residency': residency, 'battery': battery}
-                                  for kv, s, target, residency, battery in zip(plist, snaps, targets, pan_residencies, batteries)],
+                                   'target_fps': target, 'gpu_residency': residency, 'battery': battery,
+                                   'summary': pan_summary}
+                                  for kv, s, target, residency, battery, pan_summary in
+                                  zip(plist, snaps, targets, pan_residencies, batteries, pan_summaries)],
                          'freq_stable': stable, 'freq_changes': changes,
                          'summary': summary, 'windows': windows, 'thermal': thermal,
                          **({'memory': memory} if memory else {}), **({'ab': ab} if ab else {})})

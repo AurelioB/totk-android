@@ -184,6 +184,17 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
   Sparse long-frame logs give lower-bound counts, not a complete duration trace. `--target-fps 30|60` overrides the
   recorded target/preset; an unknown target must not be guessed. Dip time weights each window by 300/fps, not one vote.
   `fps_mean` is the legacy arithmetic mean of window fps; `fps_time_mean` is frames / elapsed window time.
+- Each pan and arm summary retains backend `recording_ms_mean`, framework-fence `present_p95_ms_max` /
+  `present_p99_ms_max` (maxima of window percentiles, **not pooled percentiles**), plus six-bin counts/shares and
+  coverage. Bin shares use observed pairs, not D/300 or equal window votes. The **judder proxy** is the 20.9–29 ms
+  bin share (`present_judder_proxy_fraction`); it cannot identify the full >16.7 & <30 ms range.
+  For a separate diagnostic run, `TOTK_PRESENT_CADENCE_TRACE=1` emits immutable `[present-trace]` transaction
+  ID/generation/source-frame/framework-fence timestamps. The analyzer joins only consecutive valid IDs in one
+  generation, independent of callback order, and reports exact strict >16.7 & <30 ms share **among observed valid
+  pairs**, with hit/pair counts (`present_judder_exact_*`); missing/reset/reversed endpoints are never bridged.
+  This trace is high-volume and has perturbed Thor cadence: use both arms consistently and keep it off for ordinary
+  performance acceptance. `TOTK_FRAME_TIMELINE=1` only logs late per-frame rows and is not a complete trace.
+  All fence metrics remain framework proxies, not guaranteed panel scanout. Full field semantics: bench README.
 - `compare.py` / `abtest.py` compare steady fps and dip time separately. A dip fraction difference >0.05 (five
   percentage points) reports **verdict confounded by dips**, not an optimization win/loss from a controller state.
   All-dip arms have no steady estimate; historic results without pacing data keep labelled legacy comparisons.

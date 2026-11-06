@@ -288,6 +288,68 @@ def ab_log(windows, ctl):
     return '\n'.join(lines + [e[1] for e in events]) + '\n'
 
 
+class PresentationReporting(unittest.TestCase):
+    def test_per_pan_and_arm_recording_quantiles_and_weighted_bin_shares(self):
+        ctl = [(1, '[totk-ctl] gen=1 frame=1 mark ab arm=A block=1'),
+               (601, '[totk-ctl] gen=2 frame=601 mark ab arm=B block=2')]
+        text = ab_log({600: (57, 20, 10, 0), 1200: (56, 21, 10, 0)}, ctl)
+        for frame, p95, p99, bins in ((600, 25, 34, '0/240/30/20/5/5'), (1200, 35, 45, '0/120/15/10/3/2')):
+            needle = next(line for line in text.splitlines() if line.startswith(f'[nvn-vk] frame {frame}:'))
+            text = text.replace(needle, needle + '\n'
+                                f'[nvn-vk] window present-fence cadence, last 300 results: '
+                                f'interval min/mean/max=16/20/50ms p50/p95/p99=17/{p95}/{p99}ms samples=300/300\n'
+                                '[nvn-vk] window present-fence interval bins ms '
+                                '[<12.5,12.5-20.9,20.9-29,29-37.5,37.5-45.8,>=45.8]: '
+                                f'all={bins}; adjacent immutable interval2=0/0/0/0/0/0')
+        text = text.replace('frame 1200, per frame: recording 2.0', 'frame 1200, per frame: recording 4.0')
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'logs').mkdir()
+            (d / 'logs/odin.log').write_text(text)
+            (d / 'pans.txt').write_text('odin hateno F0=0 F1=600 T0=100 T1=120 V=16000\n'
+                                      'odin hateno2 F0=600 F1=1200 T0=200 T1=220 V=16000\n')
+            result = run(BENCH / 'analyze.py', d, '--arms', '--json', d / 'result.json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads((d / 'result.json').read_text())['runs'][0]
+        s = record['summary']
+        self.assertEqual(s['recording_ms_mean'], 3)
+        self.assertEqual((s['present_p95_ms_max'], s['present_p99_ms_max']), (35, 45))
+        self.assertEqual(s['present_interval_bin_counts'], [0, 360, 45, 30, 8, 7])
+        self.assertEqual(s['present_interval_pairs'], 450)  # weight by observed pairs, not one vote/window
+        self.assertEqual(s['present_judder_proxy_fraction'], 0.1)
+        self.assertAlmostEqual(sum(s['present_interval_bin_shares']), 1)
+        self.assertEqual(record['pans'][0]['summary']['present_p99_ms_max'], 34)
+        self.assertEqual(record['pans'][1]['summary']['recording_ms_mean'], 4)
+        self.assertEqual(record['ab']['arms']['A']['summary']['present_p95_ms_max'], 25)
+        self.assertEqual(record['ab']['arms']['B']['summary']['recording_ms_mean'], 4)
+        self.assertIsNone(s['present_judder_exact_fraction'])
+        self.assertIn('20.9-29 ms 10.00%', result.stdout)
+        self.assertIn('fence p95/p99 window maxima 35.000/45.000', result.stdout)
+
+    def test_exact_trace_joins_ids_not_callback_order_and_keeps_strict_boundaries(self):
+        rows = [(1, 1, 300, 1_000_000_000), (2, 1, 301, 1_016_700_000),
+                (3, 1, 302, 1_036_700_000), (4, 1, 303, 1_066_700_000),
+                (5, 1, 304, 0), (6, 1, 305, 1_100_000_000), (8, 1, 306, 1_120_000_000),
+                (9, 2, 307, 1_140_000_000), (10, 2, 308, 1_169_999_999),
+                (11, 2, 309, 1_160_000_000), (12, 2, 310, 1_200_000_000),
+                (12, 2, 310, 1_210_000_000), (13, 2, 311, 1_230_000_000)]
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'totk.log'
+            # Deliberately reverse callback/log delivery. A conflicting duplicate invalidates ID12.
+            p.write_text(''.join(f'[nvn-vk] [present-trace] id={i} generation={g} source_frame={f} '
+                                 f'kind=real desired_ns=0 apply_ns=0 display_ns={ns} refresh_ns=16666667 interval=1 reason=0\n'
+                                 for i, g, f, ns in reversed(rows)))
+            info = analyze.parse_log(p)[5]
+        window = analyze.presentation_of(301, 600, info)
+        self.assertEqual(window['present_intervals_ns'], [16_700_000, 20_000_000, 30_000_000, 29_999_999])
+        s = analyze.presentation_summary([window])
+        self.assertEqual((s['present_judder_exact_hits'], s['present_judder_exact_pairs']), (2, 4))
+        self.assertEqual(s['present_judder_exact_fraction'], 0.5)
+        self.assertIsNone(s['present_judder_proxy_fraction'])  # cannot reverse-infer a histogram from sparse traces
+        # Never attribute a pair across a pan/window's incoming source-frame boundary.
+        self.assertEqual(analyze.presentation_of(308, 600, info)['present_intervals_ns'], [29_999_999])
+
+
 class Pacing(unittest.TestCase):
     def test_bimodal_arms_do_not_turn_mean_changes_into_speed_verdicts(self):
         base = {'windows': 12, 'fps_mean': 50, 'fps_steady': 57, 'dip_windows': 3,

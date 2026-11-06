@@ -61,6 +61,34 @@ Draws are a **cumulative** backend counter: `draws_per_frame` uses consecutive 3
 missing intermediate samples have no rate (null); the next complete monotonic pair resumes measurement.
 `draws_per_frame_mean` and `draws_windows` report the mean and coverage over usable windows.
 
+### Presentation tails, bins and judder
+
+Each selected window retains `[nvn-vk]` `recording_ms` and the framework present-fence cadence line's
+`present_p95_ms` / `present_p99_ms`. Every `pans[].summary`, run summary and live-switch arm/block summary includes
+`recording_ms_mean`, `present_p95_ms_max`, `present_p99_ms_max` and their window coverage. The latter are **maxima
+of the reported window percentiles**, not reconstructed pooled p95/p99; percentiles cannot be pooled from quantiles.
+These fields are informational and do not silently change A/B verdict tolerances.
+
+Always-on AHB bins are `<12.5 / 12.5–20.9 / 20.9–29 / 29–37.5 / 37.5–45.8 / >=45.8 ms`.
+`present_interval_bin_counts` sums selected windows' observed pairs; `present_interval_bin_shares` divides by the
+total observed pair count, not by 300 or by window count. `present_judder_proxy_fraction` is the **20.9–29 ms bin
+share**, only a proxy: the bins cannot recover an exact >16.7 & <30 ms share. Missing histogram coverage is explicit.
+Cadence/histogram records are associated with the latest runtime FPS-window marker in the log, as for pacing-state
+analysis; asynchronous fence-result blocks are not claimed to be exact physical pan-boundary measurements.
+
+For exact timestamp arithmetic in a **separate diagnostic run**, set `TOTK_PRESENT_CADENCE_TRACE=1` in `totk.env`
+for both arms and restart. `[present-trace]` records carry immutable `generation`, transaction `id`, `source_frame`
+and `display_ns`. The analyzer sorts/join consecutive IDs within the same generation, requiring both framework fence
+timestamps to be present and increasing; it never joins callback order, bridges missing IDs or crosses generation
+boundaries. Intervals belong to included frame windows only when both source endpoints lie within that window
+(allowing its preceding boundary frame). Duplicate conflicting identities are excluded.
+`present_judder_exact_fraction` counts strictly **16,700,000 < delta_ns < 30,000,000**, with explicit
+`present_judder_exact_hits` / `present_judder_exact_pairs`: exact over the **observed valid trace pairs**, not an
+estimate for missing pairs or proof of physical scanout. It is null without valid traced intervals.
+`TOTK_FRAME_TIMELINE=1` logs only selected late per-frame intervals and is not a substitute for this full trace.
+Cadence tracing is high-volume and has measurably perturbed Thor timing: keep it off in ordinary performance arms,
+do not mix traced/untraced arms, and use independent distinct-picture evidence for displayed smoothness.
+
 ### Long pans and exact GPU residency
 
 The target defaults to the active preset (`settings.env`, then developer `totk.env` override); `--target-fps`
