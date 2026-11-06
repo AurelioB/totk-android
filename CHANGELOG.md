@@ -32,6 +32,14 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Schema-3 rows retain draw/primitive knownness and sampling/loss authority; the host analyzer ranks exact
   pipelines and shader pairs without treating a pass's first shader or draw count as their cost.
   Existing pass profiling stays unchanged when this switch is off; on-device overhead still needs calibration.
+- Make enabled pipeline profiling default to bounded sampled-key 300-frame compact JSONL windows,
+  suppressing per-group/per-frame rows while preserving parent pass/window aggregates. Explicit
+  `TOTK_VK_GPU_PROFILE_PIPELINES_RAW=1` restores the large raw stream; profiling with PIPELINES off is unchanged.
+  Intern exact pipeline/full-shader identities with bounded inactive-key eviction and per-file dictionary
+  authority. Preserve actual-denominator moments, completed-frame domain eligibility, population exposure
+  and explicit loss/overflow; flush partial windows once at close without inventing GPU retirement.
+  Publish worker CPU, cumulative output bytes, backlog/memory bounds and a deterministic no-GPU
+  4096-key churn fixture using the production queue/aggregation/output path. Host capacity is not device proof.
 
 ### Menu
 - Add **40 fps** to Frame rate without changing existing presets or 30/60 settings. It caps real game updates

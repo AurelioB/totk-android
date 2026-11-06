@@ -1573,28 +1573,45 @@ measurements, the ownership contract is:
   of draw count/pass length. The Horvitz-Thompson sum is **measured group ms × N/k**, never equal draw
   work or observed/sample scaling. This is conditional on domain coverage and workload independent of
   instrumentation, NOT proof of unperturbed cost or confidence. Headers retain the initial population and
-  full launch bits (`pipeline_phase`); coverage rows retain each frame's actual population/phase.
+  full launch bits (`pipeline_phase`); compact exposure strata retain actual population and selection weights.
   Actual GPU timing includes timestamp cost and intervening GPU state/setup; ALL_COMMANDS can serialize
   work/change tiled scheduling. A group is not an isolated shader invocation or marginal cost.
   Bounds: at most **2k extra timestamp writes/frame**, 2048 metadata records/lease and 1024 query pairs/
   lease (64 frame segments × max budget 16); sixteen existing leases bound backlog. Space for ALL selected
   groups is reserved; optional unselected detail uses at most 1024 records/lease, with additional omitted
   detail explicitly counted as `unretained_groups`, not a selected timing drop. Thus a long pass cannot
-  crowd tail samples out. All arrays/pools exist only when PIPELINES is enabled. The walker compares three
-  pointers, copies names only at retained group boundaries, never scans bindings or allocates group storage.
-  Pass `timestamp_count` remains unchanged; sum `pipeline_coverage.timestamp_count` for the extra pool.
+  crowd tail samples out. Lease arrays/query pools are allocated only when PIPELINES is enabled.
+  The walker compares three pointers, copies names only at retained group boundaries, never scans bindings
+  or allocates group storage. Fixed compact aggregation storage is touched only in compact pipeline mode.
+  Pass `timestamp_count` remains unchanged; sum compact coverage `timestamp_count` for the extra pool.
   With pass sample budget `s`, the combined normal-frame write bound is **2s + 2 + 2k**.
-  Additive schema-3 `pipeline` rows name frame/global group, pass key/ordinal, launch-local Vulkan handle,
-  full `vs`/`fs`/`cs` variant names, actual emitted draw/dispatch counts, input primitive counts/knownness,
-  selected/status, nullable `gpu_ms`, timestamp count and probability numerator/denominator.
+  Default pipeline output is compact: schema-3 header `pipeline_output:"compact"`,
+  `pipeline_compact_version:1` and `pipeline_window_columns` publish the numeric column order.
+  `pipeline_key` interns actual launch-local Vulkan handle + kind + full VS/FS/CS tuple, never pass key
+  or ordinal. Only keys selected within a 300-frame window emit `pipeline_window` numeric arrays.
+  Sums, sum-squares, actual-denominator weighted sums and eligible-domain counterparts remain separate;
+  moments are descriptive, not IID standard errors. `pipeline_window_coverage` retains completed-frame
+  counts, domain exclusions, selected/valid/missing samples, timestamps, optional omissions and true loss.
+  `population_exposure` entries are `[N,k,N,frames,eligible_frames,observed_groups,selected_groups]`,
+  so population growth within a window never borrows the latest denominator for earlier samples.
+  Eligibility is committed only at completed-frame closure, after every split lease/nested scope.
+  Missing/invalid selected samples, dropped slots/closures and explicit key/frame/aggregate overflows
+  withhold unsupported estimates; unknown remains unknown. Suppressed unselected-only key observations
+  also count as `unretained_groups`, making count subtotals honestly incomplete.
+  `TOTK_VK_GPU_PROFILE_PIPELINES_RAW=1` restores the old per-group/per-lease-frame and global frame
+  rows. Default compact suppresses all three, retaining parent pass/window rows (and explicit mode-3
+  long-frame diagnostics). Parent profiling with PIPELINES off is unchanged. Startup logs
+  `[gpu-profile] pipeline-output=compact/raw`. Raw `pipeline` rows name frame/global group, pass
+  key/ordinal, handle, full variants, emitted draw/dispatch counts, primitive knownness, selected/status,
+  nullable `gpu_ms`, timestamp count and probability numerator/denominator.
   Primitive counts include instances and generated quad triangles, not clipped/rasterized primitives.
   Indexed restart strips are unknown without index reads (`primitives:null`, known subtotal and unknown
   draw count); compute is `null`/`not-graphics`. This backend lowers guest draws to concrete direct draws:
   it does not synthesize zero primitive counts for unavailable GPU-indirect argument buffers.
-  Each lease/frame emits `pipeline_coverage`: observed/dropped/selected/unretained/out-of-range groups,
-  timestamp count, immutable lease/submission IDs, population/phase and discard state. Unselected or
+  Raw mode emits per-lease/frame `pipeline_coverage`: observed/dropped/selected/unretained/out-of-range
+  groups, timestamp count, lease/submission IDs, population/phase and discard state. Unselected or
   unavailable/invalid/incomplete/discarded timings have `gpu_ms:null`, never fake zero durations. Setup
-  attempts rejected before drawing have zero draws and explicit `no-work` status, not a shader-cost sample.
+  attempts rejected before drawing are explicit `no-work`, a missing selected sample rather than zero cost.
   A frame larger than its domain censors the WHOLE-capture `estimated_gpu_ms`. The analyzer separately
   ranks `eligible_estimated_gpu_ms` over its explicitly named domain-covered frames, with exclusions
   retained as `domain_excluded_frames`; it never pretends that subtotal includes the growing frame's tail.
@@ -1609,6 +1626,40 @@ measurements, the ownership contract is:
   query counts and drops. Then hold pass sampling fixed and ABBA PIPELINES=0/4 to isolate incremental
   cost. Repeat fresh launches (independent phases), extend beyond several rotations and require adequate
   per-pair samples before ranking. No device calibration was performed as part of the implementation.
+  Compact state is fixed: 8192 exact keys, a 16384-cell open-addressed index, 8192 frame-touched IDs and
+  64 exposure strata: **4,230,400 bytes** on the supported 64-bit ABI (`sizeof` also published in headers).
+  The compact aggregator makes no per-group/window allocations; existing parent pass buffering/histograms
+  remain separately bounded. Inactive previous-window dictionary entries are
+  evicted under lifetime churn; IDs are never reused. Current-window entries cannot be evicted: saturation
+  is an explicit overflow, not a silently weakened estimate. A referenced key is announced before its
+  summary in each file; reserve only that key/summary pair on rotation, never replay an entire dictionary.
+  Losing earlier rotated files still loses coverage and cannot silently regain full-capture authority.
+  Close flushes a remaining partial window once; unfinished frames are explicitly excluded/overflowed,
+  and in-flight GPU retirement remains unknown.
+  Coverage reports `CLOCK_THREAD_CPUTIME_ID` aggregation and key-encoding/flush CPU milliseconds,
+  serialized bytes before the coverage row (including parent rows and repeated rotation headers),
+  peak queued+active leases and the fixed aggregation bound. The footer reports cumulative serialized
+  bytes, backlog and close-flush thread CPU. File retention size is not cumulative emitted bytes.
+
+  Host-only fixture, with outputs kept in a fresh scratch directory:
+  build `make -C games/totk/android TARGET=linux CC=cc OUT=<absolute-scratch-build> vkgpuprofcompacttest`,
+  then `<absolute-scratch-build>/vkgpuproftest --compact-contract` (no GPU), and
+  `vkgpuproftest --compact-fixture --seconds 600 --fps 0 --pace 0 --loss 0`.
+  `--fps 0` cycles 20/30/40/50/60 logical fps every 20 seconds; `--fps 60` is the size upper-rate arm.
+  4096 groups/frame span two leases, each retaining 1024 optional unselected records plus selected groups.
+  Recurrent keys appear/disappear between windows and a fresh-variant tail forces bounded lifetime churn.
+  `--frames 302` exercises partial close; `--loss 1` injects unavailable/invalid/incomplete queries, true
+  group loss and one dropped-slot counter. RAW=1 replays identical deterministic identities/timestamps/
+  phase for analyzer comparisons. Tiny MAX_BYTES exercises dictionary reannouncement/retention eviction.
+  The fixture prints cumulative bytes/average window, worker thread CPU/average/peak window, backlog,
+  aggregation/lease and parent-aggregation memory bounds, zero compact allocation count, write-call count,
+  producer wait and close CPU/wall time. `--pace 0` is accelerated throughput,
+  not 600 wall seconds. `--pace 1` uses monotonic absolute wall pacing. Both wait for a free synthetic
+  lease to keep generated datasets identical; producer wait and wall time MUST therefore be reported:
+  zero fixture drops alone does not prove the host kept pace. Backlog is queued+active host leases,
+  not GPU latency. This excludes real query calls/GPU/driver/device scheduling and proves no Duo result.
+  Host commands run with `taskset -c 0-3 nice -n 10`; matrices also hold the shared hosttest flock.
+
 - **Profiler capture lifecycle:** the default is 128 MiB per JSONL file × four files; compact windows
   target a 6–8-minute pan without rotation, not a guaranteed duration for arbitrary pass counts/raw modes.
   Each rotation repeats a schema-3 header with launch ID, APK `assets/build.txt` commit, package/versionCode
