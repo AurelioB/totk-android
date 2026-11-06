@@ -1927,10 +1927,14 @@ needs `su`). The folder holds what the adb-shell folder holds:
 
 A/B measurements change experiment switches inside one running session, so both arms share one loaded scene
 (`tools/bench/ab.sh`, the `totk-benchmark` skill). A thread at nice 10 (on the slower CPUs, like the logcat copy)
-follows `<game folder>/totk.ctl` with inotify (on the file only once it exists; 250 ms polling without inotify).
-While the file is absent it retains one directory watch and ignores unrelated creates/moves without reopening
-the file or removing/rearming the watch. Explicit watch removals' `IN_IGNORED` events cannot feed a retry loop.
-It stages each complete line appended after the start; the lines of one write are staged together:
+follows `<game folder>/totk.ctl` with inotify (on the file only once readable; 250 ms polling without inotify).
+While the file is absent or cannot be opened it retains one directory watch, including the target's close-write
+and attribute changes (chown/chmod/SELinux context), and ignores unrelated events without reopening or rearming.
+Failed opens other than a missing file, and failed reads, also retry at most every 250 ms if no relevant event
+arrives; a missing file still blocks without polling. Explicit watch removals' `IN_IGNORED` cannot feed a retry loop.
+It stages each complete line appended after the start; the lines of one write are staged together. `tools/bench/live.sh`
+publishes only its new batch via a same-directory temp file, with owner/mode/context set before atomic rename;
+replacement is read from the beginning, so it must not copy old commands (which would replay them).
 
 - `set KEY=VALUE` sets a live switch to a decimal inside its range; `unset KEY` returns it to its launch value
   (`totk.env`, else the switch's default); `mark <text>` only writes a marker (the A/B arm).

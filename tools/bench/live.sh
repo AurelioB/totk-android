@@ -4,10 +4,10 @@
 #   e.g. live.sh -s X set TOTK_VK_DESC_STOCK=1 mark ab arm=B block=2
 #        live.sh -s X 'unset TOTK_VK_DESC_STOCK' 'mark ab arm=A block=1'
 #
-# Appends the lines to the running game's control file <game>/totk.ctl (runtime/live_ctl.h) in ONE write, so they apply
-# at the same frame boundary (one generation). Root (the serial's persistent root shell, rootsh.py) writes it with the
-# game folder's owner, mode 0600 and SELinux context (chcon --reference=<game dir>: a root-made file lacks the app's MLS
-# categories and the app could not read it). Then waits up to --wait seconds (default 10) for the game's [totk-ctl]
+# Publishes the lines as one atomic replacement of <game>/totk.ctl (runtime/live_ctl.h), so they apply at the same
+# frame boundary (one generation). Root (the serial's persistent root shell, rootsh.py) prepares a temp file with
+# the game folder's owner, mode 0600 and SELinux context before rename, so it is readable on first appearance.
+# Then waits up to --wait seconds (default 10) for the game's [totk-ctl]
 # lines in totk.log and prints them: the mark's line when there is a mark, refusals always. Exit 3 when a mark was not
 # acknowledged in time, 4 when the game refused a line (the other lines of the write still apply).
 set -u
@@ -52,15 +52,17 @@ root() { python3 "$HERE/rootsh.py" -s "$SER" run -c "$1"; }   # the serial's per
 # Lines already in the log, so only the answer to this write is shown.
 N0=$(root "grep -ac '\\[totk-ctl\\]' $LOG" 2>/dev/null | tr -d '\r')
 case $N0 in ""|*[!0-9]*) N0=0 ;; esac
-# Give the control file the game folder's owner / mode / context (create it if needed), then append the whole batch
-# with one cat (one write). The batch keeps its final newline: the game stages complete lines only, and an unterminated
-# last line would wait for (and run into) the next write. The lines were validated above, so none is the delimiter.
+# Publish only this batch, not a copy of old commands: replacement is read from the beginning. Prepare owner and
+# context before rename so neither an empty nor an unreadable root-owned control file is ever exposed.
+# Keep the final newline: the game stages complete lines only. Validated lines cannot contain the delimiter.
 REMOTE="umask 077
-[ -e $CTL ] || : > $CTL || exit 1
-chown \$(stat -c %u:%g $GAME) $CTL && chmod 0600 $CTL || exit 1
-chcon --reference=$GAME $CTL 2>/dev/null || chcon \$(ls -Zd $GAME | cut -d' ' -f1) $CTL || exit 1
-cat >> $CTL <<'TOTK_CTL_END'
-${LINES}TOTK_CTL_END"
+tmp=\$(mktemp $GAME/.totk.ctl.XXXXXX) || exit 1
+trap 'rm -f \"\$tmp\"' EXIT
+cat > \"\$tmp\" <<'TOTK_CTL_END'
+${LINES}TOTK_CTL_END
+chown \$(stat -c %u:%g $GAME) \"\$tmp\" && chmod 0600 \"\$tmp\" || exit 1
+chcon --reference=$GAME \"\$tmp\" 2>/dev/null || chcon \$(ls -Zd $GAME | cut -d' ' -f1) \"\$tmp\" || exit 1
+mv -f \"\$tmp\" $CTL"
 root "$REMOTE" || die "could not write $CTL (root, owner or SELinux context)"
 
 end=$(( $(date +%s) + WAIT )); shown=0; acked=""
