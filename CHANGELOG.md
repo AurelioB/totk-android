@@ -31,6 +31,7 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 - Preserve the scripted-camera 30 fps safety floor at 40 fps using a 33.333 ms producer period and matching
   two-/four-refresh slots on 60/120 Hz. If 120 Hz is unavailable, request at least 60 Hz content cadence so a
   30/60 Hz panel does not drop to 30 Hz; ADPF work targets and the existing 30/60 settings stay unchanged.
+  The 120 Hz three-refresh path is fixture-tested only, not yet device-qualified; device smokes remain at the user's 60 Hz limit.
 - **Keep the GPU busy** in Graphics → Performance feeds smaller batches earlier and requests clocks that keep up.
   On by default only on Snapdragon 8 Elite-class chips (Odin 3), independently of the chosen preset; it uses a
   little more GPU and CPU clock, power and heat. Restart-based Odin 3 tests raised Hateno from 46.5 to 57.3 fps

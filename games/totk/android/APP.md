@@ -3855,6 +3855,8 @@ scripted-camera/cutscene safety enforces a separate 33.333 ms producer floor, no
 While that floor is admitted, auto slots use two observed 60 Hz or four observed 120 Hz refreshes; completion
 returns immediately to the 40 fps policy. If 120 Hz is unavailable, auto40 requests at least 60 Hz content cadence
 to avoid a 30 Hz panel-mode fallback. This changes neither ADPF's work target nor the user's Android refresh policy.
+**Qualification:** 120 Hz three-refresh pacing is fixture-tested only, not yet device-qualified.
+The Thor and Odin smokes remained at the user's 60 Hz limit; they qualify the uneven fallback, not physical 120 Hz output.
 
 The 40 choice writes `TOTK_FPS60=1`, `TOTK_UNCAPPED=1`, `TOTK_UNCAPPED_HZ=40`, `TOTK_UNCAPPED_INTERVAL=1`,
 `TOTK_REALTIME=1`, `TOTK_FRAME_LAG=0`, `TOTK_FPS_AUTO=0`, `TOTK_PACE=0`, `TOTK_PRESENT_SLOTS=auto`,
