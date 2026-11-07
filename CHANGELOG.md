@@ -28,6 +28,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   at 40 with normal game speed and frame lag off, requesting 120 Hz when advertised. Presentation slots follow
   the actual display clock: smoothest on 120 Hz; on 60 Hz (including a user-imposed cap) it is uneven.
   Selecting 40 disables frame generation; returning to 30/60 removes the 40-specific timing and refresh request.
+- Preserve the scripted-camera 30 fps safety floor at 40 fps using a 33.333 ms producer period and matching
+  two-/four-refresh slots on 60/120 Hz. If 120 Hz is unavailable, request at least 60 Hz content cadence so a
+  30/60 Hz panel does not drop to 30 Hz; ADPF work targets and the existing 30/60 settings stay unchanged.
 - **Keep the GPU busy** in Graphics → Performance feeds smaller batches earlier and requests clocks that keep up.
   On by default only on Snapdragon 8 Elite-class chips (Odin 3), independently of the chosen preset; it uses a
   little more GPU and CPU clock, power and heat. Restart-based Odin 3 tests raised Hateno from 46.5 to 57.3 fps

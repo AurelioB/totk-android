@@ -41,7 +41,7 @@ class AndroidFrameRateHint(unittest.TestCase):
 #include <stdlib.h>
 #include <string.h>
 static pthread_once_t config_once = PTHREAD_ONCE_INIT;
-static int rate_on, fps60, framegen, lattice, hold_launch, hold_logged = -1;
+static int rate_on, fps60, framegen, lattice, auto40, hold_launch, hold_logged = -1;
 static unsigned rate_request;
 static _Atomic unsigned content_rate = 60, rate_override;
 static _Atomic uint64_t generated_presents;
@@ -150,6 +150,34 @@ int main(void) {
             rate_frame(1, 16666667); assert(totk_perf_rate() == 60);
         }
     }
+    /* A device denying120 must keep auto40 at60, including its cutscene30 floor,
+     * without changing the existing ADPF33.3ms work target. */
+    assert(!setenv("TOTK_FPS60", "1", 1) && !setenv("TOTK_PRESENT_SLOTS", "auto", 1));
+    assert(!setenv("TOTK_UNCAPPED", "1", 1) && !setenv("TOTK_UNCAPPED_HZ", "40", 1));
+    settings("1", "120"); framegen = lattice = 0;
+    jni_failure = 4; frame_rate_hint_update(&activity); jni_failure = 0;
+    rate_frame(1, 33333333); assert(totk_perf_rate() == 60);
+    rate_frame(2, 33333333); assert(totk_perf_rate() == 60);
+    assert(totk_adpf_target(25000000, 1, 0) == 33333333);
+    totk_perf_window(&window); totk_perf_surface(&tx, &surface);
+    assert(window_calls == 1 && surface_calls == 1 && window_hz == 60 && surface_hz == 60);
+    window_calls = surface_calls = 0;
+    assert(totk_frame_rate_minimum(0, 30) == 30);
+    assert(totk_frame_rate_minimum(0, 60) == 60);
+    assert(totk_frame_rate_minimum(1, 30) == 60);
+    assert(totk_frame_rate_minimum(1, 60) == 60);
+    assert(totk_frame_rate_minimum(1, 120) == 120);
+    for (int change = 0; change < 4; change++) {
+        const char *key[] = {"TOTK_UNCAPPED", "TOTK_UNCAPPED_HZ", "TOTK_PRESENT_SLOTS", "TOTK_FPS60"};
+        const char *before[] = {"1", "40", "auto", "1"};
+        const char *after[] = {"0", "55", "0", "0"};
+        assert(!setenv(key[change], after[change], 1));
+        settings("1", "0"); framegen = lattice = 0;
+        rate_frame(1, 33333333); assert(totk_perf_rate() == 30);
+        assert(!setenv(key[change], before[change], 1));
+    }
+    assert(!unsetenv("TOTK_UNCAPPED") && !unsetenv("TOTK_UNCAPPED_HZ"));
+    assert(!unsetenv("TOTK_PRESENT_SLOTS") && !unsetenv("TOTK_FPS60"));
     settings("1", "120"); framegen = lattice = 0;
     assert(totk_perf_rate_request() == 120);
     rate_frame(2, 33333333); assert(totk_perf_rate() == 30); /* not yet validated */

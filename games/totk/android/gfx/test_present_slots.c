@@ -192,7 +192,7 @@ static void auto40_policy(void) {
         assert(r.desired_ns == base + (uint64_t)(i + 1) * 3 * refresh120);
         assert(r.copy_open_ns == r.desired_ns);
     }
-    const double other_periods[] = {0, -1, 1.0 / 30, 1.0 / 60, 0.025001, 0.024999};
+    const double other_periods[] = {0, -1, 1.0 / 60, 0.025001, 0.024999};
     for (unsigned i = 0; i < sizeof other_periods / sizeof *other_periods; i++) {
         p = (vk_present_slots){0};
         r = vk_present_slots_auto40_reserve(&p, other_periods[i], base, refresh120, base);
@@ -207,6 +207,22 @@ static void auto40_policy(void) {
     p = (vk_present_slots){0};
     r = vk_present_slots_auto40_reserve(&p, 0.025, base, 8341675, base);
     assert(r.mode == VK_PRESENT_SLOTS_ACTIVE && r.interval == 3); /*119.88Hz*/
+    const uint64_t cutscene_refreshes[] = {refresh60, refresh120};
+    for (unsigned i = 0; i < 2; i++) {
+        uint64_t refresh = cutscene_refreshes[i], previous = 0;
+        p = (vk_present_slots){0};
+        for (unsigned frame = 0; frame < 600; frame++) {
+            unsigned interval = i ? 4 : 2;
+            uint64_t callback = base + (uint64_t)frame * interval * refresh;
+            r = vk_present_slots_auto40_reserve(&p, (1000000000ull / 30) / 1e9, callback, refresh, callback + 1);
+            assert(r.mode == VK_PRESENT_SLOTS_ACTIVE && r.interval == interval);
+            assert(r.desired_ns == callback + interval * refresh);
+            if (previous) assert(r.desired_ns - previous == interval * refresh);
+            previous = r.desired_ns;
+        }
+        r = vk_present_slots_auto40_reserve(&p, 0.025, previous, refresh, previous + 1);
+        assert(r.interval == (i ? 3 : 0) && r.desired_ns > previous);
+    }
 }
 static void auto40_transitions(void) {
     const uint64_t refresh120 = 8333333;

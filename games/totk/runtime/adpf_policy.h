@@ -40,6 +40,11 @@ static inline unsigned totk_frame_rate(unsigned real_hz, int framegen, int latti
     /* A 30-Hz physical mode would turn the two-slot 30fps lattice into 15fps. */
     return framegen || lattice || real_hz >= 60 ? 60 : 30;
 }
+/* The opt-in auto40 profile must not select a physical30Hz mode, even while
+ * its scripted-camera floor is active. Preserve higher validated overrides. */
+static inline unsigned totk_frame_rate_minimum(int auto40, unsigned hz) {
+    return auto40 && hz < 60 ? 60 : hz;
+}
 /* Startup-only integer decimal Hz; 0/unset disables the override. The actual window display must separately
  * advertise the requested rate before it is used. Reject signs, fractions, suffixes and overflow. */
 static inline int totk_frame_rate_hint_parse(const char *s, unsigned *hz) {

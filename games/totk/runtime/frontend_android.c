@@ -1129,7 +1129,7 @@ static int android_display_vsync_start(void) {
                 slack && !strcmp(slack, "1") ? "requested" : "off",
                 display_pace_on ? "display" : "legacy 60 Hz");
     if (present_slots_auto)
-        fprintf(stderr, "[totk-pace] presenter slots auto requested: UNCAPPED=1/HZ=40 +25ms frames + observed120Hz use interval3; other caps/refresh/unknown/stale clock retain producer pacing; auto never enables acquire lead or frame lag\n");
+        fprintf(stderr, "[totk-pace] presenter slots auto requested: UNCAPPED=1/HZ=40 +25ms frames + observed120Hz use interval3; scripted30 floor uses interval2/4 at60/120Hz; other caps/refresh/unknown/stale clock retain producer pacing; auto never enables acquire lead or frame lag\n");
     if (acquire_clock_on)
         fprintf(stderr, "[totk-pace] acquire clock available (TOTK_ACQUIRE_CLOCK=vsync): persistent real-vsync lattice, guest interval; strict >one-period stall reanchor, bounded catch-up; VI %s\n",
                 display_pace_on ? "display" : "legacy 60 Hz");

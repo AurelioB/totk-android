@@ -22,7 +22,7 @@
 static pthread_once_t config_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t thread_key;
-static int mode, rate_on, fps60, framegen, lattice, registry_dirty, key_ready;
+static int mode, rate_on, fps60, framegen, lattice, auto40, registry_dirty, key_ready;
 static int (*window_rate)(ANativeWindow *, float, int8_t);
 static void (*surface_rate)(ASurfaceTransaction *, ASurfaceControl *, float, int8_t, int8_t);
 static totk_adpf_api api;
@@ -109,6 +109,8 @@ static void configure(void) {
         fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u ignored: needs TOTK_FRAME_RATE_HINT=1\n", rate_request);
         rate_request = 0;
     }
+    const char *slots = getenv("TOTK_PRESENT_SLOTS"), *cap = getenv("TOTK_UNCAPPED_HZ");
+    auto40 = slots && !strcmp(slots, "auto") && is_one("TOTK_UNCAPPED") && cap && !strcmp(cap, "40");
     span_applied = span_launch = is_one("TOTK_ADPF_GPU");
     load_applied = load_launch = is_one("TOTK_ADPF_LOAD_HINT");
     cpu_split_applied = cpu_split_launch = is_one("TOTK_ADPF_CPU_SPLIT");
@@ -340,6 +342,7 @@ static void rate_frame(int guest_interval, int64_t target) {
         hz = totk_rate_hold_step(&rate_hold, totk_output_rate(guest_interval, generating, lattice),
             mono_ns(), (uint64_t)hold_ms * 1000000);
     }
+    hz = totk_frame_rate_minimum(auto40 && fps60 && !framegen, hz);
     atomic_store_explicit(&content_rate, hz, memory_order_relaxed);
 }
 void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_interval) {

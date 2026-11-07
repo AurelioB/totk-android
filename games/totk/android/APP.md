@@ -3851,7 +3851,10 @@ window/SurfaceControl hints, but cannot override the user's peak-refresh setting
 Only an actually observed 120 Hz display clock enables the three-refresh presentation slots; a 60 Hz-only or
 60 Hz-limited display keeps a 25 ms producer cap without slots, displaying alternating one/two-refresh holds.
 A successful hint alone does not establish 120 Hz or even presentation. Busy scenes may still miss the 40 fps cap;
-the existing scripted-camera/cutscene 30 fps safety floor remains in force.
+scripted-camera/cutscene safety enforces a separate 33.333 ms producer floor, not a rounded 25 ms tick.
+While that floor is admitted, auto slots use two observed 60 Hz or four observed 120 Hz refreshes; completion
+returns immediately to the 40 fps policy. If 120 Hz is unavailable, auto40 requests at least 60 Hz content cadence
+to avoid a 30 Hz panel-mode fallback. This changes neither ADPF's work target nor the user's Android refresh policy.
 
 The 40 choice writes `TOTK_FPS60=1`, `TOTK_UNCAPPED=1`, `TOTK_UNCAPPED_HZ=40`, `TOTK_UNCAPPED_INTERVAL=1`,
 `TOTK_REALTIME=1`, `TOTK_FRAME_LAG=0`, `TOTK_FPS_AUTO=0`, `TOTK_PACE=0`, `TOTK_PRESENT_SLOTS=auto`,

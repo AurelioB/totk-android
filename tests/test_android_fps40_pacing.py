@@ -181,6 +181,7 @@ int main(int argc, char **argv) {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "games/totk/android/gfx/vk_present_slots.h"
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
 enum { MFX_OFF, MFX_HALF, MFX_30, MFX_MAX };
 #define UNCAPPED_HZ 120
@@ -200,6 +201,15 @@ static int runtime_android_display_pace_active(void) { return 0; } /* PACE=0, as
 static int runtime_android_display_hz(void) { return (int)((1000000000 + actual_refresh / 2) / actual_refresh); }
 static unsigned (*runtime_cutscene_present_ticks)(unsigned, uint64_t);
 static int uncapped_interval_on(void) { return atoi(getenv("TOTK_UNCAPPED_INTERVAL")) != 0; }
+static int scripted_camera, cutscene_calls;
+static unsigned cutscene_floor(unsigned ticks, uint64_t refresh) {
+    cutscene_calls++;
+    /* Same physical-tick rounding as the runtime authority: a25ms tick would
+     * round the30fps floor back to1. The producer must ask in guest60 units. */
+    assert(refresh == 1000000000ull / 60);
+    unsigned floor = (unsigned)((1000000000ull / 30 + refresh / 2) / refresh);
+    return scripted_camera && ticks < floor ? floor : ticks;
+}
 '''
         source += section(stubs, 'int mtl_display_hz(void) { return runtime_android_display_pace_active()', 'int mtl_link_wait_tick(')
         source += section(producer, 'static int uncapped_now(void)', '/* 30+30 on a display')
@@ -220,6 +230,37 @@ int main(void) {
         assert(present_period(&window) == 25000000 && g_hz == 40 && uncapped_now());
         assert(present_ticks(&window) == 1 && !g_display_mode);
     }
+    runtime_cutscene_present_ticks = cutscene_floor;
+    scripted_camera = 1; window.interval = 2;
+    for (unsigned i = 0; i < 2; i++) {
+        actual_refresh = refreshes[i];
+        vk_present_slots slots = {0};
+        uint64_t previous = 0;
+        for (unsigned frame = 0; frame < 600; frame++) {
+            window.interval = frame & 1 ? 1 : 2;
+            cutscene_calls = 0;
+            uint64_t period = present_period(&window);
+            assert(period == 33333333 && cutscene_calls == 1);
+            unsigned interval = i ? 4 : 2;
+            uint64_t callback = 1000000000ull + (uint64_t)frame * interval * actual_refresh;
+            vk_present_slot picture = vk_present_slots_auto40_reserve(&slots, period / 1e9,
+                callback, actual_refresh, callback + 1);
+            assert(picture.mode == VK_PRESENT_SLOTS_ACTIVE && picture.interval == interval);
+            if (previous) assert(picture.desired_ns - previous == interval * actual_refresh);
+            previous = picture.desired_ns;
+        }
+        scripted_camera = 0;
+        assert(present_period(&window) == 25000000); /* Completion/expiry releases the floor immediately. */
+        vk_present_slot resumed = vk_present_slots_auto40_reserve(&slots, present_period(&window) / 1e9,
+            previous, actual_refresh, previous + 1);
+        assert(resumed.interval == (i ? 3 : 0) && resumed.desired_ns > previous);
+        scripted_camera = 1;
+    }
+    assert(!setenv("TOTK_UNCAPPED_INTERVAL", "0", 1));
+    window.interval = 2;
+    assert(present_period(&window) == 50000000); /* A slower explicit guest interval is not shortened. */
+    assert(!setenv("TOTK_UNCAPPED_INTERVAL", "1", 1));
+    runtime_cutscene_present_ticks = NULL;
     assert(!setenv("TOTK_UNCAPPED_HZ", "55", 1)); g_hz = -1;
     assert(present_period(&window) == 1000000000 / 55 && g_hz == 55); /* Developer cap wins. */
     assert(!setenv("TOTK_UNCAPPED", "0", 1)); g_hz = -1;
