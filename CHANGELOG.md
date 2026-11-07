@@ -11,6 +11,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Per-thread period-weighted self/inclusive reports separate walker, recorder, submit and game CPU.
 - Give newly linked `libtotk.so` a SHA-1 GNU build ID retained in the packaged library,
   so native profiles can identify matching unstripped symbols without relying on source revision alone.
+- Add experimental `TOTK_FRAME_RATE_HINT_HZ` (default off, needs `TOTK_FRAME_RATE_HINT=1`): request only integer
+  rates advertised by the current game-window display, through the existing FIXED_SOURCE window/AHB-child hints.
+  Invalid or unavailable rates retain the old hint policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).

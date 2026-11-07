@@ -39,6 +39,7 @@
 #include "live_ctl.h"
 #include "thread_sampler.h"
 #include "build_kind.h"
+#include "android_perf.h"
 #include <android/api-level.h>
 #include <android/choreographer.h>
 #include <android/asset_manager.h>
@@ -2086,6 +2087,25 @@ static jmethodID surface_parent_method(JNIEnv *env, jobject obj, const char *nam
     (*env)->DeleteLocalRef(env, cls);
     return method;
 }
+/* Validate before publishing a new window, and again on existing window/display lifecycle notifications.
+ * A previous window's accepted override must never authorize a rate on a different display. */
+static void frame_rate_hint_update(ANativeActivity *a) {
+    unsigned requested = totk_perf_rate_request();
+    if (!requested) return;   /* Off leaves the existing path unchanged, including no Java query. */
+    JNIEnv *env = a->env;
+    jmethodID method = surface_parent_method(env, a->clazz, "supportsFrameRateHint", "(I)Z");
+    jboolean supported = method && !(*env)->ExceptionCheck(env) ?
+        (*env)->CallBooleanMethod(env, a->clazz, method, (jint)requested) : JNI_FALSE;
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        supported = JNI_FALSE;
+        fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u refused: display query JNI error; retaining existing policy\n", requested);
+    } else if (!method || !supported) {
+        fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u refused: unavailable or not advertised by current window display; retaining existing policy\n", requested);
+    }
+    totk_perf_rate_override(supported ? requested : 0);
+    if (supported) fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u validated for current window display; FIXED_SOURCE request, not observed panel cadence\n", requested);
+}
 /* Optional Java32 root hint listener, never a guessed panel orientation or a
  * default-display query. Keep JNI and AttachedSurfaceControl on this UI thread.
  * The successful explicit parent attachment gates the initial hint query.
@@ -2301,6 +2321,7 @@ static void window_clear(ANativeActivity *a) {
     g_window_display_id = -1;
 }
 static void surface_parent_retry(ANativeActivity *a, ANativeWindow *w, const char *event) {
+    if (w && w == g_window) frame_rate_hint_update(a);
     if (w && w == g_window && g_window_ahb && !g_surface_parent_window && surface_parent_create(a, event))
         g_window_epoch = vk_window_set(g_window, g_surface_parent_window, g_window_display_id);
     if (w && w == g_window) present_transform_update(a,g_window_epoch);
@@ -2311,6 +2332,7 @@ static void on_window_created(ANativeActivity *a, ANativeWindow *w) {
     g_window = w;
     const char *present = getenv("TOTK_VK_PRESENT");
     g_window_ahb = !present || !*present || !strcmp(present, "ahb");
+    frame_rate_hint_update(a);
     if (g_window_ahb) surface_parent_create(a, "created");
     g_window_epoch = vk_window_set(w, g_surface_parent_window, g_window_display_id);
     present_transform_update(a,g_window_epoch);
@@ -2387,6 +2409,7 @@ static void on_resume(ANativeActivity *a) {
     (void)a;
     game_input_after_ns = (int64_t)mono_ns();
     android_game_lifecycle_pause(0);
+    if (g_window) frame_rate_hint_update(a);
     /* The focus facet may still hold the gate until the window regains focus. */
     vk_window_resized(g_window, g_window_epoch);
     present_transform_update(a,g_window_epoch);

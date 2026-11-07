@@ -3868,6 +3868,7 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 | `TOTK_ADPF` | Existing render-only session (unset/`legacy`) | `0` disables all CPU hints; `full` opts into the bounded critical-thread group, profile-derived targets and wait-stripped work reporting. |
 | `TOTK_ADPF_TARGET_MS` | `33.3` | Existing render-only target override; nonpositive disables the legacy session. Retained for existing profiles; ignored by `TOTK_ADPF=full`. |
 | `TOTK_FRAME_RATE_HINT` | `0` | `1` requests FIXED_SOURCE content cadence through the window and zero-copy SurfaceControl. It is only a request, never evidence of a panel-mode change. |
+| `TOTK_FRAME_RATE_HINT_HZ` | unset (`0`, off) | Startup-only integer decimal Hz override; needs `TOTK_FRAME_RATE_HINT=1` and a matching mode advertised by the current window display. Invalid/unavailable rates retain the existing policy. See below. |
 | `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
 | `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
 
@@ -3965,10 +3966,10 @@ nothing in our hint code; session creation happens only at configuration changes
 without a physical-clock lattice; fixed present slots, display pacing or acquire clocks
 retain a 60fps request so a 30Hz panel mode cannot turn two physical slots into 15fps.
 The SurfaceControl request is also applied to the actual zero-copy child, not only its
-parent window, and permits seamless switches only. No custom display-mode override is
-set. Panel offerings, request acceptance and actual per-layer SurfaceFlinger cadence must
-be measured separately on each handheld. A successful window return/void transaction or
-our fence diagnostics does not prove 60Hz physical scanout.
+parent window, and permits seamless switches only. No preferred display mode or Android setting is
+written. Panel offerings, request acceptance and actual physical panel cadence must be measured separately
+on each handheld. Game frame intervals, framework/SurfaceFlinger fences and physical scanout are distinct:
+a successful window return, void transaction or fence diagnostic does not prove a panel-rate change.
 
 `TOTK_RATE_HINT_HOLD=<ms>` (default unset/0 = the configured rate above; 5000 is the design value; live through
 `totk.ctl` at the next guest present; needs `TOTK_FRAME_RATE_HINT=1`) requests the window's output rate instead: the
@@ -3977,6 +3978,20 @@ most 30, so 20 real + generated asks for 40, not a forced 60), at least 60 on th
 rate of the last `<ms>`: up at once, down only after the lower rate held that long. Never the measured present period,
 which follows a panel that took a lower request. Logs `[totk-perf] TOTK_RATE_HINT_HOLD=N ms (launch|live)`; each
 change still logs `window frame-rate hint=`. Measure the number of those lines and fps dips after 60→30→60 per arm.
+
+`TOTK_FRAME_RATE_HINT_HZ=120` plus `TOTK_FRAME_RATE_HINT=1` is an experimental app-side FIXED_SOURCE
+request on both the native window and actual AHB child. Unset/empty/`0` keeps the exact existing hint
+policy. Only integer decimal Hz is accepted (no signs, fractions or suffixes); the current window's
+`decorView.getDisplay().getSupportedModes()` must advertise that rate within 0.01 Hz, allowing float
+rounding such as 120.00001 but not substituting a distinct fractional mode. There is no default-display
+fallback. Window creation/recreation and existing readiness/configuration/focus/resume callbacks
+revalidate against the current window display; a missing display, unadvertised rate or JNI failure logs
+a refusal and restores the old hint policy. A validated override takes precedence over per-frame
+content-rate recomputation and `TOTK_RATE_HINT_HOLD`, but changes no game/presentation pacing.
+`TOTK_FRAME_RATE_HINT=0` leaves the override ineffective and logs that it requires `=1`.
+This is not a preferred-mode/system-setting write and cannot override an OS/user refresh-rate vote.
+Treat an accepted hint only as a request; measure game intervals, framework fences and real physical
+panel cadence separately before claiming even 40 fps at 120 Hz.
 
 Device comparison arms are unchanged default / `TOTK_ADPF=0` /
 `TOTK_ADPF=full` / `TOTK_ADPF=full TOTK_FRAME_RATE_HINT=1`, interleaved on the same

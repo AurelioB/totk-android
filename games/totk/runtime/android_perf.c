@@ -31,6 +31,8 @@ static int64_t legacy_target;
 static unsigned logged, frames;
 static uint64_t previous_frame, sample_time;
 static _Atomic unsigned content_rate = 60;
+static unsigned rate_request;
+static _Atomic unsigned rate_override;
 /* TOTK_RATE_HINT_HOLD (ms; 0 = the configured rate as before): launch value, live cache, the guest present thread's
  * hold state, the value it last logged, and generated outputs the presenter queued (frame generation is running). */
 static int hold_launch, hold_logged = -1;
@@ -99,6 +101,14 @@ static void configure(void) {
     legacy_target = ms > 0 && ms < 1000 ? (int64_t)(ms * 1e6) : 0;
     if (mode == 1 && !legacy_target) mode = 0;
     rate_on = is_one("TOTK_FRAME_RATE_HINT"); fps60 = is_one("TOTK_FPS60");
+    const char *hint = getenv("TOTK_FRAME_RATE_HINT_HZ");
+    if (!totk_frame_rate_hint_parse(hint, &rate_request)) {
+        fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%s refused: expected integer decimal Hz; retaining existing policy\n", hint);
+        rate_request = 0;
+    } else if (rate_request && !rate_on) {
+        fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u ignored: needs TOTK_FRAME_RATE_HINT=1\n", rate_request);
+        rate_request = 0;
+    }
     span_applied = span_launch = is_one("TOTK_ADPF_GPU");
     load_applied = load_launch = is_one("TOTK_ADPF_LOAD_HINT");
     cpu_split_applied = cpu_split_launch = is_one("TOTK_ADPF_CPU_SPLIT");
@@ -413,9 +423,19 @@ void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_i
     else log_changes(totk_adpf_report(&session, &api, work));
     pthread_mutex_unlock(&mu);
 }
+unsigned totk_perf_rate_request(void) {
+    pthread_once(&config_once, configure);
+    return rate_request;
+}
+void totk_perf_rate_override(unsigned hz) {
+    pthread_once(&config_once, configure);
+    atomic_store_explicit(&rate_override, rate_on && hz == rate_request ? hz : 0, memory_order_relaxed);
+}
 unsigned totk_perf_rate(void) {
     pthread_once(&config_once, configure);
-    return rate_on ? atomic_load_explicit(&content_rate, memory_order_relaxed) : 0;
+    if (!rate_on) return 0;
+    unsigned override = atomic_load_explicit(&rate_override, memory_order_relaxed);
+    return override ? override : atomic_load_explicit(&content_rate, memory_order_relaxed);
 }
 void totk_perf_window(ANativeWindow *window) {
     unsigned hz = totk_perf_rate();
