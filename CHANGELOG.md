@@ -13,6 +13,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   so native profiles can identify matching unstripped symbols without relying on source revision alone.
 
 ### Runtime
+- Fill screens larger than the docked 1920×1080 canvas instead of showing it 1:1 inside black bars (e.g. a
+  2400×1504 tablet used 57% of the panel, now 90%). The front buffer keeps the canvas size; the compositor
+  destination (or the copy fallback's blit) is aspect-fitted to the window. Panels no larger than the canvas,
+  such as the Odin's 1920×1080, are unchanged.
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
   Normal launches no longer start its tail thread or wake logd for every frame log. Crash reports remain enabled.
 - Let the live-control reader sleep when `totk.ctl` is absent, including after unrelated files are created or deleted.
