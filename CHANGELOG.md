@@ -24,6 +24,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   incrementing an atomic counter every frame; publish immutable stage names only when they change.
 
 ### Menu
+- Add **40 fps** to Frame rate without changing existing presets or 30/60 settings. It caps real game updates
+  at 40 with normal game speed and frame lag off, requesting 120 Hz when advertised. Presentation slots follow
+  the actual display clock: smoothest on 120 Hz; on 60 Hz (including a user-imposed cap) it is uneven.
+  Selecting 40 disables frame generation; returning to 30/60 removes the 40-specific timing and refresh request.
 - **Keep the GPU busy** in Graphics → Performance feeds smaller batches earlier and requests clocks that keep up.
   On by default only on Snapdragon 8 Elite-class chips (Odin 3), independently of the chosen preset; it uses a
   little more GPU and CPU clock, power and heat. Restart-based Odin 3 tests raised Hateno from 46.5 to 57.3 fps

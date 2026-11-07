@@ -3844,6 +3844,28 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 60 then only renders a few surplus frames. On the AYN Thor that was 31.8 fps at 4.94 W against 30.0 fps at 4.81 W.
 `TOTK_FPS60=1` in `totk.env` turns the patch on.
 
+The menu's **Frame rate** choices are **30 / 40 / 60 fps**; no preset or device recommendation changes.
+**40 fps** is a real-game-update cap, not frame generation, and keeps measured `TOTK_REALTIME=1` game speed.
+Smoothest on 120 Hz displays; on 60 Hz it is uneven. The app requests an advertised 120 Hz mode through its
+window/SurfaceControl hints, but cannot override the user's peak-refresh setting or other Android policy.
+Only an actually observed 120 Hz display clock enables the three-refresh presentation slots; a 60 Hz-only or
+60 Hz-limited display keeps a 25 ms producer cap without slots, displaying alternating one/two-refresh holds.
+A successful hint alone does not establish 120 Hz or even presentation. Busy scenes may still miss the 40 fps cap;
+the existing scripted-camera/cutscene 30 fps safety floor remains in force.
+
+The 40 choice writes `TOTK_FPS60=1`, `TOTK_UNCAPPED=1`, `TOTK_UNCAPPED_HZ=40`, `TOTK_UNCAPPED_INTERVAL=1`,
+`TOTK_REALTIME=1`, `TOTK_FRAME_LAG=0`, `TOTK_FPS_AUTO=0`, `TOTK_PACE=0`, `TOTK_PRESENT_SLOTS=auto`,
+`TOTK_ACQUIRE_SLACK=0`, `TOTK_ACQUIRE_CLOCK=0`, `TOTK_FRAME_RATE_HINT=1`, and `TOTK_FRAME_RATE_HINT_HZ=120`.
+Frame generation switches back to real 30; selecting 40 turns frame generation off. Latency is fixed for 40,
+and frame lag stays off. Returning to 30/60 removes all 40-specific lines and the 120 Hz request.
+Developer `totk.env` is still read last: explicit overrides, including `TOTK_UNCAPPED=0`, win and can invalidate
+the menu's pacing contract. Leave `DM_PRESENT_HZ` and `DM_PRESENT_INTERVAL` unset for the 40 producer path.
+
+`TOTK_PRESENT_SLOTS=auto` is startup-only and opt-in (the menu writes it only at 40); explicit `0`/`1`
+retain their existing behavior. It selects slots from the observed display clock, not the advertised mode list.
+Measure delivered-fence/SurfaceFlinger interval shares near 25 ms versus 16.7/33.3 ms and record effective
+display mode; producer fps alone cannot show even pacing.
+
 | Frame-rate option | Android default | Effect |
 | --- | --- | --- |
 | `TOTK_FPS60` | `0` | `1` permits the game's 60-fps controller; `0` retains the shipping 30-fps minimum interval. |
