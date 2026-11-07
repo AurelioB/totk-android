@@ -566,6 +566,19 @@ class Analyzer(unittest.TestCase):
                     self.assertTrue(all(g['estimated_gpu_ms'] is None and g['eligible_estimated_gpu_ms'] is None
                                         and not g['counts_complete'] for g in pipeline['pipelines']))
 
+    def test_sink_overflow_is_independent_fail_closed_authority(self):
+        for rows in compact_runs(frames=1024, truth=True):
+            changed = [dict(r, output_sink_overflows=1) if r['type'] == 'session_end' else r for r in rows]
+            report = self.analyze(changed)
+            self.assertEqual(report['coverage']['output_failures'], 0)
+            self.assertEqual(report['coverage']['output_sink_overflows'], 1)
+            self.assertIn('output_sink_overflows', report['pipelines']['censor_reasons'])
+            self.assertTrue(all(g['eligible_estimated_gpu_ms'] is None and not g['counts_complete']
+                                for g in report['pipelines']['pipelines']))
+        for value in (-1, True, 0.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                gpuprof.validate(session_end(output_sink_overflows=value))
+
     def test_pipeline_compact_strict_numeric_columns_and_exposure(self):
         _, rows = compact_runs(frames=1)
         summary = next(r for r in rows if r['type'] == 'pipeline_window')
@@ -1871,6 +1884,52 @@ class Analyzer(unittest.TestCase):
         self.assertIn('inconsistent-session-launch', replay['streams'][0]['authority_reasons'])
 
 
+@unittest.skipUnless(os.environ.get('GPUPROF_TEST_BIN'), 'set GPUPROF_TEST_BIN for the host worker fixture')
+class CompactSink(unittest.TestCase):
+    def test_sink_is_bounded_nonblocking_and_preserves_bytes_across_wrap(self):
+        binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
+        result = subprocess.run([str(binary), '--sink-contract'], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('failures=0 capacity_bytes=1048576 peak_bytes=1048576 overflows=1 output_failures=1',
+                      result.stdout)
+        self.assertIn('bytes_checked=2097252', result.stdout)
+
+    def test_device_rate_gpu_holds_and_writer_stall_do_not_block_lease_consumer(self):
+        binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
+        for coupled in (1, 0):
+            with self.subTest(coupled=coupled), tempfile.TemporaryDirectory(dir=binary.parent) as temporary:
+                env = dict(os.environ, TOTK_VK_GPU_PROFILE_PIPELINES_RAW='0')
+                args = ['--compact-fixture', '--frames', '330', '--fps', '30', '--pace', '1',
+                        '--parts', '18', '--gpu-held', '8', '--nonblocking', '1',
+                        '--writer-stall-ms', '200', '--coupled-stall', str(coupled), '--sample-budget', '2',
+                        '--spread-percent', '60']
+                run = subprocess.run([str(binary), *args], cwd=temporary, env=env,
+                                     capture_output=True, text=True, timeout=40)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                report = gpuprof.analyze([str(Path(temporary) / 'gpuprof-*.jsonl*')])
+                footer = report['sessions'][0]['end']
+                self.assertTrue(footer['clean_end'])
+                self.assertEqual(footer['output_sink_overflows'], 0)
+                self.assertLessEqual(footer['output_sink_peak_bytes'], 1 << 20)
+                if coupled:
+                    self.assertGreater(footer['background_dropped_slots'], 0)
+                    self.assertEqual(footer['background_dropped_inflight_only'], 0)
+                    self.assertEqual(footer['background_dropped_with_worker_backlog'],
+                                     footer['background_dropped_slots'])
+                    self.assertTrue(footer['background_drop_frames'])
+                    self.assertTrue(all(300 <= d[0] <= 330 and d[2] >= 15
+                                        for d in footer['background_drop_frames']))
+                    self.assertTrue(any(d[5] & 16 for d in footer['background_drop_frames']))
+                    self.assertTrue(report['pipelines']['censored'])
+                else:
+                    self.assertEqual(footer['background_dropped_slots'], 0)
+                    self.assertEqual(footer['pending_frame_closures'], 0)
+                    self.assertEqual(footer['background_drop_frames'], [])
+                    self.assertEqual(report['coverage']['streams_without_end'], 0)
+                    self.assertEqual(report['pipelines']['coverage']['invalid_coverage'], 0)
+                    self.assertFalse(report['pipelines']['censored'], report['pipelines']['censor_reasons'])
+
+
 @unittest.skipUnless(os.environ.get('GPUPROF_TEST_BIN'), 'set GPUPROF_TEST_BIN to run the real Vulkan fixture')
 class Lavapipe(unittest.TestCase):
     def launch(self, mode, workers, stats, *, unsupported=False, rotate=False, areas=False, ordinals=None,
@@ -1985,6 +2044,15 @@ class Lavapipe(unittest.TestCase):
                 self.assertEqual(first['background_slots'], 32)
                 self.assertEqual(first['background_worker'], 'totk-gpuprof')
                 self.assertEqual(first['background_closures'], 256)
+                budget = sample_budget or 0
+                self.assertEqual(first['parent_query_count_per_lease'],
+                                 (budget * 2 * 64 if budget else 4096) + 130)
+                pipe_budget = pipeline_budget if isinstance(pipeline_budget, int) and 1 <= pipeline_budget <= 16 else 0
+                self.assertEqual(first['pipeline_query_count_per_lease'], pipe_budget * 2 * 64)
+                self.assertEqual(first['pipeline_record_capacity'], 1024 + pipe_budget * 64 if pipe_budget else 0)
+                self.assertGreaterEqual(first['worker_effective_nice'], -20)
+                self.assertLessEqual(first['worker_effective_nice'], 19)
+                self.assertTrue(first['worker_affinity'])
                 if sample_budget:
                     self.assertEqual(first['sample_budget'], sample_budget)
                     self.assertEqual(first['env']['TOTK_VK_GPU_PROFILE_SAMPLE'], str(sample_budget))

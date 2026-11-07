@@ -68,6 +68,38 @@ def validate_pipeline_key(row):
     return row
 
 
+def validate_worker_diagnostics(row):
+    for key in ('output_sink_overflows', 'output_sink_peak_bytes', 'output_sink_capacity_bytes',
+                'worker_nice_errno', 'worker_service_count', 'background_dropped_with_worker_backlog',
+                'background_dropped_inflight_only', 'background_drop_frame_overflow'):
+        if key in row:
+            number(row, key, True)
+    for key in ('worker_service_cpu_ms', 'worker_service_wall_ms', 'worker_service_wall_max_ms',
+                'worker_query_wall_ms', 'worker_reset_wall_ms', 'worker_report_wall_ms',
+                'worker_queue_wait_max_ms'):
+        if key in row:
+            number(row, key)
+    if 'worker_effective_nice' in row and not -20 <= number(row, 'worker_effective_nice', True, -20) <= 19:
+        raise ValueError('worker_effective_nice: outside Linux nice range')
+    if 'background_drop_frames' in row:
+        events = row['background_drop_frames']
+        if not isinstance(events, list) or len(events) > 64:
+            raise ValueError('background_drop_frames: expected bounded per-frame summary')
+        previous, total = 0, 0
+        for values in events:
+            if not isinstance(values, list) or len(values) != 6:
+                raise ValueError('background_drop_frames: expected six columns')
+            d = dict(zip(('frame', 'count', 'queued', 'active', 'inflight', 'phases'), values))
+            for key in d:
+                number(d, key, True, 1 if key in ('frame', 'count') else 0)
+            if d['frame'] <= previous or d['queued'] > 32 or d['active'] > 1 or d['inflight'] > 32 or d['phases'] > 31:
+                raise ValueError('background_drop_frames: invalid order, lease count or phase mask')
+            previous = d['frame']
+            total += d['count']
+        if total > row.get('background_dropped_slots', 0):
+            raise ValueError('background_drop_frames: exceeds cumulative losses')
+
+
 def validate_pipeline_compact(row):
     if row['type'] == 'pipeline_key':
         return validate_pipeline_key(row)
@@ -369,7 +401,8 @@ def pipeline_report(by_type, loss):
     coverage['missing_compact_windows'] = len(missing_compact_contexts)
     loss_keys = ('malformed_rows', 'truncated_rows', 'conflicting_rows', 'missing_frame_ids',
                  'missing_windows', 'rotation_evictions', 'missing_rotation_files', 'header_conflicts',
-                 'output_failures', 'background_dropped_slots', 'background_dropped_closures', 'streams_without_end')
+                 'output_failures', 'output_sink_overflows', 'background_dropped_slots',
+                 'background_dropped_closures', 'streams_without_end')
     complete = not compact_losses and not any(coverage[key] for key in (
         'dropped_groups', 'discarded_groups', 'discarded_segments', 'missing_selected', 'invalid_coverage',
         'missing_headers', 'missing_dictionary', 'missing_compact_windows', 'missing_compact_frames')) and not any(
@@ -620,6 +653,7 @@ def validate(row):
     if not isinstance(row, dict) or type(row.get('schema')) is not int or row['schema'] != 3:
         raise ValueError('expected object with schema=3')
     kind = row.get('type')
+    validate_worker_diagnostics(row)
     if kind in ('pipeline', 'pipeline_coverage'):
         return validate_pipeline(row)
     if kind in ('pipeline_key', 'pipeline_window', 'pipeline_window_coverage'):
@@ -1135,6 +1169,9 @@ def retention(observations, issues):
         output_failures = max((r.get('output_failures', 0) for r in rows), default=0)
         if output_failures:
             issues.append(f'{stream}: producer reports {output_failures} cumulative output failure(s)')
+        sink_overflows = max((r.get('output_sink_overflows', 0) for r in rows), default=0)
+        if sink_overflows:
+            issues.append(f'{stream}: bounded profiler output sink overflowed {sink_overflows} time(s)')
         background_drops = max((r.get('background_dropped_slots', 0) for r in rows), default=0)
         if background_drops:
             issues.append(f'{stream}: profiler background backlog dropped {background_drops} slot(s); '
@@ -1148,6 +1185,7 @@ def retention(observations, issues):
                              missing_windows=missing, rotation_evictions=evictions,
                              missing_rotation_files=missing_files, header_conflict=header_conflict,
                              output_failures=output_failures, background_dropped_slots=background_drops,
+                             output_sink_overflows=sink_overflows,
                              background_dropped_closures=closure_drops,
                              query_drain_timed_out=ends[0].get('query_drain_timed_out') if len(ends) == 1 else None,
                              pending_frame_closures=ends[0].get('pending_frame_closures') if len(ends) == 1 else None,
@@ -1563,6 +1601,7 @@ def analyze(paths, legacy_span_replay=False, per_window=False, frame_close_repla
                      'streams_without_end': sum(not s['clean_end'] for s in sessions),
                      'header_conflicts': sum(s['header_conflict'] for s in sessions),
                      'output_failures': sum(s['output_failures'] for s in sessions),
+                     'output_sink_overflows': sum(s['output_sink_overflows'] for s in sessions),
                      'background_dropped_slots': sum(s['background_dropped_slots'] for s in sessions),
                      'background_dropped_closures': sum(s['background_dropped_closures'] for s in sessions),
                      'ordinal_metadata_mismatches': ordinal_mismatches,

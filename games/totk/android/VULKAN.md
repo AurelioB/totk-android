@@ -1472,8 +1472,9 @@ measurements, the ownership contract is:
   worker; startup may wait for readiness once. Thereafter the walker takes a prepared lease with
   a short private O(1) mutex operation, without query resets, result reads, formatting or I/O.
   Existing fence completion only detaches/enqueues the fenced lease and releases the game ring slot.
-  The profiler worker alone reads results without WAIT or polling, aggregates, formats, writes/logs,
-  resets queries and returns prepared leases. The bounded 32-lease FIFO never blocks the game
+  The profiler worker reads results without WAIT or polling, aggregates, formats, resets queries
+  and returns prepared leases. Compact file writes/flushes run on the separate `totk-prof-io` sink.
+  The bounded 32-lease FIFO never blocks the game
   for output: no available lease means dropped profiler coverage, recorded by cumulative
   `background_dropped_slots` and missing frame coverage. Its mutex is not the recorder-worker mutex.
   CPU frame closure has its own bounded 256-entry FIFO under the same private background mutex:
@@ -1576,13 +1577,19 @@ measurements, the ownership contract is:
   full launch bits (`pipeline_phase`); compact exposure strata retain actual population and selection weights.
   Actual GPU timing includes timestamp cost and intervening GPU state/setup; ALL_COMMANDS can serialize
   work/change tiled scheduling. A group is not an isolated shader invocation or marginal cost.
-  Bounds: at most **2k extra timestamp writes/frame**, 2048 metadata records/lease and 1024 query pairs/
-  lease (64 frame segments × max budget 16); 32 prepared leases bound backlog. Space for ALL selected
-  groups is reserved; optional unselected detail uses at most 1024 records/lease, with additional omitted
-  detail explicitly counted as `unretained_groups`, not a selected timing drop. Thus a long pass cannot
-  crowd tail samples out. Lease arrays/query pools are allocated only when PIPELINES is enabled.
-  The walker compares three pointers, copies names only at retained group boundaries, never scans bindings
-  or allocates group storage. Fixed compact aggregation storage is touched only in compact pipeline mode.
+  Bounds: at most **2k extra timestamp writes/frame**, `1024 + 64k` metadata records/lease and
+  `64k` query pairs/lease for configured pipeline budget k (maximum 16); 32 prepared leases bound
+  backlog. Space for ALL selected groups is reserved; optional unselected detail uses at most
+  1024 records/lease, with additional omitted detail explicitly counted as `unretained_groups`,
+  not a selected timing drop. Thus a long pass cannot crowd tail samples out. Pipeline arrays/query
+  pools exist only with PIPELINES enabled. Parent timestamp pools similarly pack the configured
+  SAMPLE budget (386 query slots at SAMPLE=2, rather than the full-mode 4226); statistics scratch
+  arrays exist only with STATS enabled. Headers report all actual capacities and CPU lease bytes.
+  The walker compares/borrows three immutable shader-name pointers, never copies names, scans bindings
+  or allocates group storage. Published shader objects never move or die (`vk_shader.c`); names are
+  initialized before publication. Leases therefore keep valid references after GPU fence retirement.
+  The worker copies canonical full names only when interning a new identity. Exact names still merge
+  aliases from different source objects; stable source tuples avoid repeating string comparisons.
   Pass `timestamp_count` remains unchanged; sum compact coverage `timestamp_count` for the extra pool.
   With pass sample budget `s`, the combined normal-frame write bound is **2s + 2 + 2k**.
   Default pipeline output is compact: schema-3 header `pipeline_output:"compact"`,
@@ -1627,16 +1634,48 @@ measurements, the ownership contract is:
   cost. Repeat fresh launches (independent phases), extend beyond several rotations and require adequate
   per-pair samples before ranking. No device calibration was performed as part of the implementation.
   Compact state is fixed: 8192 exact keys, a 16384-cell open-addressed index, 8192 frame-touched IDs and
-  64 exposure strata: **4,230,400 bytes** on the supported 64-bit ABI (`sizeof` also published in headers).
-  Pipeline lease storage is separately bounded at **51,980,288 bytes** for all 32 leases (including
+  64 exposure strata: **4,427,008 bytes** on the supported 64-bit ABI (`sizeof` also published in headers).
+  Pipeline lease storage is separately bounded by 32 leases and the configured budget (including
   pipeline metadata, parent records and readback arrays; excluding Vulkan driver/query-pool storage).
-  This is not RSS. The previous Duo gate reached 13–14 queued/active leases and dropped five with
-  capacity 16; 32 provides more than 2x that measured backlog, not a substitute for worker throughput.
-  The worker uses nice +10 on Linux/Android and retains its inherited CPU mask, with no extra pinning.
+  SAMPLE=2/PIPELINES=4/STATS=0 uses **31,075,072 bytes** on the host 64-bit ABI, down from compact2's
+  **51,980,288 bytes** (−40.2%); header `lease_memory_bytes` publishes the actual build's size.
+  At SAMPLE=2/PIPELINES=4/STATS=0, each lease has 1280 pipeline records, 386 parent and 512 pipeline
+  timestamp query slots; across 32 leases that is **28,736 query slots**, versus compact2's
+  **200,768** (32 × (4226 + 2048)). Actual driver bytes are not inferred from query counts.
+  This is not RSS. A subsequent compact2 Duo pan exhausted all 32 leases (74 drops in frames
+  4801–5100), despite aggregation averaging only about 160 ms per 300-frame gameplay window.
+  Its worker peak was 32 **already-fenced queued/active leases**; the renderer has only eight slots,
+  so GPU latency alone cannot explain that exhaustion. The old two-leases/frame host model missed
+  the device's approximately 18 submissions/frame and unmeasured writer/scheduling stalls.
+  The consumer requests nice +5; the independent blocking sink requests nice +10. Both retain
+  inherited affinity, without extra pinning. Effective consumer nice/error/mask are in the header.
+  Compact serialized bytes use a **1 MiB fixed FIFO**, with a **256 KiB sink-thread stack** plus
+  fixed mutex/cursor state (`output_sink_memory_bytes` reports its actual size). A full FIFO never
+  blocks the consumer: it increments `output_sink_overflows` and `output_failures`; the analyzer
+  withholds estimates. Bounded rotation markers keep rotation IO on the sink as well; only terminal/
+  test close waits for prior writes, and close joins the sink after writing the footer.
+  Raw pipeline output and non-pipeline modes retain synchronous IO for their diagnostic fixtures.
+  Worker service CPU/wall, readback/reset/report wall totals, maximum service and queue-wait wall
+  time are cumulative window/footer counters. The footer retains at most 64 drop-frame summaries:
+  `[frame, count, peak_queued, peak_consuming, peak_inflight, phase_bitmask]`; additional attempts
+  are counted in `background_drop_frame_overflow`. These are per-frame maxima, not additive
+  instantaneous occupancy. Phase names are in the header. No per-event logging or syscalls occur
+  on draws; enqueue/service clocks are per submission.
   Bucket selection mixes the pipeline handle; full shader strings and compute kind still determine
-  exact identity, including reused handles. No per-observation shader-byte hashing or second key copy
-  remains. Only selected keys enter the per-frame moment-reduction list; optional counters still
-  accumulate exactly. A frame-ordered cursor walks each immutable lease once across frame segments.
+  exact identity, including reused handles. Shader bytes are neither hashed per observation nor copied by the walker.
+  Each pipeline lease record is 104 bytes rather than 320: hot counters and borrowed source pointers,
+  not a 240-byte shader tuple copied per group. The dictionary owns the capture text; pointer equality
+  is only a cache over already-proven immutable source objects, never a weaker exported shader identity.
+  Optional count columns stay exact integers in the hot loop, with the same 2^53−1
+  representability guard; only selected keys enter the per-frame floating-point moment-reduction list.
+  A frame-ordered cursor walks each immutable lease once across frame segments. Dictionary strings
+  are encoded only when needed for the retained file; ordinary JSON string runs use bounded copies,
+  not per-character printf calls. Numeric window columns use one fixed-schema encoding call. Parent
+  table occupancy is a 2 KiB bitmap; reports visit/clear only live groups instead of scanning/clearing
+  a multi-MiB cold table. JSON initialization resets cursors, not whole 8192-byte scratch arrays.
+  The compact index is rebuilt only after actual eviction leaves tombstones, not on insert-only
+  windows; clean dictionary bucket positions remain valid across reset.
+  These remove report bursts rather than hiding them with more leases.
   The compact aggregator makes no per-group/window allocations; existing parent pass buffering/histograms
   remain separately bounded. Inactive previous-window dictionary entries are
   evicted under lifetime churn; IDs are never reused. Current-window entries cannot be evicted: saturation
@@ -1667,13 +1706,29 @@ measurements, the ownership contract is:
   lease to keep generated datasets identical; producer wait and wall time MUST therefore be reported:
   zero fixture drops alone does not prove the host kept pace. Backlog is queued+active host leases,
   not GPU latency. This excludes real query calls/GPU/driver/device scheduling and proves no Duo result.
-  `--worker-scale 2700 --pace 1 --seconds 600 --fps 60` adds test-only sleep equal to 1.7x each
-  lease's measured worker CPU service, emulating Duo's observed ~2.7x device/host ratio for ten wall
-  minutes at 60 fps. It is a queue/throughput stress model, not real GPU readback or a device gate.
+  `--worker-scale 2700` adds test-only sleep equal to 1.7x each lease's measured worker CPU service.
+  For the Duo production-rate check add `--seconds 600 --fps 30 --pace 1 --parts 18 --gpu-held 8
+  --nonblocking 1 --sample-budget 2 --spread-percent 60 --writer-stall-ms 200`: approximately 540
+  submissions/second, not the old two-leases/frame model. A separate `--seconds 120 --fps 45` run
+  models a higher Thor rate (18 submissions/frame is assumed, not measured). The 60 fps variant is
+  a 2x-Duo-rate burst stress, not the production acceptance rate. None is a real GPU/device gate.
   Check stable low backlog, producer waits, queued/processed equality and the writer-end footer;
   a larger pool with growing backlog is not success. `--record-fixture` measures production pipeline
   hooks and lease handoffs at 4096 groups/8192 draws per frame. Its counted timestamp sink excludes
   driver command encoding: report this CPU lower bound separately from real Vulkan/device recording.
+  To exercise the observed mechanism, run `--compact-fixture --frames 330 --fps 30 --pace 1
+  --parts 18 --gpu-held 8 --nonblocking 1 --sample-budget 2 --spread-percent 60 --writer-stall-ms 200`.
+  Submissions span 60% of each frame (~20 ms at device 30 fps, ~10 ms at 60 fps stress), matching the
+  measured recording interval rather than an instantaneous 18-lease burst. It uses the exact production
+  no-free-lease path and retains up to eight synthetic GPU-held leases. `--coupled-stall 1` is a
+  test-only control that stalls the lease consumer at the same output point; it must reproduce
+  pool exhaustion. The default stalls only the independent sink and must drain without lease
+  drops, output overflow or missing writer-end. `--sink-contract` checks FIFO overflow, nonblocking
+  rejection, byte identity across ring wrap and final drain.
+  Leases already cover an entire actual queue submission, including its pre/main primaries and
+  every pass, not individual draws/secondary command buffers. Sharing across independent fences
+  or frames is not a safe local rate reduction: cancellation, multiple frame markers per submission,
+  immutable publication and query reset all rely on that ownership boundary.
   Host commands run with `taskset -c 0-3 nice -n 10`; matrices also hold the shared hosttest flock.
 
 - **Profiler capture lifecycle:** the default is 128 MiB per JSONL file × four files; compact windows

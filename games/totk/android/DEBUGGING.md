@@ -1764,7 +1764,11 @@ independent timestamp reports: at least two and at most `2k+2` for budget `k`. A
 draws, areas and completed-frame scene metadata remain recorded, even with zero samples.
 Existing fence completion detaches/enqueues the fenced profiler lease and immediately releases the
 game ring slot; it does not read queries or report inline. The profiler worker owns result reads
-without WAIT or polling, aggregation, JSONL/log output, query resets and lease return. Its bounded
+without WAIT or polling, aggregation, formatting, query resets and lease return. In compact pipeline
+mode a separate nice+10 sink owns file writes/flushes through a bounded 1 MiB FIFO; the consumer
+requests nice+5 and keeps inherited affinity. FIFO overflow is explicit output loss and censors
+pipeline authority, never a wait on the consumer. Window service/readback/reset/report wall counters
+and bounded footer drop-frame/queued/inflight/phase summaries diagnose bursts, not just average CPU. Its
 32-lease FIFO does not share the recorder-worker mutex. No free lease drops profiler coverage
 (`background_dropped_slots`, cumulative, and missing frame coverage), never blocks the game for I/O.
 CPU present independently publishes `{frame, end_sequence}` to a bounded 256-entry closure FIFO under

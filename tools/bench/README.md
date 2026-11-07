@@ -406,7 +406,7 @@ scans texture/storage-image bindings, looks up/copies the texture registry, sear
 allocates audit arrays or logs liveness candidates, including on unselected passes. Static attachment
 LOAD/CLEAR/STORE/DONT_CARE operations and logical byte estimates remain pass-key-derived summaries,
 not a speculative liveness audit or hardware traffic counter. The dedicated `totk-gpuprof` worker
-owns query result reads, aggregation, formatting/output and resets; its 32 prepared leases are
+owns query result reads, aggregation, formatting and resets; its 32 prepared leases are
 bounded. One-time opt-in startup preparation can wait, but exhaustion during play drops coverage
 (`background_dropped_slots`, cumulative, plus missing frame coverage), never waits for profiler I/O.
 CPU present has an independent ordered closure FIFO (256 entries, header `background_closures`).
@@ -616,12 +616,33 @@ Missing `session_end` is also a pipeline censor reason, for raw and compact alik
 retained windows do not prove that the final partial window or final loss counters were captured.
 Regression cases remove the footer (and separately leave a partial footer JSON line) from both
 known-truth encodings; both estimates and counter-completeness authority must fail closed.
-The bounded pool is 32 leases (51,980,288 bytes including pipeline/parent CPU arrays; driver query-pool
-memory is additional). Duo's prior 13–14-lease backlog motivated the margin; worker throughput must
-still exceed production. `--worker-scale 2700 --pace 1 --seconds 600 --fps 60` models the measured
-device/host CPU-service ratio with test-only worker sleep. Report backlog over the run and final drain,
-not just zero drops from the larger pool. `--record-fixture` isolates production hook/lease CPU at
-4096 groups and 8192 draws/frame, counting but not driver-encoding timestamp calls.
+The bounded pool is 32 packed leases; headers publish CPU storage bytes and actual query capacities.
+The device configuration uses 31,075,072 CPU lease bytes on the host 64-bit ABI (compact2: 51,980,288,
+−40.2%), excluding driver storage, compact aggregation, parent aggregation and sink/stack memory.
+SAMPLE=2/PIPELINES=4/STATS=0 uses 1280 pipeline records, 386 parent and 512 pipeline timestamp slots
+per lease (28,736 total query slots versus compact2's 200,768); disabled statistics allocate no scratch.
+Lease records borrow process-lifetime immutable shader-name pointers (104 rather than 320 bytes/record);
+the bounded 4,427,008-byte worker dictionary owns full names, merges exact-name aliases and caches
+immutable source tuples. The host fixture precomputes the identical 4096-key/churn names with a
+separately reported `fixture_identity_memory_bytes` bound, instead of formatting them on every sample.
+Driver query-pool memory is additional and not inferred from those counts. Compact writes use an
+independent bounded 1 MiB byte FIFO and 256 KiB sink stack; overflow is explicit
+`output_sink_overflows`/`output_failures`, not a consumer wait or valid estimate. Bounded rotation
+markers move rotation IO to the sink too; close drains prior writes then joins the sink after its footer.
+The old `--worker-scale 2700 --pace 1` model uses only two leases/frame and did **not** predict Duo's
+approximately 18 submissions/frame or burst stalls. Use the device-shaped regression instead:
+`--compact-fixture --frames 330 --fps 30 --pace 1 --parts 18 --gpu-held 8 --nonblocking 1
+--sample-budget 2 --spread-percent 60 --writer-stall-ms 200`. Submissions span 60% of each frame,
+matching the device's ~20 ms recording/33 ms frame rather than an instantaneous lease burst.
+`--coupled-stall 1` stalls the consumer as a failure control; default stalls
+the independent sink, which must preserve lease recycling, clean drain and end authority.
+`--sink-contract` checks bounded overflow/rejection and ring-wrap byte identity. Effective consumer
+nice/affinity are in headers; window cumulative service CPU/wall and phase wall counters, and
+bounded footer drop-frame occupancy/phase summaries, distinguish worker backlog from in-flight
+ownership without per-event lines. Leases already cover whole submissions, not individual passes;
+coarsening across independent fences would require different publication/reset/closure authority.
+`--record-fixture` isolates production hook/lease CPU at 4096 groups and 8192 draws/frame, counting
+but not driver-encoding timestamp calls.
 
 
 For parent-owned host execution, `vkgpuprofcompacttest` builds the production-worker fixture without

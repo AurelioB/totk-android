@@ -17,6 +17,7 @@
 #include "vk_gpuprof_compact.h"
 int vk_gpuprof_test_compact_run(int argc, char **argv);
 int vk_gpuprof_test_record_run(void);
+int vk_gpuprof_test_sink_run(void);
 #include "vk_load.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include <errno.h>
@@ -118,44 +119,57 @@ static void pipeline_contract(void) {
 }
 static void compact_contract(void) {
     static gp_compact c;
-    gp_compact_key key = {.pipeline = 17};
-    strcpy(key.shader[0], "full-vs-variant-a"); strcpy(key.shader[1], "full-fs-variant-a");
+    gp_compact_key key = {.pipeline = 17, .shader = {"full-vs-variant-a", "full-fs-variant-a", NULL}};
     gp_compact_begin(&c, 1, 2048, 4);
     gp_compact_observe(&c, &key, 1, 1, 0, 0, 2, 2048, 4, 3, 0, 9, 0);
     gp_compact_entry *e = gp_compact_get(&c, &key);
     uint64_t id = e->id;
     c.frame_out_of_range = 1; /* later lease/nested scope invalidates the prefix */
     gp_compact_finish(&c, 1);
-    CHECK(e->v[GC_VALID] == 1 && e->v[GC_ELIGIBLE] == 0,
+    CHECK(e->v[GC_VALID].integer == 1 && e->v[GC_ELIGIBLE].real == 0,
         "later-frame domain gap excludes every earlier sample from eligible subtotal");
     gp_compact_begin(&c, 2, 4096, 4);
     gp_compact_observe(&c, &key, 1, 1, 0, 0, 3, 4096, 4, 4, 0, 12, 0);
     gp_compact_finish(&c, 1);
-    CHECK(e->v[GC_MS] == 5 && e->v[GC_SQUARE] == 13 && e->v[GC_WEIGHTED] == 4096 &&
-        e->v[GC_ELIGIBLE_WEIGHTED] == 3072 && e->v[GC_ELIGIBLE_SQUARE] == 3072.0 * 3072,
+    CHECK(e->v[GC_MS].real == 5 && e->v[GC_SQUARE].real == 13 && e->v[GC_WEIGHTED].real == 4096 &&
+        e->v[GC_ELIGIBLE_WEIGHTED].real == 3072 && e->v[GC_ELIGIBLE_SQUARE].real == 3072.0 * 3072,
         "population growth weights each sample by its actual denominator and preserves moments");
     gp_compact_begin(&c, 3, 4096, 4);
     gp_compact_observe(&c, &key, 1, 0, 0, 0, 0, 4096, 4, 1, 0, 3, 0);
     gp_compact_finish(&c, 1);
-    CHECK(e->v[GC_SELECTED] == 3 && e->v[GC_MISSING] == 1 && e->v[GC_ELIGIBLE_MISSING] == 1,
+    CHECK(e->v[GC_SELECTED].integer == 3 && e->v[GC_MISSING].integer == 1 && e->v[GC_ELIGIBLE_MISSING].real == 1,
         "missing selected timing is not zero and retains eligible-domain missing authority");
     CHECK(c.frames == 3 && c.eligible_frames == 2 && c.domain_excluded_frames == 1 &&
         c.nexposure == 2 && c.exposure[0].population == 2048 && c.exposure[1].frames == 2,
         "partial windows retain exact exposure strata and completed-frame counts");
-    gp_compact_key variant = key; strcpy(variant.shader[1], "full-fs-variant-b");
+    gp_compact_key variant = key; variant.shader[1] = "full-fs-variant-b";
     CHECK(gp_compact_get(&c, &variant)->id != id, "full shader variant participates in dictionary identity");
     variant = key; variant.compute = 1;
     CHECK(gp_compact_get(&c, &variant)->id != id, "graphics and compute never share a dictionary key");
+    static const char alias_vs[] = "full-vs-variant-a", alias_fs[] = "full-fs-variant-a";
+    gp_compact_key alias = {.pipeline = 17, .shader = {alias_vs, alias_fs, NULL}};
+    CHECK(gp_compact_get(&c, &alias)->id == id && gp_compact_get(&c, &key)->id == id,
+        "different immutable source objects with identical full names intern to the same exact identity");
+    static char oversized_name[81];
+    memset(oversized_name, 'x', 80);
+    gp_compact_key oversized = {.pipeline = 18, .shader = {oversized_name, NULL, NULL}};
+    CHECK(!gp_compact_get(&c, &oversized) && c.aggregate_overflow && !c.counts_complete,
+        "an unrepresentable full variant is rejected, never truncated into an existing identity");
+    CHECK(!c.map_dirty, "insert-only dictionary has no tombstones to rebuild");
     gp_compact_reset(&c);
     gp_compact_begin(&c, 301, 4096, 4);
-    CHECK(gp_compact_get(&c, &key)->id == id && !e->v[GC_SELECTED],
+    CHECK(gp_compact_get(&c, &key)->id == id && !e->v[GC_SELECTED].integer,
         "window reset preserves interned identity but never duplicates flushed samples");
     for (unsigned i = 0; i < GP_COMPACT_KEYS; i++) {
         gp_compact_key churn = {.pipeline = UINT64_C(100000) + i};
         gp_compact_get(&c, &churn);
     }
-    CHECK(c.key_overflow > 0 && !c.counts_complete, "current-window key overflow is bounded and explicit");
+    CHECK(c.key_overflow > 0 && !c.counts_complete && c.map_dirty,
+        "current-window overflow is explicit and successful inactive eviction marks the index dirty");
     gp_compact_reset(&c);
+    unsigned tombstones = 0;
+    for (unsigned i = 0; i < GP_COMPACT_KEYS * 2; i++) tombstones += c.map[i] == UINT32_MAX;
+    CHECK(!c.map_dirty && !tombstones, "dirty reset rebuilds exact key slots and clears every eviction tombstone");
     gp_compact_begin(&c, 601, 4096, 4);
     gp_compact_key fresh = {.pipeline = UINT64_C(100000000)};
     gp_compact_entry *next = gp_compact_get(&c, &fresh);
@@ -163,7 +177,7 @@ static void compact_contract(void) {
         "fresh-key lifetime churn evicts inactive dictionary entries without permanent exhaustion");
     gp_compact_observe(&c, &fresh, 1, 1, 0, 0, 1, 4096, 4, 1, 0, 1, 0);
     gp_compact_finish(&c, 0);
-    CHECK(!next->v[GC_ELIGIBLE] && c.domain_excluded_frames == 1,
+    CHECK(!next->v[GC_ELIGIBLE].real && c.domain_excluded_frames == 1,
         "unfinished close never grants completed-frame eligibility");
     gp_compact_begin(&c, 602, 4096, 4);
     gp_compact_observe(&c, &fresh, 0, 0, 0, 0, 0, 4096, 4, UINT64_MAX, 0, 1, 0);
@@ -171,16 +185,16 @@ static void compact_contract(void) {
         "counter values beyond exact numeric-array range expose overflow instead of rounding authority");
     gp_compact_begin(&c, 602, 8192, 4);
     gp_compact_finish(&c, 1);
-    CHECK(c.frame_overflow && !next->v[GC_ELIGIBLE],
+    CHECK(c.frame_overflow && !next->v[GC_ELIGIBLE].real,
         "inconsistent per-frame population snapshots cannot grant eligibility");
-    CHECK(sizeof c == 4230400, "compact worker memory bound matches published 64-bit ABI documentation");
+    CHECK(sizeof c == 4427008, "compact worker memory bound matches published 64-bit ABI documentation");
     gp_compact_begin(&c, 603, 4096, 4);
     fresh.pipeline++;
     gp_compact_observe(&c, &fresh, 1, 0, 1, 0, 0, 4096, 4, 1, 0, 1, 0);
     gp_compact_entry *discarded = gp_compact_get(&c, &fresh);
     gp_compact_finish(&c, 1);
-    CHECK(discarded->selected_discarded == 1 && discarded->v[GC_SELECTED] == 0 &&
-        discarded->v[GC_DISCARDED] == 1 && discarded->v[GC_ELIGIBLE] == 0,
+    CHECK(discarded->selected_discarded == 1 && discarded->v[GC_SELECTED].integer == 0 &&
+        discarded->v[GC_DISCARDED].integer == 1 && discarded->v[GC_ELIGIBLE].real == 0,
         "selected discarded-only keys retain output authority without becoming eligible samples");
 }
 static void unavailable_query_contract(void) {
@@ -696,6 +710,8 @@ int main(int argc, char **argv) {
         return vk_gpuprof_test_compact_run(argc, argv);
     if (argc == 2 && !strcmp(argv[1], "--record-fixture"))
         return vk_gpuprof_test_record_run();
+    if (argc == 2 && !strcmp(argv[1], "--sink-contract"))
+        return vk_gpuprof_test_sink_run();
     timestamp_contract();
     pipeline_contract();
     compact_contract();

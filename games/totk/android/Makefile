@@ -337,6 +337,7 @@ vktest: $(OUT)/vkgpuproftest
 $(OUT)/vkgpuproftest: $(TOTK)/android/gfx/test_vk_gpuprof.c $(VKTEST_SRC) $(TOTK)/android/gfx/vk_int.h $(TOTK)/android/gfx/vk_record.h $(TOTK)/android/gfx/vk_load_proof.h
 $(OUT)/vkgpuproftest: $(TOTK)/android/gfx/vk_gpuprof_time.h $(TOTK)/android/gfx/vk_gpuprof_pipe.h
 $(OUT)/vkgpuproftest: $(TOTK)/android/gfx/vk_gpuprof_compact.h $(TOTK)/android/gfx/vk_gpuprof_fixture.h
+$(OUT)/vkgpuproftest: $(TOTK)/android/gfx/vk_gpuprof_sink.h
 	@mkdir -p $(dir $@)
 	$(CC) $(VKTEST_FLAGS) -o $@ $(filter %.c,$^) $(VKTEST_LIBS)
 	@echo "built $@"

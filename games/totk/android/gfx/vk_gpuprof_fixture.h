@@ -3,8 +3,17 @@
 static double fixture_elapsed_ms(struct timespec a, struct timespec b) {
     return (b.tv_sec - a.tv_sec) * 1000.0 + (b.tv_nsec - a.tv_nsec) / 1e6;
 }
+static void fixture_wait(struct timespec start, double seconds) {
+    uint64_t ns = (uint64_t)(seconds * 1e9);
+    start.tv_sec += ns / UINT64_C(1000000000);
+    start.tv_nsec += ns % UINT64_C(1000000000);
+    if (start.tv_nsec >= 1000000000) { start.tv_sec++; start.tv_nsec -= 1000000000; }
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &start, NULL) == EINTR) {}
+}
 int vk_gpuprof_test_compact_run(int argc, char **argv) {
     unsigned seconds = 600, fps = 0, pace = 0, loss = 0, limit_frames = 0;
+    unsigned parts = 2, gpu_held = 0, nonblocking = 0, writer_stall_ms = 0, coupled_stall = 0;
+    unsigned parent_budget = 0, spread_percent = 0;
     for (int i = 2; i < argc; i += 2) {
         if (i + 1 == argc) return 2;
         char *end; unsigned long value = strtoul(argv[i + 1], &end, 10);
@@ -16,9 +25,33 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         else if (!strcmp(argv[i], "--frames") && value) limit_frames = (unsigned)value;
         else if (!strcmp(argv[i], "--worker-scale") && value >= 1000 && value <= 10000)
             fixture_worker_scale = (unsigned)value;
+        else if (!strcmp(argv[i], "--parts") && value >= 2 && value <= 32) parts = (unsigned)value;
+        else if (!strcmp(argv[i], "--gpu-held") && value <= 8) gpu_held = (unsigned)value;
+        else if (!strcmp(argv[i], "--nonblocking") && value <= 1) nonblocking = (unsigned)value;
+        else if (!strcmp(argv[i], "--writer-stall-ms") && value <= 10000) writer_stall_ms = (unsigned)value;
+        else if (!strcmp(argv[i], "--coupled-stall") && value <= 1) coupled_stall = (unsigned)value;
+        else if (!strcmp(argv[i], "--sample-budget") && value <= 16) parent_budget = (unsigned)value;
+        else if (!strcmp(argv[i], "--spread-percent") && value <= 100) spread_percent = (unsigned)value;
         else return 2;
     }
-    fixture_mode = 1; vk_gpuprof_on = 1; vk_gpuprof_pipeline_on = 4;
+    /* Like the renderer's shader cache, these names never move or mutate while
+       leases/dictionary source tuples can refer to them. Dataset bytes are
+       identical to the former per-observation snprintf workload. */
+    unsigned max_frames = limit_frames ? limit_frames : seconds * (fps ? fps : 60) + 1;
+    unsigned identity_count = 4096 + ((max_frames + 299) / 300) * 64;
+    char (*names)[2][80] = calloc(identity_count, sizeof *names);
+    if (!names) return 1;
+    for (unsigned i = 0; i < identity_count; i++) {
+        uint64_t variant = i < 4096 ? i :
+            ((i - 4096) % 64) * 64 + (uint64_t)((i - 4096) / 64) * 4096;
+        snprintf(names[i][0], sizeof names[i][0], "%016llx%016llx%016llx%016llx-vs",
+            (unsigned long long)variant, (unsigned long long)(variant * 13),
+            (unsigned long long)(variant * 31), (unsigned long long)(variant * 43));
+        snprintf(names[i][1], sizeof names[i][1], "%016llx%016llx%016llx%016llx-fs",
+            (unsigned long long)(variant * 7), (unsigned long long)(variant * 17),
+            (unsigned long long)(variant * 37), (unsigned long long)(variant * 47));
+    }
+    fixture_mode = 1; vk_gpuprof_on = 1; vk_gpuprof_pipeline_on = 4; sample_budget = parent_budget;
     const char *raw = getenv("TOTK_VK_GPU_PROFILE_PIPELINES_RAW");
     pipeline_raw = raw && !strcmp(raw, "1");
     pipeline_launch_phase = 17; pipeline_random = 1;
@@ -26,45 +59,74 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
     V.props.limits.timestampComputeAndGraphics = 1;
     snprintf(V.props.deviceName, sizeof V.props.deviceName, "host synthetic fenced-lease fixture (no GPU)");
     game_reference_w = 1600; game_reference_h = 900;
+    if (coupled_stall) fixture_coupled_stall_ms = writer_stall_ms;
+    else { output_sink.stall_ms = writer_stall_ms; output_sink.stall_after = 65536; }
     background_start();
     struct timespec wall_start; clock_gettime(CLOCK_MONOTONIC, &wall_start);
     double logical = 0, producer_wait_ms = 0;
     unsigned frames = 0;
     uint32_t population = VK_GPUPROF_PIPE_ORDINALS;
+    vk_gpuprof_slot *pending_gpu[8] = {0};
+    uint64_t attempted = 0;
     while (limit_frames ? frames < limit_frames : logical < seconds - 1e-8) {
         uint64_t number = ++frames;
+        frame = number; /* production drop diagnostics use the recording frame */
         unsigned logical_fps = fps ? fps : 20 + ((unsigned)logical / 20 % 5) * 10;
         uint32_t phase = (pipeline_launch_phase + (uint32_t)(number - 1) * 4) & (population - 1);
-        for (unsigned part = 0; part < 2; part++) {
-            pthread_mutex_lock(&background_mu);
-            struct timespec wait_start, wait_end; clock_gettime(CLOCK_MONOTONIC, &wait_start);
-            while (!background_nfree) pthread_cond_wait(&background_cv, &background_mu);
-            clock_gettime(CLOCK_MONOTONIC, &wait_end);
-            producer_wait_ms += fixture_elapsed_ms(wait_start, wait_end);
-            vk_gpuprof_slot *slot = background_free[--background_nfree];
-            pthread_mutex_unlock(&background_mu);
-            slot->n = 1; slot->nsegment = 1; slot->nt = slot->ns = slot->dropped = 0;
+        for (unsigned part = 0; part < parts; part++) {
+            /* Device submits span its ~20 ms recording interval, not an
+               instantaneous 18-lease burst followed by an idle frame. */
+            if (pace && spread_percent)
+                fixture_wait(wall_start, logical + part * spread_percent / (100.0 * parts * logical_fps));
+            unsigned gpu_at = gpu_held ? attempted % gpu_held : 0;
+            if (gpu_held && attempted >= gpu_held) background_enqueue(&pending_gpu[gpu_at], 0);
+            uint64_t sequence = ++recording_sequence;
+            vk_gpuprof_slot *slot = NULL;
+            if (nonblocking) {
+                (void)background_acquire(&slot); /* exact production failure path */
+            } else {
+                pthread_mutex_lock(&background_mu);
+                struct timespec wait_start, wait_end; clock_gettime(CLOCK_MONOTONIC, &wait_start);
+                while (!background_nfree) pthread_cond_wait(&background_cv, &background_mu);
+                clock_gettime(CLOCK_MONOTONIC, &wait_end);
+                producer_wait_ms += fixture_elapsed_ms(wait_start, wait_end);
+                slot = background_free[--background_nfree];
+                pthread_mutex_unlock(&background_mu);
+            }
+            attempted++;
+            if (!slot) { if (gpu_held) pending_gpu[gpu_at] = NULL; continue; }
+            int parent_selected = !sample_budget || part < sample_budget;
+            slot->n = 1; slot->nsegment = 1; slot->nt = parent_selected; slot->ns = slot->dropped = 0;
             slot->npipeline = slot->pipeline_timed = slot->pipeline_unselected = 0;
-            slot->discard = 0; slot->sealed = part ? number : 0; slot->sequence = ++recording_sequence;
+            slot->discard = 0; slot->sealed = part + 1 == parts ? number : 0; slot->sequence = sequence;
             slot->lease = slot->sequence; slot->has_pre = 0;
             slot->domain = (vk_gpuprof_time_domain){1, 1, 0, 48, 1};
-            uint64_t tick = number * UINT64_C(20000000) + part * UINT64_C(5000000);
+            uint64_t tick = number * UINT64_C(20000000) + part * UINT64_C(10000000) / parts;
             slot->span_ticks[0] = (vk_gpuprof_timestamp){tick, 1};
-            slot->span_ticks[1] = (vk_gpuprof_timestamp){tick + UINT64_C(5000000), 1};
+            slot->span_ticks[1] = (vk_gpuprof_timestamp){tick + UINT64_C(10000000) / parts, 1};
             slot->ticks[0] = (vk_gpuprof_timestamp){tick + 100, 1};
-            slot->ticks[1] = (vk_gpuprof_timestamp){tick + 1000100, 1};
+            uint64_t pass_ns = UINT64_C(10000000) / parts / 2;
+            if (pass_ns > 1000000) pass_ns = 1000000;
+            slot->ticks[1] = (vk_gpuprof_timestamp){tick + 100 + pass_ns, 1};
             slot->rec[0] = (gp_record){.frame = number, .instance = part + 1,
-                .draws = 2048, .selected = 1, .timestamp_q1 = 1, .timestamp_count = 2,
+                .draws = 4096 / parts, .selected = parent_selected,
+                .timestamp_q1 = parent_selected, .timestamp_count = parent_selected * 2,
                 .key = {.w = 1600, .h = 900, .samples = 1, .shader = part + 1}};
             gp_segment *s = &slot->segment[0];
             *s = (gp_segment){.frame = number, .first = 0, .last = 1,
-                .pipeline_population = population, .pipeline_phase = phase};
-            unsigned optional = 0;
-            for (unsigned j = 0; j < 2048; j++) {
-                unsigned ordinal = part * 2048 + j;
+                .pipeline_population = population, .pipeline_phase = phase,
+                .first_valid = sample_budget && !part, .last_valid = sample_budget && part + 1 == parts,
+                .timestamp_count = sample_budget ? (!part) + (part + 1 == parts) : 0};
+            unsigned optional = 0, injected_drop = 0;
+            unsigned begin = part * 4096 / parts, end = (part + 1) * 4096 / parts;
+            for (unsigned ordinal = begin; ordinal < end; ordinal++) {
+                unsigned j = ordinal - begin;
                 int selected = vk_gpuprof_pipe_selected(ordinal, phase, 4, population);
                 s->pipeline_observed++; s->pipeline_out_of_range += ordinal >= population;
                 s->pipeline_selected += selected;
+                if (loss && part && number % 107 == 0 && !selected && !injected_drop) {
+                    s->pipeline_dropped++; injected_drop = 1; continue;
+                }
                 if (!selected && optional == 1024) { s->pipeline_unretained++; continue; }
                 if (!selected) optional++;
                 gp_pipeline *p = &slot->pipeline[slot->npipeline++];
@@ -72,16 +134,11 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
                     (unsigned)(number / 75 % 2) * 128) & 4095;
                 /* Recurrent pool plus fresh variants exercises bounded lifetime
                    eviction, not just an immortal fixed 4096-entry dictionary. */
-                uint64_t variant = key + (key % 64 ? 0 : (number - 1) / 300 * 4096);
+                unsigned identity = key % 64 ? key : 4096 + (unsigned)((number - 1) / 300) * 64 + key / 64;
                 *p = (gp_pipeline){.frame = number, .key = {.pipeline = key + 1}, .ordinal = ordinal,
                     .population = population, .selected = selected, .draws = 1 + key % 7,
                     .primitives = 2 + key % 11, .unknown_draws = key % 19 == 0};
-                snprintf(p->key.shader[0], sizeof p->key.shader[0], "%016llx%016llx%016llx%016llx-vs",
-                    (unsigned long long)variant, (unsigned long long)(variant * 13),
-                    (unsigned long long)(variant * 31), (unsigned long long)(variant * 43));
-                snprintf(p->key.shader[1], sizeof p->key.shader[1], "%016llx%016llx%016llx%016llx-fs",
-                    (unsigned long long)(variant * 7), (unsigned long long)(variant * 17),
-                    (unsigned long long)(variant * 37), (unsigned long long)(variant * 47));
+                p->key.shader[0] = names[identity][0]; p->key.shader[1] = names[identity][1];
                 if (selected) {
                     p->query1 = slot->pipeline_timed++ * 2 + 1; p->timestamps = 2;
                     uint64_t duration = 10000 + key * 13;
@@ -93,20 +150,27 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
                     s->pipeline_timestamps += p->timestamps;
                 }
             }
-            if (loss && part && number % 107 == 0) { s->pipeline_dropped++; s->pipeline_unretained--; }
             if (loss && part && number == 109) atomic_fetch_add(&background_dropped_slots, 1);
-            background_enqueue(&slot, 0);
+            if (gpu_held) pending_gpu[gpu_at] = slot;
+            else background_enqueue(&slot, 0);
+        }
+        if (nonblocking) {
+            pthread_mutex_lock(&background_mu);
+            if (background_close_tail - background_close_head == GP_CLOSURES)
+                atomic_fetch_add(&background_dropped_closures, 1);
+            else background_closures[background_close_tail++ % GP_CLOSURES] =
+                (gp_closure){number, recording_sequence};
+            pthread_cond_signal(&background_cv);
+            pthread_mutex_unlock(&background_mu);
         }
         population = vk_gpuprof_pipe_population(population, 4096);
         logical += 1.0 / logical_fps;
-        if (pace) {
-            struct timespec target = wall_start;
-            uint64_t ns = (uint64_t)(logical * 1e9);
-            target.tv_sec += ns / UINT64_C(1000000000);
-            target.tv_nsec += ns % UINT64_C(1000000000);
-            if (target.tv_nsec >= 1000000000) { target.tv_sec++; target.tv_nsec -= 1000000000; }
-            while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &target, NULL) == EINTR) {}
-        }
+        if (pace) fixture_wait(wall_start, logical);
+    }
+    if (gpu_held) {
+        unsigned count = attempted < gpu_held ? (unsigned)attempted : gpu_held;
+        unsigned first = attempted < gpu_held ? 0 : attempted % gpu_held;
+        for (unsigned i = 0; i < count; i++) background_enqueue(&pending_gpu[(first + i) % gpu_held], 0);
     }
     struct timespec close_start, close_end; clock_gettime(CLOCK_MONOTONIC, &close_start);
     vk_gpuprof_shutdown(); vk_gpuprof_shutdown();
@@ -118,20 +182,24 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         "backlog_peak=%llu aggregation_memory_bytes=%zu lease_memory_bytes=%zu parent_aggregation_memory_bound_bytes=%zu "
         "aggregation_allocations=0 output_write_calls=%llu close_flush_cpu_ms=%.6f close_wall_ms=%.6f "
         "producer_wait_ms=%.6f wall_ms=%.6f dropped_slots=%llu output_failures=%llu worker_scale=%u "
-        "queued_slots=%llu processed_slots=%llu\n",
+        "queued_slots=%llu processed_slots=%llu parts=%u gpu_held=%u nonblocking=%u writer_stall_ms=%u "
+        "coupled_stall=%u output_sink_peak_bytes=%llu output_sink_overflows=%llu fixture_identity_memory_bytes=%zu\n",
         frames, logical, fps, pace, loss, pipeline_raw, (unsigned long long)windows,
         (unsigned long long)output_serialized_bytes, output_serialized_bytes / (double)windows,
         worker_cpu_total_ms, worker_cpu_total_ms / windows, worker_window_cpu_peak_ms,
         (unsigned long long)background_backlog_peak, sizeof compact,
-        GP_BACKLOG * (sizeof(vk_gpuprof_slot) + GP_RECORDS * sizeof(gp_pipeline) +
-            2 * VK_GPUPROF_PIPE_BUDGET * GP_SEGMENTS * sizeof(vk_gpuprof_timestamp)),
-        sizeof groups + GP_GROUPS * sizeof(gp_group),
+        background_lease_bytes(),
+        sizeof groups + sizeof group_occupied + GP_GROUPS * sizeof(gp_group),
         (unsigned long long)output_write_calls, compact_close_cpu_ms, fixture_elapsed_ms(close_start, close_end), producer_wait_ms,
         fixture_elapsed_ms(wall_start, close_end), (unsigned long long)atomic_load(&background_dropped_slots),
         (unsigned long long)atomic_load(&output_failures), fixture_worker_scale,
         (unsigned long long)atomic_load(&background_queued_slots),
-        (unsigned long long)atomic_load(&background_processed_slots));
-    return atomic_load(&output_failures) != 0;
+        (unsigned long long)atomic_load(&background_processed_slots), parts, gpu_held, nonblocking,
+        writer_stall_ms, coupled_stall, (unsigned long long)output_sink.peak,
+        (unsigned long long)output_sink.overflows, identity_count * sizeof *names);
+    free(names);
+    return atomic_load(&output_failures) != 0 ||
+        (nonblocking && !coupled_stall && !loss && atomic_load(&background_dropped_slots) != 0);
 }
 
 /* CPU-only recording microbenchmark. The production hooks and lease handoffs
@@ -189,4 +257,50 @@ int vk_gpuprof_test_record_run(void) {
         fixture_query_writes / (double)frames);
     free(slot->pipeline); free(slot);
     return fixture_query_writes != (uint64_t)frames * 10;
+}
+
+int vk_gpuprof_test_sink_run(void) {
+    gp_json escaped = {0}, overflow = {0};
+    json_string(&escaped, "plain\"\\\n\001\xc3\xa9");
+    int ok = !escaped.failed && !strcmp(escaped.data, "\"plain\\\"\\\\\\u000a\\u0001\xc3\xa9\"");
+    static char oversized[8192];
+    memset(oversized, 'a', sizeof oversized - 1);
+    json_string(&overflow, oversized);
+    ok &= overflow.failed;
+    static char payload[GP_SINK_BYTES];
+    for (size_t i = 0; i < sizeof payload; i++) payload[i] = (char)(i * 17u);
+    output_file = tmpfile();
+    if (!output_file) return 1;
+    output_sink.paused = 1;
+    gp_sink_start(output_file);
+    ok &= output_write_locked(payload, sizeof payload);
+    uint64_t before = monotonic_ns();
+    int rejected = !output_write_locked("x", 1);
+    double reject_ms = (monotonic_ns() - before) / 1e6;
+    ok &= rejected && output_sink.overflows == 1 && atomic_load(&output_failures) == 1;
+    pthread_mutex_lock(&output_sink.mu);
+    output_sink.paused = 0; pthread_cond_broadcast(&output_sink.cv);
+    pthread_mutex_unlock(&output_sink.mu);
+    gp_sink_flush(1);
+    ok &= output_write_locked(payload, sizeof payload - 100);
+    gp_sink_flush(1);
+    ok &= output_write_locked(payload, 200); /* ring wraps in the middle of this write */
+    gp_sink_stop();
+    rewind(output_file);
+    char buffer[4096]; size_t offset = 0, n;
+    while ((n = fread(buffer, 1, sizeof buffer, output_file))) {
+        for (size_t i = 0; i < n; i++, offset++) {
+            size_t p = offset < GP_SINK_BYTES ? offset :
+                offset < 2 * GP_SINK_BYTES - 100 ? offset - GP_SINK_BYTES :
+                offset - (2 * GP_SINK_BYTES - 100);
+            ok &= buffer[i] == payload[p];
+        }
+    }
+    ok &= offset == 2 * GP_SINK_BYTES + 100;
+    fclose(output_file); output_file = NULL;
+    printf("gpuprof-sink-contract failures=%d capacity_bytes=%u peak_bytes=%llu overflows=%llu "
+        "output_failures=%llu rejected_write_wall_ms=%.6f bytes_checked=%zu\n", !ok,
+        GP_SINK_BYTES, (unsigned long long)output_sink.peak, (unsigned long long)output_sink.overflows,
+        (unsigned long long)atomic_load(&output_failures), reject_ms, offset);
+    return !ok;
 }

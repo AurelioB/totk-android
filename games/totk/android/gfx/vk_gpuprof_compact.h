@@ -23,13 +23,20 @@ static const char *const gp_compact_columns[GP_COMPACT_COLUMNS] = {
     "eligible_weighted_gpu_ms_square_sum", "eligible_missing_selected", "out_of_range_groups",
     "sampled_draws", "sampled_dispatches", "weighted_gpu_ms_sum"
 };
-typedef struct { uint64_t pipeline; uint32_t compute; char shader[3][80]; } gp_compact_key;
+/* Names are immutable and remain alive until the consumer stops. The renderer's
+   published vk_shader objects never move or die (vk_shader.c); fixtures obey the
+   same lifetime. Dictionary text is still copied/compared exactly on interning. */
+typedef struct { uint64_t pipeline; uint32_t compute; const char *shader[3]; } gp_compact_key;
+typedef union { double real; uint64_t integer; } gp_compact_value;
 typedef struct {
     gp_compact_key key;
     uint64_t id, hash, frame, window, announced_rotation;
     uint32_t map_slot, selected_discarded;
-    double v[GP_COMPACT_COLUMNS];
+    /* Integer columns never need per-observation integer-to-double conversion.
+       Each column has one representation, selected explicitly by the encoder. */
+    gp_compact_value v[GP_COMPACT_COLUMNS];
     double pending[5]; /* valid, ms, weighted ms, weighted square, missing */
+    char shader[3][80]; /* owned canonical text; hot source-pointer tuple is in key */
 } gp_compact_entry;
 typedef struct {
     uint32_t population, numerator, denominator;
@@ -38,7 +45,7 @@ typedef struct {
 typedef struct {
     gp_compact_entry key[GP_COMPACT_KEYS];
     uint32_t map[GP_COMPACT_KEYS * 2], nkeys, evict;
-    uint32_t touched[GP_COMPACT_KEYS], ntouched;
+    uint32_t touched[GP_COMPACT_KEYS], ntouched, map_dirty;
     gp_compact_exposure exposure[GP_COMPACT_EXPOSURES];
     uint32_t nexposure;
     uint64_t next_id, start, end, frames, eligible_frames, domain_excluded_frames;
@@ -66,11 +73,23 @@ static gp_compact_entry *gp_compact_get(gp_compact *c, const gp_compact_key *key
         if (!index) { if (insert == UINT32_MAX) insert = at; break; }
         if (index == UINT32_MAX) { if (insert == UINT32_MAX) insert = at; continue; }
         gp_compact_entry *e = &c->key[index - 1];
-        if (e->hash == hash && e->key.pipeline == key->pipeline && e->key.compute == key->compute &&
-            !strcmp(e->key.shader[0], key->shader[0]) && !strcmp(e->key.shader[1], key->shader[1]) &&
-            !strcmp(e->key.shader[2], key->shader[2])) { e->window = c->start; return e; }
+        if (e->hash != hash || e->key.pipeline != key->pipeline || e->key.compute != key->compute) continue;
+        int same_source = e->key.shader[0] == key->shader[0] && e->key.shader[1] == key->shader[1] &&
+            e->key.shader[2] == key->shader[2];
+        if (!same_source) {
+            if (strcmp(e->shader[0], key->shader[0] ? key->shader[0] : "") ||
+                strcmp(e->shader[1], key->shader[1] ? key->shader[1] : "") ||
+                strcmp(e->shader[2], key->shader[2] ? key->shader[2] : "")) continue;
+            e->key = *key;
+        }
+        e->window = c->start; return e;
     }
     if (insert == UINT32_MAX || c->next_id == UINT64_MAX) { c->aggregate_overflow++; return NULL; }
+    size_t length[3];
+    for (unsigned i = 0; i < 3; i++) {
+        length[i] = key->shader[i] ? strnlen(key->shader[i], 80) : 0;
+        if (length[i] == 80) { c->aggregate_overflow++; c->counts_complete = 0; return NULL; }
+    }
     unsigned index = c->nkeys;
     if (index == GP_COMPACT_KEYS) {
         unsigned n;
@@ -80,10 +99,13 @@ static gp_compact_entry *gp_compact_get(gp_compact *c, const gp_compact_key *key
         }
         if (n == GP_COMPACT_KEYS) { c->key_overflow++; c->counts_complete = 0; return NULL; }
         c->map[c->key[index].map_slot] = UINT32_MAX;
+        c->map_dirty = 1;
     } else c->nkeys++;
     gp_compact_entry *e = &c->key[index];
     memset(e, 0, sizeof *e);
     e->key = *key; e->hash = hash; e->id = ++c->next_id; e->window = c->start; e->map_slot = insert;
+    for (unsigned i = 0; i < 3; i++)
+        if (key->shader[i]) memcpy(e->shader[i], key->shader[i], length[i] + 1);
     c->map[insert] = index + 1;
     return e;
 }
@@ -99,32 +121,31 @@ static void gp_compact_observe(gp_compact *c, const gp_compact_key *key, int sel
         uint64_t draws, uint64_t dispatches, uint64_t primitives, uint64_t unknown_draws) {
     gp_compact_entry *e = gp_compact_get(c, key);
     if (!e) return;
-    double *v = e->v;
+    gp_compact_value *v = e->v;
     if (discarded) {
-        v[GC_DISCARDED]++; e->selected_discarded += selected; c->frame_bad = 1; return;
+        v[GC_DISCARDED].integer++; e->selected_discarded += selected; c->frame_bad = 1; return;
     }
-    /* Counter arrays use exact binary64 integers. Refuse estimator authority
-       rather than silently rounding an exceptionally large per-key subtotal. */
-    if (v[GC_DRAWS] + (double)draws > 9007199254740991.0 ||
-        v[GC_DISPATCHES] + (double)dispatches > 9007199254740991.0 ||
-        v[GC_PRIMITIVES] + (double)primitives > 9007199254740991.0 ||
-        v[GC_UNKNOWN_DRAWS] + (double)unknown_draws > 9007199254740991.0) {
-        c->aggregate_overflow++; c->counts_complete = 0;
+    /* Preserve the exact binary64 output contract, without hot FP conversions.
+       Overflow makes the whole window non-authoritative, never wraps counts. */
+    const uint64_t exact = UINT64_C(9007199254740991);
+    if (draws > exact - v[GC_DRAWS].integer || dispatches > exact - v[GC_DISPATCHES].integer ||
+        primitives > exact - v[GC_PRIMITIVES].integer || unknown_draws > exact - v[GC_UNKNOWN_DRAWS].integer) {
+        c->aggregate_overflow++; c->counts_complete = 0; return;
     }
-    v[GC_OBSERVED]++; v[GC_SELECTED] += selected; v[GC_OUT_OF_RANGE] += out_of_range;
-    v[GC_DRAWS] += draws; v[GC_DISPATCHES] += dispatches;
-    v[GC_PRIMITIVES] += primitives; v[GC_UNKNOWN_DRAWS] += unknown_draws;
+    v[GC_OBSERVED].integer++; v[GC_SELECTED].integer += selected; v[GC_OUT_OF_RANGE].integer += out_of_range;
+    v[GC_DRAWS].integer += draws; v[GC_DISPATCHES].integer += dispatches;
+    v[GC_PRIMITIVES].integer += primitives; v[GC_UNKNOWN_DRAWS].integer += unknown_draws;
     if (!selected) return;
     if (e->frame != c->frame) {
         e->frame = c->frame; memset(e->pending, 0, sizeof e->pending);
         c->touched[c->ntouched++] = (uint32_t)(e - c->key);
     }
     if (!valid || !population || !numerator || out_of_range) {
-        v[GC_MISSING]++; e->pending[4]++; return;
+        v[GC_MISSING].integer++; e->pending[4]++; return;
     }
     double weighted = ms * population / numerator;
-    v[GC_VALID]++; v[GC_MS] += ms; v[GC_SQUARE] += ms * ms; v[GC_WEIGHTED] += weighted;
-    v[GC_SAMPLED_DRAWS] += draws; v[GC_SAMPLED_DISPATCHES] += dispatches;
+    v[GC_VALID].integer++; v[GC_MS].real += ms; v[GC_SQUARE].real += ms * ms; v[GC_WEIGHTED].real += weighted;
+    v[GC_SAMPLED_DRAWS].integer += draws; v[GC_SAMPLED_DISPATCHES].integer += dispatches;
     e->pending[0]++; e->pending[1] += ms; e->pending[2] += weighted; e->pending[3] += weighted * weighted;
 }
 static void gp_compact_finish(gp_compact *c, int complete) {
@@ -134,9 +155,9 @@ static void gp_compact_finish(gp_compact *c, int complete) {
     for (unsigned i = 0; i < c->ntouched; i++) {
         gp_compact_entry *e = &c->key[c->touched[i]];
         if (eligible) {
-            e->v[GC_ELIGIBLE] += e->pending[0]; e->v[GC_ELIGIBLE_MS] += e->pending[1];
-            e->v[GC_ELIGIBLE_WEIGHTED] += e->pending[2]; e->v[GC_ELIGIBLE_SQUARE] += e->pending[3];
-            e->v[GC_ELIGIBLE_MISSING] += e->pending[4];
+            e->v[GC_ELIGIBLE].real += e->pending[0]; e->v[GC_ELIGIBLE_MS].real += e->pending[1];
+            e->v[GC_ELIGIBLE_WEIGHTED].real += e->pending[2]; e->v[GC_ELIGIBLE_SQUARE].real += e->pending[3];
+            e->v[GC_ELIGIBLE_MISSING].real += e->pending[4];
         }
     }
     unsigned at;
@@ -153,16 +174,21 @@ static void gp_compact_finish(gp_compact *c, int complete) {
     c->frame_population = c->frame_numerator = c->ntouched = 0; c->frame_bad = 0;
 }
 static void gp_compact_reset(gp_compact *c) {
-    /* Retain bounded dictionary identities, clear window/frame accumulators and
-       rebuild the half-full index to remove eviction tombstones. */
-    memset(c->map, 0, sizeof c->map);
+    /* Retain identities and the already-correct index. Only an eviction creates
+       tombstones; rebuilding a clean index is a needless cold report walk. */
+    int rebuild = c->map_dirty;
+    if (rebuild) memset(c->map, 0, sizeof c->map);
     for (unsigned i = 0; i < c->nkeys; i++) {
         gp_compact_entry *e = &c->key[i];
-        memset(e->v, 0, sizeof e->v); memset(e->pending, 0, sizeof e->pending); e->frame = 0;
+        if (e->window == c->start) {
+            memset(e->v, 0, sizeof e->v); memset(e->pending, 0, sizeof e->pending); e->frame = 0;
+        }
         e->selected_discarded = 0;
-        unsigned at = e->hash & (GP_COMPACT_KEYS * 2 - 1);
-        while (c->map[at]) at = (at + 1) & (GP_COMPACT_KEYS * 2 - 1);
-        c->map[at] = i + 1; e->map_slot = at;
+        if (rebuild) {
+            unsigned at = e->hash & (GP_COMPACT_KEYS * 2 - 1);
+            while (c->map[at]) at = (at + 1) & (GP_COMPACT_KEYS * 2 - 1);
+            c->map[at] = i + 1; e->map_slot = at;
+        }
     }
     uint64_t next = c->next_id;
     memset(c->touched, 0, sizeof *c - (size_t)((char *)c->touched - (char *)c));
