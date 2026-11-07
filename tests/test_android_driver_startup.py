@@ -351,7 +351,8 @@ int main(int argc, char **argv) {
         _, log = self.startup(settings='\n'.join(block) + '\n',
                               lines='TOTK_UNCAPPED_HZ=41\nTOTK_PRESENT_SLOTS=0\n')
         self.assertIn('UNCAPPED=1 PACE=0 ACQUIRE_CLOCK=0 ACQUIRE_SLACK=0 PRESENT_SLOTS=0', log)
-        self.assertIn('totk.env: TOTK_UNCAPPED_HZ=41 TOTK_PRESENT_SLOTS=0', log)
+        self.assertIn('totk.env: TOTK_UNCAPPED_HZ=41\n', log)
+        self.assertIn('totk.env: TOTK_PRESENT_SLOTS=0\n', log)
 
     def test_acquire_slack_two_no_longer_enables_the_frame_timeline(self):
         output, _ = self.startup(settings='TOTK_ACQUIRE_SLACK=2\n')
