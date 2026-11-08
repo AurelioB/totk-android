@@ -641,6 +641,13 @@ nice/affinity are in headers; window cumulative service CPU/wall and phase wall 
 bounded footer drop-frame occupancy/phase summaries, distinguish worker backlog from in-flight
 ownership without per-event lines. Leases already cover whole submissions, not individual passes;
 coarsening across independent fences would require different publication/reset/closure authority.
+For ten-minute rate checks use `--seconds 600 --fps 30` or `--fps 45` with the same 18-part
+nonblocking parameters, `--worker-scale 2700 --catch-up 0`. Slowdown targets 2.7× measured CPU
+service and subtracts elapsed wall time before sleeping, so host scheduling is not charged twice.
+Default paced producers rebase a missed whole-frame deadline without skipping work; explicit
+`--catch-up 1` preserves old deadline catch-up burst stress. Report `producer_late_frames`,
+`producer_late_slots`, `producer_max_late_ms`, `producer_rebase_seconds` and actual wall duration.
+Keep failed old-mode evidence; corrected rate-model success is not burst-stress or device proof.
 `--record-fixture` isolates production hook/lease CPU at 4096 groups and 8192 draws/frame, counting
 but not driver-encoding timestamp calls.
 

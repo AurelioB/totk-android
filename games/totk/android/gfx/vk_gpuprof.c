@@ -254,6 +254,10 @@ static int fixture_mode;
 static unsigned fixture_worker_scale = 1000;
 static unsigned fixture_coupled_stall_ms;
 static int fixture_coupled_stalled;
+static double fixture_service_delay_ns(double cpu_ms, uint64_t elapsed_ns, unsigned scale) {
+    double target = cpu_ms * scale * 1000;
+    return target > elapsed_ns ? target - elapsed_ns : 0;
+}
 static VkResult fixture_query_results(VkDevice device, VkQueryPool pool, uint32_t first, uint32_t count,
         size_t size, void *data, VkDeviceSize stride, VkQueryResultFlags flags) {
     if (fixture_mode) return VK_SUCCESS; /* deterministic available/unavailable payloads already supplied */
@@ -1692,11 +1696,15 @@ static void *background_main(void *unused) {
             worker_reset_wall_ms += (monotonic_ns() - reset_start) / 1e6;
 #ifdef TOTK_VK_TESTS
             if (service_start) {
-                /* Emulate slower device service time, not additional CPU work.
-                   Only the paced host fixture uses this test-only multiplier. */
-                double ns = (thread_cpu_ms() - service_start) * (fixture_worker_scale - 1000) * 1000;
-                struct timespec delay = {(time_t)(ns / 1e9), (long)fmod(ns, 1e9)};
-                while (nanosleep(&delay, &delay) && errno == EINTR) {}
+                /* Target scaled CPU service, not host scheduling plus a second
+                   synthetic delay. A descheduled worker already spent that
+                   wall budget; do not compound its host stall. */
+                double ns = fixture_service_delay_ns(thread_cpu_ms() - service_start,
+                    monotonic_ns() - service_wall_start, fixture_worker_scale);
+                if (ns > 0) {
+                    struct timespec delay = {(time_t)(ns / 1e9), (long)fmod(ns, 1e9)};
+                    while (nanosleep(&delay, &delay) && errno == EINTR) {}
+                }
             }
 #endif
             double service_wall = (monotonic_ns() - service_wall_start) / 1e6;

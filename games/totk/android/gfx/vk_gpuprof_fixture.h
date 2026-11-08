@@ -10,6 +10,11 @@ static void fixture_wait(struct timespec start, double seconds) {
     if (start.tv_nsec >= 1000000000) { start.tv_sec++; start.tv_nsec -= 1000000000; }
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &start, NULL) == EINTR) {}
 }
+/* A missed whole producer frame is not permission to inject a later burst at
+   many times the named rate. --catch-up=1 explicitly retains that stress mode. */
+static double fixture_deadline_rebase(double elapsed, double deadline, double period, unsigned catch_up) {
+    return !catch_up && elapsed > deadline + period ? elapsed - deadline : 0;
+}
 static int fixture_report_check(int condition, const char *message) {
     if (condition) return 0;
     fprintf(stderr, "FAIL compact report: %s\n", message);
@@ -34,6 +39,12 @@ int vk_gpuprof_test_report_contract(void) {
     compact_report();
     int failed = fixture_report_check(compact_pending->frames == 300 && !compact.frames,
         "freezing retains the old window and resets the active counters");
+    failed += fixture_report_check(fixture_service_delay_ns(1, 1000000, 2700) == 1700000 &&
+        fixture_service_delay_ns(1, 9000000, 2700) == 0,
+        "CPU scaling charges only the unspent target budget, never host scheduling twice");
+    failed += fixture_report_check(fixture_deadline_rebase(3, 1, 1, 0) == 2 &&
+        fixture_deadline_rebase(3, 1, 1, 1) == 0 && fixture_deadline_rebase(1.5, 1, 1, 0) == 0,
+        "late producer frames rebase without dropping work unless catch-up stress is explicit");
     failed += fixture_report_check(!ftell(file) && !compact_report_cursor,
         "freezing does not serialize a row or close the snapshot");
     compact.start = 301; compact.end = 330; compact.frames = 30;
@@ -73,6 +84,7 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
     unsigned seconds = 600, fps = 0, pace = 0, loss = 0, limit_frames = 0;
     unsigned parts = 2, gpu_held = 0, nonblocking = 0, writer_stall_ms = 0, coupled_stall = 0;
     unsigned parent_budget = 0, spread_percent = 0, unavailable_frame = 0;
+    unsigned catch_up = 0;
     for (int i = 2; i < argc; i += 2) {
         if (i + 1 == argc) return 2;
         char *end; unsigned long value = strtoul(argv[i + 1], &end, 10);
@@ -91,6 +103,7 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         else if (!strcmp(argv[i], "--coupled-stall") && value <= 1) coupled_stall = (unsigned)value;
         else if (!strcmp(argv[i], "--sample-budget") && value <= 16) parent_budget = (unsigned)value;
         else if (!strcmp(argv[i], "--spread-percent") && value <= 100) spread_percent = (unsigned)value;
+        else if (!strcmp(argv[i], "--catch-up") && value <= 1) catch_up = (unsigned)value;
         else if (!strcmp(argv[i], "--unavailable-frame")) unavailable_frame = (unsigned)value;
         else return 2;
     }
@@ -123,7 +136,8 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
     else { output_sink.stall_ms = writer_stall_ms; output_sink.stall_after = 65536; }
     background_start();
     struct timespec wall_start; clock_gettime(CLOCK_MONOTONIC, &wall_start);
-    double logical = 0, producer_wait_ms = 0;
+    double logical = 0, paced = 0, producer_wait_ms = 0, producer_rebase_seconds = 0, producer_max_late_ms = 0;
+    uint64_t producer_late_frames = 0, producer_late_slots = 0;
     unsigned frames = 0;
     uint32_t population = VK_GPUPROF_PIPE_ORDINALS;
     vk_gpuprof_slot *pending_gpu[8] = {0};
@@ -132,12 +146,25 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         uint64_t number = ++frames;
         frame = number; /* production drop diagnostics use the recording frame */
         unsigned logical_fps = fps ? fps : 20 + ((unsigned)logical / 20 % 5) * 10;
+        if (pace) {
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed = fixture_elapsed_ms(wall_start, now) / 1000;
+            if (elapsed > paced + 1.0 / logical_fps) producer_late_frames++;
+            double shift = fixture_deadline_rebase(elapsed, paced, 1.0 / logical_fps, catch_up);
+            paced += shift; producer_rebase_seconds += shift;
+        }
         uint32_t phase = (pipeline_launch_phase + (uint32_t)(number - 1) * 4) & (population - 1);
         for (unsigned part = 0; part < parts; part++) {
             /* Device submits span its ~20 ms recording interval, not an
                instantaneous 18-lease burst followed by an idle frame. */
-            if (pace && spread_percent)
-                fixture_wait(wall_start, logical + part * spread_percent / (100.0 * parts * logical_fps));
+            if (pace && spread_percent) {
+                double deadline = paced + part * spread_percent / (100.0 * parts * logical_fps);
+                fixture_wait(wall_start, deadline);
+                struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+                double late_ms = fixture_elapsed_ms(wall_start, now) - deadline * 1000;
+                if (late_ms > 1000.0 / (parts * logical_fps)) producer_late_slots++;
+                if (late_ms > producer_max_late_ms) producer_max_late_ms = late_ms;
+            }
             unsigned gpu_at = gpu_held ? attempted % gpu_held : 0;
             if (gpu_held && attempted >= gpu_held) background_enqueue(&pending_gpu[gpu_at], 0);
             uint64_t sequence = ++recording_sequence;
@@ -238,7 +265,8 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         }
         population = vk_gpuprof_pipe_population(population, 4096);
         logical += 1.0 / logical_fps;
-        if (pace) fixture_wait(wall_start, logical);
+        paced += 1.0 / logical_fps;
+        if (pace) fixture_wait(wall_start, paced);
     }
     if (gpu_held) {
         unsigned count = attempted < gpu_held ? (unsigned)attempted : gpu_held;
@@ -256,7 +284,9 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         "aggregation_allocations=0 output_write_calls=%llu close_flush_cpu_ms=%.6f close_wall_ms=%.6f "
         "producer_wait_ms=%.6f wall_ms=%.6f dropped_slots=%llu output_failures=%llu worker_scale=%u "
         "queued_slots=%llu processed_slots=%llu parts=%u gpu_held=%u nonblocking=%u writer_stall_ms=%u "
-        "coupled_stall=%u output_sink_peak_bytes=%llu output_sink_overflows=%llu fixture_identity_memory_bytes=%zu\n",
+        "coupled_stall=%u output_sink_peak_bytes=%llu output_sink_overflows=%llu fixture_identity_memory_bytes=%zu "
+        "catch_up=%u producer_late_frames=%llu producer_late_slots=%llu producer_max_late_ms=%.6f "
+        "producer_rebase_seconds=%.6f\n",
         frames, logical, fps, pace, loss, pipeline_raw, (unsigned long long)windows,
         (unsigned long long)output_serialized_bytes, output_serialized_bytes / (double)windows,
         worker_cpu_total_ms, worker_cpu_total_ms / windows, worker_window_cpu_peak_ms,
@@ -269,7 +299,9 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         (unsigned long long)atomic_load(&background_queued_slots),
         (unsigned long long)atomic_load(&background_processed_slots), parts, gpu_held, nonblocking,
         writer_stall_ms, coupled_stall, (unsigned long long)output_sink.peak,
-        (unsigned long long)output_sink.overflows, identity_count * sizeof *names);
+        (unsigned long long)output_sink.overflows, identity_count * sizeof *names, catch_up,
+        (unsigned long long)producer_late_frames, (unsigned long long)producer_late_slots,
+        producer_max_late_ms, producer_rebase_seconds);
     free(names);
     return atomic_load(&output_failures) != 0 ||
         (nonblocking && !coupled_stall && !loss && atomic_load(&background_dropped_slots) != 0);

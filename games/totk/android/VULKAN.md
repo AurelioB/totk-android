@@ -1717,16 +1717,21 @@ measurements, the ownership contract is:
   The fixture prints cumulative bytes/average window, worker thread CPU/average/peak window, backlog,
   aggregation/lease and parent-aggregation memory bounds, zero compact allocation count, write-call count,
   producer wait and close CPU/wall time. `--pace 0` is accelerated throughput,
-  not 600 wall seconds. `--pace 1` uses monotonic absolute wall pacing. Both wait for a free synthetic
-  lease to keep generated datasets identical; producer wait and wall time MUST therefore be reported:
-  zero fixture drops alone does not prove the host kept pace. Backlog is queued+active host leases,
+  not 600 wall seconds. `--pace 1` uses monotonic absolute wall pacing. Without `--nonblocking 1`,
+  both wait for a free synthetic lease to keep datasets identical; producer wait and wall time MUST
+  be reported. Production-rate runs use nonblocking admission. Backlog is queued+active host leases,
   not GPU latency. This excludes real query calls/GPU/driver/device scheduling and proves no Duo result.
-  `--worker-scale 2700` adds test-only sleep equal to 1.7x each lease's measured worker CPU service.
-  For the Duo production-rate check add `--seconds 600 --fps 30 --pace 1 --parts 18 --gpu-held 8
-  --nonblocking 1 --sample-budget 2 --spread-percent 60 --writer-stall-ms 200`: approximately 540
-  submissions/second, not the old two-leases/frame model. A separate `--seconds 120 --fps 45` run
-  models a higher Thor rate (18 submissions/frame is assumed, not measured). The 60 fps variant is
-  a 2x-Duo-rate burst stress, not the production acceptance rate. None is a real GPU/device gate.
+  `--worker-scale 2700` targets wall service equal to 2.7x measured lease CPU work, sleeping only
+  the unspent budget: host descheduling is not multiplied or followed by a second full delay.
+  Paced producers default to `--catch-up 0`: a missed whole-frame deadline rebases future pacing
+  without skipping any logical frame or submission. `--catch-up 1` explicitly restores the old
+  absolute-deadline burst stress. Output counts late producer frames/slots, worst lateness and
+  rebased seconds; report those plus actual wall time, not just the nominal fps.
+  For a 600-second Duo/Thor model use `--seconds 600 --fps 30` or `--fps 45`, plus
+  `--pace 1 --parts 18 --gpu-held 8 --nonblocking 1 --sample-budget 2 --spread-percent 60
+  --writer-stall-ms 200 --worker-scale 2700 --catch-up 0`: 540/810 nominal submissions/second.
+  Eighteen submissions/frame is measured for Duo but assumed for Thor. Keep failed legacy/burst
+  captures; a corrected host model is not equivalent to that stress or a real GPU/device gate.
   Check stable low backlog, producer waits, queued/processed equality and the writer-end footer;
   a larger pool with growing backlog is not success. `--record-fixture` measures production pipeline
   hooks and lease handoffs at 4096 groups/8192 draws per frame. Its counted timestamp sink excludes
