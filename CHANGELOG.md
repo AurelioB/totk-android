@@ -59,6 +59,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Request the window display's highest advertised refresh rate; Android may keep a lower mode. This choice is best
   with a high-refresh screen and may run hotter and use more battery. Existing 30/40/60 choices and every preset
   retain their exact settings; leaving Unlimited removes its timing and refresh request.
+- Enable protected frame lag only in the Snapdragon 8 Elite-class (Odin3, `CQ8725S` / `SM8750`) native60 fps
+  menu profile, with frame generation off, including first run and existing stores. Developer `totk.env`
+  `TOTK_FRAME_LAG=0` still wins; runtime-unset, other chips and non-60 settings remain unchanged.
+  Retain automatic600-draw chunking when lag resolves on and native VMA pressure is absent.
+  Capped Odin tests improved static/pan throughput and33 ms counts; a descriptive pan p99 tail worsened,
+  so this is not a tail or responsiveness guarantee. Duo/Thor do not gain the policy.
 - Add **40 fps** to Frame rate without changing existing presets or 30/60 settings. It caps real game updates
   at 40 with normal game speed and frame lag off, requesting 120 Hz when advertised. Presentation slots follow
   the actual display clock: smoothest on 120 Hz; on 60 Hz (including a user-imposed cap) it is uneven.

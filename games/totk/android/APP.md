@@ -374,7 +374,16 @@ Final readback retained universal1b, the exact three-line profile and original d
 hashes matched the fresh user manifest (only CacheStorageKey.dat changed), no held slots remained,
 and both display controllers reported OFF after normal sleep.
 
-**Odin 3 ordinary play:** retain the existing opt-in profile:
+**Odin 3 ordinary play:** the menu's Snapdragon 8 Elite-class (`CQ8725S` / `SM8750`) 60 fps profile generates
+`TOTK_FPS60_HYSTERESIS=1` and `TOTK_FRAME_LAG=1` only at native 60 fps with frame generation off, including
+first run, existing stores and custom 60 fps mixes. Keep GPU busy retains its independent chip default.
+Developer `totk.env` is read afterward: explicit `TOTK_FRAME_LAG=0` disables lag. Other chips, 30/40/Unlimited
+and frame generation retain their prior settings. Do not add a chunk override: resolved lag automatically uses
+600 draws when native VMA pressure is absent (otherwise 75), preserving explicit developer overrides.
+Capped cross-device tests improved Odin static 57.1→59.8 / 59.2→59.9 fps and pan 58.4→59.5 / 58.2→59.5;
+33 ms counts fell 20/1800→1/1800 static and 148/5100→31/5400 pan. The descriptive pan p99 tail rose
+23.3→27.8 ms: throughput/cadence gains are not a tail or input-responsiveness guarantee. Duo tails worsened
+and capped Thor was neutral, so neither gains the default. Additional ordinary-play opt-ins remain:
 
 ```ini
 TOTK_VK_REC_THREADS=2
@@ -3915,7 +3924,7 @@ the unchanged 60-fps/GPU-busy profile and stayon 0 were restored, with the devic
 | `TOTK_FPS60_HYSTERESIS` | `0` (native) when unset; menu writes `1` only for Snapdragon 8 Elite-class native 60 fps | Startup-only, FPS60/v143: raise after seven consecutive over-budget decisions instead of three, then reload cooldown 2 instead of 6. `<game>/totk.env` `=0` overrides the menu. Compare interval-2 share/episode length and missed-refresh tails; details below. |
 | `TOTK_FPS_AUTO` | `0` (off) | `1`, only with `TOTK_FPS60=1`, selects effective 60/30 presentation intervals from measured sustainability; guest code is not repatched. |
 | `TOTK_GPU_TIME` | `hardware` when `TOTK_FPS60` is unset/`0`; `latency` when `TOTK_FPS60=1` | Android shipping-30 mode defaults to replay-free hardware-equivalent GPU reports. Explicit `hardware` or `latency` overrides either mode; unknown values log and retain latency. DRS also consumes these reports; they are not physical busy-time measurements. |
-| `TOTK_FRAME_LAG` | `0` on every platform and in every FPS mode | Only explicit `TOTK_FRAME_LAG=1` enables protected lag; unset, `0` and every other value leave it off. |
+| `TOTK_FRAME_LAG` | Runtime unset: `0`; Android menu writes `1` only for Snapdragon 8 Elite-class native 60 fps | Only exact `1` enables protected lag. First-run and saved 60 fps settings without frame generation gain the line; every other chip/mode retains its prior policy. Developer `totk.env` `=0` wins. |
 | `TOTK_VK_CHUNK_DRAWS` | `75` by default; `600` when resolved lag is on and native VMA pressure is absent | Explicit positive value or `0` wins (`0` disables automatic chunking). The resolved startup policy is logged once. |
 | `TOTK_VK_SPLIT_PASS_DRAWS` | `0` (off) | `n > 0` ends a still-open pass after `n` draws, submits that part through the chunk path and reopens the same targets with `loadOp=LOAD`. Each split adds a store and load of every attachment on tiled GPUs; try 512 or 256 and read `[split-pass]` every 300 presents (VULKAN.md). |
 | `TOTK_VK_REC_THREADS` | `2` on Android; `0` on other platforms | Explicit `0` keeps the synchronous recorder for A/B; positive overrides select up to four workers. `TOTK_VK_GPU_PROFILE` retains workers, including when pass sampling is enabled; other diagnostic guards still force inline recording. Keep profiler and sample/statistics settings fixed when comparing worker counts (VULKAN.md). |
@@ -4741,10 +4750,11 @@ Historical latency-mode runs dropped Lookout Landing in the rain to the controll
 one-frame-late waits (`TOTK_FRAME_LAG=1`) then restored 30 fps at about 1.1 W more. Thor's newer
 comparison identifies overstated latency-mode GPU reports (about 9–12 ms), not missing frame lag,
 as the cause of those controller drops: lag off plus hardware reports reaches 29.93 fps, minimum
-29.6, versus 27.71 fps, minimum 22.6, with lag on plus latency. Protected lag now defaults **off on
-every platform and in every FPS mode**; only exact `TOTK_FRAME_LAG=1` enables it, and every other
-value leaves it off. Android shipping-30 defaults to hardware reports; FPS60=1 and other platforms/BOTW
-retain latency. Explicit GPU-time overrides and the hybrid lag opt-in remain unchanged.
+29.6, versus 27.71 fps, minimum22.6, with lag on plus latency. Protected lag remains runtime-unset **off
+on every platform**; the Android menu now generates `TOTK_FRAME_LAG=1` only for Snapdragon 8 Elite-class
+native60 without frame generation, using the capped Odin evidence above. Explicit developer `=0` wins;
+every other value besides exact `1` leaves lag off. Android shipping-30 defaults to hardware reports;
+FPS60=1 and other platforms/BOTW retain latency. Explicit GPU-time overrides and the hybrid opt-in are unchanged.
 The open shadow report occurred in a round-nine lag-plus-slab-driver run; lag causation remains unestablished.
 `TOTK_VK_CHUNK_DRAWS` defaults to **75** with default-off lag, or **600** when resolved lag is on
 and native VMA pressure is absent, otherwise **75**; an explicit value wins, including 0 to disable chunking.

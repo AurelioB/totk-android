@@ -8,8 +8,11 @@ on Metal. This file is its Vulkan counterpart, built in stages. Each stage runs 
 disables it, while release builds (`--release` / `DEV_BUILD=0`) retain the off default. SGSR (`TOTK_POST_SCALE=sgsr`),
 automatic 60/30 control (`TOTK_FPS_AUTO=1`, with `TOTK_FPS60=1`) and camera/depth frame generation
 (`TOTK_FRAMEGEN=1`, fixed real 30 only) are opt-in; automatic control and frame generation are mutually exclusive.
-Postprocessing precedes the final overlay on copy and AHB paths. Protected `TOTK_FRAME_LAG` defaults
-off on every platform and in every FPS mode; only explicit `TOTK_FRAME_LAG=1` enables it.
+Postprocessing precedes the final overlay on copy and AHB paths. Protected `TOTK_FRAME_LAG` remains off
+when unset at runtime. The Android menu generates `TOTK_FRAME_LAG=1` only for Snapdragon 8 Elite-class
+(`CQ8725S` / `SM8750`, Odin3) native60 fps without frame generation, including first-run and saved settings;
+developer `totk.env` `=0` wins. All other chips/modes retain their prior policy. Resolved lag keeps the automatic
+600-draw chunk threshold when native VMA pressure is absent (otherwise75); explicit chunk overrides still win.
 Android shipping-30 mode (`TOTK_FPS60` unset/`0`) defaults `TOTK_GPU_TIME` to hardware; FPS60=1
 and other platforms/BOTW retain latency. Explicit hardware/latency overrides remain effective;
 unknown values log and retain latency. The latest Thor evidence supersedes the round 10.1 lag-on policy.
@@ -665,8 +668,9 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   at Lookout (minimum 29.6, no windows below 29.5, 1.4% long frames), compared with lag on plus latency
   at 27.71 fps (minimum 22.6, 10 low windows, 13.2% long). Latency reports overstated GPU time by
   roughly 9–12 ms; hardware's roughly 23 ms agrees with KGSL's roughly 22.7 ms. The older lag
-  measurements below used latency reports and do not justify default-on lag. Lag is now explicit opt-in;
-  its protection and the 600/75 chunk rule are unchanged. See `docs/translation-research.md`.
+  measurements below used latency reports and do not justify default-on lag on Thor. The Android menu's
+  Odin native60-only lag default uses newer capped cross-device evidence (APP.md); runtime unset stays off.
+  Its protection and the600/75 chunk rule are unchanged. See `docs/translation-research.md`.
 - **One frame late: `TOTK_FRAME_LAG=1`.** The frame end waits two syncs for the frame just submitted (the
   frame-end sync, then one of a pair at main+0x2db998); with the switch both wait for the previous frame's fence, so the
   next submission records while the GPU finishes the last one (at most two frames in flight). The game's own no-wait

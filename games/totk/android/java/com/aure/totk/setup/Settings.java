@@ -234,7 +234,10 @@ final class Settings {
             }
             // The device-tested 60 fps profile reports hardware GPU time (the FPS60 default, latency, overstates it).
             if (sixty) line(out, "TOTK_GPU_TIME=hardware");
-            if (sixty && fps60Hysteresis) line(out, "TOTK_FPS60_HYSTERESIS=1");
+            if (sixty && fps60Hysteresis) {
+                line(out, "TOTK_FPS60_HYSTERESIS=1");
+                line(out, "TOTK_FRAME_LAG=1");
+            }
             // Extraction cannot split passes. Leave both hints out with frame generation, retaining its timing block.
             if ("on".equals(get("gpu_feed"))) {
                 line(out, "TOTK_VK_SPLIT_PASS_DRAWS=512");
