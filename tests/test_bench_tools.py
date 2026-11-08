@@ -1163,7 +1163,34 @@ class MemorySampling(unittest.TestCase):
         self.assertIn('supply.usb.type=USB supply.usb.online=1', line)
 
     LINE = ('f={f} cpu=55000 gpu=60000 cool=0 tpl=0 gclk=1 gcap=2 mav={mav} rss=2000000 swp={swp} shm=1000 kgk=1048576 '
-            'kgm= kgi=2097152 pcs=1.50 pcf=0.00 pms={pms} pmf=3.25 kst={kst} caps= 2016000/2016000')
+            'kgm=3145728 kgi=2097152 pcs=1.50 pcf=0.00 pms={pms} pmf=3.25 kst={kst} caps= 2016000/2016000')
+
+    def test_imported_mem_path_and_legacy_fallback_are_generated(self):
+        self.assertIn('kv imported_mem', sampler.LOOP)
+        self.assertIn('kv imported)', sampler.LOOP)
+        self.assertIn('kgi=$(kv_imported)', sampler.LOOP)
+        self.assertIn('pgrep kswapd', sampler.LOOP)
+        self.assertIn("cut -d' ' -f14,15 /proc/$k/stat", sampler.LOOP)
+        self.assertIn('kst=$ks', sampler.LOOP)
+
+    def test_physical_kgsl_accounting_requires_kernel_and_imported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'samples-duo.txt'
+            p.write_text(
+                '1.0 f=300 kgk=1048576 kgm=3145728 kgi=2097152 caps= 1/1\n'
+                '2.0 f=300 kgk=0 kgm=0 kgi=0 caps= 1/1\n'
+                '3.0 f=300 kgk=1048576 kgm=3145728 caps= 1/1\n'
+                '4.0 f=300 kgk= kgm=3145728 kgi=2097152 caps= 1/1\n',
+                encoding='utf-8')
+            rows = analyze.parse_sample_rows(p)
+        self.assertEqual(rows[0]['kgsl'], 3 * (1 << 20))
+        self.assertEqual(rows[0]['kgm'], 3 * (1 << 20))
+        self.assertEqual(rows[1]['kgsl'], 0)
+        self.assertIsNone(rows[2]['kgsl'])
+        self.assertIsNone(rows[3]['kgsl'])
+        self.assertEqual(analyze.memory_of(rows[:1])['kgsl_max_mb'], 3.0)
+        self.assertEqual(analyze.memory_of(rows[2:])['kgsl_kernel_max_mb'], 1.0)
+        self.assertNotIn('kgsl_max_mb', analyze.memory_of(rows[2:]))
 
     def test_kswapd_percent(self):
         import sampler
@@ -1190,8 +1217,8 @@ class MemorySampling(unittest.TestCase):
         self.assertEqual(m['mem_available_min_mb'], round(400000 / 1024, 1))
         self.assertEqual(m['swap_max_mb'], round(500000 / 1024, 1))
         self.assertEqual(m['psi_mem_some_max'], 9.5)
-        self.assertEqual(m['kgsl_max_mb'], 3.0)   # kernel + imported, mapped absent
-        self.assertNotIn('kgsl_mapped_max_mb', m)
+        self.assertEqual(m['kgsl_max_mb'], 3.0)   # kernel + imported; mapped overlaps kernel
+        self.assertEqual(m['kgsl_mapped_max_mb'], 3.0)
         self.assertEqual(analyze.window_memory(300, got), {})
         self.assertEqual(analyze.worst_memory([m, {'mem_available_min_mb': 100.0, 'swap_max_mb': 1.0}])['mem_available_min_mb'], 100.0)
 

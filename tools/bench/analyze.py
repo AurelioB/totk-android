@@ -449,8 +449,8 @@ def parse_sample_rows(path):
         row.update(power_of_tokens(d))
         for key, *_ in MEMORY_FIELDS:
             row[key] = real(key) if key in d else None
-        parts = [row[k] for k in ('kgk', 'kgm', 'kgi') if row[k] is not None]
-        row['kgsl'] = sum(parts) if parts else None
+        # KGSL kernel memory already includes mapped allocations; only add the separate imported_mem counter.
+        row['kgsl'] = row['kgk'] + row['kgi'] if row['kgk'] is not None and row['kgi'] is not None else None
         rows.append(row)
     return rows
 
