@@ -41,7 +41,7 @@ int vk_gpuprof_test_report_contract(void) {
         "freezing retains the old window and resets the active counters");
     failed += fixture_report_check(fixture_service_delay_ns(1, 1000000, 2700) == 1700000 &&
         fixture_service_delay_ns(1, 9000000, 2700) == 0,
-        "CPU scaling charges only the unspent target budget, never host scheduling twice");
+        "CPU scaling charges the unspent thread-CPU budget, not elapsed host wall time");
     failed += fixture_report_check(fixture_deadline_rebase(3, 1, 1, 0) == 2 &&
         fixture_deadline_rebase(3, 1, 1, 1) == 0 && fixture_deadline_rebase(1.5, 1, 1, 0) == 0,
         "late producer frames rebase without dropping work unless catch-up stress is explicit");
@@ -283,6 +283,7 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         "backlog_peak=%llu aggregation_memory_bytes=%zu lease_memory_bytes=%zu parent_aggregation_memory_bound_bytes=%zu "
         "aggregation_allocations=0 output_write_calls=%llu close_flush_cpu_ms=%.6f close_wall_ms=%.6f "
         "producer_wait_ms=%.6f wall_ms=%.6f dropped_slots=%llu output_failures=%llu worker_scale=%u "
+        "worker_scale_clock=thread_cpu "
         "queued_slots=%llu processed_slots=%llu parts=%u gpu_held=%u nonblocking=%u writer_stall_ms=%u "
         "coupled_stall=%u output_sink_peak_bytes=%llu output_sink_overflows=%llu fixture_identity_memory_bytes=%zu "
         "catch_up=%u producer_late_frames=%llu producer_late_slots=%llu producer_max_late_ms=%.6f "

@@ -1696,15 +1696,13 @@ static void *background_main(void *unused) {
             worker_reset_wall_ms += (monotonic_ns() - reset_start) / 1e6;
 #ifdef TOTK_VK_TESTS
             if (service_start) {
-                /* Target scaled CPU service, not host scheduling plus a second
-                   synthetic delay. A descheduled worker already spent that
-                   wall budget; do not compound its host stall. */
-                double ns = fixture_service_delay_ns(thread_cpu_ms() - service_start,
-                    monotonic_ns() - service_wall_start, fixture_worker_scale);
-                if (ns > 0) {
-                    struct timespec delay = {(time_t)(ns / 1e9), (long)fmod(ns, 1e9)};
-                    while (nanosleep(&delay, &delay) && errno == EINTR) {}
-                }
+                /* Charge the configured multiplier to measured thread CPU,
+                   never scheduler wall time. Tiny per-lease nanosleeps turn
+                   the fixture into a timer/wakeup stress rather than slower
+                   aggregation; explicit coupled/sink stalls model IO instead. */
+                double cpu = thread_cpu_ms() - service_start;
+                while (fixture_service_delay_ns(cpu,
+                    (uint64_t)((thread_cpu_ms() - service_start) * 1e6), fixture_worker_scale) > 0) {}
             }
 #endif
             double service_wall = (monotonic_ns() - service_wall_start) / 1e6;

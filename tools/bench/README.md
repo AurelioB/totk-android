@@ -642,8 +642,9 @@ bounded footer drop-frame occupancy/phase summaries, distinguish worker backlog 
 ownership without per-event lines. Leases already cover whole submissions, not individual passes;
 coarsening across independent fences would require different publication/reset/closure authority.
 For ten-minute rate checks use `--seconds 600 --fps 30` or `--fps 45` with the same 18-part
-nonblocking parameters, `--worker-scale 2700 --catch-up 0`. Slowdown targets 2.7× measured CPU
-service and subtracts elapsed wall time before sleeping, so host scheduling is not charged twice.
+nonblocking parameters, `--worker-scale 2700 --catch-up 0`. Slowdown charges 2.7× measured service
+to thread CPU time using synthetic CPU work, not tiny per-lease sleeps or multiplied host scheduling.
+Model worker CPU includes that synthetic work; explicit sink/coupled stalls still model IO separately.
 Default paced producers rebase a missed whole-frame deadline without skipping work; explicit
 `--catch-up 1` preserves old deadline catch-up burst stress. Report `producer_late_frames`,
 `producer_late_slots`, `producer_max_late_ms`, `producer_rebase_seconds` and actual wall duration.

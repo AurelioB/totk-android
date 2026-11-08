@@ -1721,8 +1721,10 @@ measurements, the ownership contract is:
   both wait for a free synthetic lease to keep datasets identical; producer wait and wall time MUST
   be reported. Production-rate runs use nonblocking admission. Backlog is queued+active host leases,
   not GPU latency. This excludes real query calls/GPU/driver/device scheduling and proves no Duo result.
-  `--worker-scale 2700` targets wall service equal to 2.7x measured lease CPU work, sleeping only
-  the unspent budget: host descheduling is not multiplied or followed by a second full delay.
+  `--worker-scale 2700` charges 2.7x measured lease service to `CLOCK_THREAD_CPUTIME_ID`, using
+  test-only CPU work rather than per-lease nanosleeps. Host descheduling is never multiplied;
+  explicit coupled/sink stalls independently model IO. Reported model worker CPU includes this
+  synthetic work and must not be presented as production aggregation overhead.
   Paced producers default to `--catch-up 0`: a missed whole-frame deadline rebases future pacing
   without skipping any logical frame or submission. `--catch-up 1` explicitly restores the old
   absolute-deadline burst stress. Output counts late producer frames/slots, worst lateness and
