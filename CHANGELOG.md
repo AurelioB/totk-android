@@ -44,6 +44,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   rather than holding query-lease service for the report-edge formatting burst. Close drains the snapshot;
   headers include its bounded memory. Count and retire activated pipeline timestamps in the current
   shutdown authority, retaining unavailable endpoints as outstanding. Profiling remains default-off.
+  Limit qualified pipeline captures to ≤30 fps (Duo or capped Thor); 45-fps/uncapped captures remain
+  unqualified and must fail closed on footer drops/missing coverage. The fixed lease pool is not enlarged.
 
 ### Menu
 - Add **40 fps** to Frame rate without changing existing presets or 30/60 settings. It caps real game updates

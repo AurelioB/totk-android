@@ -649,6 +649,10 @@ Default paced producers rebase a missed whole-frame deadline without skipping wo
 `--catch-up 1` preserves old deadline catch-up burst stress. Report `producer_late_frames`,
 `producer_late_slots`, `producer_max_late_ms`, `producer_rebase_seconds` and actual wall duration.
 Keep failed old-mode evidence; corrected rate-model success is not burst-stress or device proof.
+Pipeline profiling is qualified only for **≤30 fps capture configurations** (Duo or capped Thor).
+The 600-second 30-fps CPU-service model passes; 45 fps is **not qualified**, and its failed captures
+must be retained. Uncapped Thor needs a separate device check and mandatory footer/drop inspection;
+loss/missing closure fails closed. This limit does not silently clamp the game or grow the lease pool.
 `--record-fixture` isolates production hook/lease CPU at 4096 groups and 8192 draws/frame, counting
 but not driver-encoding timestamp calls.
 

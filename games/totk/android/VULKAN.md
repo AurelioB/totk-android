@@ -1633,6 +1633,10 @@ measurements, the ownership contract is:
   query counts and drops. Then hold pass sampling fixed and ABBA PIPELINES=0/4 to isolate incremental
   cost. Repeat fresh launches (independent phases), extend beyond several rotations and require adequate
   per-pair samples before ranking. No device calibration was performed as part of the implementation.
+  Supported pipeline-capture qualification is limited to **≤30 fps** (Duo or capped Thor).
+  The 600-second 30-fps model has zero drops; the shared-host 45-fps models do not qualify.
+  Uncapped Thor remains experimental pending its own O/P/P/O check. No automatic cap or larger pool
+  hides this limit: retain the footer/drop counters and fail closed on any loss or missing authority.
   Compact active state is fixed: 8192 exact keys, a 16384-cell open-addressed index, 8192 frame-touched IDs and
   64 exposure strata: **4,427,008 bytes** on the supported 64-bit ABI. Compact mode also allocates exactly
   one enabled-only frozen report snapshot of that same size, plus a `gp_json` diagnostics snapshot

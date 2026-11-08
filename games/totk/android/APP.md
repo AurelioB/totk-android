@@ -3901,6 +3901,11 @@ display mode; producer fps alone cannot show even pacing.
 | `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
 | `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
 
+**Pipeline-profiler qualification limit: ≤30 fps captures** (Duo, or Thor with a 30-fps cap).
+The 600-second 30-fps model passes; 45-fps/uncapped Thor is **not qualified**. This is a
+capture-support boundary, not an automatic game-rate clamp. Uncapped captures must retain/check
+the footer and drop counters; any lost coverage fails closed in analysis. Profiling stays default-off.
+
 The timing profiler has no speculative LOAD-before-clear/STORE-without-observed-read audit.
 It retains static attachment load/store operations and logical byte estimates from pass keys.
 Its walking-thread draw hook does fixed work: count each draw and hash the bounded shader identities
