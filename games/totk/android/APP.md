@@ -4823,8 +4823,9 @@ interval 2 means 60 fps, not 30. This switch does not force the panel into a mod
 
 **Game speed:** do not equate 77.9 rendered fps with a proven 1.30x world clock. The stock frame-step producer is
 frame dependent, but this port defaults `TOTK_REALTIME` on. `game_patches_v143.c:runtime_frame_step_update`, called
-by `nvnQueuePresentTexture` before each present, averages five measured frame intervals, clamped to 1/120..1/15 s,
-and stores ratio = seconds × 30, seconds, and interval = seconds × 60. `patch_realtime` replaces the nominal
+by `nvnQueuePresentTexture` before each present, averages five measured frame intervals with a 1/15 s hitch cap
+(no 1/120 s minimum, so short/jittery frames do not accelerate game time), and stores ratio = seconds × 30,
+seconds, and interval = seconds × 60. `patch_realtime` replaces the nominal
 producer at main+0x3e5658, retaining its half-step selector and FrameRateMgr arithmetic; it also patches the global
 ratio producer at +0x2daa54..+0x2daa78. Thus 77.9 fps is inside the real-time patch's range: [INFERENCE] consumers of
 these steps should advance at wall-clock speed, not 77.9/60 speed. `patch_secondary_animation` separately corrects
