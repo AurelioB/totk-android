@@ -7,6 +7,7 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 
 ### Developer tools
 - Release benchmark camera pans at the timed endpoint before snapshot reads, using one symmetric device-side batch.
+  Interrupt/failed-command cleanup cancels that owned batch promptly instead of queuing behind its busy root broker.
   Add an explicit restart-quartet O/B/B/O comparison rule with paired signs and reference-spread admission, without
   changing in-session direction confirmation. Report window compile provenance and unavailable scene state;
   optional bounded graphics-calm warm-up is off by default and never filters compiling measured windows.

@@ -269,7 +269,7 @@ def main():
                     p(f'    O-spread: {fmt(stats["reference_spread"])}; must be <= tolerance; '
                       'both adjacent pair signs must agree (no direction-confirmation claim)')
                     p('    session pair deltas: ' + ', '.join(
-                        f'O{pair["reference_block"]}-B{pair["arm_block"]} {fmt(pair["delta"])}'
+                        f'positions {pair["reference_block"]}/{pair["arm_block"]} (B-O) {fmt(pair["delta"])}'
                         for pair in stats['pairs']))
             mem = [(name, ref.get('memory', {}).get(name), arm.get('memory', {}).get(name)) for _, name, _, _ in MEMORY_FIELDS]
             if any(r is not None or x is not None for _, r, x in mem):

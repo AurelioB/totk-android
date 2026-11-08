@@ -145,6 +145,10 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
    Release is the **first operation after the timed second half**, before any final-frame/GPU/frequency reads;
    snapshot latency must never keep the stick deflected. Keep both halves and the first direction identical across
    corresponding sessions. This removes host/control asymmetry, not game camera dynamics or OS scheduling noise.
+   INT/TERM waits are interruptible: cancellation stops the owned device command/sleep through an exceptional
+   direct-root request and releases both axes, rather than queuing behind the busy broker. Temporary
+   `<game>/.bench-pan-<host-pid>` control data is removed on completion/cancellation. A failed batch follows the
+   same cleanup; untrappable SIGKILL can only rely on the device batch's finite duration.
    Repeat steps 5–6 and 9 for the other scenes; the sampler stays running across repeated pans.
 10. **Stop the sampler** (`kill %1` in the same shell, else `kill <pid>`, or Ctrl-C; it removes its device loop) and
     **collect**: `tools/bench/collect.sh -s <serial> --device <label> --out $OUT`. It must report 0 GPU/SMMU fault

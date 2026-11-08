@@ -5,7 +5,8 @@ and comparing against the recorded baselines. The full procedure is the `totk-be
 (`.omp/skills/totk-benchmark/SKILL.md`); this is the quick reference.
 
 Device side: `su` root (for `sendevent`, the app's private `totk.log` and `settings.env`, `dmesg`, and the thermal /
-cpufreq / kgsl sysfs files). Ordinary benchmark tools write only the dmesg marker and live-control file
+cpufreq / kgsl sysfs files). Ordinary benchmark tools write the dmesg marker, transient owned pan-control directories
+(`<game>/.bench-pan-<host-pid>`, removed on completion/cancellation), and the live-control file
 (`<game>/totk.ctl`, atomically published with the game folder's owner and explicit SELinux context from `ls -Zd`).
 The explicit CPU profiler below also stages its NDK binary in `/data/local/tmp` and temporarily changes
 recorded perf access controls. Everything is read from `totk.log` and sysfs / procfs, never from
@@ -183,6 +184,11 @@ failure/signal cleanup happen before it returns; `pan.sh` also has a best-effort
 GPU or frequency snapshot can lengthen the last deflection. Equal sleeps remove host/broker round-trip asymmetry;
 input scheduling and game camera dynamics still prevent a promise of pixel-identical endpoints. Frame/GPU boundary
 reads retain small control/read latency outside motion; only complete runtime windows are selected.
+The host waits interruptibly on the owned pan child. INT/TERM or a failed batch invokes an exceptional direct-root
+cancel command (one extra su session only on failure): mark cancellation, validate the recorded device PID against
+its control path, terminate that command and its sleep, and release the axes. It must not queue release behind the
+busy broker. Cleanup reaps the request and removes its control directory before returning. SIGKILL cannot run shell
+traps; the finite device batch remains the last-resort release bound.
 
 Every pan invokes `sampler.py --gpu-snapshot` just before and after motion via the persistent root shell, storing raw
 cumulative counters in `gpu-time-in-state.jsonl`. The first supported source is KGSL/devfreq `trans_stat`, then the

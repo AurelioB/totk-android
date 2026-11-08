@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import signal
 import tempfile
 import threading
 import time
@@ -904,6 +905,7 @@ shift 3
 case $1 in
   pidof) exit 0 ;;
   'su -c sh') exec sh ;;
+  'su -c '*) script=${1#su -c }; eval "exec sh -c $script" ;;
   *) echo "fake adb: unexpected $1" >&2; exit 1 ;;
 esac
 '''
@@ -1207,7 +1209,8 @@ class PanRelease(unittest.TestCase):
                     path.chmod(0o755)
                 dev.env['EVENTS'] = str(events)
                 result = subprocess.run(['sh', str(BENCH / 'bench_input.sh'), '-s', 'x', '--event', '/fake',
-                                         'pan', str(first), '72'], env=dev.env, capture_output=True, text=True)
+                                         '--game-dir', str(dev.game), 'pan', str(first), '72'],
+                                        env=dev.env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(events.read_text().splitlines(), [
                     f'event /fake 3 2 {first}', 'event /fake 3 5 0', 'event /fake 0 0 0', 'sleep 72',
@@ -1226,9 +1229,46 @@ class PanRelease(unittest.TestCase):
             events = dev.dir / 'events'
             dev.env['EVENTS'] = str(events)
             result = subprocess.run(['sh', str(BENCH / 'bench_input.sh'), '-s', 'x', '--event', '/fake',
-                                     'pan', '16000', '.1'], env=dev.env, capture_output=True, text=True)
+                                     '--game-dir', str(dev.game), 'pan', '16000', '.1'],
+                                    env=dev.env, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(events.read_text().splitlines()[-3:], ['/fake 3 2 0', '/fake 3 5 0', '/fake 0 0 0'])
+            self.assertEqual(list(dev.game.glob('.bench-pan-*')), [])
+
+    def test_host_signal_cancels_owned_batch_without_waiting_for_its_broker(self):
+        for group in (False, True):
+            with self.subTest(process_group=group), fake_device() as dev:
+                events = dev.dir / 'events'
+                event_script = dev.dir / 'bin/sendevent'
+                event_script.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$EVENTS"\n')
+                event_script.chmod(0o755)
+                dev.env['EVENTS'] = str(events)
+                (dev.game / 'totk.log').write_text('[nvn] 计时 至帧 300： timing\n')
+                process = subprocess.Popen(['sh', str(BENCH / 'pan.sh'), '-s', 'x', '--device', 'test',
+                    '--scene', 'hateno', '--event', '/fake', '--display', '0', '--game-dir', str(dev.game),
+                    '--target-fps', '60', '--seconds', '20', '--no-shot', '--out', str(dev.dir / 'out')],
+                    env=dev.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if events.exists() and '/fake 3 2 16000' in events.read_text():
+                        break
+                    time.sleep(.02)
+                else:
+                    process.kill()
+                    out, err = process.communicate(timeout=5)
+                    self.fail(f'pan never started: {out!r} {err!r}')
+                started = time.monotonic()
+                if group:
+                    os.killpg(process.pid, signal.SIGINT)
+                else:
+                    process.terminate()
+                out, err = process.communicate(timeout=6)
+                self.assertNotEqual(process.returncode, 0, out)
+                self.assertLess(time.monotonic() - started, 6, err)
+                self.assertEqual(events.read_text().splitlines()[-3:],
+                                 ['/fake 3 2 0', '/fake 3 5 0', '/fake 0 0 0'])
+                self.assertNotIn('/fake 3 2 -16000', events.read_text())
+                self.assertEqual(list(dev.game.glob('.bench-pan-*')), [])
 
 
 class RestartQuartet(unittest.TestCase):
@@ -1304,6 +1344,18 @@ class RestartQuartet(unittest.TestCase):
             result = run(BENCH / 'abtest.py', '--restart-quartet', *paths)
             self.assertEqual(result.returncode, 2)
             self.assertIn('identical, explicit pan', result.stderr)
+
+
+    def test_missing_session_metric_telemetry_cannot_confirm(self):
+        documents = self.documents((40, 44, 44, 40))
+        documents[0]['runs'][0]['summary']['throughput_fps'] = None
+        arms = abtest.restart_analysis(documents, 'O')['runs'][0]['ab']['arms']
+        stats = abtest.paired_metric('throughput_fps', arms['O'], arms['B'], 'restart-quartet')
+        self.assertIsNone(stats['reference_spread'])
+        self.assertEqual(abtest.metric_verdict('throughput_fps', arms['O'], arms['B'], stats)[3], 'inconclusive')
+        documents[1]['runs'][0]['pans'][0]['direction'] = None
+        with self.assertRaisesRegex(ValueError, 'explicit pan'):
+            abtest.restart_analysis(documents, 'O')
 
 
 class CompileProvenance(unittest.TestCase):

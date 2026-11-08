@@ -90,7 +90,15 @@ gpu_snapshot() {
 }
 
 mkdir -p "$OUT/shots"
-trap 'input rstick 0' EXIT
+PAN_PID=""
+cleanup() {
+  if [ -n "$PAN_PID" ]; then
+    kill -TERM "$PAN_PID" 2>/dev/null
+    wait "$PAN_PID" 2>/dev/null
+  fi
+  input rstick 0
+}
+trap cleanup EXIT
 trap 'exit 130' INT TERM
 I=1; PREV_T0=0
 while [ "$I" -le "$REPEAT" ]; do
@@ -106,7 +114,13 @@ while [ "$I" -le "$REPEAT" ]; do
   while [ "$T0" -le "$PREV_T0" ]; do sleep 1; T0=$(date +%s); done
   PREV_T0=$T0
   gpu_snapshot start
-  input pan "$((D * V))" "$HALF" || die "cannot complete/release the camera pan"
+  # wait(1)'s shell builtin is interruptible; a foreground external command would defer
+  # the host trap until the entire device batch finished.
+  "$HERE/bench_input.sh" -s "$SER" --event "$EV" --display "$DISP" --package "$PKG" --game-dir "$GAME" \
+    pan "$((D * V))" "$HALF" &
+  PAN_PID=$!
+  wait "$PAN_PID" || die "cannot complete/release the camera pan"
+  PAN_PID=""
   T1=$(date +%s)
   F1=$(lastf) || die "cannot read the final frame boundary"
   gpu_snapshot end
