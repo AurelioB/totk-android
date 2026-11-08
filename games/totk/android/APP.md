@@ -3886,6 +3886,13 @@ still win. Returning to 30/40/60 or any preset removes all Unlimited-only lines;
 For qualification, select Unlimited from the menu, warm its pipeline cache, and measure Hateno delivered fps,
 frame/fence intervals, actual panel mode, temperatures and HUD-clock progress against wall time. Check a
 scripted/title-screen camera separately for the 30 fps floor; an accepted refresh hint is not panel evidence.
+Host qualification: 800 Python tests passed (44 optional/configuration skips with the signed release APK),
+160 setup tests passed (20 skips), plus native FPS60 patch/floor, present-slot, acquire-clock, display-pace and
+acquire-slack fixtures. Settings probes pin the existing rate/preset bytes and every Unlimited transition; rate
+fixtures cover integer/max/fractional requests, display migration, JNI refusal and both hint targets.
+**Device qualification is pending (Odin locked):** no delivered-fps, interval, panel-mode, HUD-clock/game-speed,
+thermal-load or camera-floor smoke result is claimed. The attempted smoke did not reach the menu or game; RC8,
+the unchanged 60-fps/GPU-busy profile and stayon 0 were restored, with the device left asleep.
 
 | Frame-rate option | Android default | Effect |
 | --- | --- | --- |
