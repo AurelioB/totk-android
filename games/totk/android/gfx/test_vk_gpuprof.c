@@ -18,6 +18,7 @@
 int vk_gpuprof_test_compact_run(int argc, char **argv);
 int vk_gpuprof_test_record_run(void);
 int vk_gpuprof_test_sink_run(void);
+int vk_gpuprof_test_report_contract(void);
 #include "vk_load.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include <errno.h>
@@ -294,13 +295,21 @@ static void check_pixels(tex_t *target, uint8_t *memory) {
     CHECK(!bad, "profiled draw produces exact all-white real Vulkan readback at both render extents");
 }
 static int finish_fixture(unsigned frames, unsigned passes, unsigned draws, int supported) {
-    int mode = getenv("TOTK_VK_GPU_PROFILE") ? atoi(getenv("TOTK_VK_GPU_PROFILE")) : 0;
+    const char *requested = getenv("TOTK_VK_GPU_PROFILE");
+    int mode = requested && (!strcmp(requested, "1") || !strcmp(requested, "2") || !strcmp(requested, "3")) ?
+        atoi(requested) : 0;
     int workers = getenv("TOTK_VK_REC_THREADS") ? atoi(getenv("TOTK_VK_REC_THREADS")) : 0;
     int stats = getenv("TOTK_VK_GPU_PROFILE_STATS") && !strcmp(getenv("TOTK_VK_GPU_PROFILE_STATS"), "1");
     CHECK(vk_gpuprof_on == mode, "launch-time GPU profile mode remains effective");
     CHECK(!!vk_record_enabled() == !!workers, "GPU profiling does not force requested recorder workers inline");
     CHECK(!!vk_gpuprof_stats_mask() == !!(mode && stats && V.has_pipeline_statistics),
         "statistics are available only when requested and supported");
+    if (!mode) {
+        uint64_t background[3]; vk_gpuprof_test_background(background);
+        CHECK(!vk_gpuprof_pipeline_on, "pipeline subflags cannot enable a disabled master profiler");
+        CHECK(!background[0] && !background[1] && !background[2],
+            "disabled profiler never queues, processes or drops a query lease");
+    }
     if (workers && draws) {
         uint64_t leases[4]; vk_record_test_leases(leases);
         CHECK(leases[1], "parallel recorder secondary leases are actually used for real draws");
@@ -716,6 +725,8 @@ int main(int argc, char **argv) {
     pipeline_contract();
     compact_contract();
     if (argc == 2 && !strcmp(argv[1], "--compact-contract")) {
+        CHECK(!vk_gpuprof_test_report_contract(),
+            "frozen compact reports preserve snapshot data and bound each completed-frame pump");
         printf("gpuprof-compact-contract checks=%u failures=%u\n", checks, failures);
         return failures != 0;
     }

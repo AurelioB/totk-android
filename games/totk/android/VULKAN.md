@@ -1633,8 +1633,11 @@ measurements, the ownership contract is:
   query counts and drops. Then hold pass sampling fixed and ABBA PIPELINES=0/4 to isolate incremental
   cost. Repeat fresh launches (independent phases), extend beyond several rotations and require adequate
   per-pair samples before ranking. No device calibration was performed as part of the implementation.
-  Compact state is fixed: 8192 exact keys, a 16384-cell open-addressed index, 8192 frame-touched IDs and
-  64 exposure strata: **4,427,008 bytes** on the supported 64-bit ABI (`sizeof` also published in headers).
+  Compact active state is fixed: 8192 exact keys, a 16384-cell open-addressed index, 8192 frame-touched IDs and
+  64 exposure strata: **4,427,008 bytes** on the supported 64-bit ABI. Compact mode also allocates exactly
+  one enabled-only frozen report snapshot of that same size, plus a `gp_json` diagnostics snapshot
+  (8192 data bytes and bookkeeping). Header/footer aggregation memory is
+  `2 * sizeof(gp_compact) + sizeof(compact_report_diagnostics)`; this is separate from the leases and sink.
   Pipeline lease storage is separately bounded by 32 leases and the configured budget (including
   pipeline metadata, parent records and readback arrays; excluding Vulkan driver/query-pool storage).
   SAMPLE=2/PIPELINES=4/STATS=0 uses **31,075,072 bytes** on the host 64-bit ABI, down from compact2's
@@ -1666,24 +1669,36 @@ measurements, the ownership contract is:
   Each pipeline lease record is 104 bytes rather than 320: hot counters and borrowed source pointers,
   not a 240-byte shader tuple copied per group. The dictionary owns the capture text; pointer equality
   is only a cache over already-proven immutable source objects, never a weaker exported shader identity.
+  Borrowed names point into each published `vk_shader`'s inline `key[80]`, copied before cache publication.
+  Published shader objects have process lifetime: variant-list refresh, program release, seed-IO shutdown
+  and pipeline failure cleanup do not reclaim them. Native presentation/post/framegen helper modules
+  are raw Vulkan objects, not temporary `vk_shader` name owners passed to the group profiler.
+  Any future shader reclamation must retain names through reporter shutdown, including frozen reports;
+  a completed GPU fence alone is insufficient. The GPU-free `test_vk_shader_lifetime.py` pins this contract.
   Optional count columns stay exact integers in the hot loop, with the same 2^53−1
   representability guard; only selected keys enter the per-frame floating-point moment-reduction list.
-  A frame-ordered cursor walks each immutable lease once across frame segments. Dictionary strings
-  are encoded only when needed for the retained file; ordinary JSON string runs use bounded copies,
-  not per-character printf calls. Numeric window columns use one fixed-schema encoding call. Parent
-  table occupancy is a 2 KiB bitmap; reports visit/clear only live groups instead of scanning/clearing
+  A frame-ordered cursor walks each immutable lease once across frame segments. At each completed frame,
+  pending numeric/text encoding visits at most **64 key indices**; all 8192 indices drain within **128 frames**
+  of the next 300-frame window. A window edge freezes one bounded snapshot and resets active state instead
+  of encoding the full report in a burst. Dictionary strings are encoded only when needed for the retained
+  file; ordinary JSON string runs use bounded copies, not per-character printf calls. Numeric window columns
+  use one fixed-schema encoding call. No new thread or report queue is introduced; the existing 1 MiB sink
+  remains unchanged.
+  Parent table occupancy is a 2 KiB bitmap; reports visit/clear only live groups instead of scanning/clearing
   a multi-MiB cold table. JSON initialization resets cursors, not whole 8192-byte scratch arrays.
   The compact index is rebuilt only after actual eviction leaves tombstones, not on insert-only
   windows; clean dictionary bucket positions remain valid across reset.
-  These remove report bursts rather than hiding them with more leases.
+  Report-edge CPU therefore pays a bounded snapshot copy and reset, not full numeric/text encoding;
+  the subsequent encoding is amortized rather than hidden with more leases.
   The compact aggregator makes no per-group/window allocations; existing parent pass buffering/histograms
   remain separately bounded. Inactive previous-window dictionary entries are
   evicted under lifetime churn; IDs are never reused. Current-window entries cannot be evicted: saturation
   is an explicit overflow, not a silently weakened estimate. A referenced key is announced before its
   summary in each file; reserve only that key/summary pair on rotation, never replay an entire dictionary.
   Losing earlier rotated files still loses coverage and cannot silently regain full-capture authority.
-  Close flushes a remaining partial window once; unfinished frames are explicitly excluded/overflowed,
-  and in-flight GPU retirement remains unknown.
+  Terminal close and sparse window jumps synchronously drain outstanding frozen reports. Close flushes a
+  remaining partial window once; unfinished frames are explicitly excluded/overflowed, and in-flight GPU
+  retirement remains unknown.
   Coverage reports `CLOCK_THREAD_CPUTIME_ID` aggregation and key-encoding/flush CPU milliseconds,
   serialized bytes before the coverage row (including parent rows and repeated rotation headers),
   peak queued+active leases and the fixed aggregation bound. The footer reports cumulative serialized

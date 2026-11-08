@@ -40,6 +40,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   and explicit loss/overflow; flush partial windows once at close without inventing GPU retirement.
   Publish worker CPU, cumulative output bytes, backlog/memory bounds and a deterministic no-GPU
   4096-key churn fixture using the production queue/aggregation/output path. Host capacity is not device proof.
+- Amortize compact pipeline-window encoding across completed frames using one fixed report snapshot,
+  rather than holding query-lease service for the report-edge formatting burst. Close drains the snapshot;
+  headers include its bounded memory. Count and retire activated pipeline timestamps in the current
+  shutdown authority, retaining unavailable endpoints as outstanding. Profiling remains default-off.
 
 ### Menu
 - Add **40 fps** to Frame rate without changing existing presets or 30/60 settings. It caps real game updates

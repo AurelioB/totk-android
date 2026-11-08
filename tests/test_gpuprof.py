@@ -1886,6 +1886,12 @@ class Analyzer(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('GPUPROF_TEST_BIN'), 'set GPUPROF_TEST_BIN for the host worker fixture')
 class CompactSink(unittest.TestCase):
+    def test_report_snapshot_and_bounded_pump_contract(self):
+        binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
+        result = subprocess.run([str(binary), '--compact-contract'], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r'gpuprof-compact-contract checks=\d+ failures=0')
+
     def test_sink_is_bounded_nonblocking_and_preserves_bytes_across_wrap(self):
         binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
         result = subprocess.run([str(binary), '--sink-contract'], capture_output=True, text=True, timeout=30)
@@ -1929,6 +1935,75 @@ class CompactSink(unittest.TestCase):
                     self.assertEqual(report['pipelines']['coverage']['invalid_coverage'], 0)
                     self.assertFalse(report['pipelines']['censored'], report['pipelines']['censor_reasons'])
 
+    def test_pipeline_endpoint_retirement_counts_only_available_activated_queries(self):
+        binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
+        for raw in (0, 1):
+            for budget in (0, 1):
+                for unavailable in (0, 2):
+                    with self.subTest(raw=raw, budget=budget, unavailable=unavailable), \
+                            tempfile.TemporaryDirectory(dir=binary.parent) as temporary:
+                        env = dict(os.environ, TOTK_VK_GPU_PROFILE_PIPELINES_RAW=str(raw))
+                        env.pop('TOTK_VK_GPU_PROFILE_MAX_BYTES', None)
+                        args = ['--compact-fixture', '--frames', '2', '--parts', '2',
+                                '--sample-budget', str(budget), '--unavailable-frame', str(unavailable)]
+                        run = subprocess.run([str(binary), *args], cwd=temporary, env=env,
+                                             capture_output=True, text=True, timeout=30)
+                        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                        rows = [json.loads(line) for path in sorted(Path(temporary).glob('gpuprof-*.jsonl*'))
+                                for line in path.read_text(encoding='utf-8').splitlines()]
+                        footers = [row for row in rows if row['type'] == 'session_end']
+                        self.assertEqual(len(footers), 1)
+                        footer = footers[0]
+                        counts = footer['query_retirement']
+                        # Two frames, two leases/frame. Full parent: 2 pass +
+                        # 2 span endpoints/lease; sampled: 2 pass + 2 span/frame.
+                        # Each frame also activates four pipeline query pairs.
+                        submitted = 2 * ((4 if budget else 8) + 8)
+                        missing = 4 if unavailable else 0
+                        self.assertEqual(counts, dict(
+                            leases_acquired=4, leases_submitted=4, leases_retired=4,
+                            leases_cancelled=0, leases_outstanding=0,
+                            queries_submitted=submitted, queries_retired=submitted - missing,
+                            queries_cancelled=0, queries_outstanding=missing))
+                        self.assertTrue(footer['clean_end'])
+                        self.assertFalse(footer['query_drain_timed_out'])
+                        self.assertIs(footer['all_queries_retired'], not unavailable)
+                        self.assertEqual(rows[-1], footer, 'writer closure follows all deferred rows')
+
+    def test_deferred_pipeline_reports_drain_complete_and_partial_windows_before_footer(self):
+        binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
+        for frames in (330, 600):
+            with self.subTest(frames=frames), tempfile.TemporaryDirectory(dir=binary.parent) as temporary:
+                env = dict(os.environ, TOTK_VK_GPU_PROFILE_PIPELINES_RAW='0')
+                env.pop('TOTK_VK_GPU_PROFILE_MAX_BYTES', None)
+                args = ['--compact-fixture', '--frames', str(frames), '--sample-budget', '1']
+                run = subprocess.run([str(binary), *args], cwd=temporary, env=env,
+                                     capture_output=True, text=True, timeout=60)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                paths = sorted(Path(temporary).glob('gpuprof-*.jsonl*'))
+                rows = [json.loads(line) for path in paths
+                        for line in path.read_text(encoding='utf-8').splitlines()]
+                coverage = [r for r in rows if r['type'] == 'pipeline_window_coverage']
+                self.assertEqual([(r['window_start'], r['window_end'], r['frames']) for r in coverage],
+                                 [(1, 300, 300), (301, frames, frames - 300)])
+                for row in coverage:
+                    self.assertEqual(row['selected_groups'], row['frames'] * 4)
+                    self.assertEqual(row['valid_samples'], row['frames'] * 4)
+                    self.assertEqual(row['timestamp_count'], row['frames'] * 8)
+                    self.assertEqual(row['missing_selected'], 0)
+                    groups = [r for r in rows if r['type'] == 'pipeline_window' and
+                              r['window_start'] == row['window_start']]
+                    self.assertTrue(groups, 'snapshot rows cannot disappear at the next report or shutdown')
+                    self.assertEqual(sum(r['v'][gpuprof.PIPELINE_WINDOW_COLUMNS.index('selected_groups')]
+                                         for r in groups), row['selected_groups'])
+                    self.assertEqual(sum(r['v'][gpuprof.PIPELINE_WINDOW_COLUMNS.index('valid_samples')]
+                                         for r in groups), row['valid_samples'])
+                self.assertEqual(rows[-1]['type'], 'session_end')
+                self.assertTrue(rows[-1]['clean_end'])
+                self.assertTrue(rows[-1]['all_queries_retired'])
+                self.assertEqual(rows[-1]['last_window_end'], frames)
+                self.assertEqual(rows[-1]['output_failures'], 0)
+
 
 @unittest.skipUnless(os.environ.get('GPUPROF_TEST_BIN'), 'set GPUPROF_TEST_BIN to run the real Vulkan fixture')
 class Lavapipe(unittest.TestCase):
@@ -1946,6 +2021,8 @@ class Lavapipe(unittest.TestCase):
                        TOTK_VK_GPU_PROFILE_LONG_MS='0', TOTK_VK_GPU_PROFILE_LONG_FRAMES='2',
                        TOTK_VK_GPU_PROFILE_MAX_BYTES='4096' if rotate else '134217728',
                        TOTK_RENDER_RES='1280x720')
+            if mode is None:
+                env.pop('TOTK_VK_GPU_PROFILE', None)  # exercise the true launch-time default
             # Isolate launch policy from a developer's shell diagnostics.
             for key in ('TOTK_VK_OCCLUSION', 'TOTK_VK_PASS_DUMP', 'TOTK_VK_PASS_PROFILE', 'TOTK_VK_PASSPROBE',
                         'TOTK_VK_PASS_MERGE', 'GPUPROF_TEST_UNSUPPORTED', 'TOTK_VK_OFF', 'TOTK_VK_WRITEBACK',
@@ -1980,9 +2057,13 @@ class Lavapipe(unittest.TestCase):
             match = re.search(r'gpuprof-fixture frames=(\d+) passes=(\d+) draws=(\d+) mode=(\d+) workers=(\d+) '
                               r'stats_supported=(\d+) stats_enabled=(\d+)', result.stdout)
             self.assertIsNotNone(match, result.stdout + result.stderr)
-            frames, passes, draws, _, _, supported, enabled = map(int, match.groups())
+            frames, passes, draws, effective_mode, _, supported, enabled = map(int, match.groups())
             paths = sorted(Path(temporary).glob('gpuprof-*.jsonl*'))
-            if not mode:
+            if mode not in (1, 2, 3):
+                self.assertEqual(effective_mode, 0)
+                self.assertEqual(enabled, 0, 'statistics subflag cannot enable a disabled master profiler')
+                self.assertIn('[gpu-profile] disabled (TOTK_VK_GPU_PROFILE=', result.stderr)
+                self.assertIn('[gpu-profile] pipeline-budget=0 ', result.stderr)
                 self.assertEqual(paths, [], 'off mode must not create a profiler output file')
                 if shutdown_inflight or shutdown_timeout:
                     self.assertEqual((frames, passes, draws), (1, 2, 4))
@@ -2299,6 +2380,13 @@ class Lavapipe(unittest.TestCase):
                 self.assertNotIn('pipelines', report)
         self.launch(0, 2, 0, pipeline_budget=16)
 
+    def test_master_default_off_and_invalid_modes_ignore_pipeline_requests(self):
+        for mode in (None, 0, '', 'invalid', -1, 4, '01', '1 '):
+            for workers in (0, 2):
+                with self.subTest(mode=mode, workers=workers):
+                    self.launch(mode, workers, 1, pipeline_budget=16, pipeline_raw=True,
+                                sample_budget=2, last_closed=True)
+
 
     def check_sealed_present(self, report, observations, stdout, frames, passes, draws, budget, stats_enabled,
                              *, shutdown_inflight=False):
@@ -2421,8 +2509,10 @@ class Lavapipe(unittest.TestCase):
     def test_disabled_shutdown_does_not_wait_for_pending_renderer_work(self):
         for workers in (0, 2):
             for budget in (0, 2):
-                with self.subTest(workers=workers, budget=budget):
-                    self.launch(0, workers, 1, shutdown_inflight=True, sample_budget=budget)
+                for mode, pipeline_budget in ((None, 16), (0, None)):
+                    with self.subTest(workers=workers, budget=budget, mode=mode):
+                        self.launch(mode, workers, 1, shutdown_inflight=True, sample_budget=budget,
+                                    pipeline_budget=pipeline_budget)
 
     def test_shutdown_timeout_preserves_unretired_work_in_clean_footer(self):
         for workers in (0, 2):

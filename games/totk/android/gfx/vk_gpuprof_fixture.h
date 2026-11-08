@@ -10,10 +10,69 @@ static void fixture_wait(struct timespec start, double seconds) {
     if (start.tv_nsec >= 1000000000) { start.tv_sec++; start.tv_nsec -= 1000000000; }
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &start, NULL) == EINTR) {}
 }
+static int fixture_report_check(int condition, const char *message) {
+    if (condition) return 0;
+    fprintf(stderr, "FAIL compact report: %s\n", message);
+    return 1;
+}
+int vk_gpuprof_test_report_contract(void) {
+    FILE *file = tmpfile();
+    compact_pending = calloc(1, sizeof *compact_pending);
+    if (!file || !compact_pending) {
+        if (file) fclose(file);
+        free(compact_pending); compact_pending = NULL;
+        return 1;
+    }
+    output_file = file;
+    compact.start = 1; compact.end = compact.frames = 300;
+    compact.observed = compact.selected = compact.valid = 2; compact.timestamps = 4;
+    for (unsigned i = 0; i < 2; i++) {
+        gp_compact_entry *e = &compact.key[i * 64];
+        e->id = i + 1; e->key.pipeline = i + 1;
+        e->v[GC_OBSERVED].integer = e->v[GC_SELECTED].integer = e->v[GC_VALID].integer = 1;
+    }
+    compact_report();
+    int failed = fixture_report_check(compact_pending->frames == 300 && !compact.frames,
+        "freezing retains the old window and resets the active counters");
+    failed += fixture_report_check(!ftell(file) && !compact_report_cursor,
+        "freezing does not serialize a row or close the snapshot");
+    compact.start = 301; compact.end = 330; compact.frames = 30;
+    compact.key[0].id = 99; compact.key[0].v[GC_SELECTED].integer = 999;
+    failed += fixture_report_check(compact_pending->start == 1 && compact_pending->end == 300 &&
+        compact_pending->frames == 300 && compact_pending->key[0].id == 1 &&
+        compact_pending->key[0].v[GC_SELECTED].integer == 1,
+        "active next-window mutation cannot change the frozen snapshot");
+    compact_report_pump(64);
+    failed += fixture_report_check(compact_report_cursor == 64 && compact_pending->frames == 300,
+        "one completed-frame pump scans exactly 64 dictionary indices without closing coverage");
+    fflush(file); rewind(file);
+    char text[16384]; size_t n = fread(text, 1, sizeof text - 1, file); text[n] = 0;
+    failed += fixture_report_check(strstr(text, "\"key_id\":1,") &&
+        !strstr(text, "\"key_id\":2,") && !strstr(text, "\"type\":\"pipeline_window_coverage\""),
+        "a partial scan emits only reached rows and never premature coverage");
+    fseek(file, 0, SEEK_END);
+    memset(&compact, 0, sizeof compact);
+    background_flush(); /* the production terminal path; no renderer or GPU initialization */
+    failed += fixture_report_check(compact_report_cursor == GP_COMPACT_KEYS && !compact_pending->frames,
+        "terminal flush drains every remaining dictionary index");
+    fflush(file); rewind(file);
+    n = fread(text, 1, sizeof text - 1, file); text[n] = 0;
+    const char *first = strstr(text, "\"key_id\":1,");
+    const char *second = strstr(text, "\"key_id\":2,");
+    const char *coverage = strstr(text, "\"type\":\"pipeline_window_coverage\"");
+    failed += fixture_report_check(first && second && coverage && first < second && second < coverage &&
+        !strstr(coverage + 1, "\"type\":\"pipeline_window_coverage\""),
+        "terminal coverage follows all frozen rows exactly once");
+    failed += fixture_report_check(!atomic_load(&output_failures), "snapshot output completes without failure");
+    fclose(file); output_file = NULL;
+    free(compact_pending); compact_pending = NULL;
+    return failed;
+}
+
 int vk_gpuprof_test_compact_run(int argc, char **argv) {
     unsigned seconds = 600, fps = 0, pace = 0, loss = 0, limit_frames = 0;
     unsigned parts = 2, gpu_held = 0, nonblocking = 0, writer_stall_ms = 0, coupled_stall = 0;
-    unsigned parent_budget = 0, spread_percent = 0;
+    unsigned parent_budget = 0, spread_percent = 0, unavailable_frame = 0;
     for (int i = 2; i < argc; i += 2) {
         if (i + 1 == argc) return 2;
         char *end; unsigned long value = strtoul(argv[i + 1], &end, 10);
@@ -32,6 +91,7 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         else if (!strcmp(argv[i], "--coupled-stall") && value <= 1) coupled_stall = (unsigned)value;
         else if (!strcmp(argv[i], "--sample-budget") && value <= 16) parent_budget = (unsigned)value;
         else if (!strcmp(argv[i], "--spread-percent") && value <= 100) spread_percent = (unsigned)value;
+        else if (!strcmp(argv[i], "--unavailable-frame")) unavailable_frame = (unsigned)value;
         else return 2;
     }
     /* Like the renderer's shader cache, these names never move or mutate while
@@ -102,8 +162,11 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
             slot->lease = slot->sequence; slot->has_pre = 0;
             slot->domain = (vk_gpuprof_time_domain){1, 1, 0, 48, 1};
             uint64_t tick = number * UINT64_C(20000000) + part * UINT64_C(10000000) / parts;
-            slot->span_ticks[0] = (vk_gpuprof_timestamp){tick, 1};
-            slot->span_ticks[1] = (vk_gpuprof_timestamp){tick + UINT64_C(10000000) / parts, 1};
+            unsigned span_first = !sample_budget || !part;
+            unsigned span_last = !sample_budget || part + 1 == parts;
+            slot->span_writes = span_first + span_last;
+            slot->span_ticks[0] = (vk_gpuprof_timestamp){tick, span_first};
+            slot->span_ticks[1] = (vk_gpuprof_timestamp){tick + UINT64_C(10000000) / parts, span_last};
             slot->ticks[0] = (vk_gpuprof_timestamp){tick + 100, 1};
             uint64_t pass_ns = UINT64_C(10000000) / parts / 2;
             if (pass_ns > 1000000) pass_ns = 1000000;
@@ -144,13 +207,23 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
                     uint64_t duration = 10000 + key * 13;
                     slot->pipeline_ticks[p->query1 - 1] = (vk_gpuprof_timestamp){tick + j * 100, 1};
                     slot->pipeline_ticks[p->query1] = (vk_gpuprof_timestamp){tick + j * 100 + duration, 1};
-                    if (loss && number % 97 == 0) slot->pipeline_ticks[p->query1].available = 0;
+                    if ((loss && number % 97 == 0) || number == unavailable_frame)
+                        slot->pipeline_ticks[p->query1].available = 0;
                     if (loss && number % 101 == 0) slot->pipeline_ticks[p->query1].ticks = tick + j * 100 - 1;
-                    if (loss && number % 103 == 0) p->timestamps = 1;
+                    if (loss && number % 103 == 0) {
+                        p->timestamps = 1;
+                        slot->pipeline_ticks[p->query1].available = 0; /* endpoint was never activated */
+                    }
                     s->pipeline_timestamps += p->timestamps;
                 }
             }
             if (loss && part && number == 109) atomic_fetch_add(&background_dropped_slots, 1);
+            /* Synthetic GPU completion bypasses recording and vkQueueSubmit,
+               not production retirement/readback. Account exactly the query
+               instances supplied above before publishing the immutable lease. */
+            atomic_fetch_add_explicit(&leases_acquired, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&leases_submitted, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&queries_submitted, slot_queries(slot), memory_order_relaxed);
             if (gpu_held) pending_gpu[gpu_at] = slot;
             else background_enqueue(&slot, 0);
         }
@@ -187,7 +260,7 @@ int vk_gpuprof_test_compact_run(int argc, char **argv) {
         frames, logical, fps, pace, loss, pipeline_raw, (unsigned long long)windows,
         (unsigned long long)output_serialized_bytes, output_serialized_bytes / (double)windows,
         worker_cpu_total_ms, worker_cpu_total_ms / windows, worker_window_cpu_peak_ms,
-        (unsigned long long)background_backlog_peak, sizeof compact,
+        (unsigned long long)background_backlog_peak, 2 * sizeof compact + sizeof compact_report_diagnostics,
         background_lease_bytes(),
         sizeof groups + sizeof group_occupied + GP_GROUPS * sizeof(gp_group),
         (unsigned long long)output_write_calls, compact_close_cpu_ms, fixture_elapsed_ms(close_start, close_end), producer_wait_ms,

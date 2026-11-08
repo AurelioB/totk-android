@@ -94,6 +94,10 @@ int vk_gpuprof_pipeline_on;
 static uint32_t pipeline_phase, pipeline_launch_phase, pipeline_ordinal;
 static int pipeline_raw;
 static gp_compact compact;
+static gp_compact *compact_pending; /* one enabled-only frozen report; never a queue */
+static unsigned compact_report_cursor;
+static double compact_report_cpu_ms;
+static uint64_t compact_report_dropped_slots, compact_report_dropped_closures;
 static uint64_t output_serialized_bytes, compact_bytes_start;
 static _Atomic uint64_t background_backlog_peak;
 static double compact_flush_cpu_ms, compact_close_cpu_ms;
@@ -101,6 +105,7 @@ static double worker_cpu_start, worker_cpu_total_ms, worker_window_cpu_start, wo
 static int compact_closing;
 static uint64_t compact_unclosed_groups, compact_unclosed_frames, output_write_calls;
 static void compact_report(void);
+static void compact_report_pump(unsigned budget);
 static void compact_finish_frame(uint64_t number, int complete);
 static uint32_t pipeline_population = VK_GPUPROF_PIPE_ORDINALS;
 static gp_pipeline *pipeline_open;
@@ -281,6 +286,7 @@ static void json_add(gp_json *row, const char *format, ...) {
     row->used += (size_t)n;
 }
 static gp_json output_header;
+static gp_json compact_report_diagnostics;
 static void json_string(gp_json *row, const char *text) {
     if (!text) { json_add(row, "null"); return; }
     json_add(row, "\"");
@@ -418,7 +424,7 @@ static void output_init(void) {
             json_add(row, "%s", i ? "," : ""); json_string(row, gp_compact_columns[i]);
         }
         json_add(row, "],\"pipeline_aggregation_memory_bytes\":%zu,\"pipeline_key_capacity\":%u",
-            sizeof compact, GP_COMPACT_KEYS);
+            2 * sizeof compact + sizeof compact_report_diagnostics, GP_COMPACT_KEYS);
     }
     json_add(row, ",\"build_commit\":"); json_string(row, output_commit[0] ? output_commit : NULL);
     json_add(row, ",\"build_asset\":"); json_string(row, output_build[0] ? output_build : NULL);
@@ -550,9 +556,10 @@ void vk_gpuprof_shutdown(void) {
             (unsigned long long)atomic_load(&background_dropped_slots),
             (unsigned long long)atomic_load(&background_dropped_closures), (unsigned long long)pending_closures,
             (unsigned long long)output_serialized_bytes, (unsigned long long)background_backlog_peak,
-            vk_gpuprof_pipeline_on && !pipeline_raw ? sizeof compact : 0, compact_flush_cpu_ms, compact_close_cpu_ms,
+            vk_gpuprof_pipeline_on && !pipeline_raw ? 2 * sizeof compact + sizeof compact_report_diagnostics : 0,
+            compact_flush_cpu_ms, compact_close_cpu_ms,
             (unsigned long long)output_write_calls, (unsigned long long)compact_unclosed_groups,
-            (unsigned long long)compact_unclosed_frames,            query_drain_timed_out ? "true" : "false",
+            (unsigned long long)compact_unclosed_frames, query_drain_timed_out ? "true" : "false",
             (unsigned long long)acquired, (unsigned long long)submitted, (unsigned long long)retired,
             (unsigned long long)cancelled, (unsigned long long)outstanding,
             (unsigned long long)qs, (unsigned long long)qr, (unsigned long long)qc, (unsigned long long)qo);
@@ -1124,7 +1131,9 @@ static void frame_marker(VkCommandBuffer cb) {
 }
 /* Activated query instances, not unused pool capacity or individual counters. */
 static uint64_t slot_queries(const vk_gpuprof_slot *slot) {
-    return (uint64_t)(sample_budget ? slot->nt : slot->n) * 2 + slot->span_writes + slot->ns;
+    uint64_t queries = (uint64_t)(sample_budget ? slot->nt : slot->n) * 2 + slot->span_writes + slot->ns;
+    for (uint32_t i = 0; i < slot->nsegment; i++) queries += slot->segment[i].pipeline_timestamps;
+    return queries;
 }
 void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot) {
     uint64_t sequence = ++recording_sequence;
@@ -1147,6 +1156,7 @@ static void compact_finish_frame(uint64_t number, int complete) {
     if (compact.frame != number) { compact.frame_overflow++; compact.frame_bad = 1; }
     gp_compact_finish(&compact, complete);
     compact.cpu_ms += thread_cpu_ms() - start;
+    compact_report_pump(64);
 }
 static void compact_segment(vk_gpuprof_slot *slot, const gp_segment *s, VkResult result, uint32_t *cursor) {
     if (!s->pipeline_observed) return; /* an empty trailing marker is not a population observation */
@@ -1191,15 +1201,20 @@ static void compact_segment(vk_gpuprof_slot *slot, const gp_segment *s, VkResult
     }
     compact.cpu_ms += thread_cpu_ms() - start;
 }
-static void compact_report(void) {
-    if (!compact.frames) return;
+static void compact_report_pump(unsigned budget) {
+    gp_compact *c = compact_pending;
+    if (!c || !c->frames) return;
+    uint64_t wall_start = monotonic_ns();
+    unsigned previous_phase = atomic_exchange_explicit(&background_phase, GP_REPORT, memory_order_relaxed);
     double start = thread_cpu_ms();
-    for (unsigned i = 0; i < GP_COMPACT_KEYS; i++) {
-        gp_compact_entry *e = &compact.key[i];
+    unsigned end_index = compact_report_cursor + budget;
+    if (end_index > GP_COMPACT_KEYS) end_index = GP_COMPACT_KEYS;
+    for (unsigned i = compact_report_cursor; i < end_index; i++) {
+        gp_compact_entry *e = &c->key[i];
         if (!e->id) continue;
         if (!e->v[GC_SELECTED].integer && !e->selected_discarded) {
-            compact.unretained += e->v[GC_OBSERVED].integer;
-            if (e->v[GC_OBSERVED].integer) compact.counts_complete = 0;
+            c->unretained += e->v[GC_OBSERVED].integer;
+            if (e->v[GC_OBSERVED].integer) c->counts_complete = 0;
             continue;
         }
         gp_json row; json_init(&row);
@@ -1207,7 +1222,7 @@ static void compact_report(void) {
         json_add(&row, "{\"schema\":3,\"type\":\"pipeline_window\",\"window_start\":%llu,\"window_end\":%llu,"
             "\"key_id\":%llu,\"v\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
             "%.12g,%.12g,%.0f,%.12g,%.12g,%.12g,%.0f,%llu,%llu,%llu,%.12g]}\n",
-            (unsigned long long)compact.start, (unsigned long long)compact.end, (unsigned long long)e->id,
+            (unsigned long long)c->start, (unsigned long long)c->end, (unsigned long long)e->id,
             (unsigned long long)e->v[GC_OBSERVED].integer, (unsigned long long)e->v[GC_SELECTED].integer,
             (unsigned long long)e->v[GC_VALID].integer, (unsigned long long)e->v[GC_MISSING].integer,
             (unsigned long long)e->v[GC_DISCARDED].integer, (unsigned long long)e->v[GC_DRAWS].integer,
@@ -1235,17 +1250,23 @@ static void compact_report(void) {
             if (key.failed) output_failures++;
             else if (output_reserve_locked(row.used + key.used)) {
                 if (!dictionary || output_write_locked(key.data, key.used)) {
-                    e->announced_rotation = output_rotation + 1; output_write_locked(row.data, row.used);
+                    e->announced_rotation = output_rotation + 1;
+                    if (compact.key[i].id == e->id) compact.key[i].announced_rotation = e->announced_rotation;
+                    output_write_locked(row.data, row.used);
                 }
             }
         }
         pthread_mutex_unlock(&output_mu);
     }
-    pthread_mutex_lock(&output_mu);
-    output_flush_locked(0);
-    pthread_mutex_unlock(&output_mu);
-    double flush = thread_cpu_ms() - start;
-    compact_flush_cpu_ms += flush;
+    double elapsed = thread_cpu_ms() - start;
+    compact_report_cpu_ms += elapsed; compact_flush_cpu_ms += elapsed;
+    compact_report_cursor = end_index;
+    if (end_index != GP_COMPACT_KEYS) {
+        if (previous_phase != GP_REPORT) worker_report_wall_ms += (monotonic_ns() - wall_start) / 1e6;
+        atomic_store_explicit(&background_phase, previous_phase, memory_order_relaxed);
+        return;
+    }
+    double flush = compact_report_cpu_ms;
     uint64_t pending_closures = 0;
     if (compact_closing) {
         pthread_mutex_lock(&background_mu);
@@ -1258,14 +1279,14 @@ static void compact_report(void) {
         "\"observed_groups\":%llu,\"selected_groups\":%llu,\"valid_samples\":%llu,\"missing_selected\":%llu,"
         "\"timestamp_count\":%llu,\"dropped_groups\":%llu,\"unretained_groups\":%llu,"
         "\"out_of_range_groups\":%llu,\"discarded_groups\":%llu,\"counts_complete\":%s,\"population_exposure\":[",
-        (unsigned long long)compact.start, (unsigned long long)compact.end, (unsigned long long)compact.frames,
-        (unsigned long long)compact.eligible_frames, (unsigned long long)compact.domain_excluded_frames,
-        (unsigned long long)compact.observed, (unsigned long long)compact.selected, (unsigned long long)compact.valid,
-        (unsigned long long)compact.missing, (unsigned long long)compact.timestamps, (unsigned long long)compact.dropped,
-        (unsigned long long)compact.unretained, (unsigned long long)compact.out_of_range,
-        (unsigned long long)compact.discarded, compact.counts_complete ? "true" : "false");
-    for (unsigned i = 0; i < compact.nexposure; i++) {
-        const gp_compact_exposure *e = &compact.exposure[i];
+        (unsigned long long)c->start, (unsigned long long)c->end, (unsigned long long)c->frames,
+        (unsigned long long)c->eligible_frames, (unsigned long long)c->domain_excluded_frames,
+        (unsigned long long)c->observed, (unsigned long long)c->selected, (unsigned long long)c->valid,
+        (unsigned long long)c->missing, (unsigned long long)c->timestamps, (unsigned long long)c->dropped,
+        (unsigned long long)c->unretained, (unsigned long long)c->out_of_range,
+        (unsigned long long)c->discarded, c->counts_complete ? "true" : "false");
+    for (unsigned i = 0; i < c->nexposure; i++) {
+        const gp_compact_exposure *e = &c->exposure[i];
         json_add(&row, "%s[%u,%u,%u,%llu,%llu,%llu,%llu]", i ? "," : "", e->population, e->numerator, e->denominator,
             (unsigned long long)e->frames, (unsigned long long)e->eligible_frames,
             (unsigned long long)e->observed, (unsigned long long)e->selected);
@@ -1275,22 +1296,53 @@ static void compact_report(void) {
         "\"aggregate_overflow\":%llu,\"key_overflow\":%llu,\"frame_overflow\":%llu,"
         "\"pending_frame_closures\":%llu,\"aggregation_cpu_ms\":%.6f,\"aggregation_flush_cpu_ms\":%.6f,"
         "\"serialized_bytes\":%llu,\"worker_peak_backlog\":%llu,\"aggregation_memory_bytes\":%zu",
-        (unsigned long long)atomic_load(&background_dropped_slots), (unsigned long long)atomic_load(&background_dropped_closures),
-        (unsigned long long)compact.unavailable, (unsigned long long)compact.invalid, (unsigned long long)compact.query_failures,
-        (unsigned long long)compact.aggregate_overflow, (unsigned long long)compact.key_overflow,
-        (unsigned long long)compact.frame_overflow, (unsigned long long)pending_closures, compact.cpu_ms, flush,
+        (unsigned long long)compact_report_dropped_slots, (unsigned long long)compact_report_dropped_closures,
+        (unsigned long long)c->unavailable, (unsigned long long)c->invalid, (unsigned long long)c->query_failures,
+        (unsigned long long)c->aggregate_overflow, (unsigned long long)c->key_overflow,
+        (unsigned long long)c->frame_overflow, (unsigned long long)pending_closures, c->cpu_ms, flush,
         (unsigned long long)(output_serialized_bytes - compact_bytes_start),
-        (unsigned long long)background_backlog_peak, sizeof compact);
-    output_worker_diagnostics(&row, 0); json_add(&row, "}\n");
+        (unsigned long long)background_backlog_peak, 2 * sizeof compact + sizeof compact_report_diagnostics);
+    json_add(&row, "%s}\n", compact_report_diagnostics.data);
+    row.failed |= compact_report_diagnostics.failed;
     if (row.failed) output_failures++; else output_row(row.data);
     pthread_mutex_lock(&output_mu);
     output_flush_locked(0);
     pthread_mutex_unlock(&output_mu);
     compact_bytes_start = output_serialized_bytes;
+    c->frames = 0;
+    if (previous_phase != GP_REPORT) worker_report_wall_ms += (monotonic_ns() - wall_start) / 1e6;
+    atomic_store_explicit(&background_phase, previous_phase, memory_order_relaxed);
+}
+/* Freeze one bounded window, then amortize its numeric/text encoding across
+   completed frames. Even a full dictionary drains in 128 of the 300 frames;
+   no extra thread, unbounded queue, or storage wait owns a query lease. */
+static void compact_report(void) {
+    if (!compact.frames) return;
+    compact_report_pump(GP_COMPACT_KEYS); /* sparse/jumped windows and terminal flush */
+    double start = thread_cpu_ms();
+    *compact_pending = compact;
+    compact_report_cursor = 0;
+    compact_report_dropped_slots = atomic_load(&background_dropped_slots);
+    compact_report_dropped_closures = atomic_load(&background_dropped_closures);
+    json_init(&compact_report_diagnostics);
+    output_worker_diagnostics(&compact_report_diagnostics, 0);
     gp_compact_reset(&compact);
+    compact_report_cpu_ms = thread_cpu_ms() - start;
+    compact_flush_cpu_ms += compact_report_cpu_ms;
     double end = thread_cpu_ms(), worker_window_cpu = end - worker_window_cpu_start;
     if (worker_window_cpu_peak_ms < worker_window_cpu) worker_window_cpu_peak_ms = worker_window_cpu;
     worker_window_cpu_start = end;
+}
+static uint64_t pipeline_retired_queries(const vk_gpuprof_slot *slot, VkResult result) {
+    if (slot->discard || !query_readable(result)) return 0;
+    uint64_t retired = 0;
+    for (uint32_t i = 0; i < slot->npipeline; i++) {
+        const gp_pipeline *p = &slot->pipeline[i];
+        if (!p->query1) continue;
+        for (uint32_t q = 0; q < p->timestamps; q++)
+            retired += !!slot->pipeline_ticks[p->query1 - 1 + q].available;
+    }
+    return retired;
 }
 static void output_pipelines(vk_gpuprof_slot *slot) {
     if (!slot->pipeline_pool) return;
@@ -1298,6 +1350,7 @@ static void output_pipelines(vk_gpuprof_slot *slot) {
         slot->pipeline_pool, 0, slot->pipeline_timed * 2,
         slot->pipeline_timed * 2 * sizeof *slot->pipeline_ticks, slot->pipeline_ticks,
         sizeof *slot->pipeline_ticks, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) : VK_SUCCESS;
+    atomic_fetch_add_explicit(&queries_retired, pipeline_retired_queries(slot, result), memory_order_relaxed);
     for (uint32_t i = 0; i < slot->npipeline; i++) {
         const gp_pipeline *p = &slot->pipeline[i];
         const gp_record *parent = &slot->rec[p->parent];
@@ -1404,6 +1457,8 @@ static void process_slot(vk_gpuprof_slot *slot) {
     if (query_readable(span_result)) for (uint32_t q = 0; q < spans; q++)
         read_queries += !!slot->span_ticks[q].available;
     if (slot->has_pre && query_readable(pre_result)) read_queries += !!slot->pre_tick.available;
+    if (vk_gpuprof_pipeline_on && !pipeline_raw)
+        read_queries += pipeline_retired_queries(slot, pipeline_result);
     atomic_fetch_add_explicit(&queries_retired, read_queries, memory_order_relaxed);
     atomic_fetch_add_explicit(&leases_retired, 1, memory_order_relaxed);
     int slot_failed = sample_budget ? !query_readable(result) || !query_readable(span_result) :
@@ -1531,8 +1586,10 @@ static void background_flush(void) {
         }
         memset(&completed, 0, sizeof completed);
     }
-    if (!window_frames) return;
-    partial_report = 1; report_end = last_completed; report(); partial_report = 0;
+    if (window_frames) {
+        partial_report = 1; report_end = last_completed; report(); partial_report = 0;
+    }
+    compact_report_pump(GP_COMPACT_KEYS);
 }
 static void *background_main(void *unused) {
     (void)unused;
@@ -1552,6 +1609,10 @@ static void *background_main(void *unused) {
     if (long_frames) {
         long_ring = calloc(long_frames, sizeof *long_ring);
         if (!long_ring) DIE("GPU profiler long-frame ring allocation");
+    }
+    if (vk_gpuprof_pipeline_on && !pipeline_raw) {
+        compact_pending = calloc(1, sizeof *compact_pending);
+        if (!compact_pending) DIE("GPU profiler report snapshot allocation");
     }
     output_init();
     worker_cpu_start = worker_window_cpu_start = thread_cpu_ms();
@@ -1685,6 +1746,7 @@ static void *background_main(void *unused) {
     for (uint32_t i = 0; i < long_frames; i++) free(long_ring[i].pass);
     free(long_ring); long_ring = NULL;
     free(frame_pending.pass); frame_pending.pass = NULL;
+    free(compact_pending); compact_pending = NULL;
     worker_cpu_total_ms = thread_cpu_ms() - worker_cpu_start;
     return NULL;
 }
