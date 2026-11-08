@@ -16,9 +16,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Per-thread period-weighted self/inclusive reports separate walker, recorder, submit and game CPU.
 - Give newly linked `libtotk.so` a SHA-1 GNU build ID retained in the packaged library,
   so native profiles can identify matching unstripped symbols without relying on source revision alone.
-- Add experimental `TOTK_FRAME_RATE_HINT_HZ` (default off, needs `TOTK_FRAME_RATE_HINT=1`): request only integer
-  rates advertised by the current game-window display, through the existing FIXED_SOURCE window/AHB-child hints.
-  Invalid or unavailable rates retain the old hint policy; game pacing and Android settings remain unchanged.
+- Add experimental `TOTK_FRAME_RATE_HINT_HZ` (default off, needs `TOTK_FRAME_RATE_HINT=1`): request integer
+  rates advertised by the current game-window display, or `max` for its highest rate (including fractional Hz),
+  through the existing FIXED_SOURCE window/AHB-child hints. Invalid or unavailable rates retain the old hint
+  policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
@@ -48,6 +49,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   unqualified and must fail closed on footer drops/missing coverage. The fixed lease pool is not enlarged.
 
 ### Menu
+- Add **Unlimited** to Frame rate: variable real-game updates up to the existing 120 fps safety ceiling, with
+  the realtime game clock unchanged, frame generation and frame lag off, and the scripted-camera 30 fps floor intact.
+  Request the window display's highest advertised refresh rate; Android may keep a lower mode. This choice is best
+  with a high-refresh screen and may run hotter and use more battery. Existing 30/40/60 choices and every preset
+  retain their exact settings; leaving Unlimited removes its timing and refresh request.
 - Add **40 fps** to Frame rate without changing existing presets or 30/60 settings. It caps real game updates
   at 40 with normal game speed and frame lag off, requesting 120 Hz when advertised. Presentation slots follow
   the actual display clock: smoothest on 120 Hz; on 60 Hz (including a user-imposed cap) it is uneven.

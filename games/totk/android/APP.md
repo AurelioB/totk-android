@@ -3844,7 +3844,7 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 60 then only renders a few surplus frames. On the AYN Thor that was 31.8 fps at 4.94 W against 30.0 fps at 4.81 W.
 `TOTK_FPS60=1` in `totk.env` turns the patch on.
 
-The menu's **Frame rate** choices are **30 / 40 / 60 fps**; no preset or device recommendation changes.
+The menu's **Frame rate** choices are **30 / 40 / 60 fps / Unlimited**; no preset or device recommendation changes.
 **40 fps** is a real-game-update cap, not frame generation, and keeps measured `TOTK_REALTIME=1` game speed.
 Smoothest on 120 Hz displays; on 60 Hz it is uneven. The app requests an advertised 120 Hz mode through its
 window/SurfaceControl hints, but cannot override the user's peak-refresh setting or other Android policy.
@@ -3870,6 +3870,22 @@ the menu's pacing contract. Leave `DM_PRESENT_HZ` and `DM_PRESENT_INTERVAL` unse
 retain their existing behavior. It selects slots from the observed display clock, not the advertised mode list.
 Measure delivered-fence/SurfaceFlinger interval shares near 25 ms versus 16.7/33.3 ms and record effective
 display mode; producer fps alone cannot show even pacing.
+
+**Unlimited** lets real-game frame rate vary with available CPU/GPU headroom, up to the existing **120 fps safety
+ceiling**. It may run hotter and use more battery, and is best with a high-refresh screen. Frame generation and
+frame lag are off; latency is fixed. The 1.4.3 realtime clock is unchanged (five-sample measured step, 1/15 s hitch
+cap, no artificial minimum step that could accelerate jittery frames). Scripted cameras still impose a 33.333 ms
+producer floor. This is a variable producer, not a promise of 120 delivered fps or uniform panel intervals.
+The menu writes `TOTK_FPS60=1 TOTK_UNCAPPED=1 TOTK_UNCAPPED_HZ=120 TOTK_UNCAPPED_INTERVAL=1`,
+`TOTK_REALTIME=1 TOTK_FRAME_LAG=0 TOTK_FPS_AUTO=0 TOTK_PACE=0 TOTK_PRESENT_SLOTS=0`,
+`TOTK_ACQUIRE_SLACK=0 TOTK_ACQUIRE_CLOCK=0 TOTK_FRAME_RATE_HINT=1 TOTK_FRAME_RATE_HINT_HZ=max`.
+Fixed slots and acquire slack stay off so neither rounds the variable producer to a display lattice. The highest
+advertised refresh rate (fractional rates included) is requested through the existing window/AHB FIXED_SOURCE
+hints; missing display/query support falls back to the existing content-rate policy. Android/user refresh limits
+still win. Returning to 30/40/60 or any preset removes all Unlimited-only lines; frame generation returns to real30.
+For qualification, select Unlimited from the menu, warm its pipeline cache, and measure Hateno delivered fps,
+frame/fence intervals, actual panel mode, temperatures and HUD-clock progress against wall time. Check a
+scripted/title-screen camera separately for the 30 fps floor; an accepted refresh hint is not panel evidence.
 
 | Frame-rate option | Android default | Effect |
 | --- | --- | --- |
@@ -3897,7 +3913,7 @@ display mode; producer fps alone cannot show even pacing.
 | `TOTK_ADPF` | Existing render-only session (unset/`legacy`) | `0` disables all CPU hints; `full` opts into the bounded critical-thread group, profile-derived targets and wait-stripped work reporting. |
 | `TOTK_ADPF_TARGET_MS` | `33.3` | Existing render-only target override; nonpositive disables the legacy session. Retained for existing profiles; ignored by `TOTK_ADPF=full`. |
 | `TOTK_FRAME_RATE_HINT` | `0` | `1` requests FIXED_SOURCE content cadence through the window and zero-copy SurfaceControl. It is only a request, never evidence of a panel-mode change. |
-| `TOTK_FRAME_RATE_HINT_HZ` | unset (`0`, off) | Startup-only integer decimal Hz override; needs `TOTK_FRAME_RATE_HINT=1` and a matching mode advertised by the current window display. Invalid/unavailable rates retain the existing policy. See below. |
+| `TOTK_FRAME_RATE_HINT_HZ` | unset (`0`, off) | Startup-only integer decimal Hz or `max` for the highest advertised window-display rate; needs `TOTK_FRAME_RATE_HINT=1`. Invalid/unavailable rates retain the existing policy. See below. |
 | `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
 | `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
 
@@ -4015,10 +4031,11 @@ change still logs `window frame-rate hint=`. Measure the number of those lines a
 
 `TOTK_FRAME_RATE_HINT_HZ=120` plus `TOTK_FRAME_RATE_HINT=1` is an experimental app-side FIXED_SOURCE
 request on both the native window and actual AHB child. Unset/empty/`0` keeps the exact existing hint
-policy. Only integer decimal Hz is accepted (no signs, fractions or suffixes); the current window's
+policy. Integer decimal Hz is accepted (no signs, fractions or suffixes); the current window's
 `decorView.getDisplay().getSupportedModes()` must advertise that rate within 0.01 Hz, allowing float
-rounding such as 120.00001 but not substituting a distinct fractional mode. There is no default-display
-fallback. Window creation/recreation and existing readiness/configuration/focus/resume callbacks
+rounding such as 120.00001 but not substituting a distinct fractional mode. `max` instead selects the highest finite
+positive rate advertised by that same display, retaining its fractional Hz through both native hint targets.
+There is no default-display fallback. Window creation/recreation and existing readiness/configuration/focus/resume callbacks
 revalidate against the current window display; a missing display, unadvertised rate or JNI failure logs
 a refusal and restores the old hint policy. A validated override takes precedence over per-frame
 content-rate recomputation and `TOTK_RATE_HINT_HOLD`, but changes no game/presentation pacing.

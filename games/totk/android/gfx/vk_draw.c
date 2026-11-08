@@ -9070,7 +9070,7 @@ static void *presenter(void *arg) {
     uint64_t retire_logged_generation=UINT64_MAX;
     int retire_logged_active=-1,retire_logged_qualified=-1;
     int retire_qualified=0; /* existing Thor/AFME admission, not transient scene readiness */
-    unsigned hinted_rate = 0;
+    float hinted_rate = 0;
 #endif
     for (;;) {
 #ifdef __ANDROID__
@@ -9215,7 +9215,7 @@ static void *presenter(void *arg) {
         pthread_mutex_unlock(&g_win_mu);
 #ifdef __ANDROID__
         if (b->generated) totk_perf_generated();   /* TOTK_RATE_HINT_HOLD: frame generation is running */
-        unsigned requested_rate = totk_perf_rate();
+        float requested_rate = totk_perf_rate();
         if (w && requested_rate != hinted_rate) {
             totk_perf_window(w);
             if (surface && tx) totk_perf_surface(tx, surface);
