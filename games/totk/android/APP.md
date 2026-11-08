@@ -2207,7 +2207,8 @@ one. `TOTK_INPUT_LOG=1` in `totk.env` logs each −/R decision as `[chord] …`.
 
 Set `TOTK_OVERLAY=fps` (or `1`) for the frame rate alone, or `full` for the native performance panel.
 The compact first row merges real/presented FPS, real-frame milliseconds and mode (`HH` handheld,
-`DK` docked, from `runtime_handheld_mode()`). With FG off, only the real FPS appears.
+`DK` docked, from `runtime_handheld_mode()`). With FG off, the real and presented handoffs are the same,
+so the single FPS value covers both; it is not a separate count of submitted/rendered-but-unpresented work.
 The second row uses `960x540->1920x1080 BILIN+BILIN`, for example; equal sizes print one size.
 `BILIN` means bilinear/linear stretch, `FSR1` the game's docked EASU or host FSR1, and `SGSR` host SGSR.
 Only non-1:1 stages appear, in game scene → guest canvas, then host canvas → front-buffer order.
@@ -2232,6 +2233,19 @@ readable battery discharge current × voltage shows `PWR`, meaningful USB/input 
 and standard `battery/temp` shows `BAT …C`. Unavailable sensors are silently omitted; temperature is the
 battery sensor, not an inferred GPU/SoC temperature. A dedicated background sampler reads sysfs at most 1 Hz.
 The option reserves its row even when sensors are unavailable, preventing layout jitter.
+
+System telemetry is separately **off by default**: `TOTK_OVERLAY_SYS=1` reserves two extra rows in `full`
+(never in `fps`). `THM 0 H0.42 CPU6 0.75 CAP`, for example, shows Android's thermal status (0–6),
+current thermal headroom, and the current/hardware-max frequency ratio of the policy containing `g-main`'s
+sampled last host CPU. `CAP` means readable `scaling_max_freq` is below `cpuinfo_max_freq`; no marker is
+not proof of no cap when the cap counter is unreadable. CPU migration follows the next sample, not a guessed cluster.
+`RAM available/totalM RSS residentM` uses `/proc/meminfo` MemAvailable/MemTotal and `/proc/self/status` VmRSS,
+all in MiB. Missing/invalid values are omitted; both rows keep their space. The existing background sampler
+does all proc/sysfs/thermal reads at most 1 Hz while full is shown, with no per-frame system work.
+Headroom (API 30+) refreshes at most every 10 seconds as Android requires; status needs API 29+.
+Unsupported APIs, denied sysfs and NaN headroom hide only their fields. Compare a screenshot with
+`dumpsys thermalservice`, `/proc/meminfo`, the game's `VmRSS` and that CPU's `cpufreq` files; use matching
+full-overlay runs with/without SYS to measure overhead. `[totk-overlay] sys=0|1` records the startup switch.
 `TOTK_OVERLAY=0` / `off` leaves the picture untouched (release default; dev default is `full`).
 `TOTK_OVERLAY_POS=tl|tr|bl|br` selects the corner (default `tr`). `TOTK_OVERLAY` is the start mode; in app builds
 the − then R shortcut (see Controls) changes it live, so presenter images always carry `TRANSFER_DST` and the
@@ -2286,9 +2300,10 @@ For device A/B use `TOTK_OVERLAY=full`, `TOTK_OVERLAY_POS=tr`, `TOTK_VK_PRESENT=
 `TOTK_VK_PRESENT=ahb` and verify the AHB log has no copy fallback.
 The host fixture is `make -C games/totk/android vktest-overlay TARGET=linux CC=cc OUT=<scratch>/overlay`;
 run `vkoverlaytest` in fresh processes with the desired env, or `vkoverlaytest --bench` for uncached CPU raster cost.
-`vkoverlaytest --power <absent scratch directory>` runs synthetic sysfs power-source fixtures without device access.
+`vkoverlaytest --power <absent scratch directory>` runs synthetic power, CPU-frequency and proc-memory fixtures without device access.
 `vkoverlaytest --render-layout <output.ppm>` renders a controlled FG example without a game/device;
-`TOTK_OVERLAY_POWER=1` adds its optional sensor row. `--bench-record` measures the warmed production
+`TOTK_OVERLAY_POWER=1` adds its optional sensor row; `TOTK_OVERLAY_SYS=1` adds deterministic system examples.
+`--bench-record` measures the warmed production
 recorder; `TOTK_OVERLAY=off` is the empty control and `TOTK_OVERLAY_BENCH_FG=qcom` exercises the FG template.
 `vkdrawtest --overlay-scene` (also `vkdrawtest-app`) submits real MRT/depth draws to check aligned DRS sizes,
 clear-open → viewport-change → first-draw ordering, same-pass viewport updates, scene exclusions, and disabled

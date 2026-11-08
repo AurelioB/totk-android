@@ -6,6 +6,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Add default-off `TOTK_OVERLAY_SYS=1` full-overlay rows for Android thermal status/headroom, the main game's
+  sampled CPU policy current/hardware-max clock ratio and cap marker, available/total RAM and game RSS.
+  The existing background sampler owns all reads (1 Hz; headroom at 10 s); absent fields never move the layout.
 - Release benchmark camera pans at the timed endpoint before snapshot reads, using one symmetric device-side batch.
   Interrupt/failed-command cleanup cancels that owned batch promptly instead of queuing behind its busy root broker.
   Add an explicit restart-quartet O/B/B/O comparison rule with paired signs and reference-spread admission, without
