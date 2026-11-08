@@ -19,7 +19,7 @@ Common options: `-s <serial>` (adb serial), `--device <label>` (a short name use
 | Script | Use |
 |---|---|
 | `bench_input.sh -s <serial> [--event /dev/input/eventN] [--display <id>] <action>` | `press <A\|B\|X\|Y\|L\|R\|PLUS\|MINUS\|UP\|DOWN\|LEFT\|RIGHT> [ms]`, `rstick <x> [y]` (`rstick 0` releases), `shot <file>`, `log`, `detect`, `freqs` (the frequency limits as one line: `cpuN=<cpus>:<scaling_min>:<scaling_max>:<cpuinfo_max>` kHz per cpufreq policy, `gpu_maxclk`, `gpu_freqs`, `gpu_devfreq_max`, GPU power levels). Auto-detects the controller node (`getevent -p`: ABS_Z/ABS_RZ + BTN_SOUTH) and the first display (`dumpsys SurfaceFlinger --display-id`). |
-| `pan.sh -s <serial> --device <label> --scene <label> [--target-fps 30\|40\|60] [--seconds N] [--repeat N] [--value 16000] [--first right\|left] [--no-shot] --out <dir>` | Return pan: stick right for half the time then left (`--first left`: reverse). Defaults to 48 s at 30 target, 144 s at 40/60 target. Records frame/time/frequency boundaries and exact GPU cumulative snapshots per pan, then optional screenshot outside motion. |
+| `pan.sh -s <serial> --device <label> --scene <label> [--target-fps 30\|40\|60] [--seconds N] [--repeat N] [--value 16000] [--first right\|left] [--no-shot] --out <dir>` | Return pan: equal half-duration sleeps and mirrored stick events in one device command (`--first left`: reverse). Releases immediately after the second sleep, before final-frame/GPU/frequency reads. Defaults to 48 s at 30 target, 144 s at 40/60 target. Optional `--warmup-calm-windows N --warmup-timeout 120` is off by default; see provenance below. |
 | `rootsh.py -s <serial> run [-c <script>] \| status \| stop` | The serial's persistent root shell: a host-side broker holding one `adb shell su -c sh`, started by the first `run`, ended by `stop`, after 30 idle minutes or when the device goes. `run` executes the script (default: stdin) in its own `sh -c` and passes its stdout, stderr and status through (124: no answer in time, 125: no root shell). The shell pins itself to the slowest cpufreq cluster (`status` prints the cores). |
 | `live.sh -s <serial> set KEY=VALUE \| unset KEY \| mark <text>...` | Live switches (APP.md *Live switches*): atomically replaces `<game>/totk.ctl` with only the new batch (one generation at the next presented frame) and prints the game's `[totk-ctl]` answer (a mark's acknowledgement, refusals); exit 3 when a mark is not acknowledged, 4 when a line was refused. |
 | `ab.sh -s <serial> --device <label> --scene <label> --arms 'A:<lines>;B:<lines>' [--order ABBAABBA] [--pan-seconds 30] [--settle 15] --out <dir>` | In-session A/B in one loaded scene: per block, the arm's lines plus `mark ab arm=<X> block=<n> scene=<scene> direction=<right\|left>` (live.sh), a settle, a pan (direction alternating). Writes `<dir>/arms.txt` with the direction recorded. |
@@ -27,7 +27,7 @@ Common options: `-s <serial>` (adb serial), `--device <label>` (a short name use
 | `collect.sh -s <serial> --device <label> --out <dir> [--mark]` | `--mark`: dmesg marker (after the scene settles). Default: pulls `logs/<label>.log`, `logs/<label>-dmesg.txt` (from the marker), `settings-<label>.env`, `facts-<label>.txt` (model, SoC, GPU, Android, displays, app version, APK sha256, serial hash), warns about a developer `totk.env`, prints the GPU-fault check. Exit 3 when there is no `totk.log`. |
 | `analyze.py <dir> [--json <file>] [--name <name>] [--commit <sha>] [--meta <json>] [--arms]` | Per device × scene: the 300-frame windows that started after the stick was pushed and ended before it was released (end frame in `[F0+600, F1]`), thermal state over each pan, the frequency limits of each pan and whether they stayed put (`freq_stable`), each device's frequency signature, a results table and caveats; `--json` writes schema `totk-android-benchmark/1`. `--arms`: each window goes to the live-switch generation that covered it whole and that generation's arm (windows straddling a change are dropped); per arm pooled metrics, per block metrics and the same-arm spread (`ab` in the JSON). With the sampler's memory fields, each window, run and arm also gets `memory`: MemAvailable minimum and the maxima of the rest. |
 | `compare.py <reference.json> <new.json>` | Per device × scene: fps mean/min, p50 median, p95 max, worst frame, GPU ms mean, long ≥45 ms, >50 ms, max temperatures, with deltas and verdicts (thresholds in `compare.py --help`); labels each device pair by frequency signature: match / reference only / NOT COMPARABLE; warns when `settings_env` or cpufreq caps differ or caps changed during a run. Exit 1 if a scene with a matching signature is worse. |
-| `abtest.py <ab.json> [--ref A]` | Each arm of an `analyze.py --arms` result against the reference: pooled and same-direction ABBA paired deltas, per-direction deltas, sign agreement, exact sign p-value, tolerance, informational same-arm spread and verdict. Better/worse requires both deltas beyond tolerance plus unanimous pair signs (or p < 0.05 with ≥6 pairs); paired-only crossings are informational leans. Prefer ABBAABBA or longer at 60 fps; full rule in `--help` / the skill. Exit 1 if an arm is worse. |
+| `abtest.py <ab.json> [--ref A]` | In-session arms: pooled and same-direction ABBA paired deltas, per-direction deltas, sign agreement, exact sign p-value, tolerance and informational spread. Better/worse requires both deltas beyond tolerance plus unanimous signs (or p < 0.05 with ≥6 pairs) and both directions. Distinct restart mode: `--restart-quartet O1.json B1.json B2.json O2.json --ref O` (see below). Exit 1 if an arm is worse. |
 | `ledger.py add <result.json> --commit <sha> --apk <apk> --profile <text> [--note ...]` | Append a run to `docs/benchmarks/ledger.jsonl` (+ `docs/benchmarks/runs/<run-id>/<device>.json`), tied to the clean commit the APK was built from (its `assets/build.txt`); compared with the baseline of its frequency signature, or, for a signature seen for the first time (with stable caps), recorded as that signature's NEW baseline (`docs/benchmarks/baselines/<device>/<signature>.json`, pinned, indexed); re-renders `docs/benchmarks/LEDGER.md`. Also `render`, `show <run-id>`, `compare <run-id> <run-id>`. |
 | `check_baselines.py` | Fails if a baseline file (`docs/benchmarks/baseline-*`, `docs/benchmarks/baselines/**`) differs from `docs/benchmarks/BASELINES.sha256` or is unpinned, or `docs/benchmarks/baselines/index.json` is inconsistent (also run by `tests/test_bench_tools.py`). |
 
@@ -109,6 +109,63 @@ estimate for missing pairs or proof of physical scanout. It is null without vali
 Cadence tracing is high-volume and has measurably perturbed Thor timing: keep it off in ordinary performance arms,
 do not mix traced/untraced arms, and use independent distinct-picture evidence for displayed smoothness.
 
+### Restart quartets (distinct from in-session A/B)
+
+For launch-only switches, collect and analyze **four separate session directories**, in the declared
+**O1 → B1 → B2 → O2** order (one restart, same named save, settle and pan schedule each time). Do not concatenate
+their logs: frame counters reset. No synthetic live-control marks are necessary:
+
+```sh
+python3 tools/bench/abtest.py --restart-quartet \
+  "$OUT/O1/result.json" "$OUT/B1/result.json" "$OUT/B2/result.json" "$OUT/O2/result.json" --ref O
+```
+
+The report is labelled **restart-quartet**, never in-session direction-confirmed. All four JSONs must contain the
+same device/scene set, nonempty measured windows and identical explicit pan direction/stick schedules; current
+`analyze.py` records `pans[].direction` from `pans.txt D`. Re-analyze older captures rather than inventing directions.
+Keep pan durations, save, cache, caps, power and thermal admission the same; inspect each source result's caveats,
+frequency stability, compile flags and GPU residency. The command does not establish physical scene equivalence.
+Mixed capped/uncapped sessions are rejected rather than pooled.
+
+Each complete session is one block. Pairs are **B1−O1 (positions 2−1)** and **B2−O2 (3−4)**, equal weight regardless
+of window count. Pooled values are recomputed from both sessions' original windows (throughput remains frames/time).
+Per-metric BETTER/WORSE requires pooled **and** paired-mean deltas strictly beyond tolerance in the same direction,
+and **both pair signs agreeing**, with no sign-test relaxation. FPS tolerance is **max(0.5 fps, 2% of pooled O fps)**;
+other metrics retain `compare.py` tolerances and per-window count rates. **O-spread = |O2−O1| must be ≤ tolerance**,
+so any confirmed effect also exceeds O-spread. Larger/missing O-spread, missing pairs, sign disagreement or a
+paired-only/pooled-only crossing are INCONCLUSIVE, not a confirmed improvement. With admitted O-spread, a paired
+delta within tolerance is SAME. The report shows both individual pair deltas and O-spread. Primary-tail regressions
+and capped dip-confounding still apply; uncapped uses throughput/tails. This two-pair rule is not statistical
+significance. The existing in-session mode and its both-directions requirement are unchanged.
+
+### Compile and scene provenance
+
+Every measured window has `compilation`: graphics `pipeline_sync`, `pipeline_async`, their milliseconds, and
+`pipeline_creations`/milliseconds parsed from the frame-keyed `[nvn-vk] frame N, stutter: ...` line.
+`pipeline_creations` includes cache-backed creations and **is not an independent shader compile count**; do not
+sum it with sync/worker counts. `compiles_present=true` flags observed synchronous/worker builds (`COMPILES` in
+the text). Missing fields/reports stay null, never zero. Pan/run/arm/block summaries retain `compile_windows`,
+`compile_covered_windows` and the observed totals; flagged windows remain in every performance summary.
+Worker counters describe work completed in that 300-present reporting interval, not a causal stall at a specific frame.
+
+The current logs have **no always-on frame-keyed shader-translation or compute compile counts**: those fields are
+explicitly unavailable. Seed-file reads are not compiles; unframed shader completion messages cannot be assigned
+by text adjacency. The overlay's `COMPILE count totalMS` is a **rolling one-second, synchronous-only** image row,
+not a window counter (and excludes async workers/cache joins); it is not OCRed or summed into log counts.
+
+Optional `pan.sh --warmup-calm-windows 2 --warmup-timeout 120` waits before **each** pan for two **fresh consecutive**
+300-present reports with zero graphics creations, sync builds and worker builds. Existing history, duplicate/stale
+reports, missing counters and skipped reporting intervals cannot satisfy the streak. It polls a bounded log tail
+every 3 s, with a finite timeout (maximum 3600 s), and records `calm` / `timeout` / `unavailable`, elapsed time and
+every newly observed report in `warmups.jsonl`; the analyzer retains and labels these observations. Timeout or
+unavailability is visible and measurement proceeds; logs/compile-flagged measured windows are **never hidden**.
+This only admits observed graphics calm, not shader/compute quiescence or absence of queued work. Use the same
+warm-up policy in both arms. Default is off (no extra wait/polling).
+
+`scene_state` explicitly records time of day and weather as **unavailable**: neither the current game log nor the
+performance overlay exposes them. Do not substitute host wall time, save names or a guessed weather classification.
+Match the named save and camera procedure, retain screenshots and describe any visible scene differences manually.
+
 ### Long pans and exact GPU residency
 
 The target defaults to the active preset (`settings.env`, then developer `totk.env` override); `--target-fps`
@@ -121,6 +178,11 @@ boundaries. `--target-fps 60 --seconds 48 --repeat 3` is the recommended shorter
 Keep at least 12 **included** windows per session/arm; the analyzer warns for shorter 60-target scene records.
 If a prolonged slowdown leaves fewer, lengthen/repeat rather than accepting a short run. Use the same duration,
 cycle length and direction schedule in both arms; explicit `ab.sh --pan-seconds 144` keeps its own block schedule.
+The event/sleep/reverse/sleep/release sequence runs in **one device-side batch**. The normal release and
+failure/signal cleanup happen before it returns; `pan.sh` also has a best-effort release trap. No final-frame,
+GPU or frequency snapshot can lengthen the last deflection. Equal sleeps remove host/broker round-trip asymmetry;
+input scheduling and game camera dynamics still prevent a promise of pixel-identical endpoints. Frame/GPU boundary
+reads retain small control/read latency outside motion; only complete runtime windows are selected.
 
 Every pan invokes `sampler.py --gpu-snapshot` just before and after motion via the persistent root shell, storing raw
 cumulative counters in `gpu-time-in-state.jsonl`. The first supported source is KGSL/devfreq `trans_stat`, then the

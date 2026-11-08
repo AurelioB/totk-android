@@ -5,6 +5,7 @@
 # go through the serial's persistent root shell (rootsh.py: one su per session, pinned to the slowest CPU cluster).
 #   press <button> [ms]   hold a built-in controller button (A B X Y L R PLUS MINUS UP DOWN LEFT RIGHT), default 150 ms
 #   rstick <x> [y]        set the right stick (ABS_Z / ABS_RZ, -32767..32767); "rstick 0" releases it
+#   pan <x> <half-s>      symmetric return pan in one device command; releases before returning, including on failure
 #   shot <file>           screenshot of the main display, written to <file> on the host
 #   log                   print the game's totk.log
 #   detect                print the detected "event=<node> display=<id>" and exit
@@ -59,7 +60,7 @@ done
 ACT=$1; shift
 
 adbs() { adb -s "$SER" "$@"; }
-root() { python3 "$HERE/rootsh.py" -s "$SER" run -c "$1"; }
+root() { python3 "$HERE/rootsh.py" -s "$SER" run --timeout "${2:-120}" -c "$1"; }
 
 detect_event() {
   root "getevent -p" | tr -d '\r' | awk '
@@ -100,6 +101,25 @@ case $ACT in
     [ $# -ge 1 ] || usage
     need_event
     root "sendevent $EV 3 2 $1; sendevent $EV 3 5 ${2:-0}; sendevent $EV 0 0 0" ;;
+  pan)
+    [ $# -eq 2 ] || usage
+    case $1 in -*) magnitude=${1#-} ;; *) magnitude=$1 ;; esac
+    case $magnitude in ''|*[!0-9]*) die "pan x must be an integer in -32767..32767" ;; esac
+    [ "$magnitude" -le 32767 ] || die "pan x must be in -32767..32767"
+    awk -v half="$2" 'BEGIN { exit !(half ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ && half > 0) }' ||
+      die "pan half-s must be positive"
+    need_event
+    # No host/root-broker round trip between deflection, reversal and release. Both halves
+    # execute the same event sequence and sleep; snapshot latency cannot extend the last half.
+    root "release() { sendevent $EV 3 2 0; sendevent $EV 3 5 0; sendevent $EV 0 0 0; }
+trap release EXIT
+trap 'exit 130' INT TERM
+sendevent $EV 3 2 $1 && sendevent $EV 3 5 0 && sendevent $EV 0 0 0 &&
+sleep $2 &&
+sendevent $EV 3 2 $((0 - $1)) && sendevent $EV 3 5 0 && sendevent $EV 0 0 0 &&
+sleep $2 || exit 1
+release || exit 1
+trap - EXIT" "$(awk -v half="$2" 'BEGIN { print 2 * half + 60 }')" ;;
   shot)
     [ $# -ge 1 ] || usage
     need_display

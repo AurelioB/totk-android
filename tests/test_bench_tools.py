@@ -21,6 +21,8 @@ import benchlib  # noqa: E402
 import check_baselines  # noqa: E402
 import ledger  # noqa: E402
 import sampler  # noqa: E402
+import provenance  # noqa: E402
+import warmup  # noqa: E402
 
 BASELINE = benchlib.BENCH_DOCS / 'baseline-1.0.0.json'
 # A Thor snapshot as `bench_input.sh freqs` prints it (no cap below the hardware maximum).
@@ -1011,7 +1013,7 @@ class PanMeasurement(unittest.TestCase):
                       '--target-fps', '60', '--no-shot', '--event', '/fake', '--display', '0']
             result = subprocess.run(common + ['--out', str(d / 'long')], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual((d / 'calls').read_text().count('sleep 72\n'), 2)
+            self.assertIn('pan 16000 72\n', (d / 'calls').read_text())
             (d / 'calls').write_text('')
             result = subprocess.run(common + ['--seconds', '48', '--repeat', '3', '--out', str(d / 'repeats')],
                                     env=env, capture_output=True, text=True)
@@ -1022,7 +1024,13 @@ class PanMeasurement(unittest.TestCase):
             self.assertEqual(len({r['T0'] for r in identities}), 3)
             self.assertTrue(all(r['TARGET_FPS'] == '60' for r in identities))
             calls = (d / 'calls').read_text()
-            self.assertEqual(calls.count('sleep 24\n'), 6)
+            self.assertEqual(calls.count('pan 16000 24\n'), 3)
+            self.assertNotIn('sleep 24\n', calls)  # sleeps are inside one device command now
+            pan_index = calls.index('pan 16000 24\n')
+            final_read = calls.index("grep -ao", pan_index)
+            final_gpu = calls.index('--boundary end', pan_index)
+            self.assertLess(pan_index, final_read)
+            self.assertLess(final_read, final_gpu)
             self.assertEqual(calls.count('--boundary start'), 3)
             self.assertEqual(calls.count('--boundary end'), 3)
             self.assertEqual(len((d / 'repeats/freqs.txt').read_text().splitlines()), 6)
@@ -1033,7 +1041,7 @@ class PanMeasurement(unittest.TestCase):
             result = subprocess.run(auto + ['--out', str(d / 'auto')], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('TARGET_FPS=60', (d / 'auto/pans.txt').read_text())
-            self.assertEqual((d / 'calls').read_text().count('sleep 72\n'), 2)
+            self.assertIn('pan 16000 72\n', (d / 'calls').read_text())
             for name, preset, target in (
                     ('forty', 'TOTK_FPS60=1\nTOTK_UNCAPPED=1\nTOTK_UNCAPPED_HZ=40', 40),
                     ('thirty', 'TOTK_FPS60=0\nTOTK_UNCAPPED=1\nTOTK_UNCAPPED_HZ=40', 30),
@@ -1184,6 +1192,194 @@ class MemorySampling(unittest.TestCase):
         self.assertNotIn('kgsl_mapped_max_mb', m)
         self.assertEqual(analyze.window_memory(300, got), {})
         self.assertEqual(analyze.worst_memory([m, {'mem_available_min_mb': 100.0, 'swap_max_mb': 1.0}])['mem_available_min_mb'], 100.0)
+
+
+class PanRelease(unittest.TestCase):
+    def test_device_batch_is_symmetric_and_releases_before_return(self):
+        for first in (16000, -16000):
+            with self.subTest(first=first), fake_device() as dev:
+                events = dev.dir / 'events'
+                for name, source in (
+                        ('sendevent', '#!/bin/sh\nprintf "event %s\\n" "$*" >> "$EVENTS"\n'),
+                        ('sleep', '#!/bin/sh\nprintf "sleep %s\\n" "$*" >> "$EVENTS"\n')):
+                    path = dev.dir / 'bin' / name
+                    path.write_text(source)
+                    path.chmod(0o755)
+                dev.env['EVENTS'] = str(events)
+                result = subprocess.run(['sh', str(BENCH / 'bench_input.sh'), '-s', 'x', '--event', '/fake',
+                                         'pan', str(first), '72'], env=dev.env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(events.read_text().splitlines(), [
+                    f'event /fake 3 2 {first}', 'event /fake 3 5 0', 'event /fake 0 0 0', 'sleep 72',
+                    f'event /fake 3 2 {-first}', 'event /fake 3 5 0', 'event /fake 0 0 0', 'sleep 72',
+                    'event /fake 3 2 0', 'event /fake 3 5 0', 'event /fake 0 0 0'])
+                self.assertEqual(dev.root_shells(), 1)
+
+    def test_interrupted_sleep_releases_stick(self):
+        with fake_device() as dev:
+            for name, source in (
+                    ('sendevent', '#!/bin/sh\nprintf "%s\\n" "$*" >> "$EVENTS"\n'),
+                    ('sleep', '#!/bin/sh\nexit 1\n')):
+                path = dev.dir / 'bin' / name
+                path.write_text(source)
+                path.chmod(0o755)
+            events = dev.dir / 'events'
+            dev.env['EVENTS'] = str(events)
+            result = subprocess.run(['sh', str(BENCH / 'bench_input.sh'), '-s', 'x', '--event', '/fake',
+                                     'pan', '16000', '.1'], env=dev.env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(events.read_text().splitlines()[-3:], ['/fake 3 2 0', '/fake 3 5 0', '/fake 0 0 0'])
+
+
+class RestartQuartet(unittest.TestCase):
+    @staticmethod
+    def documents(fps_values, counts=(2, 2, 2, 2)):
+        documents = []
+        for fps, count in zip(fps_values, counts):
+            windows = [dict(fps=fps, uncapped=True, p50_ms=25, p95_ms=30, max_ms=40,
+                            over33=0, over50=0, long_ge45=0)] * count
+            documents.append({'runs': [{'device': 'thor', 'scene': 'hateno', 'windows': windows,
+                                        'summary': analyze.summarize(windows),
+                                        'pans': [{'direction': 'right', 'stick_value': 16000}]}]})
+        return documents
+
+    def records(self, fps_values, counts=(2, 2, 2, 2)):
+        doc = abtest.restart_analysis(self.documents(fps_values, counts), 'O')
+        return doc, doc['runs'][0]['ab']['arms']['O'], doc['runs'][0]['ab']['arms']['B']
+
+    def test_explicit_restart_pairs_confirm_same_direction_sessions(self):
+        for fps, expected in (((40, 42, 42, 40), 'better'), ((40, 38, 38, 40), 'worse'),
+                              ((40, 40.8, 40.8, 40), 'same')):
+            _, ref, arm = self.records(fps)
+            stats = abtest.paired_metric('throughput_fps', ref, arm, 'restart-quartet')
+            self.assertEqual([(p['reference_block'], p['arm_block']) for p in stats['pairs']], [(1, 2), (4, 3)])
+            self.assertEqual(abtest.metric_verdict('throughput_fps', ref, arm, stats)[3], expected)
+            # The default in-session contract is unchanged, not silently selected by JSON metadata.
+            self.assertEqual(len(abtest.paired_metric('throughput_fps', ref, arm)['pairs']), 0)
+            if expected != 'same':
+                self.assertEqual(abtest.metric_verdict('throughput_fps', ref, arm)[3], expected + '?')
+
+    def test_reference_spread_is_an_admission_gate(self):
+        for fps in ((40, 44, 44, 42), (40, 44, 44, 40.81)):
+            _, ref, arm = self.records(fps)
+            stats = abtest.paired_metric('throughput_fps', ref, arm, 'restart-quartet')
+            self.assertEqual(abtest.metric_verdict('throughput_fps', ref, arm, stats)[3], 'inconclusive')
+        _, ref, arm = self.records((40, 44, 44, 40.8))
+        stats = abtest.paired_metric('throughput_fps', ref, arm, 'restart-quartet')
+        self.assertEqual(abtest.metric_verdict('throughput_fps', ref, arm, stats)[3], 'better')
+
+    def test_pooled_pair_signs_and_missing_pairs_are_not_confirmed(self):
+        for values, counts in (((40, 44, 39, 40), (2, 2, 2, 2)),
+                               ((40, 44, 39.9, 40), (2, 1, 100, 2))):
+            _, ref, arm = self.records(values, counts)
+            stats = abtest.paired_metric('throughput_fps', ref, arm, 'restart-quartet')
+            self.assertEqual(abtest.metric_verdict('throughput_fps', ref, arm, stats)[3], 'inconclusive')
+        _, ref, arm = self.records((40, 44, 44, 40))
+        arm['blocks'].pop()
+        stats = abtest.paired_metric('throughput_fps', ref, arm, 'restart-quartet')
+        self.assertEqual(abtest.metric_verdict('throughput_fps', ref, arm, stats)[3], 'inconclusive')
+        _, ref, arm = self.records((40, 44, 44, 40))
+        arm['summary']['throughput_fps'] = 40.1  # paired speedup alone is insufficient
+        stats = abtest.paired_metric('throughput_fps', ref, arm, 'restart-quartet')
+        self.assertEqual(abtest.metric_verdict('throughput_fps', ref, arm, stats)[3], 'inconclusive')
+
+    def test_restart_cli_labels_mode_and_rejects_incomplete_or_unmatched_schedules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            documents = self.documents((40, 42, 42, 40))
+            for i, document in enumerate(documents):
+                path = Path(tmp) / f'{i}.json'
+                path.write_text(json.dumps(document))
+                paths.append(path)
+            result = run(BENCH / 'abtest.py', '--restart-quartet', *paths, '--ref', 'O')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('comparison mode: restart-quartet', result.stdout)
+            self.assertIn('arm B vs O: BETTER', result.stdout)
+            self.assertIn('O-spread:', result.stdout)
+            self.assertIn('both adjacent pair signs must agree', result.stdout)
+            result = run(BENCH / 'abtest.py', '--restart-quartet', *paths[:3])
+            self.assertEqual(result.returncode, 2)
+            documents[1]['runs'][0]['pans'][0]['direction'] = 'left'
+            paths[1].write_text(json.dumps(documents[1]))
+            result = run(BENCH / 'abtest.py', '--restart-quartet', *paths)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('identical, explicit pan', result.stderr)
+
+
+class CompileProvenance(unittest.TestCase):
+    @staticmethod
+    def line(frame, sync=0, worker=0, new=0):
+        return (f'[nvn-vk] frame {frame}, stutter: longest frame 40.0 ms, 0 frames over 33 ms, 0 over 50 ms; '
+                f'{new} new pipelines took 1.2 ms (longest 0.8 ms); {worker} compiled on worker threads in 3.4 ms; '
+                f'sync compiles {sync} in 5.6 ms; prewarm waits 0 in 0.0 ms')
+
+    def test_compile_counts_are_frame_keyed_and_missing_is_not_zero(self):
+        frame, record = provenance.compile_record(self.line(600, 2, 3, 4))
+        self.assertEqual(frame, 600)
+        self.assertEqual((record['pipeline_sync'], record['pipeline_async'], record['pipeline_creations']), (2, 3, 4))
+        self.assertEqual(record['pipeline_sync_ms'], 5.6)
+        self.assertTrue(record['compiles_present'])
+        self.assertIsNone(record['shader_compiles'])
+        self.assertFalse(provenance.compile_record(self.line(900))[1]['compiles_present'])
+        legacy = provenance.compile_record('[nvn-vk] frame 300, stutter: longest frame 40.0 ms')[1]
+        self.assertIsNone(legacy['compiles_present'])
+        self.assertIsNone(provenance.compilation_of(1200, {})['pipeline_sync'])
+        self.assertIsNone(provenance.compile_record('COMPILE 2 5.6MS'))  # not a 300-frame log counter
+
+    def test_analyzer_retains_compile_windows_and_scene_unavailability(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'logs').mkdir()
+            (d / 'logs/thor.log').write_text(ab_log({600: (40, 30, 10, 0), 900: (40, 30, 10, 0)}, []) +
+                                            self.line(600, 2, 3, 4) + '\n' + self.line(900) + '\n')
+            (d / 'pans.txt').write_text('thor hateno F0=0 F1=900 T0=100 T1=130 V=16000 D=1\n')
+            (d / 'warmups.jsonl').write_text(json.dumps({'device': 'thor', 'scene': 'hateno',
+                'status': 'timeout', 'elapsed_s': 30, 'observations': []}) + '\n')
+            result = run(BENCH / 'analyze.py', d, '--json', d / 'result.json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads((d / 'result.json').read_text())['runs'][0]
+            self.assertEqual(len(record['windows']), 2)
+            self.assertEqual(record['summary']['compile_windows'], 1)
+            self.assertEqual(record['pans'][0]['summary']['pipeline_async_total'], 3)
+            self.assertEqual(record['summary']['compile_covered_windows'], 2)
+            self.assertEqual(record['scene_state']['status'], 'unavailable')
+            self.assertIsNone(record['scene_state']['weather'])
+            self.assertEqual(record['warmups'][0]['status'], 'timeout')
+            self.assertIn('COMPILES', result.stdout)
+            self.assertIn('retained in every summary', result.stdout)
+            self.assertIn('optional graphics warm-up: timeout', result.stdout)
+
+    def wait(self, snapshots, timeout=15):
+        ticks = [0]
+        snapshots = iter(snapshots)
+        latest = ['']
+        def read_log(remaining):
+            latest[0] = next(snapshots, latest[0])
+            return latest[0]
+        return warmup.wait_for_calm(read_log, 2, timeout, interval=3, clock=lambda: ticks[0],
+                                    sleep=lambda seconds: ticks.__setitem__(0, ticks[0] + seconds))
+
+    def test_warmup_needs_fresh_consecutive_known_zero_windows(self):
+        rows = [self.line(300), self.line(600, sync=1), self.line(900), self.line(1200)]
+        result = self.wait(['\n'.join(rows[:n]) for n in range(1, 5)])
+        self.assertEqual(result['status'], 'calm')
+        self.assertEqual(result['elapsed_s'], 9)
+        self.assertEqual([r['frame'] for r in result['observations']], [600, 900, 1200])
+        self.assertEqual(result['observations'][0]['pipeline_sync'], 1)
+        for snapshots in ([self.line(300)], [''], [self.line(300), self.line(900), self.line(1500)],
+                          [self.line(300), '[nvn-vk] frame 600, stutter: longest frame 40.0 ms']):
+            with self.subTest(snapshots=snapshots):
+                result = self.wait(snapshots)
+                self.assertEqual(result['status'], 'timeout')
+                self.assertEqual(result['elapsed_s'], 15)
+
+    def test_warmup_counter_reset_and_read_failure_are_unavailable(self):
+        self.assertEqual(self.wait([self.line(900), self.line(300)])['status'], 'unavailable')
+        def fail(remaining):
+            raise OSError('no log')
+        result = warmup.wait_for_calm(fail, 2, 15)
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertIn('no log', result['reason'])
 
 
 if __name__ == '__main__':

@@ -6,6 +6,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Release benchmark camera pans at the timed endpoint before snapshot reads, using one symmetric device-side batch.
+  Add an explicit restart-quartet O/B/B/O comparison rule with paired signs and reference-spread admission, without
+  changing in-session direction confirmation. Report window compile provenance and unavailable scene state;
+  optional bounded graphics-calm warm-up is off by default and never filters compiling measured windows.
 - Add opt-in rooted-device CPU profiling with NDK simpleperf frame-pointer stacks,
   exact-build symbol checks, shell-accessible staging, and verified perf-control restoration.
   Per-thread period-weighted self/inclusive reports separate walker, recorder, submit and game CPU.
