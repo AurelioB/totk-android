@@ -189,6 +189,10 @@ cancel command (one extra su session only on failure): mark cancellation, valida
 its control path, terminate that command and its sleep, and release the axes. It must not queue release behind the
 busy broker. Cleanup reaps the request and removes its control directory before returning. SIGKILL cannot run shell
 traps; the finite device batch remains the last-resort release bound.
+The fake-device host regression retains a **6 s signal-to-completed-axis-release bound** for a 20 s pan
+(10 s before reversal). It timestamps the zero-axis/SYN sequence on the fake device with a monotonic clock;
+the separate **30 s outer timeout** allows loaded-host pipe draining, request reaping and broker/control-directory
+cleanup. That outer allowance does not relax the release bound or permit a reversal after cancellation.
 
 Every pan invokes `sampler.py --gpu-snapshot` just before and after motion via the persistent root shell, storing raw
 cumulative counters in `gpu-time-in-state.jsonl`. The first supported source is KGSL/devfreq `trans_stat`, then the

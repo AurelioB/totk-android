@@ -1239,10 +1239,31 @@ class PanRelease(unittest.TestCase):
         for group in (False, True):
             with self.subTest(process_group=group), fake_device() as dev:
                 events = dev.dir / 'events'
+                releases = dev.dir / 'releases'
                 event_script = dev.dir / 'bin/sendevent'
-                event_script.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$EVENTS"\n')
+                # Timestamp the completed zero-axis/SYN sequence in the fake device,
+                # not the later host/broker teardown or the test runner's next timeslice.
+                event_script.write_text(f'#!{sys.executable}\n' + '''import os, sys, time
+event = ' '.join(sys.argv[1:])
+with open(os.environ['EVENTS'], 'a') as output:
+    output.write(event + '\\n')
+if event == '/fake 0 0 0':
+    # Batch and direct-root cleanup may interleave identical zero events.
+    axes = {}
+    released = False
+    with open(os.environ['EVENTS']) as events:
+        for line in events:
+            node, kind, code, value = line.split()
+            if kind == '3':
+                axes[code] = value
+            elif kind == '0' and code == '0' and axes.get('2') == axes.get('5') == '0':
+                released = True
+    if released:
+        with open(os.environ['RELEASES'], 'a') as output:
+            output.write(str(time.monotonic()) + '\\n')
+''')
                 event_script.chmod(0o755)
-                dev.env['EVENTS'] = str(events)
+                dev.env.update(EVENTS=str(events), RELEASES=str(releases))
                 (dev.game / 'totk.log').write_text('[nvn] 计时 至帧 300： timing\n')
                 process = subprocess.Popen(['sh', str(BENCH / 'pan.sh'), '-s', 'x', '--device', 'test',
                     '--scene', 'hateno', '--event', '/fake', '--display', '0', '--game-dir', str(dev.game),
@@ -1262,9 +1283,14 @@ class PanRelease(unittest.TestCase):
                     os.killpg(process.pid, signal.SIGINT)
                 else:
                     process.terminate()
-                out, err = process.communicate(timeout=6)
+                # Release must still finish within 6 s (before the 10 s first half).
+                # Allow 30 s only for draining pipes, reaping children and broker cleanup.
+                out, err = process.communicate(timeout=30)
                 self.assertNotEqual(process.returncode, 0, out)
-                self.assertLess(time.monotonic() - started, 6, err)
+                self.assertTrue(releases.exists(), err)
+                released = min(map(float, releases.read_text().splitlines()))
+                self.assertGreaterEqual(released, started, err)
+                self.assertLess(released - started, 6, err)
                 self.assertEqual(events.read_text().splitlines()[-3:],
                                  ['/fake 3 2 0', '/fake 3 5 0', '/fake 0 0 0'])
                 self.assertNotIn('/fake 3 2 -16000', events.read_text())

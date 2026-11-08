@@ -11,6 +11,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   The existing background sampler owns all reads (1 Hz; headroom at 10 s); absent fields never move the layout.
 - Release benchmark camera pans at the timed endpoint before snapshot reads, using one symmetric device-side batch.
   Interrupt/failed-command cleanup cancels that owned batch promptly instead of queuing behind its busy root broker.
+  The fake-device cancellation regression measures the completed release within 6 s independently of a
+  load-tolerant 30 s host-teardown timeout.
   Add an explicit restart-quartet O/B/B/O comparison rule with paired signs and reference-spread admission, without
   changing in-session direction confirmation. Report window compile provenance and unavailable scene state;
   optional bounded graphics-calm warm-up is off by default and never filters compiling measured windows.
