@@ -141,6 +141,14 @@ delta within tolerance is SAME. The report shows both individual pair deltas and
 and capped dip-confounding still apply; uncapped uses throughput/tails. This two-pair rule is not statistical
 significance. The existing in-session mode and its both-directions requirement are unchanged.
 
+**GPU clock guard.** A GPU governor can settle at a different clock from one session to the next (the Thor ran the
+same scene at 680 MHz and 42.5 fps, then at 615 MHz and 37 fps), and that alone moves GPU ms and fps. The report
+prints each session's residency-weighted mean GPU clock from `pans[].gpu_residency`. When the two arms' means differ
+by more than **3%** the overall result is **verdict confounded by GPU clock** instead of BETTER/WORSE/SAME; repeat
+the quartet with the clock in the same state in both arms. Pass `--clock-lever` when the arm changes the clock on
+purpose (a clock floor): the difference is still printed and the verdict stands. Sessions without residency are
+reported as **not checked**, never treated as equal.
+
 ### Compile and scene provenance
 
 Every measured window has `compilation`: graphics `pipeline_sync`, `pipeline_async`, their milliseconds, and

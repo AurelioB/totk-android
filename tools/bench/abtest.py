@@ -32,13 +32,42 @@ Restart sessions: abtest.py --restart-quartet O1.json B1.json B2.json O2.json --
 This distinct mode pairs adjacent sessions (1 vs 2, 4 vs 3), with identical pan schedules, not alternating
 in-session directions. Exactly two pairs must agree in sign; pooled AND paired deltas must exceed tolerance
 (fps: max(0.5 fps, 2%)). Reference O1/O2 spread must not exceed tolerance; otherwise INCONCLUSIVE.
-Other metrics retain compare.py tolerances and capped/uncapped rules. A quartet is not statistical significance."""
+Other metrics retain compare.py tolerances and capped/uncapped rules. A quartet is not statistical significance.
+GPU clock: each session's residency-weighted mean GPU clock comes from its pans' gpu_residency. When the arm means
+differ by more than 3% the overall result is 'verdict confounded by GPU clock' (a governor that settles at another
+clock changes GPU ms and fps by itself); --clock-lever keeps the verdict for arms that change the clock on purpose.
+Missing residency is reported as not checked, never as equal."""
 import argparse, io, json, math, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchlib import (DIP_CONFOUNDED, DIP_TIME_FRACTION_TOLERANCE, LEGACY_PRIMARY, METRICS, PRIMARY,  # noqa: E402
                       guard_output, pacing_note, pacing_verdict, primary_metrics)
 from analyze import AB_METRICS, MEMORY_FIELDS, block_metric, pan_direction, summarize, worst_memory  # noqa: E402
+
+GPU_CLOCK_CONFOUNDED = 'verdict confounded by GPU clock'
+GPU_CLOCK_TOLERANCE = 0.03
+
+
+def session_gpu_clock(run):
+    """Residency-weighted mean GPU clock in Hz over a session's pans; None unless every pan has one counter kind."""
+    means, kinds = [], set()
+    for pan in run.get('pans', []):
+        residency = pan.get('gpu_residency') or {}
+        fractions = residency.get('fractions')
+        if residency.get('status') != 'ok' or not fractions:
+            return None
+        kinds.add(residency.get('counter_kind'))
+        means.append(sum(int(hz) * fraction for hz, fraction in fractions.items()))
+    return sum(means) / len(means) if means and len(kinds) == 1 else None
+
+
+def gpu_clock_difference(ref, arm):
+    """Relative difference of the arms' mean session clocks; None when any session lacks residency."""
+    clocks = ref.get('gpu_clock_hz', []) + arm.get('gpu_clock_hz', [])
+    if not ref.get('gpu_clock_hz') or not arm.get('gpu_clock_hz') or None in clocks or min(clocks) <= 0:
+        return None
+    r, a = (sum(x['gpu_clock_hz']) / len(x['gpu_clock_hz']) for x in (ref, arm))
+    return abs(a - r) / max(a, r)
 
 
 def restart_analysis(documents, reference):
@@ -78,7 +107,8 @@ def restart_analysis(documents, reference):
                 values = [block_metric(b['summary'], metric) for b in blocks]
                 spread[metric] = abs(values[1] - values[0]) if None not in values else None
             arms[name] = {'blocks': blocks, 'summary': summarize(windows), 'spread': spread,
-                          'memory': worst_memory([sessions[i].get('memory', {}) for i in indices])}
+                          'memory': worst_memory([sessions[i].get('memory', {}) for i in indices]),
+                          'gpu_clock_hz': [session_gpu_clock(sessions[i]) for i in indices]}
         result.append({'device': key[0], 'scene': key[1], 'ab': {
             'mode': 'restart-quartet', 'arms': arms,
             'windows': {'assigned': sum(len(r['windows']) for r in sessions), 'straddling': 0, 'unlabelled': 0}}})
@@ -209,6 +239,8 @@ def main():
     ap.add_argument('--out', help='also write the report to this file')
     ap.add_argument('--restart-quartet', action='store_true',
                     help='explicit independent O/B/B/O session mode; adjacent pairs and O-spread gate')
+    ap.add_argument('--clock-lever', action='store_true',
+                    help='restart-quartet: the arm changes the GPU clock on purpose; report the difference, keep the verdict')
     a = ap.parse_args()
     if a.out:
         guard_output(a.out)
@@ -241,11 +273,21 @@ def main():
             paired = {k: paired_metric(k, ref, arm, mode) for k in AB_METRICS}
             per = {k: metric_verdict(k, ref, arm, paired[k]) for k in AB_METRICS}
             v = arm_verdict(per, ref, arm, paired)
+            clock = gpu_clock_difference(ref, arm) if a.restart_quartet else None
+            if clock is not None and clock > GPU_CLOCK_TOLERANCE and not a.clock_lever and v != DIP_CONFOUNDED:
+                v = GPU_CLOCK_CONFOUNDED
             worse += v == 'worse'
-            headline = v if v == DIP_CONFOUNDED else v.upper()
+            headline = v if v in (DIP_CONFOUNDED, GPU_CLOCK_CONFOUNDED) else v.upper()
             p(f'\n  arm {name} vs {a.ref}: {headline}  ({len(arm["blocks"])} vs {len(ref["blocks"])} blocks, '
               f'{arm["summary"]["windows"]} vs {ref["summary"]["windows"]} windows)')
             p(f'  {pacing_note(ref["summary"], arm["summary"])}')
+            if a.restart_quartet:
+                mhz = lambda record: ' / '.join('-' if hz is None else f'{hz / 1e6:.1f}'
+                                                for hz in record.get('gpu_clock_hz', [])) or '-'
+                p(f'  GPU clock, residency-weighted mean MHz per session: {a.ref} {mhz(ref)}; {name} {mhz(arm)}; ' +
+                  ('residency unavailable, clock confound not checked' if clock is None else
+                   f'arms differ by {100 * clock:.1f}% (limit {100 * GPU_CLOCK_TOLERANCE:.0f}%)' +
+                   (', intended (--clock-lever)' if a.clock_lever and clock > GPU_CLOCK_TOLERANCE else '')))
             primary = primary_metrics(ref['summary'], arm['summary'])
             p(f'  {"metric":<16} {a.ref:>9} {name:>9} {"pooled Δ":>9} {"paired Δ":>9} {"tolerance":>9} {"spread":>9}  verdict')
             for key, label, *_ in METRICS:

@@ -1410,6 +1410,34 @@ class RestartQuartet(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'explicit pan'):
             abtest.restart_analysis(documents, 'O')
 
+    def clock_paths(self, tmp, clocks):
+        """Session files for a 40/44/44/40 fps quartet whose pans carry the given per-session GPU residency."""
+        paths = []
+        for i, (document, fractions) in enumerate(zip(self.documents((40, 44, 44, 40)), clocks)):
+            if fractions is not None:
+                document['runs'][0]['pans'][0]['gpu_residency'] = {
+                    'status': 'ok', 'counter_kind': 'residency', 'fractions': fractions}
+            path = Path(tmp) / f'clock{i}.json'
+            path.write_text(json.dumps(document))
+            paths.append(path)
+        return paths
+
+    def test_arms_at_different_gpu_clocks_do_not_get_a_verdict(self):
+        low, high = {'615000000': 1.0}, {'680000000': 1.0}
+        mixed = {'680000000': 0.7, '615000000': 0.3}  # 660.5 MHz: 2.9% under 680, an ordinary pan
+        with tempfile.TemporaryDirectory() as tmp:
+            for clocks, flags, headline, note in (
+                    ((low, high, high, low), (), 'verdict confounded by GPU clock', 'arms differ by 9.6%'),
+                    ((low, high, high, low), ('--clock-lever',), 'BETTER', 'intended (--clock-lever)'),
+                    ((high, mixed, mixed, high), (), 'BETTER', 'arms differ by 2.9%'),
+                    ((high, high, None, high), (), 'BETTER', 'clock confound not checked')):
+                with self.subTest(clocks=clocks, flags=flags):
+                    result = run(BENCH / 'abtest.py', '--restart-quartet', *self.clock_paths(tmp, clocks),
+                                 '--ref', 'O', *flags)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f'arm B vs O: {headline}', result.stdout)
+                    self.assertIn(note, result.stdout)
+
 
 class CompileProvenance(unittest.TestCase):
     @staticmethod
