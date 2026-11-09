@@ -2212,6 +2212,9 @@ The desktop presenter mock publishes its pixels/geometry through an atomic post 
 establish the cross-thread publication before assertions inspect ordinary pixel memory (also required under TSan).
 Pass-probe reports serialize their shared LCS/depth scratch between the presenter and explicit test callers;
 that diagnostic lock is outside recording and queue publication.
+PNG CRC lookup initialization uses `pthread_once`: walker pass dumps and presenter black-flash captures can
+write PNGs concurrently. Both diagnostics are compiled into release builds; pass dumps are opt-in, while the
+copy-presenter's black-flash detector defaults on (`TOTK_VK_BLACK=0` disables it). PNG pixels and checksums are unchanged.
 
 `vkdrawtest --lag-walk-bench [frames=6]` measures a Lookout-shaped 5,760-draw stream with two warmup frames per
 stable/churning case. It explicitly disables automatic draw-count chunking (`TOTK_VK_CHUNK_DRAWS=0`) for its

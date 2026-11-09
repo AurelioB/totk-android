@@ -6588,8 +6588,12 @@ void vk_pd_write_note(const char *what, uint64_t dst, uint64_t n, const void *da
 /* ---------- present: count frames; TOTK_VK_SHOT=<n> saves every n-th presented image as PNG (headless check) ---------- */
 static uint64_t g_present_n, g_present_t0, g_last_ticket; static double g_pres_t[64];
 static uint32_t crc_table[256];
+static pthread_once_t crc_once = PTHREAD_ONCE_INIT;
+static void crc_init(void) {
+    for (uint32_t i = 0; i < 256; i++) { uint32_t v = i; for (int k = 0; k < 8; k++) v = v & 1 ? 0xedb88320u ^ (v >> 1) : v >> 1; crc_table[i] = v; }
+}
 static uint32_t crc32_(const uint8_t *p, size_t n, uint32_t c) {
-    if (!crc_table[1]) for (uint32_t i = 0; i < 256; i++) { uint32_t v = i; for (int k = 0; k < 8; k++) v = v & 1 ? 0xedb88320u ^ (v >> 1) : v >> 1; crc_table[i] = v; }
+    pthread_once(&crc_once, crc_init);
     c = ~c; for (size_t i = 0; i < n; i++) c = crc_table[(c ^ p[i]) & 0xff] ^ (c >> 8); return ~c;
 }
 
