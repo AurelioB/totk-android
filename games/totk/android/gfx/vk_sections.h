@@ -19,6 +19,7 @@ void vk_sections_begin(VkCommandBuffer cb, const VkRenderingInfo *info);
 void vk_sections_end(VkCommandBuffer cb);
 void vk_sections_counts(uint64_t out[6]);
 uint64_t vk_sections_auxiliary_count(void);
+void vk_draw_secondary_reset(void);
 #ifdef TOTK_VK_TESTS
 void vk_sections_test_counts(uint64_t out[6]);
 #endif
@@ -27,7 +28,6 @@ void vk_sections_destroy_image(VkDevice dev, VkImage image, const VkAllocationCa
 VkResult vk_sections_create_view(VkDevice dev, const VkImageViewCreateInfo *info, const VkAllocationCallbacks *alloc, VkImageView *view);
 void vk_sections_destroy_view(VkDevice dev, VkImageView view, const VkAllocationCallbacks *alloc);
 #define VK_SECTION_CB(cb) (vk_one_primary_on ? vk_sections_route(cb) : (cb))
-#define vkCmdExecuteCommands(cb, ...) vkCmdExecuteCommands(VK_SECTION_CB(cb), __VA_ARGS__)
 #define vkCmdWaitEvents(cb, ...) vkCmdWaitEvents(VK_SECTION_CB(cb), __VA_ARGS__)
 #define vkCmdResetQueryPool(cb, ...) vkCmdResetQueryPool(VK_SECTION_CB(cb), __VA_ARGS__)
 #define vkCmdBeginQuery(cb, ...) vkCmdBeginQuery(VK_SECTION_CB(cb), __VA_ARGS__)
@@ -46,8 +46,8 @@ void vk_sections_destroy_view(VkDevice dev, VkImageView view, const VkAllocation
 #define vkCmdClearDepthStencilImage(cb, ...) vkCmdClearDepthStencilImage(VK_SECTION_CB(cb), __VA_ARGS__)
 #define vkCmdClearAttachments(cb, ...) vkCmdClearAttachments(VK_SECTION_CB(cb), __VA_ARGS__)
 #define vkCmdPushConstants(cb, ...) vkCmdPushConstants(VK_SECTION_CB(cb), __VA_ARGS__)
-#define vkCmdBeginRendering(cb, info) vk_sections_begin(cb, info)
-#define vkCmdEndRendering(cb) vk_sections_end(cb)
+#define vkCmdBeginRendering(cb, info) (vk_one_primary_on ? vk_sections_begin(cb, info) : (vkCmdBeginRendering)(cb, info))
+#define vkCmdEndRendering(cb) (vk_one_primary_on ? vk_sections_end(cb) : (vkCmdEndRendering)(cb))
 #define vkCmdBindPipeline(cb, ...) vkCmdBindPipeline(VK_SECTION_CB(cb), __VA_ARGS__)
 #define vkCmdBindDescriptorSets(cb, ...) vkCmdBindDescriptorSets(VK_SECTION_CB(cb), __VA_ARGS__)
 #define vkCmdBindVertexBuffers2(cb, ...) vkCmdBindVertexBuffers2(VK_SECTION_CB(cb), __VA_ARGS__)
@@ -74,7 +74,7 @@ void vk_sections_destroy_view(VkDevice dev, VkImageView view, const VkAllocation
 #define vkCmdSetPrimitiveRestartEnable(cb, ...) vkCmdSetPrimitiveRestartEnable(VK_SECTION_CB(cb), __VA_ARGS__)
 #define vkCmdSetRasterizerDiscardEnable(cb, ...) vkCmdSetRasterizerDiscardEnable(VK_SECTION_CB(cb), __VA_ARGS__)
 #define vkCmdSetLineWidth(cb, ...) vkCmdSetLineWidth(VK_SECTION_CB(cb), __VA_ARGS__)
-#define vkCreateImage(dev, info, alloc, image) vk_sections_create_image(dev, info, alloc, image)
-#define vkDestroyImage(dev, image, alloc) vk_sections_destroy_image(dev, image, alloc)
-#define vkCreateImageView(dev, info, alloc, view) vk_sections_create_view(dev, info, alloc, view)
-#define vkDestroyImageView(dev, view, alloc) vk_sections_destroy_view(dev, view, alloc)
+#define vkCreateImage(dev, info, alloc, image) (vk_one_primary_on ? vk_sections_create_image(dev, info, alloc, image) : (vkCreateImage)(dev, info, alloc, image))
+#define vkDestroyImage(dev, image, alloc) (vk_one_primary_on ? vk_sections_destroy_image(dev, image, alloc) : (vkDestroyImage)(dev, image, alloc))
+#define vkCreateImageView(dev, info, alloc, view) (vk_one_primary_on ? vk_sections_create_view(dev, info, alloc, view) : (vkCreateImageView)(dev, info, alloc, view))
+#define vkDestroyImageView(dev, view, alloc) (vk_one_primary_on ? vk_sections_destroy_view(dev, view, alloc) : (vkDestroyImageView)(dev, view, alloc))

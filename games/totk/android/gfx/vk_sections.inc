@@ -60,8 +60,11 @@ void vk_sections_init(void) {
         const char *value = getenv(diagnostics[i]);
         if (value && *value && strcmp(value, "0")) nworkers = 0;
     }
+    const char *framegen = getenv("TOTK_FRAMEGEN");
+    int inline_capture = framegen && (!strcmp(framegen, "1") || !strcmp(framegen, "interp") ||
+        !strcmp(framegen, "hybrid") || !strcmp(framegen, "locked") || !strcmp(framegen, "adaptive"));
     if (vk_one_primary_on && ((occlusion && *occlusion && strcmp(occlusion, "0")) ||
-            (stats && !strcmp(stats, "1") && nworkers <= 0))) {
+            (stats && !strcmp(stats, "1") && (nworkers <= 0 || inline_capture)))) {
         vk_one_primary_on = 0;
         ordered_fallback = 1;
         LOGV("one-primary fallback: primary occlusion/inline statistics query inheritance unavailable");
@@ -117,6 +120,7 @@ static void ordered_close(ordered_slot *s) {
     if (!s->open) return;
     ordered_section *section = &s->section[s->open - 1];
     if (section->cb) VKCHECK(vkEndCommandBuffer(section->cb));
+    vk_draw_secondary_reset();
     s->open = 0;
 }
 static ordered_section *ordered_append(ordered_slot *s) {

@@ -1444,6 +1444,11 @@ measurements, the ownership contract is:
   and secondary [WriteTimestamp2](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdWriteTimestamp2.html).
   The saved Thor probe and current device extension setup do not enumerate/enable maintenance7 or nested-command-buffer
   support; their availability is not inferred and the recorder does not depend on either extension.
+  `TOTK_VK_REC_ONE_PRIMARY=1` (exact `1`, read once, default off) instead retains ordered rendering sections
+  and walker secondaries, then assembles one main primary per original chunk without pass-end joins.
+  `pre` and adopted frame-generation primaries keep their original order (at most three submitted primaries).
+  Occlusion diagnostics and inline profiler statistics fall back before recording any chunk; other inline passes work.
+  Compare the recorder line's main/aux primaries, section kinds, walker secondaries and fallbacks with identical settings.
 - **Diagnostics:** occlusion queries, pass dumps, `TOTK_VK_PASS_PROFILE`, `TOTK_VK_PASS_MERGE=1`
   and pass probes force the original single-thread path with a diagnostic log. `TOTK_VK_GPU_PROFILE`
   (default off) retains recorder workers and asynchronous assembly. Full mode

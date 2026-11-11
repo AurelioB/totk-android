@@ -1479,6 +1479,7 @@ static inline __attribute__((always_inline)) int record_pass_end_impl(VkCommandB
         profile->end = profile_end ? *profile_end : (vk_gpuprof_end_token){0};
     }
     if (pending_tail) pending_tail->next = p; else pending_head = p; pending_tail = p;
+    if (vk_one_primary_on) vk_sections_park(p);
     if (pass_parallel) passes_parallel++; else passes_inline++;
     pass_head = pass_tail = building = NULL;
     return 1;
@@ -1499,7 +1500,7 @@ void vk_record_slot_seal(unsigned slot) {
     slots[slot].pending = pending_head; pending_head = pending_tail = NULL;
 }
 static void record_assemble_inner(unsigned slot, int background) {
-    if (!slots[slot].pending && !background) return;
+    if (!slots[slot].pending && !background && !vk_one_primary_on) return;
     uint64_t waited = 0, execute = 0, jobs = 0, draws = 0, resets = 0, largest_job = 0;
     uint64_t passes = 0, pass_draws = 0, largest_pass = 0;
     for (rec_pass *p = slots[slot].pending; p; p = p->next) {
@@ -1520,17 +1521,19 @@ static void record_assemble_inner(unsigned slot, int background) {
             resets += j->reset_time; /* waited-job reset total, not additive wait duration */
         }
         VkCommandBuffer commands[64]; uint32_t count = 0; uint64_t t0 = host_now_ns();
+        if (vk_one_primary_on) vk_sections_until(slot, p);
         VK_REC_DO(VK_REC_O_EXECUTE,
             for (rec_job *j = p->jobs; j; j = j->pass_next) if (j->count || j->nevent) {
                 commands[count++] = j->cb;
-                if (count == 64) { vkCmdExecuteCommands(p->primary, count, commands); count = 0; }
+                if (count == 64) { (vkCmdExecuteCommands)(p->primary, count, commands); count = 0; }
             }
-            if (count) vkCmdExecuteCommands(p->primary, count, commands);
-            vkCmdEndRendering(p->primary);
+            if (count) (vkCmdExecuteCommands)(p->primary, count, commands);
+            (vkCmdEndRendering)(p->primary);
             if (__builtin_expect(vk_gpuprof_on, 0)) vk_gpuprof_end_emit(p->primary, &((const rec_profile_pass *)p)->end);
-            VKCHECK(vkEndCommandBuffer(p->primary)));
+            if (!vk_one_primary_on) VKCHECK(vkEndCommandBuffer(p->primary)));
         execute += host_now_ns() - t0;
     }
+    if (vk_one_primary_on) vk_sections_until(slot, NULL);
     slots[slot].pending = NULL;
     pthread_mutex_lock(&rec_mu);
     if (background) { background_wait_ns += waited; background_slots++; }
@@ -1544,7 +1547,11 @@ static void record_assemble_inner(unsigned slot, int background) {
 void vk_record_assemble(unsigned slot, int background) { VK_REC_DO(VK_REC_O_ASSEMBLE, record_assemble_inner(slot, background)); }
 void vk_record_walk_wait(uint64_t ns) { wait_ns += ns; }
 #ifdef TOTK_VK_TESTS
-void vk_record_test_assemble(void) { vk_record_slot_seal(current_slot); vk_record_assemble(current_slot, 0); }
+void vk_record_test_assemble(void) {
+    if (vk_one_primary_on) vk_sections_seal();
+    vk_record_slot_seal(current_slot); vk_record_assemble(current_slot, 0);
+    if (vk_one_primary_on) vk_sections_resume(current_slot);
+}
 uint64_t vk_record_test_walk_wait(void) { return wait_ns; }
 void vk_record_test_timing(uint64_t *busy, uint64_t *background_wait) {
     pthread_mutex_lock(&rec_mu); *busy = 0;
@@ -1640,9 +1647,17 @@ void vk_record_stats(uint64_t frame) {
     }
     if (threads <= 0 || frame % 300) return;
     pthread_mutex_lock(&rec_mu);
-    LOGV("recorder frame %llu, ms/frame: walking %.3f workers %.3f %.3f %.3f %.3f wait %.3f; chunks parallel/inline %.2f/%.2f passes parallel/inline %.2f/%.2f",
+    static uint64_t section_previous[6], auxiliary_previous;
+    uint64_t section_counts[6]; vk_sections_counts(section_counts);
+    uint64_t auxiliary_count = vk_sections_auxiliary_count();
+    LOGV("recorder frame %llu, ms/frame: walking %.3f workers %.3f %.3f %.3f %.3f wait %.3f; chunks parallel/inline %.2f/%.2f passes parallel/inline %.2f/%.2f; main/aux primaries %.2f/%.2f sections pass/immediate/rendering %.2f/%.2f/%.2f walker secondaries %.2f fallbacks %.2f",
         (unsigned long long)frame, walk_ns / 3e8, busy_ns[0] / 3e8, busy_ns[1] / 3e8, busy_ns[2] / 3e8, busy_ns[3] / 3e8,
-        wait_ns / 3e8, chunks_parallel / 300.0, chunks_inline / 300.0, passes_parallel / 300.0, passes_inline / 300.0);
+        wait_ns / 3e8, chunks_parallel / 300.0, chunks_inline / 300.0, passes_parallel / 300.0, passes_inline / 300.0,
+        (section_counts[0] - section_previous[0]) / 300.0, (auxiliary_count - auxiliary_previous) / 300.0,
+        (section_counts[1] - section_previous[1]) / 300.0, (section_counts[2] - section_previous[2]) / 300.0,
+        (section_counts[3] - section_previous[3]) / 300.0, (section_counts[4] - section_previous[4]) / 300.0,
+        (section_counts[5] - section_previous[5]) / 300.0);
+    memcpy(section_previous, section_counts, sizeof section_previous); auxiliary_previous = auxiliary_count;
     LOGV("recorder overhead ms/frame: inline %.3f execute %.3f reset walking/worker %.3f/%.3f job setup %.3f (wait above; reset overlaps inline/worker busy)", inline_ns / 3e8, execute_ns / 3e8, reset_ns / 3e8, worker_reset_ns / 3e8, job_ns / 3e8);
     uint64_t retained = atomic_load(&memory_draws) + atomic_load(&memory_info);
     LOGV("recorder storage: %.1f/%llu MiB packet/descriptor slabs (active over-budget=%d, referenced block capacity %.1f MiB), retired-slot reclaims %llu/%.1f MiB, secondary CBs reclaimed %llu",
