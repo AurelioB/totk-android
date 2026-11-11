@@ -39,7 +39,8 @@ public final class AssetStore {
     private final File root;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService decoder = Executors.newSingleThreadExecutor();
-    private final LruCache<String, Bitmap> images, tiles, decorImages;
+    private final LruCache<String, Bitmap> images, tiles, overviews, decorImages;
+    private final int tileFloor;
     private final Set<String> pending = new HashSet<>(), missing = new HashSet<>();
     private final Runnable changed;
     public volatile JSONObject index = new JSONObject(), text = new JSONObject();
@@ -107,7 +108,12 @@ public final class AssetStore {
         int memory = manager == null ? 128 : manager.getMemoryClass();
         int budget = Math.min(32, Math.max(8, memory / 12)) * 1024 * 1024;
         images = cache(budget);
-        tiles = cache(Math.max(24 * 1024 * 1024, budget));
+        tileFloor = Math.max(24 * 1024 * 1024, budget);
+        tiles = cache(tileFloor);
+        // A layer's whole-map image (2400 x 2000, 19 MB decoded) shared the tile cache and left room for one detailed
+        // tile, so zoomed-in tiles evicted each other while on screen and reloaded in turn: flashing squares. It has its
+        // own cache, for one layer at a time.
+        overviews = cache(24 * 1024 * 1024);
         // Full-screen frames must not evict one another or every redraw re-decodes the menu.
         decorImages = cache(48 * 1024 * 1024);
         decoder.execute(() -> {
@@ -335,7 +341,15 @@ public final class AssetStore {
         return true;
     }
     public Bitmap bitmap(String path, boolean tile) {
-        return bitmap(path, tile ? tiles : path.startsWith("decor/") ? decorImages : images);
+        return bitmap(path, path.endsWith("/overview.webp") ? overviews : tile ? tiles : path.startsWith("decor/") ? decorImages : images);
+    }
+    /** A map tile only if it is already decoded; never starts a load. */
+    public Bitmap cachedTile(String path) { return closed ? null : tiles.get(path); }
+    /** Lets the tile cache hold at least `bytes` (what is on screen plus a margin), so visible tiles never evict each
+        other; never below the starting size, at most 64 MB. */
+    public void tileBudget(long bytes) {
+        int size = (int)Math.max(tileFloor, Math.min(64L * 1024 * 1024, bytes));
+        if (size > tiles.maxSize()) tiles.resize(size);
     }
     private Bitmap bitmap(String path, LruCache<String, Bitmap> cache) {
         if (closed) return null;
@@ -351,7 +365,11 @@ public final class AssetStore {
             synchronized (pending) {
                 pending.remove(path);
                 if (result == null) missing.add(path);
-                else if (!closed) cache.put(path, result);
+                else if (!closed) {
+                    // An image larger than its whole cache would be evicted at once and decoded again on every redraw.
+                    if (result.getAllocationByteCount() > cache.maxSize()) cache.resize(result.getAllocationByteCount() + 1024 * 1024);
+                    cache.put(path, result);
+                }
             }
             if (result != null) notifyChanged();
         });
@@ -361,7 +379,7 @@ public final class AssetStore {
     public void close() {
         closed = true;
         decoder.shutdownNow();
-        images.evictAll(); tiles.evictAll(); decorImages.evictAll();
+        images.evictAll(); tiles.evictAll(); overviews.evictAll(); decorImages.evictAll();
         decorations = java.util.Collections.emptyMap();
         softPart = null; softImage = null; softShader = null;
     }
