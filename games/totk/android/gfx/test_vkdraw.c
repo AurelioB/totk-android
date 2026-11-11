@@ -46,6 +46,15 @@ static void op(uint32_t code, const void *payload, uint32_t n) {
     memcpy(rec + rn, &h, 8); if (n) memcpy(rec + rn + 8, payload, n); memset(rec + rn + 8 + n, 0, size - 8 - n); rn += size;
 }
 static uint64_t run(void) { op(OP_END, NULL, 0); mtl_sub_begin(); mtl_exec(rec); rn = 0; return mtl_sub_commit(); }
+/* Cumulative sections are sampled only after the fixture's real final fence retires all chunk submissions. */
+static void one_primary_counts(const uint64_t before[6], uint64_t serial, const char *fixture) {
+    if (!vk_one_primary_on) return;
+    uint64_t after[6]; vk_sections_test_counts(after);
+    uint64_t chunks = vk_submit_serial() - serial, mains = after[0] - before[0];
+    CHECK(chunks && mains == chunks, "%s begins exactly one main primary per submitted chunk (%llu/%llu)",
+        fixture, (unsigned long long)mains, (unsigned long long)chunks);
+    CHECK(after[5] == before[5], "%s uses no section fallback", fixture);
+}
 static uint64_t recorder_maps(uint64_t *slabs, uint64_t *anonymous) {
     FILE *file = fopen("/proc/self/maps", "re"); char line[1024]; uint64_t count = 0; *slabs = *anonymous = 0;
     while (file && fgets(line, sizeof line, file)) {
@@ -2628,6 +2637,22 @@ int main(int argc, char **argv) {
     setenv("TOTK_VK_PASSPROBE", "2", 1);
 #endif
     mtl_init();
+    const char *one_primary = getenv("TOTK_VK_REC_ONE_PRIMARY");
+    const char *occlusion = getenv("TOTK_VK_OCCLUSION"), *statistics = getenv("TOTK_VK_GPU_PROFILE_STATS");
+    const char *framegen = getenv("TOTK_FRAMEGEN");
+    int inline_capture = framegen && (!strcmp(framegen, "1") || !strcmp(framegen, "interp") ||
+        !strcmp(framegen, "hybrid") || !strcmp(framegen, "locked") || !strcmp(framegen, "adaptive"));
+    int primary_queries = (occlusion && *occlusion && strcmp(occlusion, "0")) ||
+        (statistics && !strcmp(statistics, "1") && (!vk_record_enabled() || inline_capture));
+    CHECK(vk_one_primary_on == (one_primary && !strcmp(one_primary, "1") && !primary_queries),
+        "requested one-primary launch arm or documented query fallback is effective");
+    if (argc == 2 && !strcmp(argv[1], "--one-primary-launch")) {
+        uint64_t counts[6]; vk_sections_test_counts(counts);
+        CHECK(!counts[0] && !counts[1] && !counts[2] && !counts[3] && !counts[4],
+            "launch-policy fixture records no GPU work or frame-generation capture");
+        printf("%s: one-primary launch policy %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+        return fails != 0;
+    }
 #ifdef TOTK_VK_TESTS
     call_counts_install();
     if (getenv("TOTK_VK_TEST_WIDEN_U8")) V.has_index_u8 = 0;
@@ -3486,6 +3511,7 @@ int main(int argc, char **argv) {
             maps_start = recorder_maps(&slab_maps, &anon_start); vk_record_test_storage(storage_before);
             /* Load-like transient: hundreds of one-draw jobs per GPU slot, then many slot reuses
                with smaller passes. This used to retain full128-draw calloc/realloc arrays per job. */
+            uint64_t sections[6], warm_serial = vk_submit_serial(); vk_sections_test_counts(sections);
             mtl_sub_begin(); rn = 0;
             op(OP_SET_RT, &srt, sizeof srt); op(OP_CLEAR_COLOR, &cc, sizeof cc);
             for (int i = 0; i < 4096; i++) {
@@ -3494,12 +3520,14 @@ int main(int argc, char **argv) {
             }
             op(OP_END, NULL, 0); mtl_exec(rec); rn = 0;
             CHECK(mtl_wait(mtl_sub_commit(), 30000000000ull), "many-small-job storage warmup completes");
+            one_primary_counts(sections, warm_serial, "4096 one-draw storage warmup");
         }
         uint64_t serial = vk_submit_serial(), accepted = 0;
         vk_record_test_counts before, after; vk_record_test_counts_get(&before);
         const int frames = storage_mode ? 48 : 24;
         uint64_t cutover_fallbacks = 0;
         for (int frame = 0; frame < frames; frame++) {
+            uint64_t sections[6], frame_serial = vk_submit_serial(); vk_sections_test_counts(sections);
             if (pressure_mode) {
                 for (int i = 0; i < 64 * 64; i++) lin[4 * i + 1] = frame & 1 ? 50 : 100;
                 dm_guest_write_prepare(tx.mem, tx.L.size);
@@ -3539,6 +3567,7 @@ int main(int argc, char **argv) {
             }
             op(OP_COPY_T2B, &cp, sizeof cp); op(OP_END, NULL, 0); mtl_exec(rec); rn = 0;
             CHECK(mtl_wait(mtl_sub_commit(), 30000000000ull), "job reuse frame %d completes", frame);
+            if (storage_mode) one_primary_counts(sections, frame_serial, "many-chunk storage frame");
             int bad = 0;
             for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
                 const uint8_t *p = readback + 4 * (y * 64 + x);
@@ -3597,9 +3626,15 @@ int main(int argc, char **argv) {
             uint64_t memory[4], policy[4], named, anonymous, maps = recorder_maps(&named, &anonymous);
             vk_record_memory(memory); vk_record_test_storage(policy);
             uint64_t primary[2]; vk_record_test_primary_memory(primary);
-            CHECK(!vk_record_enabled() || (primary[0] < primary_warm[0] && primary[1] > primary_warm[1]),
-                "retired load-shaped primary CB high-water is reclaimed (%llu -> %llu, reclaimed %llu)",
-                (unsigned long long)primary_warm[0], (unsigned long long)primary[0], (unsigned long long)primary[1]);
+            if (vk_one_primary_on) {
+                CHECK(primary[0] <= primary_warm[0],
+                    "one-primary retains no pass-shaped primary high-water (%llu -> %llu)",
+                    (unsigned long long)primary_warm[0], (unsigned long long)primary[0]);
+            } else {
+                CHECK(!vk_record_enabled() || (primary[0] < primary_warm[0] && primary[1] > primary_warm[1]),
+                    "retired load-shaped primary CB high-water is reclaimed (%llu -> %llu, reclaimed %llu)",
+                    (unsigned long long)primary_warm[0], (unsigned long long)primary[0], (unsigned long long)primary[1]);
+            }
             CHECK(maps_warm && maps && maps <= maps_warm + 1024,
                 "lag-like job storage keeps steady-state VMAs bounded (%llu -> %llu)", (unsigned long long)maps_warm, (unsigned long long)maps);
             CHECK(anon_warm && anonymous <= anon_warm + 128,
@@ -3786,6 +3821,97 @@ int main(int argc, char **argv) {
         CHECK(fwrite(footer, sizeof footer, 1, out) == 1 && !fclose(out), "close split identity output");
         printf("%s: %s (TOTK_VK_SPLIT_PASS_DRAWS=%ld LRZ_SAFE=%d) kept %llu/%llu splits per round; %d checks, %d failed\n",
             fails ? "FAILED" : "ok", argv[1], n, safe, (unsigned long long)splits, (unsigned long long)candidates, checks, fails);
+        return fails != 0;
+    }
+    /* A bounded mixed stream pins commands absent from the pixel-only recorder cases: an upload while
+       rendering, in-place uniforms, compute writes, direct Vulkan commands, copies and temporary rendering. */
+    if (argc == 3 && !strcmp(argv[1], "--rec-sections")) {
+        FILE *out = fopen(argv[2], "wb"); if (!out) { perror(argv[2]); return 1; }
+        CHECK(mtl_wait(run(), 5000000000ull), "mixed-section setup completes");
+        tex_t uploaded = tx; uploaded.serial = 40101; uploaded.mem = cpu_pool + 0x20000;
+        for (int i = 0; i < 64 * 64; i++) {
+            lin[4 * i] = 64; lin[4 * i + 1] = 128; lin[4 * i + 2] = 192; lin[4 * i + 3] = 255;
+        }
+        CHECK(!nvn_swizzle(&uploaded.d, 0, 0, lin, 256, uploaded.mem), "mixed-section upload is swizzled");
+        mtl_reg_tex(2, &uploaded, NULL);
+        p_bind_handles texture = th; texture.h[0] = 2 | (1u << 20);
+        tex_t cleared = rt; cleared.serial = 40102; cleared.mem = gpu_pool + 0xa00000;
+        p_clear_tex blue = {.tex = &cleared, .r = {0, 0, 0, 64, 64, 1}, .mask = 0xf, .c = {.f = {0, 0, 1, 1}}};
+        p_clear_tex region = blue; region.r = (NVNcopyRegion){8, 4, 0, 16, 20, 1};
+        region.c.f[0] = 1; region.c.f[2] = 0;
+        uint8_t cctl[0x880], ccode[0x230]; uint32_t clen;
+        shader_binary(5, 3, cctl, ccode, &clen); memcpy(cpu_pool + 0x102000, ccode, clen);
+        prog_t compute = {.nstage = 1, .serial = 40103};
+        compute.sd[0].data = (NVNbufferAddress)(uintptr_t)(cpu_pool + 0x102000); compute.sd[0].control = cctl;
+        p_bind_program cbp = {&compute, 1u << 5};
+        uint32_t *written = (uint32_t *)(cpu_pool + 0x500000), *copied = written + 1024;
+        p_bind_buf output = {5, 0, (uint64_t)(uintptr_t)written, 256}; p_dispatch dispatch = {1, 1, 1};
+        const float full[] = {-1, -1, 3, -1, -1, 3}; memcpy(cpu_pool + 0x202000, full, sizeof full);
+        p_bind_vbuf full_vb = vb; full_vb.r[0].address = (uint64_t)(uintptr_t)(cpu_pool + 0x202000);
+        p_scissor all = {0, 0, 64, 64}; uint64_t samples = NVN_COUNTER_TYPE_SAMPLES_PASSED;
+        uint64_t *reports = (uint64_t *)(cpu_pool + 0x320000);
+        uint64_t sections[6], serial = vk_submit_serial(); vk_sections_test_counts(sections);
+        mtl_sub_begin();
+        for (int chunk = 0; chunk < 3; chunk++) {
+            memset(reports + chunk * 8, 0, 8 * sizeof *reports);
+            uint64_t before[] = {samples, (uint64_t)(uintptr_t)(reports + chunk * 8)};
+            uint64_t after[] = {samples, before[1] + 16};
+            uint64_t top[] = {NVN_COUNTER_TYPE_TIMESTAMP_TOP, before[1] + 32};
+            uint64_t bottom[] = {NVN_COUNTER_TYPE_TIMESTAMP, before[1] + 48};
+            p_copy_b2t pixels = cp; pixels.src = (uint64_t)(uintptr_t)(cpu_pool + 0x600000 + chunk * 0x10000);
+            p_copy_b2t clear_pixels = pixels; clear_pixels.tex = &cleared; clear_pixels.src += 0x8000;
+            op(OP_SET_RT, &srt, sizeof srt); op(OP_SCISSOR, &all, sizeof all); op(OP_CLEAR_COLOR, &cc, sizeof cc);
+            op(OP_BIND_PROGRAM, &bp, sizeof bp); op(OP_BIND_VATTR, &va, sizeof va); op(OP_BIND_VSTREAM, &vs, sizeof vs);
+            op(OP_BIND_VBUF, &full_vb, sizeof full_vb); op(OP_BIND_UBO, &u0, sizeof u0); op(OP_BIND_UBO, &u1, sizeof u1);
+            op(OP_BIND_TEX, &th, sizeof th); op(OP_VIEWPORTS, &vp, sizeof vp);
+            op(OP_RESET_COUNTER, &samples, sizeof samples); op(OP_REPORT_COUNTER, before, sizeof before);
+            op(OP_REPORT_COUNTER, top, sizeof top); op(OP_DRAW, &dw, sizeof dw);
+            op(OP_BIND_TEX, &texture, sizeof texture); op(OP_DRAW, &dw, sizeof dw);
+            struct { uint64_t dst, n; float tint[4]; } update = {u1.addr, 16, {1, 0.5f, 1, 1}};
+            op(OP_UPDATE_UB, &update, sizeof update); op(OP_DRAW, &dw, sizeof dw);
+            op(OP_REPORT_COUNTER, after, sizeof after); op(OP_COPY_T2B, &pixels, sizeof pixels);
+            op(OP_BIND_PROGRAM, &cbp, sizeof cbp); op(OP_BIND_UBO, &output, sizeof output);
+            op(OP_DISPATCH, &dispatch, sizeof dispatch);
+            op(OP_CLEAR_TEX, &blue, sizeof blue); op(OP_CLEAR_TEX, &region, sizeof region);
+            op(OP_COPY_T2B, &clear_pixels, sizeof clear_pixels); op(OP_END, NULL, 0); mtl_exec(rec); rn = 0;
+            VkBuffer buffer; uint64_t offset;
+            CHECK(vk_resolve((uint64_t)(uintptr_t)copied, 256, &buffer, &offset), "mixed direct fill destination resolves");
+            vkCmdFillBuffer(vk_cb(), buffer, offset, 256, 0xdeadbeef); vk_barrier_all(vk_cb());
+            mtl_sub_copy((uint64_t)(uintptr_t)written, (uint64_t)(uintptr_t)copied, 256);
+            mtl_sub_counter(bottom[1], bottom[0]);
+            if (chunk < 2) vk_submit_chunk();
+        }
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "three mixed-section chunks complete");
+        one_primary_counts(sections, serial, "mixed-section stream");
+        if (vk_one_primary_on) {
+            uint64_t after[6]; vk_sections_test_counts(after);
+            CHECK(after[2] > sections[2] && after[3] > sections[3] && after[4] > sections[4],
+                "mixed stream captures immediate, temporary rendering and walker secondary sections");
+            CHECK(!vk_record_enabled() || after[1] > sections[1], "mixed stream retains worker pass sections");
+        }
+        int wrong_words = 0;
+        for (uint32_t i = 0; i < 64; i++) wrong_words += written[i] != (i ^ 0x12345678u) || copied[i] != written[i];
+        CHECK(!wrong_words, "compute writes and the ordered copy preserve all 64 words (%d wrong)", wrong_words);
+        CHECK(fwrite(written, 256, 1, out) == 1 && fwrite(copied, 256, 1, out) == 1, "write exact compute/copy data");
+        for (int chunk = 0; chunk < 3; chunk++) {
+            uint64_t *r = reports + chunk * 8;
+            uint64_t ordered = r[5] != 0 && r[7] >= r[5] && (!chunk || r[5] >= r[-1]);
+            CHECK(r[0] == 0 && r[2] == 9 && ordered, "mixed chunk %d samples and timestamps retain stream order", chunk);
+            uint64_t values[] = {r[0], r[2], ordered};
+            CHECK(fwrite(values, sizeof values, 1, out) == 1, "write mixed query assertions");
+            int wrong = 0; uint8_t *pixels = cpu_pool + 0x600000 + chunk * 0x10000, *clear_pixels = pixels + 0x8000;
+            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+                uint8_t *p = pixels + 4 * (y * 64 + x), *c = clear_pixels + 4 * (y * 64 + x);
+                int red = x >= 8 && x < 24 && y >= 4 && y < 24;
+                wrong += p[0] != 64 || p[1] != 64 || p[2] != 192 || p[3] != 255 ||
+                    c[0] != (red ? 255 : 0) || c[1] || c[2] != (red ? 0 : 255) || c[3] != 255;
+            }
+            CHECK(!wrong, "mixed chunk %d upload/uniform and temporary clear preserve every pixel (%d wrong)", chunk, wrong);
+            CHECK(fwrite(pixels, 64 * 64 * 4, 1, out) == 1 && fwrite(clear_pixels, 64 * 64 * 4, 1, out) == 1,
+                "write exact mixed-section pixels");
+        }
+        CHECK(!fclose(out), "close mixed-section output");
+        printf("%s: mixed sections %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
         return fails != 0;
     }
     if (argc == 3 && !strcmp(argv[1], "--rec-identity")) {
@@ -3998,6 +4124,7 @@ int main(int argc, char **argv) {
         for (int round = 0; round < 12; round++) { /* wrap all eight ring slots */
             int overlap = submit_mode && vk_record_test_async_submit();
             uint64_t before_seal = 0;
+            uint64_t pass_end_wait = vk_record_test_walk_wait();
             vk_record_test_counts_get(&count0); vk_record_test_pause(); alarm(30);
             for (int version = 0; version < 2; version++) {
                 if (version && submit_mode && !overlap) vk_record_test_release();
@@ -4014,6 +4141,8 @@ int main(int argc, char **argv) {
                 if (!version) {
                     vk_record_test_flush_jobs();
                     CHECK(vk_record_test_wait_paused(), "round %d reaches worker gate before span replacement", round);
+                    if (!submit_mode) CHECK(vk_record_test_walk_wait() == pass_end_wait,
+                        "round %d pass end returns with zero worker wait while its recorder gate remains closed", round);
                     before_seal = mtl_last_fence();
                 }
                 if (version && overlap) {
