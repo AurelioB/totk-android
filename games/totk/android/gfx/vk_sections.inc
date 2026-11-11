@@ -9,7 +9,7 @@ typedef struct {
     VkSampleCountFlagBits samples;
     VkCommandBuffer cb;
     void *pass;
-    int rendering, worker;
+    int rendering, worker, has_depth, has_stencil;
 } ordered_section;
 typedef struct {
     VkCommandPool pool;
@@ -199,8 +199,9 @@ void vk_sections_begin(VkCommandBuffer cb, const VkRenderingInfo *info) {
     if (info->pStencilAttachment) section->stencil = *info->pStencilAttachment;
     /* Store presence, never stack pointers; materialize pointers at emission. */
     section->info.pColorAttachments = NULL;
-    section->info.pDepthAttachment = info->pDepthAttachment ? &section->depth : NULL;
-    section->info.pStencilAttachment = info->pStencilAttachment ? &section->stencil : NULL;
+    section->has_depth = info->pDepthAttachment != NULL;
+    section->has_stencil = info->pStencilAttachment != NULL;
+    section->info.pDepthAttachment = section->info.pStencilAttachment = NULL;
     section->samples = VK_SAMPLE_COUNT_1_BIT;
     if (!section->worker) {
         pthread_mutex_lock(&ordered_views_mu);
@@ -250,8 +251,8 @@ void vk_sections_until(unsigned slot, void *pass) {
             VkRenderingInfo info = section->info;
             info.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
             info.pColorAttachments = section->color;
-            info.pDepthAttachment = section->info.pDepthAttachment ? &section->depth : NULL;
-            info.pStencilAttachment = section->info.pStencilAttachment ? &section->stencil : NULL;
+            info.pDepthAttachment = section->has_depth ? &section->depth : NULL;
+            info.pStencilAttachment = section->has_stencil ? &section->stencil : NULL;
             (vkCmdBeginRendering)(s->primary, &info);
             if (section->pass) {
                 if (section->pass != pass) DIE("one-primary recorder section order mismatch");

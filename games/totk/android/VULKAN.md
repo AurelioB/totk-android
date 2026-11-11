@@ -1447,7 +1447,7 @@ measurements, the ownership contract is:
   `TOTK_VK_REC_ONE_PRIMARY=1` (exact `1`, read once, default off) instead retains ordered rendering sections
   and walker secondaries, then assembles one main primary per original chunk without pass-end joins.
   `pre` and adopted frame-generation primaries keep their original order (at most three submitted primaries).
-  Occlusion diagnostics and inline profiler statistics fall back before recording any chunk; other inline passes work.
+  Occlusion diagnostics and inline/FG profiler statistics fall back before recording any chunk; other inline passes work.
   Compare the recorder line's main/aux primaries, section kinds, walker secondaries and fallbacks with identical settings.
 - **Diagnostics:** occlusion queries, pass dumps, `TOTK_VK_PASS_PROFILE`, `TOTK_VK_PASS_MERGE=1`
   and pass probes force the original single-thread path with a diagnostic log. `TOTK_VK_GPU_PROFILE`

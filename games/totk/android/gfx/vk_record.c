@@ -1286,6 +1286,7 @@ int vk_record_enabled(void) {
     return threads != 0;
 }
 void vk_record_slot_reset(unsigned slot) {
+    if (vk_one_primary_on) current_slot = slot; /* test early assembly also serves walker-only slots */
     if (!vk_record_enabled()) return;
     uint64_t t0 = host_now_ns();
     /* busy/submit_busy retirement joins all jobs, submitted GPU reads and CPU posts before this handoff.
