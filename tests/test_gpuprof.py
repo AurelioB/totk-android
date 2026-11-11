@@ -2321,14 +2321,25 @@ class Lavapipe(unittest.TestCase):
                                              'observed_frames', 'sampled_frames')}
                 passes.append(json.dumps(metadata, sort_keys=True))
             retirement = report['sessions'][0]['query_retirement']
-            queries = tuple(retirement[key] for key in
-                            ('queries_submitted', 'queries_retired', 'queries_outstanding'))
+            # Pipeline groups use a fresh random launch phase. Account for
+            # every actual selected endpoint, then compare the non-random
+            # pass/envelope/statistics authority between paired launches.
+            pipeline_queries = sum(row['timestamp_count'] for row in report['_fixture_rows']
+                                   if row['type'] == 'pipeline_coverage')
+            self.assertGreaterEqual(retirement['queries_submitted'], pipeline_queries)
+            queries = (retirement['queries_submitted'] - pipeline_queries,
+                       retirement['queries_retired'] - pipeline_queries,
+                       retirement['queries_outstanding'])
             return sorted(passes), queries
 
         for case in ('full', 'sampled', 'pipelines'):
             for stats in (0, 1):
-                reference = None
+                metadata_reference = None
                 for workers in (0, 2, 3):
+                    # Worker statistics use one query per chunk, unlike the
+                    # inline query. Compare counts only at the same worker
+                    # count, and compare results across all worker counts.
+                    reference = None
                     for one_primary in (0, 1):
                         with self.subTest(case=case, stats=stats, workers=workers, one_primary=one_primary):
                             report = self.launch(3 if case == 'sampled' else 1, workers, stats,
@@ -2338,10 +2349,14 @@ class Lavapipe(unittest.TestCase):
                                                  pipeline_groups=case == 'pipelines',
                                                  pipeline_raw=True if case == 'pipelines' else None)
                             observed = signature(report)
+                            if metadata_reference is None:
+                                metadata_reference = observed[0]
+                            self.assertEqual(observed[0], metadata_reference,
+                                             'pass and statistics results must match across worker counts')
                             if reference is None:
                                 reference = observed
                             self.assertEqual(observed, reference,
-                                             'sections must preserve exact pass/statistics metadata and query accounting')
+                                             'sections preserve exact paired pass metadata and accounted queries')
 
     def test_pipeline_groups_direct_and_deferred(self):
         for workers in (0, 2):
