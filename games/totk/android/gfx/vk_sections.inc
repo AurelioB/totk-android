@@ -48,23 +48,16 @@ void vk_sections_init(void) {
     /* These primary query spans cannot inherit queries with the device features
      * currently enabled. Select legacy before any slot is opened, never mid-slot. */
     const char *occlusion = getenv("TOTK_VK_OCCLUSION"), *stats = getenv("TOTK_VK_GPU_PROFILE_STATS");
-    const char *workers = getenv("TOTK_VK_REC_THREADS");
-    int nworkers = workers ? atoi(workers) :
-#if defined(__ANDROID__) || (defined(TOTK_VK_TESTS) && defined(TOTK_TEST_ANDROID_FRAME_POLICY))
-        2;
-#else
-        0;
-#endif
-    const char *diagnostics[] = {"TOTK_VK_PASS_DUMP", "TOTK_VK_PASS_PROFILE", "TOTK_VK_PASSPROBE", "TOTK_VK_PASS_MERGE"};
-    for (unsigned i = 0; i < sizeof diagnostics / sizeof *diagnostics; i++) {
-        const char *value = getenv(diagnostics[i]);
-        if (value && *value && strcmp(value, "0")) nworkers = 0;
-    }
+    /* Reuse the recorder's actual admission result, including diagnostics and
+     * thread-creation failure, instead of maintaining a second policy parser.
+     * Only enabled statistics need early admission; workers cannot see a job
+     * until device initialization and the first slot have completed. */
+    int recorder = !vk_one_primary_on || !stats || strcmp(stats, "1") || vk_record_enabled();
     const char *framegen = getenv("TOTK_FRAMEGEN");
     int inline_capture = framegen && (!strcmp(framegen, "1") || !strcmp(framegen, "interp") ||
         !strcmp(framegen, "hybrid") || !strcmp(framegen, "locked") || !strcmp(framegen, "adaptive"));
     if (vk_one_primary_on && ((occlusion && *occlusion && strcmp(occlusion, "0")) ||
-            (stats && !strcmp(stats, "1") && (nworkers <= 0 || inline_capture)))) {
+            (stats && !strcmp(stats, "1") && (!recorder || inline_capture)))) {
         vk_one_primary_on = 0;
         ordered_fallback = 1;
         LOGV("one-primary fallback: primary occlusion/inline statistics query inheritance unavailable");
