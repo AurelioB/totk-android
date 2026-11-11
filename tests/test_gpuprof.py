@@ -2321,15 +2321,18 @@ class Lavapipe(unittest.TestCase):
                                              'observed_frames', 'sampled_frames')}
                 passes.append(json.dumps(metadata, sort_keys=True))
             retirement = report['sessions'][0]['query_retirement']
-            # Pipeline groups use a fresh random launch phase. Account for
-            # every actual selected endpoint, then compare the non-random
-            # pass/envelope/statistics authority between paired launches.
-            pipeline_queries = sum(row['timestamp_count'] for row in report['_fixture_rows']
-                                   if row['type'] == 'pipeline_coverage')
+            # Pipeline groups use independent random launch phases. Selected
+            # endpoints can also create event-only worker chunks with their
+            # own statistics queries. Raw allocation totals are therefore not
+            # comparable between these launches; exact query conservation is.
+            pipeline = [row for row in report['_fixture_rows'] if row['type'] == 'pipeline_coverage']
+            pipeline_queries = sum(row['timestamp_count'] for row in pipeline)
             self.assertGreaterEqual(retirement['queries_submitted'], pipeline_queries)
-            queries = (retirement['queries_submitted'] - pipeline_queries,
-                       retirement['queries_retired'] - pipeline_queries,
-                       retirement['queries_outstanding'])
+            self.assertEqual(retirement['queries_submitted'], retirement['queries_retired'])
+            self.assertEqual(retirement['queries_outstanding'], 0)
+            queries = ((retirement['queries_outstanding'],
+                        retirement['queries_submitted'] == retirement['queries_retired']) if pipeline else
+                       (retirement['queries_submitted'], retirement['queries_retired'], retirement['queries_outstanding']))
             return sorted(passes), queries
 
         for case in ('full', 'sampled', 'pipelines'):
