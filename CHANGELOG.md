@@ -30,19 +30,15 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
-- Add default-off, exact-`1` `TOTK_COMPANION_COVER=1` for the built-in secondary display when the companion is
-  enabled. The opaque, non-interactive cover sits beneath the unchanged Presentation; startup waits for owner
-  window focus and top-resumed readiness. Ordinary touch/game-input reclaim keeps its window-focus guard. A
-  separate one-use, token-bound 1000 ms recovery may front the verified, still-resumed game task after the cover
-  takes top-resumed state; gesture, pause, close, competing-resume and stale/expired-token guards remain.
-  On Retroid Pocket Duo, the launcher stayed stopped in 10/10 tested cover-on launches; all 30 retained
-  boundary samples showed the Cocoon activities destroyed/not visible and no Cocoon producer. Pan rate was
-  29.05–29.25 fps in the normal fast level. The earlier busy-video-off 27.7–28.4 fps state was not remeasured,
-  the qualified p95 comparison was worse, and other dual-screen devices were not tested: this is not a full
-  acceptance or performance-win claim.
-  Cover events use `[TotkCompanion] cover ...` in `<game>/totk.log`; `TOTK_LOGCAT=1` optionally mirrors them
-  to Android logcat (`totk` tag), whose platform filtering may still omit INFO. Inspect the file as canonical.
-  Owner stop/dismiss/close and process teardown clean up the cover; `noHistory` is intentionally omitted.
+- Add `TOTK_COMPANION_COVER=1` (off by default) for devices with a built-in second screen. While the companion
+  is shown there, an opaque black cover activity sits underneath it, so Android stops the app below (usually
+  the launcher), which a companion window alone does not do. The cover takes no touches and no key focus; if
+  starting it moves input focus, one bounded recovery returns it to the game. It is removed when the companion
+  closes, the game stops or exits, or the process dies. Measured: on a Retroid Pocket Duo and an AYN Thor, both
+  with the Cocoon launcher, the launcher kept drawing behind the companion without the cover (Thor: about 27%
+  of one CPU core during gameplay; Duo: about 22% in the affected launches, which ran at 27.7–28.4 instead of
+  29.1–29.3 fps) and was stopped in every tested launch with it. A frame-rate gain from the cover itself has
+  not been confirmed yet. Cover events are logged as `[TotkCompanion] cover ...` in `<game>/totk.log`.
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
   Normal launches no longer start its tail thread or wake logd for every frame log. Crash reports remain enabled.
 - Let the live-control reader sleep when `totk.ctl` is absent, including after unrelated files are created or deleted.
