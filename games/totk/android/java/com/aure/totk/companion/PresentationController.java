@@ -109,7 +109,8 @@ public final class PresentationController implements DisplayManager.DisplayListe
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
                 .putExtra(CoverActivity.TOKEN, token);
         try {
-            if (!ActivityManager.isActivityStartAllowedOnDisplay(owner, id, intent)) {
+            ActivityManager manager = owner.getSystemService(ActivityManager.class);
+            if (manager == null || !manager.isActivityStartAllowedOnDisplay(owner, id, intent)) {
                 Log.w("TotkCompanion", "cover refusal display=" + id + " reason=start_not_allowed");
                 reportCover(false, "start_not_allowed");
                 return false;
