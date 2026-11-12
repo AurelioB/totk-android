@@ -2942,6 +2942,26 @@ int main(int argc, char **argv) {
             vk_draw_exec(OP_SCISSOR, &partial);
             vk_draw_exec(OP_CLEAR_COLOR, &cc);
             CHECK(vk_in_pass(), "partial clear opens MRT pass with prior 1280x720 viewport");
+            /* Probe while a real rendering pass is open and before any draw body
+               is buffered. Unchanged all=0 must not eagerly route, open an
+               immediate section/secondary, or mutate the buffered pass. */
+            vk_record_dynamic unchanged = {0}, last = {0};
+            uint64_t sections_before[6], sections_after[6];
+            vk_record_test_counts buffered_before, buffered_after;
+            vk_sections_test_counts(sections_before);
+            vk_record_test_counts_get(&buffered_before);
+            vk_record_dynamic_emit(vk_cb(), &unchanged, &last, 0);
+            vk_sections_test_counts(sections_after);
+            vk_record_test_counts_get(&buffered_after);
+            CHECK(!memcmp(sections_before, sections_after, sizeof sections_before),
+                  "unchanged public dynamic emit creates no section or secondary");
+            CHECK(buffered_before.draws == buffered_after.draws &&
+                  buffered_before.passes == buffered_after.passes &&
+                  buffered_before.index_skips == buffered_after.index_skips &&
+                  buffered_before.widened == buffered_after.widened &&
+                  buffered_before.freeze_hits == buffered_after.freeze_hits &&
+                  buffered_before.program_hits == buffered_after.program_hits,
+                  "unchanged public dynamic emit leaves buffered render pass untouched");
             uint32_t sw, sh; vk_overlay_test_scene_size(&sw, &sh);
             CHECK(!sw && !sh, "clear-only pass never nominates the stale viewport");
             vk_draw_exec(OP_VIEWPORTS, &active);
