@@ -17,6 +17,7 @@ public final class CoverActivity extends Activity {
         void attached();
         void finished(long token);
         void refused(long token);
+        void topResumedChanged(long token, boolean top);
     }
     private static final class Launch {
         final int displayId;
@@ -27,6 +28,7 @@ public final class CoverActivity extends Activity {
     private static final HashMap<Long, Launch> launches = new HashMap<>();
     private long token;
     private String finishReason = "unexpected";
+    private boolean topResumed;
 
     static void prepare(int displayId, long token, Listener listener) {
         launches.put(token, new Launch(displayId, listener));
@@ -38,6 +40,12 @@ public final class CoverActivity extends Activity {
             launch.activity.finishReason = "session_end";
             launch.activity.finishCover();
         } else Log.i("TotkCompanion", "cover finish token=" + token + " reason=pending_cancel");
+    }
+    /** Activity/task focus authority, not window focus: this window is deliberately non-focusable. */
+    static boolean isTopResumed(long token) {
+        Launch launch = launches.get(token);
+        return launch != null && launch.activity != null && launch.activity.topResumed
+                && !launch.activity.isFinishing() && !launch.activity.isDestroyed();
     }
 
     @Override protected void onCreate(Bundle state) {
@@ -78,6 +86,14 @@ public final class CoverActivity extends Activity {
         }
         launch.activity = this;
         launch.listener.attached();
+        if (topResumed) launch.listener.topResumedChanged(token, true);
+    }
+
+    @Override public void onTopResumedActivityChanged(boolean top) {
+        super.onTopResumedActivityChanged(top);
+        topResumed = top;
+        Launch launch = launches.get(token);
+        if (launch != null && launch.activity == this) launch.listener.topResumedChanged(token, top);
     }
 
     private void finishCover() { finishAndRemoveTask(); overridePendingTransition(0, 0); }

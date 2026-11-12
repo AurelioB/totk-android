@@ -21,10 +21,17 @@ Android-device result.
 `TOTK_VK_PRESENT=copy` remained the control. The then-current chunk rule was 600 only with
 `TOTK_FRAME_LAG=1`, otherwise 75, and lag was recorded as off pending separate VMA safety work.
 `TOTK_COMPANION=0` suppresses secondary presentation, polling and action injection after `totk.env` loads;
-`TOTK_COMPANION_COVER=1` is a default-off cover experiment for the built-in secondary display and only works
-with the companion enabled. Presentation touch and guarded game-input reclaim remain active after cover start.
-The claim that the cover stops the Duo launcher renderer is a hypothesis awaiting Duo validation. Owner lifecycle
-cleanup and same-process teardown remove it; `noHistory` is intentionally absent so focus reclaim does not finish it.
+`TOTK_COMPANION_COVER=1` is a default-off, exact-`1` experiment for the built-in secondary display, only with the
+companion enabled. Cover creation waits for owner window focus and top-resumed readiness. Ordinary touch/automatic
+game-input reclaim keeps its window-focus guard; a separate one-use, token-bound 1000 ms startup recovery may front
+the verified, still-resumed game task only after the live cover reports top-resumed ownership, even if owner window
+focus was lost. Cover creation waits for no gesture; during a gesture recovery remains armed only within its original
+deadline and is checked on final UP/CANCEL. Competing cover top-resumed loss, pause, close, or stale/expired token
+suppress it. Top-resumed activity state does not imply the non-focusable cover window accepts keys.
+With the switch off, the native boolean query, disabled CoverSession allocation and one policy log still occur, but
+there is no cover activity/window, reclaim or lifecycle callback registration. Launcher-renderer shutdown remains
+a hypothesis awaiting Duo validation. Owner lifecycle cleanup and same-process teardown remove the cover;
+`noHistory` is intentionally absent so focus reclaim does not finish it.
 Omit `--dex/--assets` in the low-level APK packer for the Java-free variant (`build_android.py --no-companion`
 selects it, but that script is not part of integration verification).
 

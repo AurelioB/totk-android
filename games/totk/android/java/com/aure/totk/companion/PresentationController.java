@@ -22,6 +22,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
+import android.view.ViewTreeObserver;
 
 /** Shared by the NativeActivity and the native-library-free preview, including hot-plug behavior. The companion is shown
  * only while the owner is started (a backgrounded game leaves the secondary display to the system), and only on a
@@ -38,6 +39,13 @@ public final class PresentationController implements DisplayManager.DisplayListe
     private final boolean coverRequested;
     private final CoverSession cover;
     private boolean coverReported;
+    private long coverFocusToken, coverFocusDeadline;
+    private boolean coverFocusTopSeen;
+    private final Runnable coverRefresh = this::refresh;
+    private final Runnable coverReturnInput = () -> reclaimAfterCover(coverFocusToken);
+    private final ViewTreeObserver.OnWindowFocusChangeListener coverWindowFocus = focused -> {
+        if (focused) main.post(coverRefresh);
+    };
     private boolean closed, stopped, resumed, topResumed, returnQueued, returnRequested, reported, reportQueued;
     private ActivityManager.AppTask inputTask;
     private long returnRequestedAt;
@@ -83,12 +91,15 @@ public final class PresentationController implements DisplayManager.DisplayListe
         if (!coverRequested) reportCover(false, "switch_off_or_preview");
         owner.registerActivityLifecycleCallbacks(lifecycle);
         if (coverRequested) owner.registerActivityLifecycleCallbacks(coverLifecycle);
+        if (coverRequested) owner.getWindow().getDecorView().getViewTreeObserver().addOnWindowFocusChangeListener(coverWindowFocus);
         if (displays != null) { displays.registerDisplayListener(this, main); refresh(); }
     }
     // Kept separate from the existing focus lifecycle: only the opt-in experiment registers these callbacks.
     private final Application.ActivityLifecycleCallbacks coverLifecycle = new Application.ActivityLifecycleCallbacks() {
-        @Override public void onActivityResumed(Activity activity) { if (activity == owner) { cover.ownerResumed(true); main.post(PresentationController.this::refresh); } }
-        @Override public void onActivityPaused(Activity activity) { if (activity == owner) cover.ownerResumed(false); }
+        @Override public void onActivityResumed(Activity activity) { if (activity == owner) main.post(coverRefresh); }
+        @Override public void onActivityPaused(Activity activity) {
+            if (activity == owner) { coverFocusToken = 0; cover.ownerResumed(false); }
+        }
         @Override public void onActivityStarted(Activity activity) {}
         @Override public void onActivityStopped(Activity activity) {}
         @Override public void onActivityCreated(Activity activity, Bundle state) {}
@@ -100,9 +111,31 @@ public final class PresentationController implements DisplayManager.DisplayListe
         coverReported = true;
         Log.i("TotkCompanion", "cover requested=" + coverRequested + " effective=" + effective + " reason=" + reason);
     }
-    private void reclaimAfterCover() {
-        // startActivity returns before its window/top-resumed changes arrive. Also run this after onCreate attaches.
-        if (!touchInProgress) returnInputToOwner();
+    /** One launch-scoped recovery may repair the expected loss of window focus, but only while our cover still owns
+     * top-resumed activity authority. A gesture defers it; competing activity, pause or stale/expired launch cancels it. */
+    private void reclaimAfterCover(long token) {
+        if (token == 0 || token != coverFocusToken) return;
+        if (closed || stopped || !resumed || autoReturnBlocked
+                || SystemClock.uptimeMillis() > coverFocusDeadline || owner.isFinishing() || owner.isDestroyed()
+                || shown == null || !shown.isShowing()) { coverFocusToken = 0; return; }
+        if (touchInProgress || !CoverActivity.isTopResumed(token)) return;
+        coverFocusToken = 0; // One use even if the verified task cannot be fronted; never fight competing UI.
+        if (returnRequested && SystemClock.uptimeMillis() - returnRequestedAt < 250) return;
+        moveInputTaskToFront();
+    }
+    private boolean coverStartReady() {
+        return resumed && topResumed && owner.hasWindowFocus() && !touchInProgress
+                && !closed && !stopped && !owner.isFinishing() && !owner.isDestroyed();
+    }
+    private void armCoverFocus(long token) {
+        coverFocusToken = token;
+        coverFocusDeadline = SystemClock.uptimeMillis() + 1000;
+        coverFocusTopSeen = false;
+    }
+    private void coverTopResumedChanged(long token, boolean top) {
+        if (coverFocusToken != token) return;
+        if (top) { coverFocusTopSeen = true; main.post(() -> reclaimAfterCover(token)); }
+        else if (coverFocusTopSeen) coverFocusToken = 0;
     }
     private boolean startCover(int id, long token) {
         Intent intent = new Intent(owner, CoverActivity.class)
@@ -115,20 +148,27 @@ public final class PresentationController implements DisplayManager.DisplayListe
                 reportCover(false, "start_not_allowed");
                 return false;
             }
+            armCoverFocus(token);
             CoverActivity.prepare(id, token, new CoverActivity.Listener() {
-                @Override public void attached() { main.post(PresentationController.this::reclaimAfterCover); }
+                @Override public void attached() { main.post(() -> reclaimAfterCover(token)); }
                 @Override public void finished(long finished) {
-                    cover.ownerResumed(resumed && !closed && !stopped);
+                    if (coverFocusToken == finished) coverFocusToken = 0;
+                    cover.ownerResumed(coverStartReady());
                     cover.hostFinished(finished);
                 }
-                @Override public void refused(long refused) { cover.startRefused(refused); }
+                @Override public void refused(long refused) {
+                    if (coverFocusToken == refused) coverFocusToken = 0;
+                    cover.startRefused(refused);
+                }
+                @Override public void topResumedChanged(long focusedToken, boolean top) { coverTopResumedChanged(focusedToken, top); }
             });
             owner.startActivity(intent, ActivityOptions.makeBasic().setLaunchDisplayId(id).toBundle());
             Log.i("TotkCompanion", "cover " + (cover.isRestart() ? "restart" : "start") + " display=" + id + " token=" + token);
             reportCover(true, "start_accepted");
-            main.post(this::reclaimAfterCover);
+            main.post(() -> reclaimAfterCover(token));
             return true;
         } catch (RuntimeException unavailable) {
+            if (coverFocusToken == token) coverFocusToken = 0;
             CoverActivity.cancel(token);
             Log.w("TotkCompanion", "cover refusal display=" + id + " reason=start_exception", unavailable);
             reportCover(false, "start_exception");
@@ -137,7 +177,8 @@ public final class PresentationController implements DisplayManager.DisplayListe
     }
     private void refreshCover(Display selected) {
         cover.refresh(selected == null ? DisplayClass.NONE : DisplayClass.BUILT_IN,
-                selected == null ? -1 : selected.getDisplayId(), resumed);
+                selected == null ? -1 : selected.getDisplayId(),
+                coverStartReady());
         if (coverRequested && resumed && selected == null) reportCover(false, "no_builtin_second_panel");
     }
     /** Whether the companion is currently presented on a secondary display. */
@@ -153,6 +194,7 @@ public final class PresentationController implements DisplayManager.DisplayListe
             if (rapidAutoReturns >= 3) autoReturnBlocked = true;
             if (!autoReturnBlocked && !touchInProgress) main.postDelayed(autoReturnInput, 300);
         }
+        if (coverRequested && top) main.post(coverRefresh);
     }
     private void resetAutoReturn() {
         main.removeCallbacks(autoReturnInput);
@@ -191,6 +233,9 @@ public final class PresentationController implements DisplayManager.DisplayListe
         if (closed || stopped || !resumed || topResumed
                 || (returnRequested && SystemClock.uptimeMillis() - returnRequestedAt < 250)
                 || !owner.hasWindowFocus() || owner.isFinishing() || owner.isDestroyed()) return false;
+        return moveInputTaskToFront();
+    }
+    private boolean moveInputTaskToFront() {
         try {
             if (inputTask == null) {
                 ActivityManager manager = owner.getSystemService(ActivityManager.class);
@@ -199,7 +244,9 @@ public final class PresentationController implements DisplayManager.DisplayListe
                     if (task.getTaskInfo().taskId == owner.getTaskId()) { inputTask = task; break; }
                 }
             }
-            if (inputTask == null || !owner.getComponentName().equals(inputTask.getTaskInfo().topActivity)) return false;
+            if (inputTask == null) return false;
+            ActivityManager.RecentTaskInfo info = inputTask.getTaskInfo();
+            if (info.taskId != owner.getTaskId() || !owner.getComponentName().equals(info.topActivity)) return false;
             returnRequested = true;
             returnRequestedAt = SystemClock.uptimeMillis();
             inputTask.moveToFront();
@@ -211,6 +258,7 @@ public final class PresentationController implements DisplayManager.DisplayListe
         }
     }
     private void dismiss() {
+        coverFocusToken = 0;
         cover.dismiss();
         Presentation previous = shown;
         shown = null; displayId = -1;
@@ -271,9 +319,13 @@ public final class PresentationController implements DisplayManager.DisplayListe
                 int action = event.getActionMasked();
                 if (action == MotionEvent.ACTION_DOWN) { touching = true; touchInProgress = true; resetAutoReturn(); }
                 boolean handled = super.dispatchTouchEvent(event);
-                if (action == MotionEvent.ACTION_CANCEL) { touching = false; touchInProgress = false; }
+                if (action == MotionEvent.ACTION_CANCEL) {
+                    touching = false; touchInProgress = false;
+                    if (coverRequested) { main.post(coverRefresh); main.post(coverReturnInput); }
+                }
                 if (touching && action == MotionEvent.ACTION_UP) {
                     touching = false; touchInProgress = false;
+                    if (coverRequested) { main.post(coverRefresh); main.post(coverReturnInput); }
                     // Let Android deliver the top-resumed change caused by DOWN before checking it.
                     if (shown == this && isShowing() && !returnQueued) {
                         returnQueued = true;
@@ -309,6 +361,10 @@ public final class PresentationController implements DisplayManager.DisplayListe
         main.removeCallbacksAndMessages(null);
         owner.unregisterActivityLifecycleCallbacks(lifecycle);
         if (coverRequested) owner.unregisterActivityLifecycleCallbacks(coverLifecycle);
+        if (coverRequested) {
+            ViewTreeObserver tree = owner.getWindow().getDecorView().getViewTreeObserver();
+            if (tree.isAlive()) tree.removeOnWindowFocusChangeListener(coverWindowFocus);
+        }
         if (displays != null) displays.unregisterDisplayListener(this);
         dismiss();
     }
