@@ -1449,6 +1449,8 @@ measurements, the ownership contract is:
   `pre` and adopted frame-generation primaries keep their original order (at most three submitted primaries).
   Occlusion diagnostics and inline/FG profiler statistics fall back before recording any chunk; other inline passes work.
   Compare the recorder line's main/aux primaries, section kinds, walker secondaries and fallbacks with identical settings.
+  Recorder workers use raw secondary commands; shared dynamic state resolves a walking token only on its first
+  emitted command. Enabled recorder-overhead lines additionally report section-secondary begin/end and section-assembly ms/frame.
 - **Diagnostics:** occlusion queries, pass dumps, `TOTK_VK_PASS_PROFILE`, `TOTK_VK_PASS_MERGE=1`
   and pass probes force the original single-thread path with a diagnostic log. `TOTK_VK_GPU_PROFILE`
   (default off) retains recorder workers and asynchronous assembly. Full mode

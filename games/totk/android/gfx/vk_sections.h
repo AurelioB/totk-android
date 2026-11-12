@@ -6,6 +6,14 @@
 extern int vk_one_primary_on;
 #include "vk_load.h"
 #include <stdint.h>
+#include <stdatomic.h>
+/* A full cache line, not just aligned storage: counter updates must never
+ * invalidate the token line read by non-walking command-buffer owners. */
+typedef struct {
+    _Alignas(64) _Atomic(VkCommandBuffer) cb;
+    unsigned char padding[64 - sizeof(_Atomic(VkCommandBuffer))];
+} vk_sections_token_state;
+extern vk_sections_token_state vk_sections_token;
 void vk_sections_init(void);
 void vk_sections_reset(unsigned slot, VkCommandBuffer primary);
 void vk_sections_seal(void);
@@ -15,10 +23,17 @@ void vk_sections_park(void *pass);
 void vk_sections_until(unsigned slot, void *pass);
 void vk_sections_finish(unsigned slot);
 VkCommandBuffer vk_sections_route(VkCommandBuffer cb);
+static inline __attribute__((always_inline)) VkCommandBuffer vk_sections_command_buffer(VkCommandBuffer cb) {
+    if (vk_one_primary_on &&
+            cb == atomic_load_explicit(&vk_sections_token.cb, memory_order_relaxed))
+        return vk_sections_route(cb);
+    return cb;
+}
 void vk_sections_begin(VkCommandBuffer cb, const VkRenderingInfo *info);
 void vk_sections_end(VkCommandBuffer cb);
 void vk_sections_counts(uint64_t out[6]);
 uint64_t vk_sections_auxiliary_count(void);
+void vk_sections_times(uint64_t out[2]); /* cumulative walker secondary / assembler until ns */
 void vk_draw_secondary_reset(void);
 #ifdef TOTK_VK_TESTS
 void vk_sections_test_counts(uint64_t out[6]);
@@ -27,7 +42,7 @@ VkResult vk_sections_create_image(VkDevice dev, const VkImageCreateInfo *info, c
 void vk_sections_destroy_image(VkDevice dev, VkImage image, const VkAllocationCallbacks *alloc);
 VkResult vk_sections_create_view(VkDevice dev, const VkImageViewCreateInfo *info, const VkAllocationCallbacks *alloc, VkImageView *view);
 void vk_sections_destroy_view(VkDevice dev, VkImageView view, const VkAllocationCallbacks *alloc);
-#define VK_SECTION_CB(cb) (vk_one_primary_on ? vk_sections_route(cb) : (cb))
+#define VK_SECTION_CB(cb) vk_sections_command_buffer(cb)
 #define vkCmdWaitEvents(cb, ...) vkCmdWaitEvents(VK_SECTION_CB(cb), __VA_ARGS__)
 #define vkCmdResetQueryPool(cb, ...) vkCmdResetQueryPool(VK_SECTION_CB(cb), __VA_ARGS__)
 #define vkCmdBeginQuery(cb, ...) vkCmdBeginQuery(VK_SECTION_CB(cb), __VA_ARGS__)

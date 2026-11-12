@@ -994,34 +994,47 @@ static VkDescriptorSet descriptor_set(rec_context *c, rec_job *j, VkDescriptorSe
     c->cache[at].guard_ticket = ticket; c->cache[at].guard_spans = c->spans;
     return set;
 }
-void vk_record_dynamic_emit(VkCommandBuffer cb, const vk_record_dynamic *state, vk_record_dynamic *previous, int all) {
+/* The constant worker specialization contains only raw Vulkan calls. The
+ * shared walking entry resolves its token once, at the first emitted command;
+ * an unchanged dynamic snapshot must not create an ordered section. */
+static inline __attribute__((always_inline)) void record_dynamic_emit_inner(VkCommandBuffer cb,
+        const vk_record_dynamic *state, vk_record_dynamic *previous, int all, int walking) {
+    int routed = 0;
+#define EMIT(command, ...) do { \
+    if (walking && !routed) { cb = VK_SECTION_CB(cb); routed = 1; } \
+    (command)(cb, __VA_ARGS__); \
+} while (0)
 #define D (*state)
 #define CH(f) (all || memcmp(&D.f, &previous->f, sizeof D.f))
-    if (CH(vp)) vkCmdSetViewport(cb, 0, 1, &D.vp);
-    if (CH(sc)) vkCmdSetScissor(cb, 0, 1, &D.sc);
-    if (all) vkCmdSetLineWidth(cb, 1.0f);
-    if (CH(bias_en)) vkCmdSetDepthBiasEnable(cb, D.bias_en);
-    if (CH(bias)) vkCmdSetDepthBias(cb, D.bias[0], D.bias[1], D.bias[2]);
-    if (CH(blend)) vkCmdSetBlendConstants(cb, D.blend);
-    if (CH(cmask)) { vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, D.cmask[0]); vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, D.cmask[1]); }
-    if (CH(wmask)) { vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, D.wmask[0]); vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, D.wmask[1]); }
-    if (CH(ref)) { vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, D.ref[0]); vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, D.ref[1]); }
-    if (CH(cull)) vkCmdSetCullMode(cb, D.cull);
-    if (CH(front)) vkCmdSetFrontFace(cb, (VkFrontFace)D.front);
-    if (CH(topo)) vkCmdSetPrimitiveTopology(cb, (VkPrimitiveTopology)D.topo);
-    if (CH(dt)) vkCmdSetDepthTestEnable(cb, D.dt);
-    if (CH(dw)) vkCmdSetDepthWriteEnable(cb, D.dw);
-    if (CH(dc)) vkCmdSetDepthCompareOp(cb, (VkCompareOp)D.dc);
-    if (CH(st)) vkCmdSetStencilTestEnable(cb, D.st);
+    if (CH(vp)) EMIT(vkCmdSetViewport, 0, 1, &D.vp);
+    if (CH(sc)) EMIT(vkCmdSetScissor, 0, 1, &D.sc);
+    if (all) EMIT(vkCmdSetLineWidth, 1.0f);
+    if (CH(bias_en)) EMIT(vkCmdSetDepthBiasEnable, D.bias_en);
+    if (CH(bias)) EMIT(vkCmdSetDepthBias, D.bias[0], D.bias[1], D.bias[2]);
+    if (CH(blend)) EMIT(vkCmdSetBlendConstants, D.blend);
+    if (CH(cmask)) { EMIT(vkCmdSetStencilCompareMask, VK_STENCIL_FACE_FRONT_BIT, D.cmask[0]); EMIT(vkCmdSetStencilCompareMask, VK_STENCIL_FACE_BACK_BIT, D.cmask[1]); }
+    if (CH(wmask)) { EMIT(vkCmdSetStencilWriteMask, VK_STENCIL_FACE_FRONT_BIT, D.wmask[0]); EMIT(vkCmdSetStencilWriteMask, VK_STENCIL_FACE_BACK_BIT, D.wmask[1]); }
+    if (CH(ref)) { EMIT(vkCmdSetStencilReference, VK_STENCIL_FACE_FRONT_BIT, D.ref[0]); EMIT(vkCmdSetStencilReference, VK_STENCIL_FACE_BACK_BIT, D.ref[1]); }
+    if (CH(cull)) EMIT(vkCmdSetCullMode, D.cull);
+    if (CH(front)) EMIT(vkCmdSetFrontFace, (VkFrontFace)D.front);
+    if (CH(topo)) EMIT(vkCmdSetPrimitiveTopology, (VkPrimitiveTopology)D.topo);
+    if (CH(dt)) EMIT(vkCmdSetDepthTestEnable, D.dt);
+    if (CH(dw)) EMIT(vkCmdSetDepthWriteEnable, D.dw);
+    if (CH(dc)) EMIT(vkCmdSetDepthCompareOp, (VkCompareOp)D.dc);
+    if (CH(st)) EMIT(vkCmdSetStencilTestEnable, D.st);
     if (CH(sop)) {
-        vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, D.sop[0][0], D.sop[0][1], D.sop[0][2], D.sop[0][3]);
-        vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, D.sop[1][0], D.sop[1][1], D.sop[1][2], D.sop[1][3]);
+        EMIT(vkCmdSetStencilOp, VK_STENCIL_FACE_FRONT_BIT, D.sop[0][0], D.sop[0][1], D.sop[0][2], D.sop[0][3]);
+        EMIT(vkCmdSetStencilOp, VK_STENCIL_FACE_BACK_BIT, D.sop[1][0], D.sop[1][1], D.sop[1][2], D.sop[1][3]);
     }
-    if (CH(restart)) vkCmdSetPrimitiveRestartEnable(cb, D.restart);
+    if (CH(restart)) EMIT(vkCmdSetPrimitiveRestartEnable, D.restart);
 #undef CH
+#undef EMIT
     *previous = D;
 }
 #undef D
+void vk_record_dynamic_emit(VkCommandBuffer cb, const vk_record_dynamic *state, vk_record_dynamic *previous, int all) {
+    record_dynamic_emit_inner(cb, state, previous, all, 1);
+}
 static void record_job(rec_job *j, unsigned worker) {
     if (j->registering) {
         j->reset_time = 0;
@@ -1055,7 +1068,7 @@ static void record_job(rec_job *j, unsigned worker) {
     VKCHECK(vkBeginCommandBuffer(j->cb, &bi));
     if (__builtin_expect(vk_gpuprof_on, 0)) {
         const rec_profile_job *profile = (const rec_profile_job *)j;
-        if (profile->pool) vkCmdBeginQuery(j->cb, profile->pool, profile->query, 0);
+        if (profile->pool) (vkCmdBeginQuery)(j->cb, profile->pool, profile->query, 0);
     }
     VkPipeline pipeline = VK_NULL_HANDLE; vk_record_dynamic dynamic = {0};
     VkPipelineLayout bound_layout = VK_NULL_HANDLE; VkDescriptorSet bound_set[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -1067,20 +1080,20 @@ static void record_job(rec_job *j, unsigned worker) {
     for (uint32_t i = 0; i <= j->count; i++) {
         while (event < j->nevent && j->event[event].before == i) {
             const rec_event *e = &j->event[event++];
-            if (e->kind == REC_CLEAR) vkCmdClearAttachments(j->cb, 1, &e->clear.attachment, 1, &e->clear.rect);
-            else vkCmdWriteTimestamp2(j->cb, e->timestamp.stage, e->timestamp.pool, e->timestamp.query);
+            if (e->kind == REC_CLEAR) (vkCmdClearAttachments)(j->cb, 1, &e->clear.attachment, 1, &e->clear.rect);
+            else (vkCmdWriteTimestamp2)(j->cb, e->timestamp.stage, e->timestamp.pool, e->timestamp.query);
         }
         if (i == j->count) break;
         const vk_record_draw *d = &j->draw[i];
         if (c->spans != d->spans) { c->spans = d->spans; memset(c->hints, 0, sizeof c->hints); }
         if (bound_layout != d->layout) { bound_layout = d->layout; bound_set[0] = bound_set[1] = VK_NULL_HANDLE; }
-        if (pipeline != d->pipeline) { vkCmdBindPipeline(j->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d->pipeline); pipeline = d->pipeline; }
-        vk_record_dynamic_emit(j->cb, &d->dynamic, &dynamic, i == 0 || dyn_off);
+        if (pipeline != d->pipeline) { (vkCmdBindPipeline)(j->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d->pipeline); pipeline = d->pipeline; }
+        record_dynamic_emit_inner(j->cb, &d->dynamic, &dynamic, i == 0 || dyn_off, 0);
         /* Chunk-local binding memos are valid only while the exact pipeline layout stays unchanged. */
         for (uint32_t s = 0; s < 2; s++) if (d->sets[s].count) {
             VkDescriptorSet set = descriptor_set(c, j, d->sets[s].layout, d->sets[s].update, j->info + d->sets[s].first, d->sets[s].count, d->lag_ticket);
             if (ds_off || bound_set[s] != set) {
-                vkCmdBindDescriptorSets(j->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d->layout, s, 1, &set, 0, NULL); bound_set[s] = set;
+                (vkCmdBindDescriptorSets)(j->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d->layout, s, 1, &set, 0, NULL); bound_set[s] = set;
             }
         }
         uint32_t changed = 0;
@@ -1112,7 +1125,7 @@ static void record_job(rec_job *j, unsigned worker) {
         while (changed) {
             uint32_t first = (uint32_t)__builtin_ctz(changed), end = first + 1;
             while (end < 17 && (changed >> end & 1)) end++;
-            vkCmdBindVertexBuffers2(j->cb, first, end - first, vertices + first, offsets + first, sizes + first, strides + first);
+            (vkCmdBindVertexBuffers2)(j->cb, first, end - first, vertices + first, offsets + first, sizes + first, strides + first);
             changed &= ~(((1u << (end - first)) - 1) << first);
         }
         if (d->index || d->index_address) {
@@ -1124,15 +1137,15 @@ static void record_job(rec_job *j, unsigned worker) {
             if (d->lag_ticket && d->index_lag_reason)
                 collect_guard(j, d->spans, buffer, offset, d->index_bytes, d->lag_ticket, d->index_lag_reason);
             if (index_buffer != buffer || index_offset != offset || index_type != d->index_type) {
-                vkCmdBindIndexBuffer(j->cb, buffer, offset, d->index_type); index_buffer = buffer; index_offset = offset; index_type = d->index_type;
+                (vkCmdBindIndexBuffer)(j->cb, buffer, offset, d->index_type); index_buffer = buffer; index_offset = offset; index_type = d->index_type;
             }
-            vkCmdDrawIndexed(j->cb, d->count, d->instances, d->first, d->vertex_offset, d->base_instance);
+            (vkCmdDrawIndexed)(j->cb, d->count, d->instances, d->first, d->vertex_offset, d->base_instance);
             draws++;
-        } else if (d->count) { vkCmdDraw(j->cb, d->count, d->instances, d->first, d->base_instance); draws++; }
+        } else if (d->count) { (vkCmdDraw)(j->cb, d->count, d->instances, d->first, d->base_instance); draws++; }
     }
     if (__builtin_expect(vk_gpuprof_on, 0)) {
         const rec_profile_job *profile = (const rec_profile_job *)j;
-        if (profile->pool) vkCmdEndQuery(j->cb, profile->pool, profile->query);
+        if (profile->pool) (vkCmdEndQuery)(j->cb, profile->pool, profile->query);
     }
     VKCHECK(vkEndCommandBuffer(j->cb));
     project_guards(j);   /* freeze every owner/view/alias VA while this recording job still owns its inputs */
@@ -1659,7 +1672,14 @@ void vk_record_stats(uint64_t frame) {
         (section_counts[3] - section_previous[3]) / 300.0, (section_counts[4] - section_previous[4]) / 300.0,
         (section_counts[5] - section_previous[5]) / 300.0);
     memcpy(section_previous, section_counts, sizeof section_previous); auxiliary_previous = auxiliary_count;
-    LOGV("recorder overhead ms/frame: inline %.3f execute %.3f reset walking/worker %.3f/%.3f job setup %.3f (wait above; reset overlaps inline/worker busy)", inline_ns / 3e8, execute_ns / 3e8, reset_ns / 3e8, worker_reset_ns / 3e8, job_ns / 3e8);
+    if (vk_one_primary_on) {
+        static uint64_t previous[2];
+        uint64_t times[2]; vk_sections_times(times);
+        LOGV("recorder overhead ms/frame: inline %.3f execute %.3f reset walking/worker %.3f/%.3f job setup %.3f (wait above; reset overlaps inline/worker busy); section secondary begin/end %.3f section assembly %.3f",
+            inline_ns / 3e8, execute_ns / 3e8, reset_ns / 3e8, worker_reset_ns / 3e8, job_ns / 3e8,
+            (times[0] - previous[0]) / 3e8, (times[1] - previous[1]) / 3e8);
+        memcpy(previous, times, sizeof previous);
+    } else LOGV("recorder overhead ms/frame: inline %.3f execute %.3f reset walking/worker %.3f/%.3f job setup %.3f (wait above; reset overlaps inline/worker busy)", inline_ns / 3e8, execute_ns / 3e8, reset_ns / 3e8, worker_reset_ns / 3e8, job_ns / 3e8);
     uint64_t retained = atomic_load(&memory_draws) + atomic_load(&memory_info);
     LOGV("recorder storage: %.1f/%llu MiB packet/descriptor slabs (active over-budget=%d, referenced block capacity %.1f MiB), retired-slot reclaims %llu/%.1f MiB, secondary CBs reclaimed %llu",
         retained / 1048576.0, (unsigned long long)(storage_limit >> 20), retained > storage_limit, storage_referenced / 1048576.0,

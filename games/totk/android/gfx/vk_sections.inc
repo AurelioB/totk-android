@@ -2,6 +2,9 @@
  * but are exclusively walking-owned. Only the main pool is assembler-owned. */
 #include "nvn_hmap.h"
 int vk_one_primary_on;
+vk_sections_token_state vk_sections_token;
+_Static_assert(sizeof(vk_sections_token_state) == 64, "section token owns one complete cache line");
+_Static_assert(_Alignof(vk_sections_token_state) == 64, "section token cache-line alignment");
 typedef struct {
     VkRenderingInfo info;
     VkRenderingAttachmentInfo color[8], depth, stencil;
@@ -26,6 +29,12 @@ static ordered_slot ordered_slots[8];
 static _Atomic(ordered_slot *) ordered_current;
 static _Atomic uint64_t ordered_counts[6];
 static _Atomic uint64_t ordered_auxiliary_begins;
+static _Alignas(64) _Atomic uint64_t ordered_walk_ns;
+static _Alignas(64) _Atomic uint64_t ordered_assemble_ns;
+void vk_sections_times(uint64_t out[2]) {
+    out[0] = atomic_load_explicit(&ordered_walk_ns, memory_order_relaxed);
+    out[1] = atomic_load_explicit(&ordered_assemble_ns, memory_order_relaxed);
+}
 static int ordered_fallback;
 static void ordered_note_primary(int auxiliary) {
     if (auxiliary) atomic_fetch_add_explicit(&ordered_auxiliary_begins, 1, memory_order_relaxed);
@@ -111,10 +120,12 @@ static VkFormat ordered_attachment(VkImageView view, VkSampleCountFlagBits *samp
 }
 static void ordered_close(ordered_slot *s) {
     if (!s->open) return;
+    uint64_t start = host_now_ns();
     ordered_section *section = &s->section[s->open - 1];
     if (section->cb) VKCHECK(vkEndCommandBuffer(section->cb));
     vk_draw_secondary_reset();
     s->open = 0;
+    atomic_fetch_add_explicit(&ordered_walk_ns, host_now_ns() - start, memory_order_relaxed);
 }
 static ordered_section *ordered_append(ordered_slot *s) {
     if (s->count == s->capacity) {
@@ -127,6 +138,7 @@ static ordered_section *ordered_append(ordered_slot *s) {
     return section;
 }
 static VkCommandBuffer ordered_secondary(ordered_slot *s, const ordered_section *section) {
+    uint64_t start = host_now_ns();
     if (s->used == s->nbuffers) {
         if (s->nbuffers == s->capbuffers) {
             uint32_t capacity = s->capbuffers ? s->capbuffers * 2 : 32;
@@ -150,6 +162,7 @@ static VkCommandBuffer ordered_secondary(ordered_slot *s, const ordered_section 
             (section->rendering ? VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT : 0), .pInheritanceInfo = &inheritance};
     VKCHECK(vkBeginCommandBuffer(cb, &begin));
     atomic_fetch_add_explicit(&ordered_counts[4], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ordered_walk_ns, host_now_ns() - start, memory_order_relaxed);
     return cb;
 }
 void vk_sections_reset(unsigned slot, VkCommandBuffer primary) {
@@ -164,6 +177,7 @@ void vk_sections_reset(unsigned slot, VkCommandBuffer primary) {
     if (!s->primary) s->primary = primary;
     s->count = s->cursor = s->open = s->used = 0; s->begun = 0;
     atomic_store_explicit(&ordered_current, s, memory_order_release);
+    atomic_store_explicit(&vk_sections_token.cb, primary, memory_order_relaxed);
 }
 VkCommandBuffer vk_sections_route(VkCommandBuffer cb) {
     ordered_slot *s = atomic_load_explicit(&ordered_current, memory_order_acquire);
@@ -220,16 +234,24 @@ void vk_sections_seal(void) {
     ordered_slot *s = atomic_load_explicit(&ordered_current, memory_order_acquire);
     if (!s) return;
     if (s->open && s->section[s->open - 1].rendering) DIE("one-primary sealed inside rendering");
-    ordered_close(s); atomic_store_explicit(&ordered_current, NULL, memory_order_release);
+    ordered_close(s);
+    atomic_store_explicit(&vk_sections_token.cb, VK_NULL_HANDLE, memory_order_relaxed);
+    atomic_store_explicit(&ordered_current, NULL, memory_order_release);
 }
 void vk_sections_resume(unsigned slot) {
     atomic_store_explicit(&ordered_current, &ordered_slots[slot], memory_order_release);
+    atomic_store_explicit(&vk_sections_token.cb, ordered_slots[slot].primary, memory_order_relaxed);
 }
 void vk_sections_cancel(void) {
     ordered_slot *s = atomic_load_explicit(&ordered_current, memory_order_acquire);
-    if (s) { ordered_close(s); atomic_store_explicit(&ordered_current, NULL, memory_order_release); }
+    if (s) {
+        ordered_close(s);
+        atomic_store_explicit(&vk_sections_token.cb, VK_NULL_HANDLE, memory_order_relaxed);
+        atomic_store_explicit(&ordered_current, NULL, memory_order_release);
+    }
 }
 void vk_sections_until(unsigned slot, void *pass) {
+    uint64_t start = host_now_ns();
     ordered_slot *s = &ordered_slots[slot];
     if (!s->begun) {
         VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -249,6 +271,7 @@ void vk_sections_until(unsigned slot, void *pass) {
             (vkCmdBeginRendering)(s->primary, &info);
             if (section->pass) {
                 if (section->pass != pass) DIE("one-primary recorder section order mismatch");
+                atomic_fetch_add_explicit(&ordered_assemble_ns, host_now_ns() - start, memory_order_relaxed);
                 return; /* recorder emits its jobs, EndRendering and profiler end */
             }
             if (section->cb) (vkCmdExecuteCommands)(s->primary, 1, &section->cb);
@@ -256,6 +279,7 @@ void vk_sections_until(unsigned slot, void *pass) {
         } else if (section->cb) (vkCmdExecuteCommands)(s->primary, 1, &section->cb);
     }
     if (pass) DIE("one-primary recorder section not found");
+    atomic_fetch_add_explicit(&ordered_assemble_ns, host_now_ns() - start, memory_order_relaxed);
 }
 void vk_sections_finish(unsigned slot) {
     ordered_slot *s = &ordered_slots[slot];
