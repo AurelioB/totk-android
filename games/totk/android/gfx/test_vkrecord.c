@@ -1,8 +1,8 @@
 /* Fresh-process comparisons: no Vulkan objects or caches shared across modes. Every invocation runs
    TOTK_VK_REC_ONE_PRIMARY=0/1; binary fixtures compare every output byte between those launch arms.
-   Run vkrectest for identity/boundaries/mixed sections/split passes, --job-reuse for storage/leases/failures,
-   --lag-guards for backend copy/guard liveness plus private uniforms, and --launch-policy for hardware-free
-   framegen/statistics startup decisions. Pixel fixtures need the completed draw seed. */
+   Run vkrectest for identity/boundaries/mixed sections (including deferred payload/storage/cancel)/split passes,
+   --job-reuse for the 4096-pass storage oracle/leases/failures, --lag-guards for backend copy/guard liveness plus
+   private uniforms, and --launch-policy for hardware-free framegen/statistics startup decisions. Pixel fixtures need the completed draw seed. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

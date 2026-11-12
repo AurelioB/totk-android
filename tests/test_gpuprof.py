@@ -2333,9 +2333,9 @@ class Lavapipe(unittest.TestCase):
             queries = ((retirement['queries_outstanding'],
                         retirement['queries_submitted'] == retirement['queries_retired']) if pipeline else
                        (retirement['queries_submitted'], retirement['queries_retired'], retirement['queries_outstanding']))
-            return sorted(passes), queries
+            return sorted(passes), (queries, retirement['queries_cancelled'], retirement['leases_cancelled'])
 
-        for case in ('full', 'sampled', 'pipelines'):
+        for case in ('full', 'sampled', 'pipelines', 'cancel'):
             for stats in (0, 1):
                 metadata_reference = None
                 for workers in (0, 2, 3):
@@ -2350,7 +2350,8 @@ class Lavapipe(unittest.TestCase):
                                                  sample_budget=2 if case == 'sampled' else None,
                                                  pipeline_budget=16 if case == 'pipelines' else None,
                                                  pipeline_groups=case == 'pipelines',
-                                                 pipeline_raw=True if case == 'pipelines' else None)
+                                                 pipeline_raw=True if case == 'pipelines' else None,
+                                                 cancel=case == 'cancel')
                             observed = signature(report)
                             if metadata_reference is None:
                                 metadata_reference = observed[0]

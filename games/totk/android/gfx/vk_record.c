@@ -1679,6 +1679,23 @@ void vk_record_stats(uint64_t frame) {
             inline_ns / 3e8, execute_ns / 3e8, reset_ns / 3e8, worker_reset_ns / 3e8, job_ns / 3e8,
             (times[0] - previous[0]) / 3e8, (times[1] - previous[1]) / 3e8);
         memcpy(previous, times, sizeof previous);
+        static uint64_t deferred_previous[3], command_previous[VK_SECTION_COMMAND_COUNT];
+        uint64_t deferred[3], commands[VK_SECTION_COMMAND_COUNT];
+        vk_sections_deferred_counts(deferred); vk_sections_command_counts(commands);
+        LOGV("recorder sections per-frame: deferred records/frame %.2f deferred-only sections/frame %.2f secondary sections/frame %.2f",
+            (deferred[0] - deferred_previous[0]) / 300.0,
+            (deferred[1] - deferred_previous[1]) / 300.0,
+            (deferred[2] - deferred_previous[2]) / 300.0);
+        /* One line per nonzero command keeps exact identities without a fixed
+         * formatting buffer; all lines use the existing 300-frame cadence. */
+#define VK_SECTION_LOG(name) \
+        if (commands[VK_SECTION_##name] != command_previous[VK_SECTION_##name]) \
+            LOGV("recorder immediate commands/frame: " #name " %.2f", \
+                (commands[VK_SECTION_##name] - command_previous[VK_SECTION_##name]) / 300.0);
+        VK_SECTION_COMMANDS(VK_SECTION_LOG)
+#undef VK_SECTION_LOG
+        memcpy(deferred_previous, deferred, sizeof deferred_previous);
+        memcpy(command_previous, commands, sizeof command_previous);
     } else LOGV("recorder overhead ms/frame: inline %.3f execute %.3f reset walking/worker %.3f/%.3f job setup %.3f (wait above; reset overlaps inline/worker busy)", inline_ns / 3e8, execute_ns / 3e8, reset_ns / 3e8, worker_reset_ns / 3e8, job_ns / 3e8);
     uint64_t retained = atomic_load(&memory_draws) + atomic_load(&memory_info);
     LOGV("recorder storage: %.1f/%llu MiB packet/descriptor slabs (active over-budget=%d, referenced block capacity %.1f MiB), retired-slot reclaims %llu/%.1f MiB, secondary CBs reclaimed %llu",

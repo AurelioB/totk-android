@@ -5,6 +5,19 @@ int vk_one_primary_on;
 vk_sections_token_state vk_sections_token;
 _Static_assert(sizeof(vk_sections_token_state) == 64, "section token owns one complete cache line");
 _Static_assert(_Alignof(vk_sections_token_state) == 64, "section token cache-line alignment");
+/* Records and variable payloads are 8-byte aligned. No retained pointer refers
+ * into this growable arena: sections hold offsets; replay rebuilds pointers. */
+typedef struct {
+    size_t bytes;
+    vk_section_command command;
+    union {
+        VkDependencyInfo barrier;
+        struct { VkBuffer src, dst; uint32_t count; } copy;
+        struct { VkBuffer dst; VkDeviceSize offset, size; uint32_t data; } buffer;
+        struct { VkQueryPool pool; VkPipelineStageFlags2 stage; uint32_t first, count; } query;
+    };
+} ordered_record;
+_Static_assert(sizeof(ordered_record) % 8 == 0, "aligned deferred payload");
 typedef struct {
     VkRenderingInfo info;
     VkRenderingAttachmentInfo color[8], depth, stencil;
@@ -12,6 +25,7 @@ typedef struct {
     VkSampleCountFlagBits samples;
     VkCommandBuffer cb;
     void *pass;
+    size_t first_record, end_record;
     int rendering, worker, has_depth, has_stencil;
 } ordered_section;
 typedef struct {
@@ -20,6 +34,8 @@ typedef struct {
     uint32_t nbuffers, capbuffers, used;
     ordered_section *section;
     uint32_t count, capacity, cursor, open;
+    unsigned char *arena;
+    size_t arena_used, arena_capacity, arena_growths;
     int begun;
 } ordered_slot;
 static ordered_slot ordered_slots[8];
@@ -31,6 +47,21 @@ static _Atomic uint64_t ordered_counts[6];
 static _Atomic uint64_t ordered_auxiliary_begins;
 static _Alignas(64) _Atomic uint64_t ordered_walk_ns;
 static _Alignas(64) _Atomic uint64_t ordered_assemble_ns;
+static _Atomic uint64_t ordered_commands[VK_SECTION_COMMAND_COUNT], ordered_deferred[3];
+void vk_sections_command_counts(uint64_t out[VK_SECTION_COMMAND_COUNT]) {
+    for (unsigned i = 0; i < VK_SECTION_COMMAND_COUNT; i++)
+        out[i] = atomic_load_explicit(&ordered_commands[i], memory_order_relaxed);
+}
+void vk_sections_deferred_counts(uint64_t out[3]) {
+    for (unsigned i = 0; i < 3; i++)
+        out[i] = atomic_load_explicit(&ordered_deferred[i], memory_order_relaxed);
+}
+#ifdef TOTK_VK_TESTS
+void vk_sections_test_storage(unsigned slot, size_t out[3]) {
+    ordered_slot *s = &ordered_slots[slot];
+    out[0] = s->arena_used; out[1] = s->arena_capacity; out[2] = s->arena_growths;
+}
+#endif
 void vk_sections_times(uint64_t out[2]) {
     out[0] = atomic_load_explicit(&ordered_walk_ns, memory_order_relaxed);
     out[1] = atomic_load_explicit(&ordered_assemble_ns, memory_order_relaxed);
@@ -123,6 +154,7 @@ static void ordered_close(ordered_slot *s) {
     uint64_t start = host_now_ns();
     ordered_section *section = &s->section[s->open - 1];
     if (section->cb) VKCHECK(vkEndCommandBuffer(section->cb));
+    if (!section->rendering) atomic_fetch_add_explicit(&ordered_deferred[section->cb ? 2 : 1], 1, memory_order_relaxed);
     vk_draw_secondary_reset();
     s->open = 0;
     atomic_fetch_add_explicit(&ordered_walk_ns, host_now_ns() - start, memory_order_relaxed);
@@ -176,19 +208,151 @@ void vk_sections_reset(unsigned slot, VkCommandBuffer primary) {
     if (s->primary && s->primary != primary) DIE("one-primary slot changed its stable handle");
     if (!s->primary) s->primary = primary;
     s->count = s->cursor = s->open = s->used = 0; s->begun = 0;
+    s->arena_used = 0;
     atomic_store_explicit(&ordered_current, s, memory_order_release);
     atomic_store_explicit(&vk_sections_token.cb, primary, memory_order_relaxed);
 }
-VkCommandBuffer vk_sections_route(VkCommandBuffer cb) {
-    ordered_slot *s = atomic_load_explicit(&ordered_current, memory_order_acquire);
-    if (!s || cb != s->primary) return cb;
-    ordered_section *section = s->open ? &s->section[s->open - 1] : ordered_append(s);
+static void ordered_replay(ordered_slot *s, ordered_section *section, VkCommandBuffer cb) {
+    for (size_t offset = section->first_record; offset < section->end_record;) {
+        const ordered_record *r = (const void *)(s->arena + offset);
+        const void *payload = r + 1;
+        switch (r->command) {
+        case VK_SECTION_PipelineBarrier2: {
+            VkDependencyInfo info = r->barrier;
+            info.pMemoryBarriers = payload;
+            info.pBufferMemoryBarriers = (const void *)((const unsigned char *)payload +
+                info.memoryBarrierCount * sizeof(VkMemoryBarrier2));
+            info.pImageMemoryBarriers = (const void *)((const unsigned char *)info.pBufferMemoryBarriers +
+                info.bufferMemoryBarrierCount * sizeof(VkBufferMemoryBarrier2));
+            (vkCmdPipelineBarrier2)(cb, &info);
+            break;
+        }
+        case VK_SECTION_CopyBuffer:
+            (vkCmdCopyBuffer)(cb, r->copy.src, r->copy.dst, r->copy.count, payload); break;
+        case VK_SECTION_UpdateBuffer:
+            (vkCmdUpdateBuffer)(cb, r->buffer.dst, r->buffer.offset, r->buffer.size, payload); break;
+        case VK_SECTION_FillBuffer:
+            (vkCmdFillBuffer)(cb, r->buffer.dst, r->buffer.offset, r->buffer.size, r->buffer.data); break;
+        case VK_SECTION_ResetQueryPool:
+            (vkCmdResetQueryPool)(cb, r->query.pool, r->query.first, r->query.count); break;
+        case VK_SECTION_WriteTimestamp2:
+            (vkCmdWriteTimestamp2)(cb, r->query.stage, r->query.pool, r->query.first); break;
+        default: DIE("one-primary unknown deferred command");
+        }
+        offset += r->bytes;
+    }
+}
+static ordered_section *ordered_immediate(ordered_slot *s) {
+    if (s->open) return &s->section[s->open - 1];
+    ordered_section *section = ordered_append(s);
+    atomic_fetch_add_explicit(&ordered_counts[2], 1, memory_order_relaxed);
+    return section;
+}
+static void ordered_note_command(ordered_slot *s, vk_section_command command) {
+    if (!s->open || !s->section[s->open - 1].rendering)
+        atomic_fetch_add_explicit(&ordered_commands[command], 1, memory_order_relaxed);
+}
+static VkCommandBuffer ordered_materialize(ordered_slot *s, ordered_section *section) {
     if (section->worker) DIE("one-primary direct command inside a worker-rendered pass");
     if (!section->cb) {
         section->cb = ordered_secondary(s, section);
-        if (!section->rendering) atomic_fetch_add_explicit(&ordered_counts[2], 1, memory_order_relaxed);
+        /* A single secondary owns the whole mixed section. Replay the prefix
+         * before its first unsupported command, then record everything here. */
+        ordered_replay(s, section, section->cb);
+        section->first_record = section->end_record = 0;
     }
     return section->cb;
+}
+VkCommandBuffer vk_sections_route_command(VkCommandBuffer cb, vk_section_command command) {
+    ordered_slot *s = atomic_load_explicit(&ordered_current, memory_order_acquire);
+    if (!s || cb != s->primary) return cb;
+    ordered_note_command(s, command);
+    return ordered_materialize(s, ordered_immediate(s));
+}
+VkCommandBuffer vk_sections_route(VkCommandBuffer cb) {
+    return vk_sections_route_command(cb, VK_SECTION_External);
+}
+static ordered_record *ordered_allocate(ordered_slot *s, ordered_section *section, vk_section_command command, size_t payload) {
+    if (payload > SIZE_MAX - sizeof(ordered_record) - 7) DIE("one-primary deferred payload overflow");
+    size_t bytes = (sizeof(ordered_record) + payload + 7) & ~(size_t)7;
+    if (bytes > SIZE_MAX - s->arena_used) DIE("one-primary arena size overflow");
+    size_t end = s->arena_used + bytes;
+    if (end > s->arena_capacity) {
+        size_t capacity = s->arena_capacity ? s->arena_capacity : 4096;
+        while (capacity < end) {
+            if (capacity > SIZE_MAX / 2) { capacity = end; break; }
+            capacity *= 2;
+        }
+        s->arena = VK_REALLOC(s->arena, capacity); s->arena_capacity = capacity; s->arena_growths++;
+    }
+    if (section->first_record == section->end_record) section->first_record = s->arena_used;
+    ordered_record *r = (void *)(s->arena + s->arena_used);
+    r->bytes = bytes; r->command = command;
+    s->arena_used = section->end_record = end;
+    atomic_fetch_add_explicit(&ordered_deferred[0], 1, memory_order_relaxed);
+    return r;
+}
+/* Only an active walking token enters these functions. Rendering and already
+ * materialized sections use the raw PFN, preserving secondary-local state. */
+static ordered_section *ordered_defer(vk_section_command command, ordered_slot **out) {
+    ordered_slot *s = atomic_load_explicit(&ordered_current, memory_order_acquire);
+    if (!s) DIE("one-primary deferred command without walking ownership");
+    ordered_note_command(s, command);
+    *out = s;
+    return ordered_immediate(s);
+}
+void vk_sections_barrier(VkCommandBuffer cb, const VkDependencyInfo *info) {
+    ordered_slot *s; ordered_section *section = ordered_defer(VK_SECTION_PipelineBarrier2, &s);
+    int extensions = info->pNext != NULL;
+    for (uint32_t i = 0; i < info->memoryBarrierCount; i++) extensions |= info->pMemoryBarriers[i].pNext != NULL;
+    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; i++) extensions |= info->pBufferMemoryBarriers[i].pNext != NULL;
+    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) extensions |= info->pImageMemoryBarriers[i].pNext != NULL;
+    if (section->rendering || section->cb || extensions) {
+        (vkCmdPipelineBarrier2)(ordered_materialize(s, section), info); return;
+    }
+    size_t memory = (size_t)info->memoryBarrierCount * sizeof(VkMemoryBarrier2);
+    size_t buffer = (size_t)info->bufferMemoryBarrierCount * sizeof(VkBufferMemoryBarrier2);
+    size_t image = (size_t)info->imageMemoryBarrierCount * sizeof(VkImageMemoryBarrier2);
+    ordered_record *r = ordered_allocate(s, section, VK_SECTION_PipelineBarrier2, memory + buffer + image);
+    r->barrier = *info; r->barrier.pMemoryBarriers = NULL;
+    r->barrier.pBufferMemoryBarriers = NULL; r->barrier.pImageMemoryBarriers = NULL;
+    unsigned char *p = (void *)(r + 1);
+    if (memory) memcpy(p, info->pMemoryBarriers, memory);
+    if (buffer) memcpy(p + memory, info->pBufferMemoryBarriers, buffer);
+    if (image) memcpy(p + memory + buffer, info->pImageMemoryBarriers, image);
+}
+void vk_sections_copy(VkCommandBuffer cb, VkBuffer src, VkBuffer dst, uint32_t count, const VkBufferCopy *regions) {
+    ordered_slot *s; ordered_section *section = ordered_defer(VK_SECTION_CopyBuffer, &s);
+    if (section->rendering || section->cb) { (vkCmdCopyBuffer)(ordered_materialize(s, section), src, dst, count, regions); return; }
+    size_t bytes = (size_t)count * sizeof *regions;
+    ordered_record *r = ordered_allocate(s, section, VK_SECTION_CopyBuffer, bytes);
+    r->copy.src = src; r->copy.dst = dst; r->copy.count = count;
+    if (bytes) memcpy(r + 1, regions, bytes);
+}
+void vk_sections_update(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, const void *data) {
+    ordered_slot *s; ordered_section *section = ordered_defer(VK_SECTION_UpdateBuffer, &s);
+    if (section->rendering || section->cb) { (vkCmdUpdateBuffer)(ordered_materialize(s, section), dst, offset, size, data); return; }
+    ordered_record *r = ordered_allocate(s, section, VK_SECTION_UpdateBuffer, size);
+    r->buffer.dst = dst; r->buffer.offset = offset; r->buffer.size = size;
+    if (size) memcpy(r + 1, data, size);
+}
+void vk_sections_fill(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, uint32_t data) {
+    ordered_slot *s; ordered_section *section = ordered_defer(VK_SECTION_FillBuffer, &s);
+    if (section->rendering || section->cb) { (vkCmdFillBuffer)(ordered_materialize(s, section), dst, offset, size, data); return; }
+    ordered_record *r = ordered_allocate(s, section, VK_SECTION_FillBuffer, 0);
+    r->buffer.dst = dst; r->buffer.offset = offset; r->buffer.size = size; r->buffer.data = data;
+}
+void vk_sections_query_reset(VkCommandBuffer cb, VkQueryPool pool, uint32_t first, uint32_t count) {
+    ordered_slot *s; ordered_section *section = ordered_defer(VK_SECTION_ResetQueryPool, &s);
+    if (section->rendering || section->cb) { (vkCmdResetQueryPool)(ordered_materialize(s, section), pool, first, count); return; }
+    ordered_record *r = ordered_allocate(s, section, VK_SECTION_ResetQueryPool, 0);
+    r->query.pool = pool; r->query.first = first; r->query.count = count;
+}
+void vk_sections_timestamp(VkCommandBuffer cb, VkPipelineStageFlags2 stage, VkQueryPool pool, uint32_t query) {
+    ordered_slot *s; ordered_section *section = ordered_defer(VK_SECTION_WriteTimestamp2, &s);
+    if (section->rendering || section->cb) { (vkCmdWriteTimestamp2)(ordered_materialize(s, section), stage, pool, query); return; }
+    ordered_record *r = ordered_allocate(s, section, VK_SECTION_WriteTimestamp2, 0);
+    r->query.pool = pool; r->query.stage = stage; r->query.first = query;
 }
 void vk_sections_begin(VkCommandBuffer cb, const VkRenderingInfo *info) {
     ordered_slot *s = atomic_load_explicit(&ordered_current, memory_order_acquire);
@@ -246,6 +410,7 @@ void vk_sections_cancel(void) {
     ordered_slot *s = atomic_load_explicit(&ordered_current, memory_order_acquire);
     if (s) {
         ordered_close(s);
+        s->count = s->cursor = 0;
         atomic_store_explicit(&vk_sections_token.cb, VK_NULL_HANDLE, memory_order_relaxed);
         atomic_store_explicit(&ordered_current, NULL, memory_order_release);
     }
@@ -277,6 +442,7 @@ void vk_sections_until(unsigned slot, void *pass) {
             if (section->cb) (vkCmdExecuteCommands)(s->primary, 1, &section->cb);
             (vkCmdEndRendering)(s->primary);
         } else if (section->cb) (vkCmdExecuteCommands)(s->primary, 1, &section->cb);
+        else ordered_replay(s, section, s->primary);
     }
     if (pass) DIE("one-primary recorder section not found");
     atomic_fetch_add_explicit(&ordered_assemble_ns, host_now_ns() - start, memory_order_relaxed);

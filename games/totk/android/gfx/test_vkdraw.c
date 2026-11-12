@@ -73,6 +73,230 @@ static VKAPI_ATTR VkResult VKAPI_CALL fail_recorder_end(VkCommandBuffer cb) {
     const char *role = nvn_dirty_lag_thread_role_get();
     return role && !strcmp(role, "recorder") ? VK_ERROR_MEMORY_MAP_FAILED : fault_real_end(cb);
 }
+/* Observe the real driver call as well as GPU results: synchronization arrays have no
+   deterministic pixel effect on a serial driver if their dependencies are dropped. */
+static PFN_vkCmdPipelineBarrier2 section_real_barrier;
+static VkMemoryBarrier2 section_memory[2];
+static VkBufferMemoryBarrier2 section_buffers[2];
+static VkImageMemoryBarrier2 section_images[2];
+static _Atomic unsigned section_barrier_seen, section_barrier_wrong;
+static VKAPI_ATTR void VKAPI_CALL section_check_barrier(VkCommandBuffer cb, const VkDependencyInfo *info) {
+    if (info->memoryBarrierCount == 2 && info->bufferMemoryBarrierCount == 2 && info->imageMemoryBarrierCount == 2) {
+        atomic_fetch_add(&section_barrier_seen, 1);
+        if (info->pNext || info->dependencyFlags ||
+                memcmp(info->pMemoryBarriers, section_memory, sizeof section_memory) ||
+                memcmp(info->pBufferMemoryBarriers, section_buffers, sizeof section_buffers) ||
+                memcmp(info->pImageMemoryBarriers, section_images, sizeof section_images))
+            atomic_fetch_add(&section_barrier_wrong, 1);
+    }
+    section_real_barrier(cb, info);
+}
+static void section_break(VkCommandBuffer cb) {
+    VkRenderingInfo rendering = {VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = {{0, 0}, {1, 1}}, .layerCount = 1};
+    vkCmdBeginRendering(cb, &rendering); vkCmdEndRendering(cb);
+}
+static void section_storage(size_t out[8][3]) {
+    for (unsigned slot = 0; slot < 8; slot++) vk_sections_test_storage(slot, out[slot]);
+}
+/* Runs in the existing paired mixed fixture, before any large slot high-water.
+   Poison every borrowed input before assembly; compare the complete GPU payload
+   in both launch arms, not just the ON-only recorder counters. */
+static void section_deferred_fixture(FILE *out) {
+    enum { BLOCKS = 64, WORDS = 16384, BYTES = WORDS * 4, DATA = BLOCKS * BYTES };
+    VkBuffer buffer;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 2 * DATA + 32,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, &buffer));
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, buffer, &req);
+    int type = vk_pick_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (type < 0) DIE("deferred fixture needs host-coherent readback memory");
+    VkMemoryAllocateInfo allocation = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size, .memoryTypeIndex = (uint32_t)type};
+    VkDeviceMemory memory; VKCHECK(vkAllocateMemory(V.dev, &allocation, NULL, &memory));
+    VKCHECK(vkBindBufferMemory(V.dev, buffer, memory, 0));
+    uint32_t *mapped; VKCHECK(vkMapMemory(V.dev, memory, 0, VK_WHOLE_SIZE, 0, (void **)&mapped));
+    memset(mapped, 0x39, 2 * DATA + 32);
+    VkImage image[2]; VkDeviceMemory image_memory[2];
+    for (unsigned i = 0; i < 2; i++) {
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+            .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {1, 1, 1}, .mipLevels = 1, .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+        VKCHECK(vkCreateImage(V.dev, &ii, NULL, &image[i]));
+        vkGetImageMemoryRequirements(V.dev, image[i], &req);
+        type = vk_pick_type(req.memoryTypeBits, 0);
+        if (type < 0) DIE("deferred fixture image has no compatible memory");
+        allocation.allocationSize = req.size; allocation.memoryTypeIndex = (uint32_t)type;
+        VKCHECK(vkAllocateMemory(V.dev, &allocation, NULL, &image_memory[i]));
+        VKCHECK(vkBindImageMemory(V.dev, image[i], image_memory[i], 0));
+    }
+    VkEvent event; VkEventCreateInfo ei = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    VKCHECK(vkCreateEvent(V.dev, &ei, NULL, &event)); VKCHECK(vkSetEvent(V.dev, event));
+    VkQueryPool queries = VK_NULL_HANDLE;
+    if (V.timestamp_bits) {
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2};
+        VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &queries));
+    }
+    uint64_t counts[6], serial = vk_submit_serial(); vk_sections_test_counts(counts);
+    mtl_sub_begin(); VkCommandBuffer cb = vk_cb();
+    uint64_t before[3], after[3], secondaries[6]; vk_sections_deferred_counts(before);
+    vk_sections_test_counts(secondaries);
+    vk_barrier_all(cb); section_break(cb);
+    if (vk_one_primary_on) {
+        vk_sections_deferred_counts(after);
+        uint64_t now[6]; vk_sections_test_counts(now);
+        CHECK(after[0] == before[0] + 1 && after[1] == before[1] + 1 && after[2] == before[2] &&
+                now[4] == secondaries[4], "barrier-only immediate section closes without a walker secondary");
+    }
+    size_t storage_before[8][3], storage_grown[8][3]; section_storage(storage_before);
+    VkMemoryBarrier2 mb[2]; VkBufferMemoryBarrier2 bb[2]; VkImageMemoryBarrier2 ib[2];
+    for (unsigned i = 0; i < 2; i++) {
+        mb[i] = (VkMemoryBarrier2){VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
+        bb[i] = (VkBufferMemoryBarrier2){VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+            .srcStageMask = mb[i].srcStageMask, .srcAccessMask = mb[i].srcAccessMask,
+            .dstStageMask = mb[i].dstStageMask, .dstAccessMask = mb[i].dstAccessMask,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = buffer, .offset = i * (DATA / 2), .size = DATA / 2};
+        ib[i] = (VkImageMemoryBarrier2){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image[i], .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    }
+    memcpy(section_memory, mb, sizeof mb); memcpy(section_buffers, bb, sizeof bb); memcpy(section_images, ib, sizeof ib);
+    atomic_store(&section_barrier_seen, 0); atomic_store(&section_barrier_wrong, 0);
+    section_real_barrier = vkCmdPipelineBarrier2; vkCmdPipelineBarrier2 = section_check_barrier;
+    VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 2, .pMemoryBarriers = mb, .bufferMemoryBarrierCount = 2, .pBufferMemoryBarriers = bb,
+        .imageMemoryBarrierCount = 2, .pImageMemoryBarriers = ib};
+    vkCmdPipelineBarrier2(cb, &dependency);
+    memset(mb, 0xa5, sizeof mb); memset(bb, 0xa5, sizeof bb); memset(ib, 0xa5, sizeof ib);
+    memset(&dependency, 0xa5, sizeof dependency);
+    if (queries) { vkCmdResetQueryPool(cb, queries, 0, 2); vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, queries, 0); }
+    uint32_t payload[WORDS];
+    for (unsigned block = 0; block < BLOCKS; block++) {
+        for (unsigned i = 0; i < WORDS; i++) payload[i] = 0xc0000000u ^ (block << 16) ^ i;
+        vkCmdUpdateBuffer(cb, buffer, block * BYTES, sizeof payload, payload);
+        memset(payload, 0xa5, sizeof payload);
+    }
+    if (queries) vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, queries, 1);
+    vk_barrier_all(cb);
+    VkBufferCopy copies[2] = {{0, DATA, DATA / 2}, {DATA / 2, DATA + DATA / 2, DATA / 2}};
+    vkCmdCopyBuffer(cb, buffer, buffer, 2, copies); memset(copies, 0xa5, sizeof copies);
+    section_break(cb); section_storage(storage_grown);
+    unsigned grown_slot = 8;
+    if (vk_one_primary_on) {
+        for (unsigned slot = 0; slot < 8; slot++)
+            if (storage_grown[slot][2] >= storage_before[slot][2] + 3) grown_slot = slot;
+        CHECK(grown_slot < 8 && storage_grown[grown_slot][0] >= DATA &&
+                storage_grown[grown_slot][1] >= storage_grown[grown_slot][0],
+            "one slot grows its deferred arena at least three times while retaining earlier records");
+    }
+    const VkDeviceSize marker = 2 * DATA;
+    vk_sections_deferred_counts(before); vk_sections_test_counts(secondaries);
+    vkCmdFillBuffer(cb, buffer, marker, 4, 0x12345678); vk_barrier_all(cb);
+    vkCmdWaitEvents(cb, 1, &event, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, NULL, 0, NULL, 0, NULL);
+    vk_sections_deferred_counts(after);
+    VkBufferCopy copy = {marker, marker + 4, 4};
+    vkCmdCopyBuffer(cb, buffer, buffer, 1, &copy); vk_barrier_all(cb);
+    vkCmdFillBuffer(cb, buffer, marker, 4, 0x87654321); vk_barrier_all(cb); section_break(cb);
+    if (vk_one_primary_on) {
+        uint64_t tail[3], now[6]; vk_sections_deferred_counts(tail); vk_sections_test_counts(now);
+        CHECK(after[0] == before[0] + 2 && tail[0] == after[0] && tail[1] == before[1] &&
+                tail[2] == before[2] + 1 && now[4] == secondaries[4] + 1,
+            "deferred/unsupported/deferred replays the prefix once and records its tail in one secondary");
+    }
+    vk_sections_deferred_counts(before); vk_sections_test_counts(secondaries);
+    vkCmdWaitEvents(cb, 1, &event, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, NULL, 0, NULL, 0, NULL);
+    vkCmdFillBuffer(cb, buffer, marker + 8, 4, 0xabcdef01); vk_barrier_all(cb);
+    copy = (VkBufferCopy){marker + 8, marker + 12, 4};
+    vkCmdCopyBuffer(cb, buffer, buffer, 1, &copy); section_break(cb);
+    if (vk_one_primary_on) {
+        vk_sections_deferred_counts(after); uint64_t now[6]; vk_sections_test_counts(now);
+        CHECK(after[0] == before[0] && after[1] == before[1] && after[2] == before[2] + 1 &&
+                now[4] == secondaries[4] + 1, "unsupported/deferred opens one secondary with no deferred tail records");
+    }
+    CHECK(mtl_wait(mtl_sub_commit(), 10000000000ull), "deferred deep-copy and materialization submission retires");
+    vkCmdPipelineBarrier2 = section_real_barrier;
+    CHECK(atomic_load(&section_barrier_seen) == 1 && !atomic_load(&section_barrier_wrong),
+        "real driver receives the original memory/buffer/image barrier arrays, not poisoned stack bytes");
+    unsigned wrong = 0;
+    for (unsigned block = 0; block < BLOCKS; block++) for (unsigned i = 0; i < WORDS; i++)
+        wrong += mapped[DATA / 4 + block * WORDS + i] != (0xc0000000u ^ (block << 16) ^ i);
+    CHECK(!wrong, "GPU readback retains every UpdateBuffer byte and both CopyBuffer regions across arena relocation (%u wrong words)", wrong);
+    uint32_t *markers = mapped + marker / 4;
+    CHECK(markers[0] == 0x87654321 && markers[1] == 0x12345678 &&
+            markers[2] == 0xabcdef01 && markers[3] == 0xabcdef01,
+        "materialization preserves pending fill/copy order and both raw-recorded tails");
+    uint64_t ordered = 1;
+    if (queries) {
+        uint64_t ticks[2]; VKCHECK(vkGetQueryPoolResults(V.dev, queries, 0, 2, sizeof ticks, ticks, sizeof *ticks, VK_QUERY_RESULT_64_BIT));
+        ordered = ticks[0] && ticks[1] >= ticks[0];
+        CHECK(ordered, "deferred query reset and timestamps execute in order");
+    }
+    size_t retired[8][3]; section_storage(retired);
+    if (vk_one_primary_on && grown_slot < 8)
+        CHECK(retired[grown_slot][0] >= storage_grown[grown_slot][0] &&
+                retired[grown_slot][1] == storage_grown[grown_slot][1] &&
+                retired[grown_slot][2] == storage_grown[grown_slot][2],
+            "sealing and GPU retirement retain arena bytes, capacity and cumulative growth");
+    int reused = 0;
+    for (unsigned round = 0; round < 8; round++) {
+        mtl_sub_begin(); VkCommandBuffer next = vk_cb();
+        if (next == cb) {
+            reused = 1;
+            if (vk_one_primary_on && grown_slot < 8) {
+                size_t reset[3]; vk_sections_test_storage(grown_slot, reset);
+                CHECK(reset[0] < retired[grown_slot][0] && reset[1] == retired[grown_slot][1] &&
+                        reset[2] == retired[grown_slot][2], "retired slot reuse rewinds bytes but retains capacity and growth history");
+            }
+        }
+        vkCmdFillBuffer(next, buffer, marker + 16, 4, 0x10203040);
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "arena retirement reuse round %u completes", round);
+    }
+    if (vk_one_primary_on) CHECK(reused, "ordinary submissions really reuse the grown arena slot");
+    vk_rec_lock();
+    int optional = 0;
+    for (unsigned attempt = 0; attempt < 1000 && !optional; attempt++) {
+        optional = vk_submit_optional_begin_immutable(); if (!optional) usleep(1000);
+    }
+    CHECK(optional, "pending-record cancellation claims real optional slots");
+    VkCommandBuffer cancelled = VK_NULL_HANDLE;
+    if (optional) {
+        cancelled = vk_cb(); vk_sections_deferred_counts(before);
+        vkCmdFillBuffer(cancelled, buffer, marker + 20, 4, 0xbadbad00); vk_barrier_all(cancelled);
+        copy = (VkBufferCopy){marker + 20, marker + 24, 4}; vkCmdCopyBuffer(cancelled, buffer, buffer, 1, &copy);
+        if (vk_one_primary_on) {
+            vk_sections_deferred_counts(after);
+            CHECK(after[0] == before[0] + 3 && after[2] == before[2],
+                "cancellation fixture actually has pending records and no materialized secondary");
+        }
+        vk_submit_optional_cancel();
+    }
+    vk_rec_unlock();
+    reused = 0;
+    for (unsigned round = 0; round < 8; round++) {
+        mtl_sub_begin(); VkCommandBuffer next = vk_cb(); reused |= next == cancelled;
+        vkCmdFillBuffer(next, buffer, marker + 28, 4, 0x50607080);
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "cancelled arena reuse round %u completes", round);
+    }
+    CHECK(!optional || reused, "ordinary retirement cycle reuses the cancelled slot");
+    CHECK(markers[4] == 0x10203040 && markers[5] == 0x39393939 && markers[6] == 0x39393939 && markers[7] == 0x50607080,
+        "cancelled pending fill/copy records never replay when their slot is reused");
+    one_primary_counts(counts, serial, "deferred payload/storage/cancel stream");
+    CHECK(fwrite(mapped + DATA / 4, DATA, 1, out) == 1 && fwrite(markers, 32, 1, out) == 1 &&
+            fwrite(&ordered, sizeof ordered, 1, out) == 1, "write exact deferred GPU payload and timestamp-order assertion");
+    if (queries) vkDestroyQueryPool(V.dev, queries, NULL);
+    vkDestroyEvent(V.dev, event, NULL);
+    for (unsigned i = 0; i < 2; i++) { vkDestroyImage(V.dev, image[i], NULL); vkFreeMemory(V.dev, image_memory[i], NULL); }
+    vkUnmapMemory(V.dev, memory); vkDestroyBuffer(V.dev, buffer, NULL); vkFreeMemory(V.dev, memory, NULL);
+}
 typedef struct { VkEvent gate; _Atomic int returned; int timed_out; } pressure_return;
 static void *pressure_return_run(void *arg) {
     pressure_return *p = arg;
@@ -3848,6 +4072,7 @@ int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--rec-sections")) {
         FILE *out = fopen(argv[2], "wb"); if (!out) { perror(argv[2]); return 1; }
         CHECK(mtl_wait(run(), 5000000000ull), "mixed-section setup completes");
+        section_deferred_fixture(out);
         tex_t uploaded = tx; uploaded.serial = 40101; uploaded.mem = cpu_pool + 0x20000;
         for (int i = 0; i < 64 * 64; i++) {
             lin[4 * i] = 64; lin[4 * i + 1] = 128; lin[4 * i + 2] = 192; lin[4 * i + 3] = 255;
