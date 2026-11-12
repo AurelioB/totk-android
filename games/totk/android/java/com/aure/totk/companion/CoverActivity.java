@@ -29,6 +29,11 @@ public final class CoverActivity extends Activity {
     private long token;
     private String finishReason = "unexpected";
     private boolean topResumed;
+    private boolean finishLogged;
+
+    private static void logCover(String message) {
+        if (!CompanionNative.logCover(message)) Log.i("TotkCompanion", message);
+    }
 
     static void prepare(int displayId, long token, Listener listener) {
         launches.put(token, new Launch(displayId, listener));
@@ -39,7 +44,7 @@ public final class CoverActivity extends Activity {
         if (launch.activity != null) {
             launch.activity.finishReason = "session_end";
             launch.activity.finishCover();
-        } else Log.i("TotkCompanion", "cover finish token=" + token + " reason=pending_cancel");
+        } else logCover("cover finish token=" + token + " reason=pending_cancel");
     }
     /** Activity/task focus authority, not window focus: this window is deliberately non-focusable. */
     static boolean isTopResumed(long token) {
@@ -62,6 +67,7 @@ public final class CoverActivity extends Activity {
 
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        reportFinish("new_intent");
         release();
         setIntent(intent);
         bind(false);
@@ -70,6 +76,7 @@ public final class CoverActivity extends Activity {
 
     private void bind(boolean restored) {
         token = getIntent().getLongExtra(TOKEN, 0);
+        finishLogged = false; finishReason = "unexpected";
         Launch launch = launches.get(token);
         if (restored || launch == null || launch.activity != null) {
             finishReason = restored ? "restored" : "no_live_session";
@@ -79,6 +86,7 @@ public final class CoverActivity extends Activity {
         }
         if (getDisplay() == null || getDisplay().getDisplayId() != launch.displayId) {
             Log.w("TotkCompanion", "cover refusal token=" + token + " reason=wrong_display");
+            logCover("cover refusal token=" + token + " reason=wrong_display");
             launch.listener.refused(token);
             finishReason = "wrong_display";
             finishCover();
@@ -96,7 +104,16 @@ public final class CoverActivity extends Activity {
         if (launch != null && launch.activity == this) launch.listener.topResumedChanged(token, top);
     }
 
-    private void finishCover() { finishAndRemoveTask(); overridePendingTransition(0, 0); }
+    private void reportFinish(String reason) {
+        if (finishLogged) return;
+        finishLogged = true;
+        logCover("cover finish token=" + token + " reason=" + reason);
+    }
+    private void finishCover() {
+        // NativeActivity teardown can exit before onDestroy reaches this Activity; persist the finish request now.
+        reportFinish(finishReason);
+        finishAndRemoveTask(); overridePendingTransition(0, 0);
+    }
 
     private void release() {
         Launch launch = launches.get(token);
@@ -106,7 +123,7 @@ public final class CoverActivity extends Activity {
         }
     }
     @Override protected void onDestroy() {
-        Log.i("TotkCompanion", "cover finish token=" + token + " reason=" + finishReason);
+        reportFinish(finishReason);
         release();
         super.onDestroy();
     }

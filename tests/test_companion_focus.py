@@ -99,6 +99,8 @@ public final class CompanionFocusProbe {
     final ActivityManager.AppTask task = new ActivityManager.AppTask(17, "TotkActivity");
     int refreshes, dismissals;
     boolean coverRequested;
+    final List<String> coverLogs = new ArrayList<>();
+    void logCover(String message) { coverLogs.add(message); }
     void refresh() { refreshes++; }
     void dismiss() { dismissals++; shown = null; }
 '''
@@ -242,6 +244,7 @@ TESTS = r'''
                 p.coverTookFocus(); // Both notifications arrive before either queued startup check.
                 p.main.drain();
                 require(p.task.moves == 1 && p.coverFocusToken == 0, "expected cover focus loss was not repaired once");
+                require(p.coverLogs.contains("cover recovery token=41 result=moved"), "recovery result missed native-log sink");
                 p.main.drainDelayed();
                 p.coverTop(true); p.main.drain();
                 require(p.task.moves == 1, "ordinary auto path or repeated top callback bypassed the one-use limit");
@@ -258,6 +261,8 @@ TESTS = r'''
                 p.coverTop(false); // Settings/another Activity takes top-resumed before the queued checks.
                 p.main.drain(); p.main.drainDelayed();
                 require(p.task.moves == 0 && p.coverFocusToken == 0, "cover recovery fronted over competing UI");
+                require(p.coverLogs.contains("cover recovery canceled token=41 reason=competing_top_resumed"),
+                        "competing UI cancellation missed native-log sink");
                 p.coverTop(true); p.main.drain();
                 require(p.task.moves == 0, "later cover focus rearmed a canceled startup");
                 break;

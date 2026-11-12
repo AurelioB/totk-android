@@ -272,6 +272,16 @@ class CompanionGate(unittest.TestCase):
                 ], env=self.environment())
                 self.assertIn('pass: companion gate ' + setting, result.stdout)
                 self.assertNotIn('RegisterNatives failed', result.stderr)
+                self.assertIn('[TotkCompanion] cover requested=false effective=false reason=host_probe\n', result.stderr)
+
+    def test_cover_diagnostics_reach_native_stderr_when_companion_is_off(self):
+        result = self.command([
+            self.java, '-Djava.library.path=' + str(self.directory), '-cp', str(self.classes),
+            'com.aure.totk.CompanionGateProbe', '0',
+        ], env=self.environment())
+        line = '[TotkCompanion] cover requested=false effective=false reason=host_probe'
+        self.assertIn(line + '\n', result.stderr)
+        print('native cover log probe: ' + line)
 
     def test_native_gate(self):
         # This driver is also suitable for TSan: no uninstrumented JVM GC/JIT
@@ -290,6 +300,7 @@ class CompanionGate(unittest.TestCase):
                     result = self.command([str(executable), setting, cover_setting], env=self.environment())
                     self.assertIn('pass: native companion gate ' + setting, result.stdout)
                     self.assertIn('pass: native companion cover ' + cover_setting, result.stdout)
+                    self.assertIn('[TotkCompanion] cover requested=false effective=false reason=native_probe\n', result.stderr)
 
     def test_jni_load_without_companion_classes(self):
         result = self.command([

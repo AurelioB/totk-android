@@ -28,6 +28,8 @@ public final class CompanionGateProbe {
         DataSource source = new CompanionNative();
         check(source.enabled() == enabled, "source must expose the runtime gate");
         for (int i = 0; i < 4; i++) check(count(i) == 0, "gate must not inspect guest state or press buttons");
+        check(CompanionNative.logCover("cover requested=false effective=false reason=host_probe"),
+                "cover diagnostics must bind native stderr even when the companion is disabled");
         // A live recents tile can lose/regain focus without onPause/onResume.
         // Only a single display admits that extra pause facet.
         for (int kind = 0; kind < 3; kind++) {

@@ -49,6 +49,10 @@ public class Activity {
     'android/view/Window.java': 'package android.view; public class Window { public void addFlags(int flags) {} }',
     'android/view/WindowManager.java': 'package android.view; public interface WindowManager { final class LayoutParams { public static final int FLAG_NOT_FOCUSABLE=8, FLAG_NOT_TOUCHABLE=16; } }',
     'com/aure/totk/companion/PresentationController.java': 'package com.aure.totk.companion; import android.view.Window; public final class PresentationController { static void immersive(Window window, boolean value) {} }',
+    'com/aure/totk/companion/CompanionNative.java': '''package com.aure.totk.companion;
+public final class CompanionNative {
+ public static boolean logCover(String message) { System.err.println("[TotkCompanion] " + message); return true; }
+}''',
 }
 
 
@@ -78,11 +82,13 @@ class CoverActivityTests(unittest.TestCase):
     def probe(self, scenario):
         result = subprocess.run([self.java, '-cp', self.temp.name, 'com.aure.totk.companion.CoverActivityProbe', scenario],
                                 check=True, capture_output=True, text=True, timeout=60)
+        self.last_stderr = result.stderr
         return result.stdout.strip().splitlines()
 
     def test_canceled_pending_token_finishes_when_activity_is_created(self):
         lines = self.probe('canceled-pending')
         self.assertIn('canceled  finished=true', lines)
+        self.assertIn('[TotkCompanion] cover finish token=101 reason=pending_cancel\n', self.last_stderr)
 
     def test_two_accepted_intents_ignore_canceled_stale_create_and_bind_next(self):
         lines = self.probe('two-intents')
@@ -93,17 +99,20 @@ class CoverActivityTests(unittest.TestCase):
         lines = self.probe('rebind')
         self.assertIn('rebound attached,top:301:true,finished:301,attached,top:302:true finished=false', lines)
         self.assertIn('top301=false top302=true', lines)
+        self.assertEqual(self.last_stderr.count('[TotkCompanion] cover finish token=301 reason=new_intent\n'), 1)
         self.assertIn('stale311=false current312=true', self.probe('stale-destroy')[0])
 
     def test_restored_activity_without_live_launch_self_finishes(self):
         lines = self.probe('restored')
         self.assertIn('restored  finished=true', lines)
         self.assertIn('events=[]', lines)
+        self.assertIn('[TotkCompanion] cover finish token=401 reason=restored\n', self.last_stderr)
 
     def test_expected_display_attaches_and_wrong_display_is_refused(self):
         lines = self.probe('displays')
         self.assertIn('right attached finished=false', lines)
         self.assertIn('wrong attached,refused:502 finished=true', lines)
+        self.assertIn('[TotkCompanion] cover refusal token=502 reason=wrong_display\n', self.last_stderr)
 
     def test_top_resumed_authority_is_current_token_bound_and_cleared(self):
         lines = self.probe('top-resumed')
@@ -111,6 +120,7 @@ class CoverActivityTests(unittest.TestCase):
         self.assertIn('afterCancel=false', lines)
         self.assertIn('stale602=false current603=false', lines)
         self.assertTrue(any(line.startswith('afterStaleCallback=false events=') for line in lines))
+        self.assertIn('[TotkCompanion] cover finish token=601 reason=session_end\n', self.last_stderr)
 
 
 if __name__ == '__main__':

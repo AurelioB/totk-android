@@ -85,7 +85,10 @@ public final class PresentationController implements DisplayManager.DisplayListe
             @Override public boolean start(int id, long token) { return startCover(id, token); }
             @Override public void finish(long token) {
                 try { CoverActivity.cancel(token); }
-                catch (RuntimeException unavailable) { Log.w("TotkCompanion", "cover finish refused token=" + token, unavailable); }
+                catch (RuntimeException unavailable) {
+                    logCover("cover finish refused token=" + token + " error=" + unavailable);
+                    Log.w("TotkCompanion", "cover finish refused token=" + token, unavailable);
+                }
             }
         });
         if (!coverRequested) reportCover(false, "switch_off_or_preview");
@@ -98,7 +101,7 @@ public final class PresentationController implements DisplayManager.DisplayListe
     private final Application.ActivityLifecycleCallbacks coverLifecycle = new Application.ActivityLifecycleCallbacks() {
         @Override public void onActivityResumed(Activity activity) { if (activity == owner) main.post(coverRefresh); }
         @Override public void onActivityPaused(Activity activity) {
-            if (activity == owner) { coverFocusToken = 0; cover.ownerResumed(false); }
+            if (activity == owner) { cancelCoverFocus("owner_paused"); cover.ownerResumed(false); }
         }
         @Override public void onActivityStarted(Activity activity) {}
         @Override public void onActivityStopped(Activity activity) {}
@@ -106,10 +109,14 @@ public final class PresentationController implements DisplayManager.DisplayListe
         @Override public void onActivitySaveInstanceState(Activity activity, Bundle state) {}
         @Override public void onActivityDestroyed(Activity activity) {}
     };
+    private void logCover(String message) {
+        // A preview must not initialize/load the native library merely to emit a diagnostic.
+        if (!(source instanceof CompanionNative) || !CompanionNative.logCover(message)) Log.i("TotkCompanion", message);
+    }
     private void reportCover(boolean effective, String reason) {
         if (coverReported) return;
         coverReported = true;
-        Log.i("TotkCompanion", "cover requested=" + coverRequested + " effective=" + effective + " reason=" + reason);
+        logCover("cover requested=" + coverRequested + " effective=" + effective + " reason=" + reason);
     }
     /** One launch-scoped recovery may repair the expected loss of window focus, but only while our cover still owns
      * top-resumed activity authority. A gesture defers it; competing activity, pause or stale/expired launch cancels it. */
@@ -117,11 +124,15 @@ public final class PresentationController implements DisplayManager.DisplayListe
         if (token == 0 || token != coverFocusToken) return;
         if (closed || stopped || !resumed || autoReturnBlocked
                 || SystemClock.uptimeMillis() > coverFocusDeadline || owner.isFinishing() || owner.isDestroyed()
-                || shown == null || !shown.isShowing()) { coverFocusToken = 0; return; }
+                || shown == null || !shown.isShowing()) { cancelCoverFocus("inactive_or_expired"); return; }
         if (touchInProgress || !CoverActivity.isTopResumed(token)) return;
         coverFocusToken = 0; // One use even if the verified task cannot be fronted; never fight competing UI.
-        if (returnRequested && SystemClock.uptimeMillis() - returnRequestedAt < 250) return;
-        moveInputTaskToFront();
+        if (returnRequested && SystemClock.uptimeMillis() - returnRequestedAt < 250) {
+            logCover("cover recovery token=" + token + " result=coalesced");
+            return;
+        }
+        boolean moved = moveInputTaskToFront();
+        logCover("cover recovery token=" + token + " result=" + (moved ? "moved" : "refused"));
     }
     private boolean coverStartReady() {
         return resumed && topResumed && owner.hasWindowFocus() && !touchInProgress
@@ -131,11 +142,17 @@ public final class PresentationController implements DisplayManager.DisplayListe
         coverFocusToken = token;
         coverFocusDeadline = SystemClock.uptimeMillis() + 1000;
         coverFocusTopSeen = false;
+        logCover("cover recovery armed token=" + token + " deadline_ms=" + coverFocusDeadline);
     }
     private void coverTopResumedChanged(long token, boolean top) {
         if (coverFocusToken != token) return;
         if (top) { coverFocusTopSeen = true; main.post(() -> reclaimAfterCover(token)); }
-        else if (coverFocusTopSeen) coverFocusToken = 0;
+        else if (coverFocusTopSeen) cancelCoverFocus("competing_top_resumed");
+    }
+    private void cancelCoverFocus(String reason) {
+        long token = coverFocusToken;
+        coverFocusToken = 0;
+        if (token != 0) logCover("cover recovery canceled token=" + token + " reason=" + reason);
     }
     private boolean startCover(int id, long token) {
         Intent intent = new Intent(owner, CoverActivity.class)
@@ -145,6 +162,7 @@ public final class PresentationController implements DisplayManager.DisplayListe
             ActivityManager manager = owner.getSystemService(ActivityManager.class);
             if (manager == null || !manager.isActivityStartAllowedOnDisplay(owner, id, intent)) {
                 Log.w("TotkCompanion", "cover refusal display=" + id + " reason=start_not_allowed");
+                logCover("cover refusal display=" + id + " reason=start_not_allowed");
                 reportCover(false, "start_not_allowed");
                 return false;
             }
@@ -152,25 +170,26 @@ public final class PresentationController implements DisplayManager.DisplayListe
             CoverActivity.prepare(id, token, new CoverActivity.Listener() {
                 @Override public void attached() { main.post(() -> reclaimAfterCover(token)); }
                 @Override public void finished(long finished) {
-                    if (coverFocusToken == finished) coverFocusToken = 0;
+                    if (coverFocusToken == finished) cancelCoverFocus("cover_finished");
                     cover.ownerResumed(coverStartReady());
                     cover.hostFinished(finished);
                 }
                 @Override public void refused(long refused) {
-                    if (coverFocusToken == refused) coverFocusToken = 0;
+                    if (coverFocusToken == refused) cancelCoverFocus("start_refused");
                     cover.startRefused(refused);
                 }
                 @Override public void topResumedChanged(long focusedToken, boolean top) { coverTopResumedChanged(focusedToken, top); }
             });
             owner.startActivity(intent, ActivityOptions.makeBasic().setLaunchDisplayId(id).toBundle());
-            Log.i("TotkCompanion", "cover " + (cover.isRestart() ? "restart" : "start") + " display=" + id + " token=" + token);
+            logCover("cover " + (cover.isRestart() ? "restart" : "start") + " display=" + id + " token=" + token);
             reportCover(true, "start_accepted");
             main.post(() -> reclaimAfterCover(token));
             return true;
         } catch (RuntimeException unavailable) {
-            if (coverFocusToken == token) coverFocusToken = 0;
+            if (coverFocusToken == token) cancelCoverFocus("start_exception");
             CoverActivity.cancel(token);
             Log.w("TotkCompanion", "cover refusal display=" + id + " reason=start_exception", unavailable);
+            logCover("cover refusal display=" + id + " reason=start_exception error=" + unavailable);
             reportCover(false, "start_exception");
             return false;
         }
@@ -258,7 +277,7 @@ public final class PresentationController implements DisplayManager.DisplayListe
         }
     }
     private void dismiss() {
-        coverFocusToken = 0;
+        cancelCoverFocus("dismiss");
         cover.dismiss();
         Presentation previous = shown;
         shown = null; displayId = -1;
