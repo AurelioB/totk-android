@@ -101,6 +101,15 @@ static inline vk_present_rect vk_present_guest_fit(uint32_t guest_w, uint32_t gu
     if (!w || !h) return (vk_present_rect){0};
     return (vk_present_rect){(int32_t)((window_w-w)/2),(int32_t)((window_h-h)/2),w,h};
 }
+/* Where a fitted guest picture (vk_present_guest_fit) is shown in the window: the largest centered rect with its
+ * aspect. The front buffer keeps the fitted size (no extra GPU upsampling for AHB, whose compositor destination is
+ * this rect); only the window-sized copy fallback blits into it. A panel larger than the canvas (e.g. a 2400x1504
+ * tablet docked at 1920x1080) is therefore filled instead of showing the canvas 1:1 inside black bars. A fit that
+ * already touches a window edge (any panel no larger than the canvas) is returned unchanged. */
+static inline vk_present_rect vk_present_guest_display(vk_present_rect fit, uint32_t window_w, uint32_t window_h) {
+    if (!fit.w || !fit.h || !window_w || !window_h || fit.w >= window_w || fit.h >= window_h) return fit;
+    return vk_present_fit_shown(fit.w, fit.h, 0, window_w, window_h);
+}
 /* Nonzero guest basis and host extent; map endpoints identically for real and
    generated native UI output, including nonzero crops and rounded edges. */
 static inline vk_present_rect vk_present_native_crop(vk_present_rect r,

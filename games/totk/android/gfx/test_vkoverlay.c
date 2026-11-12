@@ -102,6 +102,41 @@ static void size_policy_tests(void) {
               "shared copy/AHB size case %u: %ux%u expected %ux%u", i, r.w, r.h, cases[i].w, cases[i].h);
     }
 }
+/* Docked guest output: the buffer keeps the no-upsampling fit, the shown rect
+ * fills a larger panel, and panels no larger than the canvas stay unchanged. */
+static void guest_display_policy_tests(void) {
+    static const struct { uint32_t gw, gh, ww, wh; vk_present_rect fit, shown; } cases[] = {
+        {1920,1080, 2400,1504, {240,212,1920,1080}, {0,77,2400,1350}},   /* 16:10 tablet (Astra) */
+        {1920,1080, 1920,1080, {0,0,1920,1080},     {0,0,1920,1080}},    /* Odin: unchanged */
+        {1920,1080, 1920,1200, {0,60,1920,1080},    {0,60,1920,1080}},   /* fit touches width: unchanged */
+        {1920,1080, 1280,800,  {0,40,1280,720},     {0,40,1280,720}},    /* smaller panel: unchanged */
+        {1920,1080, 2560,1080, {320,0,1920,1080},   {320,0,1920,1080}},  /* ultrawide, touches height */
+        {1920,1080, 3840,2160, {960,540,1920,1080}, {0,0,3840,2160}},    /* 4K TV */
+        {1280,720,  1920,1080, {320,180,1280,720},  {0,0,1920,1080}},    /* smaller canvas */
+        {960,536,   1920,1080, {480,272,960,536},   {0,4,1920,1072}},    /* crop with odd ratio */
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
+        vk_present_rect fit = vk_present_guest_fit(cases[i].gw, cases[i].gh, cases[i].ww, cases[i].wh);
+        vk_present_rect shown = vk_present_guest_display(fit, cases[i].ww, cases[i].wh), f = cases[i].fit, s = cases[i].shown;
+        CHECK(fit.x == f.x && fit.y == f.y && fit.w == f.w && fit.h == f.h,
+              "guest fit case %u: %d,%d %ux%u expected %d,%d %ux%u", i, fit.x, fit.y, fit.w, fit.h, f.x, f.y, f.w, f.h);
+        CHECK(shown.x == s.x && shown.y == s.y && shown.w == s.w && shown.h == s.h,
+              "guest display case %u: %d,%d %ux%u expected %d,%d %ux%u", i, shown.x, shown.y, shown.w, shown.h, s.x, s.y, s.w, s.h);
+    }
+    vk_present_rect none = vk_present_guest_display((vk_present_rect){0}, 1920, 1080);
+    CHECK(!none.w && !none.h, "an unready fit stays unready");
+    /* Every window: the shown rect contains the fit, stays inside and centered, touches an edge, keeps the ratio. */
+    unsigned bad = 0;
+    for (uint32_t ww = 640; ww <= 3840; ww += 37) for (uint32_t wh = 360; wh <= 2400; wh += 41) {
+        vk_present_rect fit = vk_present_guest_fit(1920, 1080, ww, wh), sh = vk_present_guest_display(fit, ww, wh);
+        int inside = sh.x >= 0 && sh.y >= 0 && sh.x + sh.w <= ww && sh.y + sh.h <= wh;
+        int grows = sh.w >= fit.w && sh.h >= fit.h, edge = sh.w + 1 >= ww || sh.h + 1 >= wh;
+        int centered = abs((int)(ww - sh.w) - 2 * sh.x) <= 1 && abs((int)(wh - sh.h) - 2 * sh.y) <= 1;
+        int ratio = llabs((long long)sh.w * 1080 - (long long)sh.h * 1920) <= 1920;  /* within one pixel of height */
+        bad += !(inside && grows && edge && centered && ratio);
+    }
+    CHECK(!bad, "guest display sweep: %u windows violate fill/center/ratio", bad);
+}
 /* Inspect the actual committed shader declarations, independently of the
  * pixel oracle. Command/layout selection is traced by the native-UI policy
  * fixture; this host path does not claim Android AHB import coverage. */
@@ -153,8 +188,12 @@ static uint32_t source_pixel(unsigned x, unsigned y) {
 }
 static uint32_t background_pixel(unsigned x, unsigned y) {
     if (guest_output) {
-        vk_present_rect fit=vk_present_guest_fit(guest_canvas_w ? guest_canvas_w : source_w,
-            guest_canvas_h ? guest_canvas_h : source_h,output_w,output_h);
+        /* Independent oracle (not the production helpers): the canvas aspect-fitted to the whole window,
+           enlarged when the window is larger, centered. */
+        uint32_t gw=guest_canvas_w ? guest_canvas_w : source_w, gh=guest_canvas_h ? guest_canvas_h : source_h;
+        double sc=fmin((double)output_w/gw,(double)output_h/gh);
+        vk_present_rect fit={0,0,(uint32_t)(gw*sc+0.5),(uint32_t)(gh*sc+0.5)};
+        fit.x=((int32_t)output_w-(int32_t)fit.w)/2; fit.y=((int32_t)output_h-(int32_t)fit.h)/2;
         return x<(unsigned)fit.x || x>=(unsigned)fit.x+fit.w ||
             y<(unsigned)fit.y || y>=(unsigned)fit.y+fit.h ? COLOR(0,0,0) : COLOR(0,255,0);
     }
@@ -788,7 +827,7 @@ static void rotation_pixel_tests(int expected_mode) {
 }
 int main(int argc, char **argv) {
     int bench_record = argc > 1 && !strcmp(argv[1], "--bench-record");
-    if (!bench_record) { cpu_tests(); generation_window_tests(); size_policy_tests(); present_shader_contract_tests(); }
+    if (!bench_record) { cpu_tests(); generation_window_tests(); size_policy_tests(); guest_display_policy_tests(); present_shader_contract_tests(); }
     if (argc > 1 && !strcmp(argv[1], "--bench")) { benchmark(); return fails != 0; }
     if (argc == 3 && !strcmp(argv[1], "--power")) {
         power_tests(argv[2]);
