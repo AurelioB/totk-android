@@ -110,7 +110,7 @@ class CoverActivityTests(unittest.TestCase):
         self.assertIn('top601=true events=[attached, top:601:true, top:601:false, top:601:true]', lines)
         self.assertIn('afterCancel=false', lines)
         self.assertIn('stale602=false current603=false', lines)
-        self.assertIn('afterStaleCallback=false', lines)
+        self.assertTrue(any(line.startswith('afterStaleCallback=false events=') for line in lines))
 
 
 if __name__ == '__main__':
