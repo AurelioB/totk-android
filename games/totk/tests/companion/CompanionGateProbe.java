@@ -28,7 +28,12 @@ public final class CompanionGateProbe {
         DataSource source = new CompanionNative();
         check(source.enabled() == enabled, "source must expose the runtime gate");
         for (int i = 0; i < 4; i++) check(count(i) == 0, "gate must not inspect guest state or press buttons");
-        check(CompanionNative.logCover("cover requested=false effective=false reason=host_probe"),
+        String coverSetting = System.getenv("TOTK_COMPANION_COVER");
+        if (coverSetting == null) coverSetting = "unset";
+        check(CompanionNative.coverSetting().equals(coverSetting), "cover diagnostics must retain the raw request");
+        boolean coverEnabled = enabled && !"0".equals(coverSetting);
+        check(CompanionNative.isCoverEnabled() == coverEnabled, "cover must default on with exact-zero opt-out");
+        check(CompanionNative.logCover("cover requested=" + coverSetting + " effective=" + coverEnabled + " reason=host_probe"),
                 "cover diagnostics must bind native stderr even when the companion is disabled");
         // A live recents tile can lose/regain focus without onPause/onResume.
         // Only a single display admits that extra pause facet.

@@ -113,6 +113,8 @@ JNIEXPORT jint JNICALL Java_com_aure_totk_CompanionGateProbe_count(JNIEnv *env, 
 #include <time.h>
 extern jint JNI_OnLoad(JavaVM *, void *);
 static jboolean (JNICALL *cover_enabled_fn)(JNIEnv *, jclass);
+static jstring (JNICALL *cover_setting_fn)(JNIEnv *, jclass);
+static const char *expected_cover_setting;
 static void (JNICALL *cover_log_fn)(JNIEnv *, jclass, jstring);
 static jboolean (JNICALL *enabled_fn)(JNIEnv *, jclass);
 static jstring (JNICALL *snapshot_fn)(JNIEnv *, jclass, jint);
@@ -128,10 +130,14 @@ static jclass JNICALL find_class(JNIEnv *env, const char *name) {
 }
 static void JNICALL exception_clear(JNIEnv *env) { (void)env; }
 static jint JNICALL register_methods(JNIEnv *env, jclass cls, const JNINativeMethod *methods, jint count) {
-    (void)env; (void)cls; assert(count == 7);
+    (void)env; (void)cls; assert(count == 8);
     for (jint i = 0; i < count; i++) {
         if (!strcmp(methods[i].name, "nativeEnabled")) enabled_fn = methods[i].fnPtr;
         else if (!strcmp(methods[i].name, "nativeCoverEnabled")) cover_enabled_fn = methods[i].fnPtr;
+        else if (!strcmp(methods[i].name, "nativeCoverSetting")) {
+            assert(!strcmp(methods[i].signature, "()Ljava/lang/String;"));
+            cover_setting_fn = methods[i].fnPtr;
+        }
         else if (!strcmp(methods[i].name, "nativeCoverLog")) {
             assert(!strcmp(methods[i].signature, "(Ljava/lang/String;)V"));
             cover_log_fn = methods[i].fnPtr;
@@ -147,7 +153,9 @@ static jint JNICALL register_methods(JNIEnv *env, jclass cls, const JNINativeMet
 static const char *JNICALL get_chars(JNIEnv *env, jstring s, jboolean *copy) { (void)env; (void)copy; return (const char *)s; }
 static void JNICALL release_chars(JNIEnv *env, jstring s, const char *chars) { (void)env; (void)s; (void)chars; }
 static jstring JNICALL new_string(JNIEnv *env, const char *text) {
-    (void)env; assert(strstr(text, "\"status\":\"ready\"")); return (jstring)(uintptr_t)1;
+    (void)env;
+    if (expected_cover_setting && !strcmp(text, expected_cover_setting)) return (jstring)text;
+    assert(strstr(text, "\"status\":\"ready\"")); return (jstring)(uintptr_t)1;
 }
 static jint JNICALL get_env(JavaVM *vm, void **out, jint version) {
     (void)vm; assert(version == JNI_VERSION_1_6); *out = &fixture_env; return JNI_OK;
@@ -166,14 +174,17 @@ int main(int argc, char **argv) {
     unsetenv("TOTK_COMPANION");
     unsetenv("TOTK_COMPANION_COVER");
     assert(JNI_OnLoad(&vm, NULL) == JNI_VERSION_1_6);
-    assert(enabled_fn && cover_enabled_fn && cover_log_fn && snapshot_fn && action_fn && request_fn && result_fn);
+    assert(enabled_fn && cover_enabled_fn && cover_setting_fn && cover_log_fn && snapshot_fn && action_fn && request_fn && result_fn);
     assert(atomic_load(&runtime_companion_tick));   /* the frame-end hook is installed at load, nothing pending */
     assert(!atomic_load(&runtime_companion_pending));
     jstring action = (jstring)"equip", category = (jstring)"weapons", actor = (jstring)"Weapon_Sword_001";
     if (argc > 1 && strcmp(argv[1], "unset")) setenv("TOTK_COMPANION", argv[1], 1);
     if (argc > 2 && strcmp(argv[2], "unset")) setenv("TOTK_COMPANION_COVER", argv[2], 1);
     int on = argc < 2 || strcmp(argv[1], "0");
-    int cover_on = on && argc > 2 && !strcmp(argv[2], "1");
+    int cover_on = on && (argc < 3 || strcmp(argv[2], "0"));
+    expected_cover_setting = getenv("TOTK_COMPANION_COVER");
+    if (!expected_cover_setting) expected_cover_setting = "unset";
+    assert(!strcmp((const char *)cover_setting_fn(&fixture_env, NULL), expected_cover_setting));
     assert(enabled_fn(&fixture_env, NULL) == on);
     assert(cover_enabled_fn(&fixture_env, NULL) == cover_on);
     cover_log_fn(&fixture_env, NULL, (jstring)"cover requested=false effective=false reason=native_probe");

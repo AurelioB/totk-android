@@ -9,6 +9,7 @@ public final class CompanionNative implements DataSource {
     }
     private static native boolean nativeEnabled();
     private static native boolean nativeCoverEnabled();
+    private static native String nativeCoverSetting();
     private static native void nativeCoverLog(String message);
     /** Uses the runtime's native stderr, already redirected into <game>/totk.log; Java Log/System.err do not. */
     public static boolean logCover(String message) {
@@ -16,11 +17,17 @@ public final class CompanionNative implements DataSource {
         try { nativeCoverLog(message); return true; }
         catch (UnsatisfiedLinkError unavailable) { loaded = false; return false; }
     }
-    /** Experimental cover: opt in only with the exact value TOTK_COMPANION_COVER=1, after native initialization. */
+    /** Cover defaults on after native initialization; only exact TOTK_COMPANION_COVER=0 opts out. */
     public static boolean isCoverEnabled() {
         if (!loaded) return false;
         try { return nativeCoverEnabled(); }
         catch (UnsatisfiedLinkError unavailable) { loaded = false; return false; }
+    }
+    /** Raw startup request for diagnostics, read from the same native environment as the enablement query. */
+    public static String coverSetting() {
+        if (!loaded) return "unavailable";
+        try { return nativeCoverSetting(); }
+        catch (UnsatisfiedLinkError unavailable) { loaded = false; return "unavailable"; }
     }
     /** Call after NativeActivity.onCreate has initialized the runtime options. */
     public static boolean isEnabled() {

@@ -30,15 +30,16 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
-- Add `TOTK_COMPANION_COVER=1` (off by default) for devices with a built-in second screen. While the companion
-  is shown there, an opaque black cover activity sits underneath it, so Android stops the app below (usually
-  the launcher), which a companion window alone does not do. The cover takes no touches and no key focus; if
-  starting it moves input focus, one bounded recovery returns it to the game. It is removed when the companion
-  closes, the game stops or exits, or the process dies. Measured: on a Retroid Pocket Duo and an AYN Thor, both
-  with the Cocoon launcher, the launcher kept drawing behind the companion without the cover (Thor: about 27%
-  of one CPU core during gameplay; Duo: about 22% in the affected launches, which ran at 27.7–28.4 instead of
-  29.1–29.3 fps) and was stopped in every tested launch with it. A frame-rate gain from the cover itself has
-  not been confirmed yet. Cover events are logged as `[TotkCompanion] cover ...` in `<game>/totk.log`.
+- Enable the companion's opaque cover by default on devices with a built-in second screen;
+  `TOTK_COMPANION_COVER=0` turns it off. A companion window alone does not make Android stop the app
+  underneath it; an opaque activity does. Tested only with the Cocoon launcher: it was stopped in every
+  cover-on launch on both the Retroid Pocket Duo and AYN Thor.
+  On Duo, launches started from the launcher pooled 28.70 fps and 101 frames over 50 ms per 24 windows
+  without the cover, versus 29.22 fps and 40 with it. The frame-rate difference is inside the comparison
+  tool's tolerance; the tool rates the pooled result better.
+  On Thor, launcher CPU use during gameplay fell from about 27% of one core to about 0.05%, and compositor
+  CPU use from about 19% to about 17%, with no frame-rate change (44.80 → 45.32 fps standing;
+  44.65 → 44.69 fps panning).
 - Add experimental `TOTK_VK_REC_ONE_PRIMARY=1`, off by default: record each submitted chunk into one main
   command buffer instead of one per render pass. On the AYN Thor, measured GPU time per frame was about 5% lower:
   18.67 → 17.65 ms standing and 18.64 → 17.63 ms while panning. Frame rate was about 2% higher

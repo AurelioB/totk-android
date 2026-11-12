@@ -20,18 +20,22 @@ Android-device result.
 **Round-eight default record (historical):** Android tried AHB with automatic copy fallback; explicit
 `TOTK_VK_PRESENT=copy` remained the control. The then-current chunk rule was 600 only with
 `TOTK_FRAME_LAG=1`, otherwise 75, and lag was recorded as off pending separate VMA safety work.
-`TOTK_COMPANION=0` suppresses secondary presentation, polling and action injection after `totk.env` loads;
-`TOTK_COMPANION_COVER=1` is a default-off, exact-`1` option for the built-in secondary display, only with the
-companion enabled. Start waits for owner window focus and top-resumed readiness. Ordinary touch/game-input reclaim
+`TOTK_COMPANION=0` suppresses secondary presentation, polling and action injection after `totk.env` loads.
+The cover defaults on for built-in secondary displays with the companion enabled. Exact
+`TOTK_COMPANION_COVER=0` opts out; unset, `1` and other values keep it on.
+Start waits for owner window focus and top-resumed readiness. Ordinary touch/game-input reclaim
 keeps its window-focus guard; a separate one-use, token-bound 1000 ms recovery may front the verified, still-resumed
 game after the live cover takes top-resumed state. Creation waits for no gesture; recovery remains within its original
 deadline and is checked on final UP/CANCEL. Pause, close, competing top-resumed loss, or a stale/expired token
 suppresses it. The cover is non-focusable/non-interactive and intentionally has no `noHistory`.
 
-Duo R2 observation: the launcher stayed stopped in 10/10 cover-on launches; all 30 retained boundary samples showed
-Cocoon activities DESTROYED/not visible with no Cocoon producer. Pan rate was 29.05–29.25 fps at the normal fast
-level. The earlier busy-video-off 27.7–28.4 fps state was not remeasured; a qualified p95 comparison was worse, so
-do not call this full acceptance or a performance win. Other dual-screen devices remain untested.
+Tested only with Cocoon: the launcher was stopped in every cover-on launch on Retroid Pocket Duo and AYN Thor.
+Duo launches started from the launcher pooled 28.70 → 29.22 fps and 101 → 40 frames over 50 ms per 24 windows;
+the frame-rate difference is inside the comparison tool's tolerance, while the tool rates the pooled result better.
+Thor launcher CPU use fell from about 27% of one core to about 0.05%, and compositor CPU use from about 19% to
+about 17%, with no frame-rate change (44.80 → 45.32 fps standing; 44.65 → 44.69 fps panning).
+The policy log shows the raw startup request: `requested=unset effective=true` for an eligible default-on
+launch, or `requested=0 effective=false` for explicit opt-out. Built-in-panel gating still uses `DisplayClass`.
 Cover start/finish/refusal/restart/policy/recovery lines use `[TotkCompanion] cover ...` in canonical
 `<game>/totk.log`; the optional `TOTK_LOGCAT=1` mirror uses Android tag `totk` but platform filtering may still drop
 INFO. Inspect the file, not logcat alone. With the switch off, no cover activity/window, reclaim or cover lifecycle

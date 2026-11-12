@@ -1518,21 +1518,24 @@ other than exactly `0` retain the existing default-on behavior; an eligible seco
 This is a startup option, not a live file watcher: edit `totk.env` before restarting the app. `--no-companion`
 instead omits the companion Java and assets at build time and keeps the original `android.app.NativeActivity`.
 
-`TOTK_COMPANION_COVER=1` in `totk.env` opts into an opaque, non-interactive cover beneath the unchanged Presentation
-on the built-in secondary display. Only exact `1` enables it; it is default off, requires the companion enabled, and
-does nothing for single-screen or external displays. Start waits for owner window focus and top-resumed readiness.
+The companion uses an opaque, non-interactive cover beneath the unchanged Presentation on built-in secondary
+displays by default. Exact `TOTK_COMPANION_COVER=0` in `totk.env` turns it off; unset, `1` and other values keep
+it on. It requires the companion enabled and does nothing for single-screen or external displays.
+Start waits for owner window focus and top-resumed readiness.
 Ordinary touch/game-input reclaim keeps its window-focus guard; separate one-use, token-bound 1000 ms startup recovery
 may front the verified, still-resumed game task after the cover takes top-resumed state. Creation waits for no gesture;
 recovery stays within its deadline and is checked on final UP/CANCEL. Pause, close, competing top-resumed loss, or a
 stale/expired token suppresses it. The cover remains non-focusable and non-interactive.
 
-On Retroid Pocket Duo, the launcher remained stopped in all 10 tested cover-on launches. All 30 retained boundary
-samples showed Cocoon activities destroyed/not visible and no Cocoon producer; pan rate was 29.05–29.25 fps at the
-normal fast level. The earlier busy-video-off 27.7–28.4 fps state was not remeasured, and the qualified p95
-comparison was worse, so this is not a full acceptance pass or performance-win claim. Other dual-screen devices
-remain untested. Cover start/finish/refusal/restart/policy/recovery diagnostics are written with prefix
-`[TotkCompanion] cover ...` to the canonical `<game>/totk.log`, independently of Android INFO filtering. The
-existing `TOTK_LOGCAT=1` opt-in mirrors the file to Android logcat under tag `totk`, where platform filtering may
+Tested only with Cocoon: the launcher was stopped in every cover-on launch on Retroid Pocket Duo and AYN Thor.
+Duo launches started from the launcher pooled 28.70 → 29.22 fps and 101 → 40 frames over 50 ms per 24 windows;
+the frame-rate difference is inside the comparison tool's tolerance, while the tool rates the pooled result better.
+Thor launcher CPU use fell from about 27% of one core to about 0.05%, and compositor CPU use from about 19% to
+about 17%, with no frame-rate change (44.80 → 45.32 fps standing; 44.65 → 44.69 fps panning).
+Cover start/finish/refusal/restart/policy/recovery diagnostics use `[TotkCompanion] cover ...` in canonical
+`<game>/totk.log`, independently of Android INFO filtering. The policy line retains the raw startup request:
+`requested=unset effective=true` for an eligible default-on launch, or `requested=0 effective=false` for opt-out.
+The existing `TOTK_LOGCAT=1` opt-in mirrors the file to Android logcat under tag `totk`, where platform filtering may
 still drop INFO; inspect `totk.log`. With the switch off, the native query, disabled CoverSession allocation and
 policy log remain, but no cover activity/window, reclaim or cover lifecycle callback registration occurs.
 Owner stop/dismiss/close and process teardown clean up the cover. This startup setting requires restarting the app.

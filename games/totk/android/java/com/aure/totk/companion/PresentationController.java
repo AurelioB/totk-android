@@ -37,6 +37,7 @@ public final class PresentationController implements DisplayManager.DisplayListe
     private final int initialPage;
     private final Runnable changed;
     private final boolean coverRequested;
+    private final String coverSetting;
     private final CoverSession cover;
     private boolean coverReported;
     private long coverFocusToken, coverFocusDeadline;
@@ -81,6 +82,7 @@ public final class PresentationController implements DisplayManager.DisplayListe
         this.owner = owner; this.source = source; this.initialPage = initialPage; this.changed = changed;
         displays = (DisplayManager) owner.getSystemService(Context.DISPLAY_SERVICE);
         coverRequested = source instanceof CompanionNative && CompanionNative.isCoverEnabled();
+        coverSetting = source instanceof CompanionNative ? CompanionNative.coverSetting() : "preview";
         cover = new CoverSession(coverRequested, new CoverSession.Host() {
             @Override public boolean start(int id, long token) { return startCover(id, token); }
             @Override public void finish(long token) {
@@ -97,7 +99,7 @@ public final class PresentationController implements DisplayManager.DisplayListe
         if (coverRequested) owner.getWindow().getDecorView().getViewTreeObserver().addOnWindowFocusChangeListener(coverWindowFocus);
         if (displays != null) { displays.registerDisplayListener(this, main); refresh(); }
     }
-    // Kept separate from the existing focus lifecycle: only the opt-in experiment registers these callbacks.
+    // Kept separate from the existing focus lifecycle: only enabled covers register these callbacks.
     private final Application.ActivityLifecycleCallbacks coverLifecycle = new Application.ActivityLifecycleCallbacks() {
         @Override public void onActivityResumed(Activity activity) { if (activity == owner) main.post(coverRefresh); }
         @Override public void onActivityPaused(Activity activity) {
@@ -116,7 +118,7 @@ public final class PresentationController implements DisplayManager.DisplayListe
     private void reportCover(boolean effective, String reason) {
         if (coverReported) return;
         coverReported = true;
-        logCover("cover requested=" + coverRequested + " effective=" + effective + " reason=" + reason);
+        logCover("cover requested=" + coverSetting + " effective=" + effective + " reason=" + reason);
     }
     /** One launch-scoped recovery may repair the expected loss of window focus, but only while our cover still owns
      * top-resumed activity authority. A gesture defers it; competing activity, pause or stale/expired launch cancels it. */
