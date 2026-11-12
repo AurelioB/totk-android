@@ -5011,6 +5011,21 @@ first option). Neither has device measurements yet; extra pass boundaries can co
 
 ### Packed shader IO and learned demand warming
 
+Exact integer shader-address folding is now on by default. For an unfurled A/B control, put
+`TOTK_VK_INT_FOLD=0` in `totk.env` and restart; removing it restores the default. It is read once
+and logs `requested=... effective=... (startup-only)` once. Floating-point math/NaN guards are unchanged.
+The loader folds the original seed SPIR-V immediately before creating each Vulkan shader module.
+Shared guest/bind-state variant hashes, `.vk` reflection, `.vv` indexes, `seed-id.txt` and `seed.vkpack`
+do not change; existing packs and newly prepared seeds work in both arms. Do not pre-fold the seed.
+No full shader rebuild/import is required for this update, and the APK does not bundle game-derived packs.
+The enabled arm uses `.intfold-v1` driver-pipeline, prewarm/import, compute-history and learned-IO
+namespaces; explicit paths and alternate seeds are isolated too. The first default launch after updating
+therefore has cold driver pipelines: expect possible one-time loading/first-visit stutter while they compile
+and learn, rather than the full shader-setup wait. Exact seconds/minutes depend on the device/route and are
+not yet measured for this update. Later starts reuse the newly warmed namespace. The opt-out can still
+reuse its old unfurled caches; old files are not deleted.
+
+
 Android now defaults to indexed seed IO (`TOTK_VK_SEED_IO=0` retains legacy loose IO for diagnosis).
 The build machine, not the APK or device, translates the user's own verified RomFS with
 `scripts/prepare_shader_seed.py --keep-spirv`; `build_android.py --shaders` then stages the `.spv`,
