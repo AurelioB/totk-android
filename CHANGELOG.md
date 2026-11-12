@@ -30,6 +30,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Add default-off `TOTK_COMPANION_COVER=1` for the built-in secondary display, only when the companion is enabled.
+  An opaque non-interactive cover sits beneath the unchanged Presentation; presentation touch and the existing
+  guarded game-input reclaim still run after cover start. Whether this stops the Duo launcher renderer is a
+  hypothesis awaiting Duo validation. Owner stop/dismiss/close and process teardown clean up the cover;
+  `noHistory` is intentionally omitted so focus reclaim does not auto-finish it.
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
   Normal launches no longer start its tail thread or wake logd for every frame log. Crash reports remain enabled.
 - Let the live-control reader sleep when `totk.ctl` is absent, including after unrelated files are created or deleted.

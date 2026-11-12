@@ -112,6 +112,7 @@ JNIEXPORT jint JNICALL Java_com_aure_totk_CompanionGateProbe_count(JNIEnv *env, 
 #include <stdio.h>
 #include <time.h>
 extern jint JNI_OnLoad(JavaVM *, void *);
+static jboolean (JNICALL *cover_enabled_fn)(JNIEnv *, jclass);
 static jboolean (JNICALL *enabled_fn)(JNIEnv *, jclass);
 static jstring (JNICALL *snapshot_fn)(JNIEnv *, jclass, jint);
 static jboolean (JNICALL *action_fn)(JNIEnv *, jclass, jint, jint);
@@ -126,9 +127,10 @@ static jclass JNICALL find_class(JNIEnv *env, const char *name) {
 }
 static void JNICALL exception_clear(JNIEnv *env) { (void)env; }
 static jint JNICALL register_methods(JNIEnv *env, jclass cls, const JNINativeMethod *methods, jint count) {
-    (void)env; (void)cls; assert(count == 5);
+    (void)env; (void)cls; assert(count == 6);
     for (jint i = 0; i < count; i++) {
         if (!strcmp(methods[i].name, "nativeEnabled")) enabled_fn = methods[i].fnPtr;
+        else if (!strcmp(methods[i].name, "nativeCoverEnabled")) cover_enabled_fn = methods[i].fnPtr;
         else if (!strcmp(methods[i].name, "snapshot")) snapshot_fn = methods[i].fnPtr;
         else if (!strcmp(methods[i].name, "action")) action_fn = methods[i].fnPtr;
         else if (!strcmp(methods[i].name, "request")) request_fn = methods[i].fnPtr;
@@ -157,14 +159,18 @@ int main(int argc, char **argv) {
     fixture_env = &functions; JavaVM vm = &invocation;
     /* Registration must not cache the environment before NativeActivity loads it. */
     unsetenv("TOTK_COMPANION");
+    unsetenv("TOTK_COMPANION_COVER");
     assert(JNI_OnLoad(&vm, NULL) == JNI_VERSION_1_6);
-    assert(enabled_fn && snapshot_fn && action_fn && request_fn && result_fn);
+    assert(enabled_fn && cover_enabled_fn && snapshot_fn && action_fn && request_fn && result_fn);
     assert(atomic_load(&runtime_companion_tick));   /* the frame-end hook is installed at load, nothing pending */
     assert(!atomic_load(&runtime_companion_pending));
     jstring action = (jstring)"equip", category = (jstring)"weapons", actor = (jstring)"Weapon_Sword_001";
     if (argc > 1 && strcmp(argv[1], "unset")) setenv("TOTK_COMPANION", argv[1], 1);
+    if (argc > 2 && strcmp(argv[2], "unset")) setenv("TOTK_COMPANION_COVER", argv[2], 1);
     int on = argc < 2 || strcmp(argv[1], "0");
+    int cover_on = on && argc > 2 && !strcmp(argv[2], "1");
     assert(enabled_fn(&fixture_env, NULL) == on);
+    assert(cover_enabled_fn(&fixture_env, NULL) == cover_on);
     if (!on) {
         assert(!snapshot_fn(&fixture_env, NULL, COMPANION_FULL));
         assert(!action_fn(&fixture_env, NULL, 1, 10));
@@ -191,6 +197,7 @@ int main(int argc, char **argv) {
         assert(atomic_load(&releases) == 1);
     }
     printf("pass: native companion gate %s\n", argc > 1 ? argv[1] : "unset");
+    printf("pass: native companion cover %s\n", argc > 2 ? argv[2] : "unset");
     return 0;
 }
 #endif

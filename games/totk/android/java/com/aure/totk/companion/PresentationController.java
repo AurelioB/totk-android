@@ -2,9 +2,11 @@ package com.aure.totk.companion;
 
 import android.app.Activity;
 import android.app.ActivityManager;
+import android.app.ActivityOptions;
 import android.app.Application;
 import android.app.Presentation;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.ColorDrawable;
@@ -33,6 +35,9 @@ public final class PresentationController implements DisplayManager.DisplayListe
     private int displayId = -1;
     private final int initialPage;
     private final Runnable changed;
+    private final boolean coverRequested;
+    private final CoverSession cover;
+    private boolean coverReported;
     private boolean closed, stopped, resumed, topResumed, returnQueued, returnRequested, reported, reportQueued;
     private ActivityManager.AppTask inputTask;
     private long returnRequestedAt;
@@ -67,8 +72,72 @@ public final class PresentationController implements DisplayManager.DisplayListe
     public PresentationController(Activity owner, DataSource source, int initialPage, Runnable changed) {
         this.owner = owner; this.source = source; this.initialPage = initialPage; this.changed = changed;
         displays = (DisplayManager) owner.getSystemService(Context.DISPLAY_SERVICE);
+        coverRequested = source instanceof CompanionNative && CompanionNative.isCoverEnabled();
+        cover = new CoverSession(coverRequested, new CoverSession.Host() {
+            @Override public boolean start(int id, long token) { return startCover(id, token); }
+            @Override public void finish(long token) {
+                try { CoverActivity.cancel(token); }
+                catch (RuntimeException unavailable) { Log.w("TotkCompanion", "cover finish refused token=" + token, unavailable); }
+            }
+        });
+        if (!coverRequested) reportCover(false, "switch_off_or_preview");
         owner.registerActivityLifecycleCallbacks(lifecycle);
+        if (coverRequested) owner.registerActivityLifecycleCallbacks(coverLifecycle);
         if (displays != null) { displays.registerDisplayListener(this, main); refresh(); }
+    }
+    // Kept separate from the existing focus lifecycle: only the opt-in experiment registers these callbacks.
+    private final Application.ActivityLifecycleCallbacks coverLifecycle = new Application.ActivityLifecycleCallbacks() {
+        @Override public void onActivityResumed(Activity activity) { if (activity == owner) { cover.ownerResumed(true); main.post(PresentationController.this::refresh); } }
+        @Override public void onActivityPaused(Activity activity) { if (activity == owner) cover.ownerResumed(false); }
+        @Override public void onActivityStarted(Activity activity) {}
+        @Override public void onActivityStopped(Activity activity) {}
+        @Override public void onActivityCreated(Activity activity, Bundle state) {}
+        @Override public void onActivitySaveInstanceState(Activity activity, Bundle state) {}
+        @Override public void onActivityDestroyed(Activity activity) {}
+    };
+    private void reportCover(boolean effective, String reason) {
+        if (coverReported) return;
+        coverReported = true;
+        Log.i("TotkCompanion", "cover requested=" + coverRequested + " effective=" + effective + " reason=" + reason);
+    }
+    private void reclaimAfterCover() {
+        // startActivity returns before its window/top-resumed changes arrive. Also run this after onCreate attaches.
+        if (!touchInProgress) returnInputToOwner();
+    }
+    private boolean startCover(int id, long token) {
+        Intent intent = new Intent(owner, CoverActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                .putExtra(CoverActivity.TOKEN, token);
+        try {
+            if (!ActivityManager.isActivityStartAllowedOnDisplay(owner, id, intent)) {
+                Log.w("TotkCompanion", "cover refusal display=" + id + " reason=start_not_allowed");
+                reportCover(false, "start_not_allowed");
+                return false;
+            }
+            CoverActivity.prepare(id, token, new CoverActivity.Listener() {
+                @Override public void attached() { main.post(PresentationController.this::reclaimAfterCover); }
+                @Override public void finished(long finished) {
+                    cover.ownerResumed(resumed && !closed && !stopped);
+                    cover.hostFinished(finished);
+                }
+                @Override public void refused(long refused) { cover.startRefused(refused); }
+            });
+            owner.startActivity(intent, ActivityOptions.makeBasic().setLaunchDisplayId(id).toBundle());
+            Log.i("TotkCompanion", "cover " + (cover.isRestart() ? "restart" : "start") + " display=" + id + " token=" + token);
+            reportCover(true, "start_accepted");
+            main.post(this::reclaimAfterCover);
+            return true;
+        } catch (RuntimeException unavailable) {
+            CoverActivity.cancel(token);
+            Log.w("TotkCompanion", "cover refusal display=" + id + " reason=start_exception", unavailable);
+            reportCover(false, "start_exception");
+            return false;
+        }
+    }
+    private void refreshCover(Display selected) {
+        cover.refresh(selected == null ? DisplayClass.NONE : DisplayClass.BUILT_IN,
+                selected == null ? -1 : selected.getDisplayId(), resumed);
+        if (coverRequested && resumed && selected == null) reportCover(false, "no_builtin_second_panel");
     }
     /** Whether the companion is currently presented on a secondary display. */
     public boolean showing() { return shown != null; }
@@ -141,6 +210,7 @@ public final class PresentationController implements DisplayManager.DisplayListe
         }
     }
     private void dismiss() {
+        cover.dismiss();
         Presentation previous = shown;
         shown = null; displayId = -1;
         touchInProgress = false;
@@ -187,9 +257,13 @@ public final class PresentationController implements DisplayManager.DisplayListe
     private void refresh() {
         if (closed || stopped || displays == null || owner.isFinishing() || owner.isDestroyed()) return;
         Display selected = builtInDisplay(displays, owner.getDisplay());
-        if (selected != null && selected.getDisplayId() == displayId && shown != null && shown.isShowing()) return;
+        if (selected != null && selected.getDisplayId() == displayId && shown != null && shown.isShowing()) {
+            refreshCover(selected);
+            return;
+        }
         dismiss();
-        if (selected == null) return;
+        if (selected == null) { refreshCover(null); return; }
+        refreshCover(selected);
         Presentation next = new Presentation(owner, selected) {
             private boolean touching;
             @Override public boolean dispatchTouchEvent(MotionEvent event) {
@@ -216,7 +290,7 @@ public final class PresentationController implements DisplayManager.DisplayListe
             }
         };
         next.setOnDismissListener(dialog -> {
-            if (shown == next) { shown = null; displayId = -1; report(); if (!closed) main.post(this::refresh); }
+            if (shown == next) { shown = null; displayId = -1; cover.dismiss(); report(); if (!closed) main.post(this::refresh); }
         });
         shown = next; displayId = selected.getDisplayId();
         try { next.show(); report(); }
@@ -230,8 +304,10 @@ public final class PresentationController implements DisplayManager.DisplayListe
     @Override public void onDisplayChanged(int id) { if (id == displayId) dismiss(); refresh(); }
     public void close() {
         closed = true;
+        cover.close();
         main.removeCallbacksAndMessages(null);
         owner.unregisterActivityLifecycleCallbacks(lifecycle);
+        if (coverRequested) owner.unregisterActivityLifecycleCallbacks(coverLifecycle);
         if (displays != null) displays.unregisterDisplayListener(this);
         dismiss();
     }

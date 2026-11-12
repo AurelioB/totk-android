@@ -3,6 +3,7 @@
    JNI_OnLoad below; NativeActivity has already loaded the same library, so both share one runtime. Its drawings come
    from <game>/companion/, which the app's setup generates from the player's RomFS (Java AssetStore).
      boolean nativeEnabled()           -> TOTK_COMPANION != "0", queried after NativeActivity has read totk.env
+     boolean nativeCoverEnabled()      -> TOTK_COMPANION_COVER == "1" (default off)
      String snapshot(int detail)        -> companion_snapshot() JSON for the running game
      boolean action(int kind, int arg)  -> kind 1: press and release Switch button `arg` (libnx Npad bit index)
      int request(String action, String category, int slot, String actor, int partition, long pouchGen)
@@ -42,6 +43,10 @@ static jboolean JNICALL native_enabled(JNIEnv *env, jclass cls) {
     (void)env; (void)cls;
     const char *option = getenv("TOTK_COMPANION");
     return !option || strcmp(option, "0") ? JNI_TRUE : JNI_FALSE;
+}
+static jboolean JNICALL native_cover_enabled(JNIEnv *env, jclass cls) {
+    const char *option = getenv("TOTK_COMPANION_COVER");
+    return native_enabled(env, cls) && option && !strcmp(option, "1") ? JNI_TRUE : JNI_FALSE;
 }
 
 static int guest_read(uint64_t a, void *out, size_t n) { return host_safe_read(a, out, n); }
@@ -162,6 +167,7 @@ __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserve
     if (!cls) { (*env)->ExceptionClear(env); fprintf(stderr, "[companion] CompanionNative class not found\n"); return JNI_VERSION_1_6; }
     static const JNINativeMethod methods[] = {
         {"nativeEnabled", "()Z", (void *)native_enabled},
+        {"nativeCoverEnabled", "()Z", (void *)native_cover_enabled},
         {"snapshot", "(I)Ljava/lang/String;", (void *)native_snapshot},
         {"action", "(II)Z", (void *)native_action},
         {"request", "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;IJ)I", (void *)native_request},

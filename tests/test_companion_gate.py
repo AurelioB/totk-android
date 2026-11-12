@@ -260,6 +260,7 @@ class CompanionGate(unittest.TestCase):
         env = os.environ.copy()
         env.pop('TOTK_COMPANION', None)
         env.pop('TOTK_COMPANION_LOG', None)
+        env.pop('TOTK_COMPANION_COVER', None)
         return env
 
     def test_runtime_switch_and_lifecycle(self):
@@ -284,9 +285,11 @@ class CompanionGate(unittest.TestCase):
             '-o', str(executable),
         ])
         for setting in ('unset', '', '0', '1', 'false', '00'):
-            with self.subTest(setting=setting):
-                result = self.command([str(executable), setting], env=self.environment())
-                self.assertIn('pass: native companion gate ' + setting, result.stdout)
+            for cover_setting in ('unset', '', '0', '1', 'false', '00', '01', ' 1'):
+                with self.subTest(setting=setting, cover_setting=cover_setting):
+                    result = self.command([str(executable), setting, cover_setting], env=self.environment())
+                    self.assertIn('pass: native companion gate ' + setting, result.stdout)
+                    self.assertIn('pass: native companion cover ' + cover_setting, result.stdout)
 
     def test_jni_load_without_companion_classes(self):
         result = self.command([

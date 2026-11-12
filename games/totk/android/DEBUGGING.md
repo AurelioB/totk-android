@@ -21,7 +21,11 @@ Android-device result.
 `TOTK_VK_PRESENT=copy` remained the control. The then-current chunk rule was 600 only with
 `TOTK_FRAME_LAG=1`, otherwise 75, and lag was recorded as off pending separate VMA safety work.
 `TOTK_COMPANION=0` suppresses secondary presentation, polling and action injection after `totk.env` loads;
-omit `--dex/--assets` in the low-level APK packer for the Java-free variant (`build_android.py --no-companion`
+`TOTK_COMPANION_COVER=1` is a default-off cover experiment for the built-in secondary display and only works
+with the companion enabled. Presentation touch and guarded game-input reclaim remain active after cover start.
+The claim that the cover stops the Duo launcher renderer is a hypothesis awaiting Duo validation. Owner lifecycle
+cleanup and same-process teardown remove it; `noHistory` is intentionally absent so focus reclaim does not finish it.
+Omit `--dex/--assets` in the low-level APK packer for the Java-free variant (`build_android.py --no-companion`
 selects it, but that script is not part of integration verification).
 
 **Round-ten status (historical, superseded for frame lag):** SGSR and automatic 60/30 selection are optional;

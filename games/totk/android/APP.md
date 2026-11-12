@@ -1518,6 +1518,14 @@ other than exactly `0` retain the existing default-on behavior; an eligible seco
 This is a startup option, not a live file watcher: edit `totk.env` before restarting the app. `--no-companion`
 instead omits the companion Java and assets at build time and keeps the original `android.app.NativeActivity`.
 
+`TOTK_COMPANION_COVER=1` in `totk.env` opts into an opaque, non-interactive cover activity on the same built-in
+secondary display, beneath the unchanged Presentation. It is default off, starts only when the companion is enabled,
+and does nothing for single-screen or external displays. Presentation touch and the existing guarded game-input
+reclaim still run after the cover starts. Stopping the launcher renderer is only a hypothesis pending Duo validation;
+no app API can observe whether another app is rendering. The cover is cleaned up on owner stop/dismiss/close and
+with process teardown. It deliberately has no `noHistory`: focus reclaim must not auto-finish the cover.
+This startup option is read with the companion settings and requires restarting the app.
+
 Startup ordering is deliberate: `TotkActivity.onCreate` first calls `NativeActivity.super.onCreate`, which invokes
 `ANativeActivity_onCreate`; its `start_game` reads `totk.env` synchronously. Only after `super.onCreate` returns does
 Java query the native runtime switch and, if enabled, construct the controller. There is no second environment-file

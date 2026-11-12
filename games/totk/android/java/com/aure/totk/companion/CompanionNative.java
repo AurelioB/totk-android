@@ -8,6 +8,13 @@ public final class CompanionNative implements DataSource {
         catch (UnsatisfiedLinkError ignored) { loaded = false; }
     }
     private static native boolean nativeEnabled();
+    private static native boolean nativeCoverEnabled();
+    /** Experimental cover: opt in only with the exact value TOTK_COMPANION_COVER=1, after native initialization. */
+    public static boolean isCoverEnabled() {
+        if (!loaded) return false;
+        try { return nativeCoverEnabled(); }
+        catch (UnsatisfiedLinkError unavailable) { loaded = false; return false; }
+    }
     /** Call after NativeActivity.onCreate has initialized the runtime options. */
     public static boolean isEnabled() {
         if (!loaded) return false;
