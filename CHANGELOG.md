@@ -5,6 +5,15 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 
 ## Unreleased
 
+### Frame generation
+- Add *Lossless Scaling* to *Graphics → Performance → Frame generation* and *Game data → Lossless Scaling DLL* to
+  import your own `Lossless.dll`. The engine, its timing and its limits are the existing experimental LSFG path
+  (`TOTK_FRAMEGEN_ENGINE=lsfg`); the app still ships no DLL and nothing derived from one. Without an imported file
+  the choice falls back to the built-in interpolation. The Game data list scrolls now, since it has more rows than
+  fit. Host tests cover the import and the settings; on an AYN Thor the row refused a file that is not a DLL, and
+  took and removed a stand-in file with a DLL header. The engine with a real imported file has not been run from
+  this change.
+
 ### Developer tools
 - Add launch-only, default-off `TOTK_BENCH_TIME=HH:MM` for restored-save benchmark arms.
   It pins the native effective clock, overriding timeline/sleep/day progression; weather and randomness remain uncontrolled.
