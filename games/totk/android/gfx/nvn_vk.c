@@ -533,6 +533,13 @@ static int g_gpu_time_fps_median;
 static void ts_clock_init(void);
 enum { POOLS_HOST = 1, POOLS_EXPORT, POOLS_HEAP };
 static int g_pool_mode; static const char *g_pool_mode_name;
+static int g_wb_alias_enabled;   /* frozen by vk_init_once before any pool or backend worker exists */
+int vk_wb_alias_enabled(void) { return g_wb_alias_enabled; }
+static void wb_alias_init(void) {
+    const char *e = getenv("TOTK_WB_ALIAS"); g_wb_alias_enabled = e && !strcmp(e, "1");
+    if (g_wb_alias_enabled)
+        LOGV("write-back alias: enabled (TOTK_WB_ALIAS=1); backend-private RW dma-buf mapping per owned pool; host-import/CPU ranges use existing path");
+}
 static VkDeviceSize g_host_align = 4096;
 static int g_lookup_stats;   /* immutable after vk_init_once: one predictable branch per lookup when disabled */
 static _Atomic uintptr_t g_lookup_thread;
@@ -619,6 +626,7 @@ static void vk_init_once(void) {
            fps60 && strcmp(fps60, "0") != 0, runtime_frame_lag_requested(), vk_frame_chunk_limit()); }
     { const char *e = getenv("TOTK_VK_HITCH"); g_hitch_on = e && atoi(e) > 0; }
     { const char *e = getenv("TOTK_VK_LOOKUP_STATS"); g_lookup_stats = e && atoi(e); }
+    wb_alias_init();
     { const char *e = getenv("TOTK_VK_REC_PROFILE"); vk_rec_profile_on = e && !strcmp(e, "1"); }
     vk_rec_timing_on = vk_rec_profile_on || totk_ft_on();
     const char *gpl_env = getenv("TOTK_VK_PIPELINE_LIBRARY");
@@ -972,8 +980,12 @@ typedef struct pool_ent {
     uintptr_t lo, hi, base, end;    /* registered range; page-rounded range */
     int kind, fd;
     VkBuffer buf; VkDeviceMemory mem;
+    uint8_t *wb_alias;             /* backend-private RW dma-buf mapping; never a registered guest range */
     uint64_t identity;             /* registration lifetime, not a guest pool object's reusable address */
     struct pool_ent *owner; uint64_t off;   /* VIEW: owner pool, offset of base in owner's buffer */
+#ifdef TOTK_VK_TESTS
+    int test_backing; uint64_t test_fd_offset;   /* synthetic fd-backed registry fixtures, no Vulkan objects */
+#endif
 } pool_ent;
 typedef struct { uintptr_t va, end; pool_ent *owner; uint64_t off; } alias_ent;   /* virtual pool pages -> owner's buffer offset */
 static pool_ent **g_pools; static int g_npool, g_cappool;
@@ -981,6 +993,7 @@ static alias_ent *g_alias; static int g_nalias, g_capalias;
 static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_pool_identity;
 static uint64_t g_pool_bytes, g_pool_cpu;
+static uint64_t g_wb_alias_maps, g_wb_alias_bytes;   /* g_pool_mu; one mapping per supported K_OWN */
 /* Address index for resolve(): GPU-backed spans sorted by start, plus elementary segments naming the furthest-reaching
    span. An early large pool kept the old prefix-max backscan linear; resolve_local was 10.6% of recording at Lookout Landing. */
 typedef struct { uintptr_t lo, end; VkBuffer buf; uint64_t off; } span_t;   /* off: buffer offset of lo */
@@ -1050,7 +1063,9 @@ static int back_pool(pool_ent *e) {
     memcpy(tmp, (void *)e->base, size);
     if (mmap((void *)e->base, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) != (void *)e->base)
         DIE("pool %#llx+%#zx: mapping the dma-buf at the guest address: %s", (unsigned long long)e->base, size, strerror(errno));
-    munmap(tmp, size);
+    if (g_wb_alias_enabled) {
+        e->wb_alias = tmp; g_wb_alias_maps++; g_wb_alias_bytes += size;
+    } else munmap(tmp, size);
     e->fd = fd;
     return 1;
 }
@@ -1064,6 +1079,13 @@ static void unback_pool(pool_ent *e) {
             DIE("pool %#llx: restoring guest pages: %s", (unsigned long long)e->base, strerror(errno));
         close(e->fd); e->fd = -1;
     }
+    if (e->wb_alias) {
+        munmap(e->wb_alias, size); e->wb_alias = NULL;
+        g_wb_alias_maps--; g_wb_alias_bytes -= size;
+    }
+#ifdef TOTK_VK_TESTS
+    if (e->test_backing) return;
+#endif
     vkDestroyBuffer(g_dev, e->buf, NULL); vk_memory_release(e->mem, VK_MEMORY_POOL);
 }
 static void pool_insert(pool_ent *e) {
@@ -1147,6 +1169,92 @@ int vk_wb_pool_lock(uint64_t identity, const void *address, uint64_t size) {
     return 0;
 }
 void vk_wb_pool_unlock(void) { pthread_mutex_unlock(&g_pool_mu); }
+/* Caller owns g_pool_mu through the last store. Alias-table mappings take precedence over physical pools,
+   including when a virtual mapping replaces part of a physical owner's guest address. A span stops at
+   every mapping transition, so neither supported bytes nor an unsupported gap can hide a later owner. */
+void *vk_wb_alias_span_locked(uintptr_t guest, size_t requested, size_t *available) {
+    if (available) *available = 0;
+    if (!g_wb_alias_enabled || !requested || requested > UINTPTR_MAX - guest) return NULL;
+    uintptr_t end = guest + requested;
+    const pool_ent *owner = NULL; uint64_t off = 0;
+    for (int i = 0; i < g_nalias; i++) {
+        const alias_ent *a = &g_alias[i];
+        if (guest >= a->va && guest < a->end) {
+            owner = a->owner; off = a->off + (guest - a->va);
+            if (a->end < end) end = a->end;
+            goto mapped;
+        }
+        if (a->va > guest && a->va < end) end = a->va;
+    }
+    for (int i = 0; i < g_npool; i++) {
+        const pool_ent *p = g_pools[i];
+        if (p->kind != K_OWN && p->kind != K_VIEW) continue;
+        if (guest >= p->base && guest < p->end) {
+            owner = p->kind == K_OWN ? p : p->owner;
+            off = p->kind == K_OWN ? guest - p->base : p->off + (guest - p->base);
+            if (p->end < end) end = p->end;
+            break;
+        }
+        if (p->base > guest && p->base < end) end = p->base;
+    }
+mapped:
+    if (available) *available = end - guest;
+    if (!owner || !owner->wb_alias || off >= owner->end - owner->base) return NULL;
+    size_t left = (size_t)(owner->end - owner->base - off);
+    if (left < end - guest) { end = guest + left; if (available) *available = left; }
+    return owner->wb_alias + (size_t)off;
+}
+int vk_wb_alias_range_locked(uintptr_t guest, size_t size) {
+    if (!g_wb_alias_enabled || !size || size > UINTPTR_MAX - guest) return 0;
+    while (size) {
+        size_t available;
+        if (!vk_wb_alias_span_locked(guest, size, &available) || !available) return 0;
+        guest += available; size -= available;
+    }
+    return 1;
+}
+/* Site2 publication keeps the same gates/dirty ownership as the ordinary store. Enabled callers
+   pin the registry only when immediately available; contention retains the original unpinned store. */
+static int wb_store_legacy(void *guest, const void *data, size_t size, int event32, int add32, int guarded) {
+    if (event32) {
+        uint32_t value; memcpy(&value, data, sizeof value);
+        volatile uint32_t *word = guest;
+        if (guarded) return nvn_dirty_lag_store32(word, value, add32);
+        if (add32) *word += value; else *word = value;
+    } else if (guarded) return nvn_dirty_lag_store(guest, data, size);
+    else memcpy(guest, data, size);
+    return 1;
+}
+static int wb_alias_store(void *guest, const void *data, size_t size, int event32, int add32, int guarded) {
+    uintptr_t address = (uintptr_t)guest; const uint8_t *src = data;
+    int ok = 1;
+    /* Legacy owner destruction can hold the registry while waiting for this completion cursor.
+       No alias pointer exists yet: contention must use the original whole-operation store, not wait. */
+    if (pthread_mutex_trylock(&g_pool_mu))
+        return wb_store_legacy(guest, data, size, event32, add32, guarded);
+    if (event32) {
+        size_t available; void *alias = vk_wb_alias_span_locked(address, size, &available);
+        /* Never split the read/modify/write word (or its volatile assignment) between owners. */
+        if (alias && available == size)
+            ok = nvn_dirty_lag_store_alias(guest, alias, src, size, add32);
+        else ok = wb_store_legacy(guest, src, size, 1, add32, guarded);
+    } else while (size) {
+        size_t available; void *alias = vk_wb_alias_span_locked(address, size, &available);
+        size_t n = available ? available : size;
+        if (alias) ok = nvn_dirty_lag_store_alias((void *)address, alias, src, n, 0);
+        else ok = wb_store_legacy((void *)address, src, n, 0, 0, guarded);
+        if (!ok) break;
+        address += n; src += n; size -= n;
+    }
+    pthread_mutex_unlock(&g_pool_mu);
+    return ok;
+}
+#ifdef TOTK_VK_TESTS
+int vk_wb_test_alias_store(void *guest, const void *data, size_t size, int event32, int add32, int guarded) {
+    return g_wb_alias_enabled ? wb_alias_store(guest, data, size, event32, add32, guarded) :
+                               wb_store_legacy(guest, data, size, event32, add32, guarded);
+}
+#endif
 /* totk_vpool.c: a virtual pool's range, and its page aliases. */
 void mtl_vpool_add(const void *mem, uint64_t size) { add_range(mem, size, 1); }
 void mtl_vpool_del(const void *mem) { del_range(mem, 1); }
@@ -1164,7 +1272,8 @@ static void alias_replace(uintptr_t va, uintptr_t end, pool_ent *owner, uint64_t
         } else { g_alias[i].va = end; g_alias[i].off += end - x.va; }
         i++;
     }
-    g_alias[g_nalias++] = (alias_ent){va, end, owner, off}; span_changed();
+    if (owner) g_alias[g_nalias++] = (alias_ent){va, end, owner, off};
+    span_changed();
 }
 int mtl_pool_alias(void *dst, const void *src, uint64_t size) {
     mtl_init();
@@ -1189,6 +1298,147 @@ void vk_record_test_alias(void *address, uint64_t source, uint64_t size) {
     pool_ent *owner = own_containing(source, source + size);
     if (!owner) DIE("recorder test alias has no donor");
     alias_replace((uintptr_t)address, (uintptr_t)address + size, owner, source - owner->base);
+    pthread_mutex_unlock(&g_pool_mu);
+}
+/* Host-only registry fixtures use real shared fd mappings but never create a Vulkan object. The caller
+   owns every guest mapping; all ranges/offsets are page aligned, and the supplied fd remains caller-owned. */
+void vk_wb_test_alias_init(void) {
+    pthread_mutex_lock(&g_pool_mu);
+    if (g_npool) DIE("alias fixture initialization requires an empty pool registry");
+    wb_alias_init();
+    pthread_mutex_unlock(&g_pool_mu);
+}
+static pool_ent *wb_test_pool(void *guest) {
+    for (int i = g_npool; i-- > 0; ) if (g_pools[i]->lo == (uintptr_t)guest) return g_pools[i];
+    return NULL;
+}
+static int wb_test_bounds(void *guest, size_t size, uint64_t offset) {
+    uintptr_t a = (uintptr_t)guest, pg = page_sz();
+    return a && size && size <= UINTPTR_MAX - a && !(a % pg) && !(size % pg) &&
+           !(offset % pg) && offset <= INT64_MAX && size <= (uint64_t)INT64_MAX - offset;
+}
+int vk_wb_test_alias_attach(void *guest, uint64_t size, int fd, uint64_t offset) {
+    if (size > SIZE_MAX || fd < 0 || !wb_test_bounds(guest, (size_t)size, offset)) return 0;
+    pthread_mutex_lock(&g_pool_mu);
+    pool_ent *p = own_containing((uintptr_t)guest, (uintptr_t)guest + (size_t)size);
+    int ok = g_wb_alias_enabled && p && p->base == (uintptr_t)guest &&
+             p->end - p->base == size && !p->wb_alias;
+    if (ok) {
+        void *alias = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)offset);
+        ok = alias != MAP_FAILED;
+        if (ok) { p->wb_alias = alias; g_wb_alias_maps++; g_wb_alias_bytes += size; }
+    }
+    pthread_mutex_unlock(&g_pool_mu);
+    return ok;
+}
+uint64_t vk_wb_test_alias_owner(void *guest, size_t size, int fd, uint64_t offset) {
+    if (fd < 0 || !wb_test_bounds(guest, size, offset)) return 0;
+    pool_ent *p = VK_CALLOC(1, sizeof *p);
+    p->lo = p->base = (uintptr_t)guest; p->hi = p->end = p->base + size;
+    p->kind = K_OWN; p->fd = -1; p->test_backing = 1; p->test_fd_offset = offset;
+    pthread_mutex_lock(&g_pool_mu);
+    int ok = !own_overlapping(p->base, p->end) && !wb_test_pool(guest);
+    if (ok) { p->fd = dup(fd); ok = p->fd >= 0; }
+    if (ok && g_wb_alias_enabled) {
+        void *alias = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, p->fd, (off_t)offset);
+        ok = alias != MAP_FAILED;
+        if (ok) { p->wb_alias = alias; g_wb_alias_maps++; g_wb_alias_bytes += size; }
+    }
+    uint64_t identity = 0;
+    if (ok) { pool_insert(p); g_pool_bytes += size; identity = p->identity; }
+    else { if (p->fd >= 0) close(p->fd); free(p); }
+    pthread_mutex_unlock(&g_pool_mu);
+    return identity;
+}
+uint64_t vk_wb_test_alias_view(void *guest, size_t size, void *owner_guest, uint64_t owner_offset) {
+    if (!wb_test_bounds(guest, size, owner_offset)) return 0;
+    pthread_mutex_lock(&g_pool_mu);
+    pool_ent *owner = wb_test_pool(owner_guest); uint64_t identity = 0;
+    if (owner && owner->kind == K_OWN && owner->test_backing && !wb_test_pool(guest) &&
+        owner_offset <= owner->end - owner->base && size <= owner->end - owner->base - owner_offset &&
+        mmap(guest, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, owner->fd,
+             (off_t)(owner->test_fd_offset + owner_offset)) == guest) {
+        pool_ent *p = VK_CALLOC(1, sizeof *p);
+        p->lo = p->base = (uintptr_t)guest; p->hi = p->end = p->base + size;
+        p->kind = K_VIEW; p->fd = -1; p->owner = owner; p->off = owner_offset; p->test_backing = 1;
+        pool_insert(p); identity = p->identity;
+    }
+    pthread_mutex_unlock(&g_pool_mu);
+    return identity;
+}
+uint64_t vk_wb_test_alias_virtual(void *guest, size_t size) {
+    if (!wb_test_bounds(guest, size, 0)) return 0;
+    pthread_mutex_lock(&g_pool_mu);
+    uint64_t identity = 0;
+    if (!wb_test_pool(guest)) {
+        pool_ent *p = VK_CALLOC(1, sizeof *p);
+        p->lo = p->base = (uintptr_t)guest; p->hi = p->end = p->base + size;
+        p->kind = K_VIRT; p->fd = -1; p->test_backing = 1;
+        pool_insert(p); identity = p->identity;
+    }
+    pthread_mutex_unlock(&g_pool_mu);
+    return identity;
+}
+int vk_wb_test_alias_map(void *virtual_guest, size_t virtual_offset, void *owner_guest, size_t owner_offset, size_t size) {
+    if (!wb_test_bounds(virtual_guest, size, virtual_offset) || owner_offset % page_sz()) return 0;
+    pthread_mutex_lock(&g_pool_mu);
+    pool_ent *v = wb_test_pool(virtual_guest), *owner = wb_test_pool(owner_guest);
+    int ok = v && v->kind == K_VIRT && v->test_backing && owner && owner->kind == K_OWN && owner->test_backing &&
+             virtual_offset <= v->end - v->base && size <= v->end - v->base - virtual_offset &&
+             owner_offset <= owner->end - owner->base && size <= owner->end - owner->base - owner_offset;
+    if (ok) {
+        uintptr_t address = v->base + virtual_offset;
+        ok = mmap((void *)address, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, owner->fd,
+                  (off_t)(owner->test_fd_offset + owner_offset)) == (void *)address;
+        if (ok) alias_replace(address, address + size, owner, owner_offset);
+    }
+    pthread_mutex_unlock(&g_pool_mu);
+    return ok;
+}
+int vk_wb_test_alias_unmap(void *virtual_guest, size_t virtual_offset, size_t size) {
+    if (!wb_test_bounds(virtual_guest, size, virtual_offset)) return 0;
+    pthread_mutex_lock(&g_pool_mu);
+    pool_ent *v = wb_test_pool(virtual_guest);
+    int ok = v && v->kind == K_VIRT && v->test_backing &&
+             virtual_offset <= v->end - v->base && size <= v->end - v->base - virtual_offset;
+    if (ok) {
+        uintptr_t address = v->base + virtual_offset;
+        ok = mmap((void *)address, size, PROT_READ | PROT_WRITE,
+                  MAP_SHARED | MAP_FIXED | MAP_ANONYMOUS, -1, 0) == (void *)address;
+        if (ok) alias_replace(address, address + size, NULL, 0);
+    }
+    pthread_mutex_unlock(&g_pool_mu);
+    return ok;
+}
+int vk_wb_test_alias_registry_trylock(void) {
+    if (pthread_mutex_trylock(&g_pool_mu)) return 0;
+    pthread_mutex_unlock(&g_pool_mu);
+    return 1;
+}
+void vk_wb_test_alias_remove(void *guest) {
+    pthread_mutex_lock(&g_pool_mu);
+    pool_ent *p = wb_test_pool(guest);
+    if (p && p->test_backing) {
+        for (int i = 0; i < g_npool; i++) if (g_pools[i] == p) { g_pools[i] = g_pools[--g_npool]; break; }
+        for (int i = 0; i < g_nalias; ) {
+            if (g_alias[i].owner == p || (p->kind == K_VIRT && g_alias[i].va >= p->base && g_alias[i].end <= p->end))
+                g_alias[i] = g_alias[--g_nalias];
+            else i++;
+        }
+        if (p->kind == K_OWN) {
+            for (int i = 0; i < g_npool; i++) if (g_pools[i]->owner == p) {
+                g_pools[i]->owner = NULL; g_pools[i]->kind = K_CPU;
+            }
+            atomic_fetch_add_explicit(&g_owner_gen, 1, memory_order_release);
+            unback_pool(p); g_pool_bytes -= p->end - p->base;
+        }
+        span_changed(); free(p);
+    }
+    pthread_mutex_unlock(&g_pool_mu);
+}
+void vk_wb_test_alias_memory(uint64_t out[2]) {
+    pthread_mutex_lock(&g_pool_mu);
+    out[0] = g_wb_alias_maps; out[1] = g_wb_alias_bytes;
     pthread_mutex_unlock(&g_pool_mu);
 }
 #endif
@@ -1984,7 +2234,8 @@ static void apply_posts(slot_t *owner, const vk_gpu_time_slot *last_slot, int la
     for (int i = 0; i < n; i++) {
         post_op *o = &p[i];
         if (o->kind == 1) {
-            if (lag_wait_on()) { if (!nvn_dirty_lag_store32(o->val, o->v, o->mode == 1)) DIE("lag event store could not restore protection"); }
+            if (g_wb_alias_enabled) { if (!wb_alias_store((void *)o->val, &o->v, sizeof o->v, 1, o->mode == 1, lag_wait_on())) DIE("lag event store could not restore protection"); }
+            else if (lag_wait_on()) { if (!nvn_dirty_lag_store32(o->val, o->v, o->mode == 1)) DIE("lag event store could not restore protection"); }
             else if (o->mode == 1) *o->val += o->v; else *o->val = o->v;
         }
         else {
@@ -2045,7 +2296,8 @@ static void apply_posts(slot_t *owner, const vk_gpu_time_slot *last_slot, int la
             }
             if (o->tsq1) atomic_store(&g_tsq_busy[o->tsq1 - 1], 0);
             uint64_t rec[2] = {o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? (g_occl_on ? occl_result(o->occl) : o->cval) : 0, ts};
-            if (lag_wait_on()) { if (!nvn_dirty_lag_store((void *)(uintptr_t)o->addr, rec, sizeof rec)) DIE("lag counter store could not restore protection"); }
+            if (g_wb_alias_enabled) { if (!wb_alias_store((void *)(uintptr_t)o->addr, rec, sizeof rec, 0, 0, lag_wait_on())) DIE("lag counter store could not restore protection"); }
+            else if (lag_wait_on()) { if (!nvn_dirty_lag_store((void *)(uintptr_t)o->addr, rec, sizeof rec)) DIE("lag counter store could not restore protection"); }
             else memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
             cpend_pop(o->addr);
         }
@@ -3759,7 +4011,9 @@ static void ub_publish(void) {
     }
     for (int k = 0; k < n; k++) {
         ub_ent *e = &g_ub[order[k]];
-        if (!nvn_dirty_lag_store((void *)(uintptr_t)e->lo, e->data, (size_t)(e->hi - e->lo)))
+        if (!(g_wb_alias_enabled ?
+              wb_alias_store((void *)(uintptr_t)e->lo, e->data, (size_t)(e->hi - e->lo), 0, 0, 1) :
+              nvn_dirty_lag_store((void *)(uintptr_t)e->lo, e->data, (size_t)(e->hi - e->lo))))
             DIE("lag uniform publication could not restore protection");
     }
     int j = 0;
@@ -5988,6 +6242,13 @@ void vk_mem_report(void) {
     }
     if (classes) nvn_dirty_lag_vma_request(1);
     memory_objects_report();
+    if (g_wb_alias_enabled) {
+        pthread_mutex_lock(&g_pool_mu);
+        uint64_t maps = g_wb_alias_maps, bytes = g_wb_alias_bytes;
+        pthread_mutex_unlock(&g_pool_mu);
+        LOGV("memory write-back aliases: mappings %llu, bytes %llu (backend-private RW dma-buf; not guest pools)",
+            (unsigned long long)maps, (unsigned long long)bytes);
+    }
     uint64_t chunk = 0, nchunk = 0, ndp = 0, posts = 0;
     for (int i = 0; i < RING; i++) { slot_t *s = &g_ring[i]; nchunk += (uint64_t)s->ar.nchunk; ndp += (uint64_t)s->ndpool; posts += (uint64_t)s->cap; for (int c = 0; c < s->ar.nchunk; c++) chunk += s->ar.chunks[c].size; }
     uint64_t slot_chunks = chunk;

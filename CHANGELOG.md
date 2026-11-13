@@ -34,6 +34,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   (`5fb080496ab7`, V rows only). Fresh host translation prepares 25,039 modules instead of 25,032,
   with zero failures and about 430 KiB of additional packed data. Existing shader packs stay valid;
   run a full shader rebuild to receive the added coverage.
+- Add experimental, launch-only `TOTK_WB_ALIAS=1` (default off): use a retained same-backing private CPU mapping
+  for supported dirty-tracked write-back extents and eligible report/event/uniform stores, without temporarily
+  making protected guest pages writable. Preserve CPU-write detection, GPU synchronization and zero-on-recommit;
+  unsupported backing and contended report/event/uniform publications keep the old path. This closes the
+  protected-page temporary-RW race, not already-writable/unwatched aliases. Cost is extra mappings/VA, not copied backing.
+  Off preserves the original path and logs; device performance and VMA-growth qualification remain pending.
 - Fix shader translation for compute texture gathers with runtime offsets.
   The translator now lowers those offsets before emitting SPIR-V instead of putting runtime values in constants.
   Existing generated shader seeds need replacement to receive the corrected modules.

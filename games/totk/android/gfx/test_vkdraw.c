@@ -1730,16 +1730,36 @@ static void settled_expected(const tex_t *t, uint8_t *expected) {
     }
     free(linear);
 }
+/* Lavapipe imports host memory rather than exporting dma-bufs. A test-only
+   backend attachment supplies a real shared fd's second CPU map so the actual
+   vk_res landing, not a replacement swizzler/store, exercises private aliases. */
+static uint8_t *settled_guest_memory(size_t bytes, int *fd) {
+    const char *setting = getenv("TOTK_WB_ALIAS");
+    *fd = -1;
+    if (setting && !strcmp(setting, "1")) {
+        *fd = memfd_create("totk-wb-alias-fixture", MFD_CLOEXEC);
+        if (*fd < 0 || ftruncate(*fd, bytes)) DIE("write-back alias fixture backing");
+    }
+    return mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+        MAP_SHARED | (*fd < 0 ? MAP_ANONYMOUS : 0), *fd, 0);
+}
+static void settled_guest_alias(uint8_t *memory, size_t bytes, int fd) {
+    if (fd < 0) return;
+    CHECK(vk_wb_test_alias_attach(memory, bytes, fd, 0), "real fd-backed private alias attaches to lavapipe owner");
+    close(fd);
+}
 static int settled_child(int disabled) {
     const char *setting = getenv("TOTK_VK_SETTLED_WB_SUBS");
     unsigned quiet = setting ? (unsigned)strtoul(setting, NULL, 10) : 60;
     CHECK(getenv("TOTK_VK_WRITEBACK") == NULL, "settled fixture never enables synchronous write-back");
     enum { POOL_BYTES = 1 << 20 };
-    uint8_t *memory = mmap(NULL, 2 * POOL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    int alias_fd;
+    uint8_t *memory = settled_guest_memory(2 * POOL_BYTES, &alias_fd);
     if (memory == MAP_FAILED) { perror("settled mmap"); return 1; }
     pool_t pool = {.mem = memory, .size = POOL_BYTES,
         .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
     mtl_init(); mtl_pool_add(memory, 2 * POOL_BYTES); mtl_pool_add(pool.mem, pool.size);
+    settled_guest_alias(memory, 2 * POOL_BYTES, alias_fd);
     nvn_dirty_add_range(memory, 2 * POOL_BYTES);
     tex_t t = {.d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0xd,
         .width = 260, .height = 260, .depth = 1, .levels = 9}, .mem = memory, .pool = &pool, .serial = 73001};
@@ -1750,6 +1770,9 @@ static int settled_child(int disabled) {
     size_t untouched = 0; for (size_t i = 0; i < t.L.size; i++) untouched += memory[i] != 0x39;
     CHECK(!untouched, "GPU rendering initially leaves every guest backing byte untouched");
     mtl_tex_release(&t); /* the write-back reference must keep the image, not its temporary texture object */
+    uint64_t landing_stamp = nvn_dirty_now();
+    nvn_dirty_mp_count mp_before[NVN_DIRTY_MP_REASON_COUNT], mp_after[NVN_DIRTY_MP_REASON_COUNT];
+    nvn_dirty_mp_reason_stats(mp_before);
     settled_idle(quiet + 2); vk_wb_test_stats(after);
     if (!disabled) { settled_wait_landed(before[0] + 1); vk_wb_test_stats(after); }
     if (disabled) {
@@ -1760,6 +1783,12 @@ static int settled_child(int disabled) {
         CHECK(!memcmp(memory, expected, t.L.size), "all nine levels and padding equal the rendered NVN-layout reference without invalidate");
         CHECK(after[0] == before[0] + 1 && after[1] == before[1] + t.L.size && !after[2] && !after[5],
             "exactly one settled rendering lands and releases staging/image record (%llu bytes)", (unsigned long long)t.L.size);
+        CHECK(!nvn_dirty_since(memory, t.L.size, landing_stamp), "GPU landing changes no CPU dirty generation");
+        nvn_dirty_mp_reason_stats(mp_after);
+        if (vk_wb_alias_enabled()) CHECK(
+            mp_after[NVN_DIRTY_MP_GPU_WRITE].calls == mp_before[NVN_DIRTY_MP_GPU_WRITE].calls &&
+            mp_after[NVN_DIRTY_MP_RESTORE].calls == mp_before[NVN_DIRTY_MP_RESTORE].calls,
+            "private-alias nine-level landing emits zero guest GPU unprotect/restore calls");
         uint64_t tile[6], tile_after[6], sync_before[7], sync_after[7]; vk_wb_test_tile(&t, tile);
         CHECK(tile[0] && tile[0] == tile[1] && tile[3] == t.serial,
             "tile evidence retains the exact landed GPU version/serial after the pending record is dropped");
@@ -2645,11 +2674,14 @@ static void settled_race_wait(_Atomic int *flag, const char *what) {
 static int settled_race(void) {
     enum { POOL_BYTES = 1 << 20, ITERATIONS = 128 };
     unsetenv("TOTK_VK_WRITEBACK"); unsetenv("TOTK_VK_OFF"); setenv("TOTK_VK_SETTLED_WB_SUBS", "2", 1);
-    uint8_t *memory = mmap(NULL, 2 * POOL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    int alias_fd;
+    uint8_t *memory = settled_guest_memory(2 * POOL_BYTES, &alias_fd);
     if (memory == MAP_FAILED) { perror("settled race mmap"); return 1; }
     pool_t pool = {.mem = memory, .size = POOL_BYTES,
         .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
     mtl_init(); mtl_pool_add(memory, 2 * pool.size); mtl_pool_add(memory, pool.size); nvn_dirty_add_range(memory, 2 * pool.size);
+    settled_guest_alias(memory, 2 * pool.size, alias_fd);
+    int private_alias = vk_wb_alias_enabled();
     tex_t t = {.d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0xd,
         .width = 8, .height = 8, .depth = 1, .levels = 1}, .mem = memory + 128, .pool = &pool, .serial = 74000};
     nvn_tex_layout(&t.d, &t.L);
@@ -2682,7 +2714,8 @@ static int settled_race(void) {
                 .value = (uint8_t)(0x60 + iteration % 31), .before = (uint8_t)(0xa0 + iteration % 31),
                 .after = (uint8_t)(0x20 + iteration % 31)};
             if (pthread_create(&write_thread, NULL, settled_race_write, &writer)) DIE("settled race writer thread");
-            if (phase == NVN_DIRTY_TEST_WB_PROTECTED) {
+            if (phase == NVN_DIRTY_TEST_WB_PROTECTED || (private_alias &&
+                (phase == NVN_DIRTY_TEST_WB_BEFORE_FRESHNESS || phase == NVN_DIRTY_TEST_WB_AFTER_FRESHNESS))) {
                 settled_race_wait(&handoff.faults, "writer actually faults on the still-read-only BUSY page");
                 CHECK(!atomic_load_explicit(&writer.done, memory_order_acquire), "already-faulted writer cannot pass BUSY ownership");
             } else {
@@ -2702,7 +2735,8 @@ static int settled_race(void) {
             }
             for (unsigned i = 0; i < 64; i++) adjacent_bad += memory[i] != 0x42;
             CHECK(!adjacent_bad, "landing never touches either adjacent same-page range or its outer guard");
-            int residual = phase == NVN_DIRTY_TEST_WB_BEFORE_FRESHNESS || phase == NVN_DIRTY_TEST_WB_AFTER_FRESHNESS;
+            int residual = !private_alias &&
+                (phase == NVN_DIRTY_TEST_WB_BEFORE_FRESHNESS || phase == NVN_DIRTY_TEST_WB_AFTER_FRESHNESS);
             if (residual) {
                 /* Stores are deliberately ordered before resuming swizzle: this demonstrates the coherency hole
                    itself, without an undefined C data race or a TSan suppression masking it. */
@@ -2713,7 +2747,7 @@ static int settled_race(void) {
                 CHECK(!texture_bad, "CPU bytes survive the protocol's guaranteed interleaving");
                 CHECK(phase == NVN_DIRTY_TEST_WB_BEFORE_OWNERSHIP ?
                     after[0] == before[0] && after[3] == before[3] + 1 :
-                    phase == NVN_DIRTY_TEST_WB_PROTECTED ?
+                    phase != NVN_DIRTY_TEST_WB_RESTORED ?
                     after[0] - before[0] + after[3] - before[3] == 1 :
                     after[0] == before[0] + 1 && after[3] == before[3],
                     "CPU-before-ownership rejects; fault under RO may cancel before freshness or store last; restored writer stores last");

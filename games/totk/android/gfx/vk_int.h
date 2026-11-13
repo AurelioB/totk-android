@@ -517,7 +517,32 @@ void vk_wb_stats(void);                          /* present's 300-frame summary 
 uint64_t vk_wb_pool_identity(const pool_t *pool, const void *address, uint64_t size);
 int vk_wb_pool_lock(uint64_t identity, const void *address, uint64_t size);
 void vk_wb_pool_unlock(void);
+/* Exact startup opt-in; no lazy initialization. The locked APIs require a successful vk_wb_pool_lock
+   (or equivalent g_pool_mu ownership), retained through every store using the returned pointer.
+   Span returns at most requested bytes, clipped at the next owner/virtual-alias transition; a NULL
+   span may describe an unsupported gap in *available. Range requires every byte to be supported. */
+int vk_wb_alias_enabled(void);
+void *vk_wb_alias_span_locked(uintptr_t guest, size_t requested, size_t *available);
+int vk_wb_alias_range_locked(uintptr_t guest, size_t size);
 #ifdef TOTK_VK_TESTS
+/* Synthetic registry fixtures: init requires an empty registry and parses the exact startup switch without
+   creating Vulkan. Guest mappings are caller-owned and already share fd/offset before owner/attach.
+   Returned registration identities work with vk_wb_pool_lock. Remove restores owned guest pages and unmaps
+   the private alias under that same lock. View/map replace caller-owned page-aligned guest mappings. */
+void vk_wb_test_alias_init(void);
+uint64_t vk_wb_test_alias_owner(void *guest, size_t size, int fd, uint64_t offset);
+uint64_t vk_wb_test_alias_view(void *guest, size_t size, void *owner_guest, uint64_t owner_offset);
+uint64_t vk_wb_test_alias_virtual(void *guest, size_t size);
+int vk_wb_test_alias_map(void *virtual_guest, size_t virtual_offset, void *owner_guest, size_t owner_offset, size_t size);
+/* Replace a virtual subrange with fresh anonymous pages and remove its alias metadata. */
+int vk_wb_test_alias_unmap(void *virtual_guest, size_t virtual_offset, size_t size);
+int vk_wb_test_alias_registry_trylock(void); /* success means acquired and immediately released */
+void vk_wb_test_alias_remove(void *guest);
+void vk_wb_test_alias_memory(uint64_t out[2]); /* private mapping count/bytes */
+/* Site2 production selector; contention uses a whole-operation legacy store without registry ownership. */
+int vk_wb_test_alias_store(void *guest, const void *data, size_t size, int event32, int add32, int guarded);
+/* Actual HOST-import K_OWN only in tests: shared guest fd mapping must predate mtl_pool_add. */
+int vk_wb_test_alias_attach(void *guest, uint64_t size, int fd, uint64_t offset);
 void vk_wb_test_stats(uint64_t v[7]); /* landed, bytes, pending, CPU skips, superseded, staging bytes, copies */
 void vk_wb_test_memory(uint64_t v[5]); /* record capacity bytes, history bytes, pinned image bytes, WB-only bytes, histories */
 void vk_wb_test_history(const tex_t *t, uint64_t v[2]); /* storage landings and next quiet interval */

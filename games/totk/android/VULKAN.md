@@ -3320,6 +3320,7 @@ eligible consumers below50ms without weakening an unfinished producer's completi
 | `TOTK_VK_SETTLED_WB_DETAIL=1` | At most 64 `[settledwb]` lines per 300-frame window: shape/format/levels, serial/storage/pool, guest/image bytes, storage landing count, old/next quiet interval, idle/invalidate cause. |
 | `TOTK_VK_WB_SERVICE_STATS=1` | Default OFF. Every300presents: recording-lock hold max/peak and owner-service delay p50/p99 upper bounds/max (100µs histogram bins, overflow uses max); no idle opcode clocks/locks. |
 | `TOTK_VK_WRITEBACK=1` | Select full legacy invalidate flush/authority behavior, default off; not required for fresh default explicit consumers. `TOTK_VK_OFF=writeback` disables only this legacy path. |
+| `TOTK_WB_ALIAS=1` | Experimental, launch-only, default OFF; only exact `1` enables it. Retain one backend-private RW mapping per dma-buf-backed owner and land supported dirty-tracked extents through it without temporarily making protected guest pages writable. Unset/other values preserve the original path and logs. |
 | `TOTK_VK_OFF=settledbackoff` | Disable learned history; use the base quiet interval for every rendering. |
 | `TOTK_VK_OFF=settledinval` | Disable default explicit-consumer landing at all ages; keep ordinary automatic settled copies. |
 | `TOTK_VK_OFF=settleddrain` | Diagnostic only: omit frontend drain for a matched default consumer; may weaken queued-command ordering. |
@@ -3359,9 +3360,10 @@ the later eight-run qualification includes the resumable1MiB/~2ms landing budget
 or its hybrid/native-interpolation interaction. See `DEBUGGING.md`; host coverage alone does not qualify that combination.
 Run `vkdrawtest --settled-wb-race` for the concurrent landing boundary test: 128 trials each before ownership,
 faulted under still-RO BUSY ownership, temporary RW before/after freshness, and after RO restoration; every writer
-stores 256 rounds into texture bytes and both adjacent same-page guards. The three protected/stamped cases must
-preserve CPU bytes; the two temporary-RW cases intentionally demonstrate residual overwrite without dirty publication.
-All adjacent guards must stay intact. Test-only handoffs do not exist in shipping code.
+stores 256 rounds into texture bytes and both adjacent same-page guards. With aliases off or unsupported backing,
+the three protected/stamped cases must preserve CPU bytes; the two temporary-RW cases intentionally demonstrate
+residual overwrite without dirty publication. All adjacent guards must stay intact. Test-only handoffs do not
+exist in shipping code. The opt-in alias path below removes that temporary-RW window only for protected guest pages.
 
 Run `vkdrawtest --settled-wb-learning` for 64 prompt RG8 tiles, 40 intermittent refreshes/new serials without recurring
 automatic copies, default invalidate before learned deadlines/reuse of staged data, CPU overwrite, fresh rendering,
@@ -3384,6 +3386,59 @@ one unbounded draw-free jump stream, proving no draw/return/submit is needed. Ru
 `TOTK_VK_TEST_OWNER_PENDING=1` adds real no-op owner requests and reports their completed count.
 Run `--settled-wb-budget` for partial >10MiB landings, byte/yield accounting, complete invalidate and CPU/GPU/pool
 cancellation between chunks, plus a point-address swizzle oracle covering2D/array/3D/linear layouts and padding.
+
+### Private write-back aliases (`TOTK_WB_ALIAS=1`, experimental)
+
+This does not enable write-back or frame lag; their existing policies remain in force. It retains the original
+temporary `MAP_SHARED`, `PROT_READ | PROT_WRITE` mapping made when each `K_OWN` dma-buf is populated, instead of
+unmapping it. Guest and private mappings use the same fd, offsets and exporter-selected memory attributes.
+`K_VIEW` and mapped `K_VIRT` ranges resolve to that owner plus the real backing offset. The pool registry lock
+pins backing through the last store and dirty-token end; deletion/remapping cannot recycle an alias mid-landing.
+Cross-owner landings split at every backing transition. The span encoder receives pointers inside each real
+mapping, handles arbitrary byte-clipped splits and leaves padding untouched, without another staging allocation.
+
+For a texture landing extent, **all** bytes must have supported backing and dirty tracking before selecting aliases;
+mixed, untracked, host-import or CPU-only extents retain the whole extent's original protocol. Report, event and
+uniform publications attempt the same backing pin with a nonblocking registry trylock, then use per-owner spans
+and the old store path for unsupported segments. On registry contention they immediately use the exact original
+whole-operation store without borrowing an alias pointer; that fallback may still change guest protections.
+This avoids a pool-deletion/completion lock cycle without changing the original lifetime/order protocol.
+An event's 32-bit assignment/addition is not split between owners; this adds no atomicity to the original operation.
+
+Alias ownership retains the existing reader tickets/unit gates, `PG_BUSY`, watch and generation checks, including
+freshness **after** ownership. A protected guest page stays RO throughout: a fresh direct CPU store faults and
+waits, then publishes the normal CPU dirty generation after alias ownership ends, preserving that CPU write.
+Alias stores themselves publish no CPU dirty generation; end restores `PG_PROT` state without `mprotect`.
+Alias gate acquisition also avoids the lag-only VMA-pressure drain that could otherwise open a guest RW window.
+This closes the documented temporary-RW race for those protected guest pages, **not** every already-writable page
+or unwatched writable alias of the same backing. Unsupported/contended fallback retains its old residual window.
+Runtime commit/decommit, zero-on-recommit and ordinary CPU-write/fault behavior are unchanged; the private pointer
+is not guest commitment authority and is never registered as a guest dirty range.
+
+Cost: one additional live VMA and owner-sized virtual-address extent per retained mapping, plus mapping/page-table
+overhead, not another pool-sized physical/RSS backing allocation. Procfs RSS accounting may count the same resident
+pages through multiple mappings; the reported alias byte count is mapped VA, not extra physical memory.
+This avoids these write-back permission flips, not all dirty-tracker/runtime `mprotect` calls, existing fragments
+or every source of VMA growth. It is not a replacement for mapping-pressure safeguards.
+
+**Cache/coherency:** on arm64, two CPU mappings of the same physical pages with identical memory type, cacheability
+and shareability need no additional CPU-alias cache maintenance. RO versus RW access permission is independent.
+Cached versus write-combined attributes must match; same-fd shared mappings preserve the exporter's selection.
+[AOSP system heap](https://android.googlesource.com/kernel/common/+/refs/heads/android14-6.1/drivers/dma-buf/heaps/system_heap.c)
+uses `pgprot_writecombine` only for its `uncached` buffers; published
+[QCOM mapping](https://github.com/OnePlusOSS/android_kernel_oneplus_sm8550/blob/c462ef8ffab7a58e035ee04705b16cdfced494b1/drivers/dma-buf/heaps/qcom_sg_ops.c)
+does likewise. Both inspected implementations select cached `system` heaps separately from their uncached heaps.
+The bundled Turnip KGSL shared-allocation path uses the system-heap fd, not its separate native-KGSL cachemode flags.
+These are source facts, **not proof of the actual Odin vendor exporter/kernel identity**.
+[Arm's alias-attribute requirements](https://documentation-service.arm.com/static/63a43e333f28e5456434e18b)
+do not eliminate CPU/GPU coherency, fences, barriers or cache synchronization: all existing device synchronization
+remains required and unchanged. See `.scratch/perf/map-limit/wb-alias/design.md` for the source-selection analysis.
+
+Enabled startup adds `[nvn-vk] write-back alias: enabled (TOTK_WB_ALIAS=1); backend-private RW dma-buf mapping per owned pool; host-import/CPU ranges use existing path`.
+The existing memory report additionally emits `[nvn-vk] memory write-back aliases: mappings N, bytes B (backend-private RW dma-buf; not guest pools)`,
+where N/B are current live retained mappings/page-rounded owner bytes. These are not guest-pool counts.
+Off adds neither line and leaves existing logs unchanged. The earlier eight-run settled-write-back qualification
+above predates this switch; it is not alias-path device evidence or a frame-rate/VMA-reduction guarantee.
 
 ## Finding rendering errors: the frame dump
 
