@@ -81,13 +81,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   variants arrive when the user runs the full shader rebuild. Upstream's new compressed pipeline-row and
   recipe-row formats are not imported.
 - Enable exact integer shader-address folding by default (`TOTK_VK_INT_FOLD=0` turns it off).
-  It removes provably unnecessary uniform-component selection without changing floating-point math or guards.
   Earlier tests reduced total native shader instructions by 6.58%; capped GPU-work estimates fell about
   2.3% on Duo and 4–5% on Odin (not confirmed battery savings), while Thor throughput stayed the same.
   Odin's uncapped standing sample rose from
   61.93 to 63.81 fps; these are workload-specific results, not a general frame-rate promise.
-  The first launch after updating rebuilds driver pipelines as they are needed, so loading or traversal may
-  stutter once. Existing shader seeds remain usable; no full shader import is needed.
+  Device check: pending
 
 ### Menu
 - Add **Unlimited** to Frame rate: variable real-game updates up to the existing 120 fps safety ceiling, with

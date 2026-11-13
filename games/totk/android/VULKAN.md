@@ -3027,6 +3027,11 @@ Host checks: `python3 -m unittest discover -s tests -p test_vk_position.py -v`; 
 The requested and effective policy is logged once. It folds only proven scalar integer bits, preserving
 byte-offset wraparound, FP/NaN guards, bounds and stage outputs. Same-block non-aliased Function locals
 carry alignment proofs into UBO component selection; unknown control-flow facts are discarded.
+Direct/group `RelaxedPrecision` values and decorated locals supply no exact-bit facts; any decorated result
+keeps its original opcode, including `NoSignedWrap` / `NoUnsignedWrap`. This avoids changing permitted reduced
+precision or leaving opcode-specific decorations on `OpCopyObject`. Per-block generation stamps and a
+constant lookup index replace bound-sized clears/searches; the lowest already-seen same-type constant ID
+is still selected. No index or proof allocation occurs in the off arm.
 The pass runs on each loaded module immediately before `vkCreateShaderModule`, after the existing runtime
 patches; it does not change translator outputs, shared variant hashes, reflection, or packed seed bytes.
 Keep seeds unfurled for both arms. Existing seeds and fresh-install packs remain usable without regeneration.

@@ -1769,6 +1769,8 @@ the script checks `run-as` before creating an export and reports the limitation 
 To export data while preserving it, install a dev APK signed with the same key over the release APK **without
 uninstalling**, run the export, then install the release APK again if wanted. Do not uninstall between builds: that
 deletes app data, including saves. Both builds must use the same signing key for an in-place update.
+`cache-import FILE...` only stages public import files and still works with a release APK; it does not use `run-as`.
+Keep each exported cache's original basename: the suffix, not the host's environment, identifies its shader-policy arm.
 
 ### November 11 list-only shader update
 
@@ -5607,9 +5609,26 @@ capture-correctness rule. Dimension-based policy is conservative inference, not 
 lifetime oracle: verify persistent Gerudo lighting and actual target traces before attributing
 a capture-sync label to a real cached probe.
 
-The cache lives in the app's private storage (`state/vk-pipeline-cache.bin`) and grows as you play.
-`sh install_app.sh cache-export` copies it to the computer; `sh install_app.sh cache-import FILE` gives it to the app
-(on this or another device), which merges it at its next start and renames the file to `vk-pipeline-cache.bin.imported`.
+At the standard base, the cache grows in private app storage as `state/vk-pipeline-cache.bin<namespace>`.
+Default-on integer folding appends `.intfold-v1`; only exact `TOTK_VK_INT_FOLD=0` keeps the unsuffixed off-arm name.
+An alternate seed's folder/content hash and any `.pos-v1-10`, `.pos-v1-01` or `.pos-v1-11` precision suffix come
+before `.intfold-v1`. `sh install_app.sh cache-export` copies **all existing recognized cache names** from private
+`files/state` into a new `cache-export-<date>-<pid>/` folder on the computer. Basenames and bytes, including the
+context envelope, stay unchanged; stale/imported/temp files and graphics-key/resume sidecars are not exported.
+
+`sh install_app.sh cache-import FILE...` stages one or more such files in the standard external game folder,
+under each file's **unchanged basename**, including on a release APK. The runtime consumes only its exact selected
+namespace, validates context, and renames a successfully merged file to `<selected path>.imported`.
+An opposite integer-fold arm is left unconsumed with a startup diagnostic; it is never promoted into the selected arm.
+The script does not infer the phone's configuration from host variables or execute `totk.env`. It accepts only the
+standard basename grammar, including the existing seed/position suffixes. Timestamp-renamed old exports have lost
+that filename provenance and are refused; never relabel an off-arm cache as `.intfold-v1`, even for the same driver.
+
+These convenience handlers cover the standard private cache and external import bases. Custom
+`TOTK_VK_PIPELINE_CACHE` / `TOTK_VK_PIPELINE_CACHE_IMPORT` bases or another selected game-data folder still require
+manual transfer to the runtime-selected full paths, retaining the complete seed/position/fold namespace. No automatic
+path discovery or compatibility fallback is promised for those overrides.
+
 Both primary and import paths validate the same **app context envelope**: exact effective `TU_DEBUG` string
 (unset and empty normalize to empty), SHA256 of the actual private copied `driver.so` when selected, and
 the opaque Vulkan payload's vendor/device/cache UUID. Context is captured after `totk.env`, the A722 default
@@ -5717,8 +5736,9 @@ MAY-read is conservative, not a shader texel-fetch measurement; double-buffered 
 neither transience nor history. No half/quarter classification relaxation follows merely from dimensions.
 No extra game-derived seed/cache payload is required by this change. The APK carries the native saver code; existing
 shader provisioning remains `sh install_app.sh data` (or `data-packed` with its existing packed-seed prerequisites).
-The cache is learned in private app storage; optional same-driver `cache-import FILE` remains supported. Never commit
-or redistribute the generated cache/seed/game data with this code.
+The cache is learned in private app storage; optional same-driver `cache-import FILE...` remains supported at the
+standard import base, preserving each exported namespace basename as described above. Never commit or redistribute
+the generated cache/seed/game data with this code.
 
 `TOTK_PSO_COLLECT=1` records all successful graphics pipeline keys (screen, capture, async and
 cache hits) off the render thread through the existing pcache saver. Collections are portable
