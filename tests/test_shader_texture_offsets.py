@@ -67,7 +67,7 @@ class TextureOffsetTests(unittest.TestCase):
     def translate(self, name, **kwargs):
         job = dict(key=name, stage='cs', code_hex=guest_code(**kwargs).hex(), c1='',
                    local=[1, 1, 1], shared=4, depth_minus_w=True, gather_bias=True,
-                   tex={'0': '2d'})
+                   tex={'0': '2d'}, softfloat64=True)
         result = subprocess.run([self.translator, '--serve'],
                                 input=json.dumps(dict(job=job, out=str(self.work))) + '\n',
                                 capture_output=True, text=True, timeout=60)
@@ -77,6 +77,14 @@ class TextureOffsetTests(unittest.TestCase):
         validation = subprocess.run(['spirv-val', '--target-env', 'vulkan1.2', str(path)],
                                     capture_output=True, text=True, timeout=30)
         self.assertEqual(validation.returncode, 0, validation.stdout + validation.stderr)
+        # This FP32 fixture must not require shaderFloat64 on the Vulkan device.
+        words = struct.unpack('<' + 'I' * (path.stat().st_size // 4), path.read_bytes())
+        index = 5
+        while index < len(words):
+            count, opcode = words[index] >> 16, words[index] & 0xffff
+            if opcode == 17:  # OpCapability
+                self.assertNotEqual(words[index + 1], 10, 'unexpected Float64 capability')
+            index += count
         return path, json.loads((self.work / (name + '.res.json')).read_text())
 
     def test_runtime_single_and_per_texel_offsets_validate(self):
@@ -102,8 +110,10 @@ class TextureOffsetTests(unittest.TestCase):
         result = subprocess.run(args, env=dict(os.environ, VK_ICD_FILENAMES=str(icds[0])),
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('Validation Error', result.stdout + result.stderr)
         self.assertIn('32/32 exact results (8 inputs x 4 components)', result.stdout)
         print(result.stdout.strip())
+        print(result.stderr.strip())
 
 
 if __name__ == '__main__':

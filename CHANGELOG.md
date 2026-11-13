@@ -33,6 +33,7 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 - Fix shader translation for compute texture gathers with runtime offsets.
   The translator now lowers those offsets before emitting SPIR-V instead of putting runtime values in constants.
   Existing generated shader seeds need replacement to receive the corrected modules.
+  Replace seeds while the game is stopped; stale loose shader files must not override the corrected pack.
 - Enable the companion's opaque cover by default on devices with a built-in second screen;
   `TOTK_COMPANION_COVER=0` turns it off. A companion window alone does not make Android stop the app
   underneath it; an opaque activity does. Tested only with the Cocoon launcher: it was stopped in every
