@@ -1,8 +1,11 @@
-"""Production dirty/alias ownership with real memfd and optional i915 GEM VMAs.
+"""Production dirty/alias ownership and real MapVirtual replacement integration.
 
 Run normally, or with WB_ALIAS_TEST_CFLAGS='-fsanitize=thread -fno-omit-frame-pointer'
 for fully instrumented fixtures (including nvn_vk.c/nvn_dirty.c), no suppressions.
 Artifacts stay below the checkout's enclosing .scratch, never in /tmp.
+The backend links totk_vpool.c directly: anonymous replacements, overlapping
+last writers, mremap fallback, fatal partial failure and pinned remap/unmap
+threads all use production operations, not synthetic alias metadata repairs.
 """
 from pathlib import Path
 import os
@@ -52,14 +55,16 @@ class WritebackAlias(unittest.TestCase):
         ]
         sources = {
             'dirty': [FIXTURE / 'probe.c'],
-            'backend': [FIXTURE / 'backend.c', TOTK / 'android/gfx/nvn_vk.c'],
+            'backend': [FIXTURE / 'backend.c', TOTK / 'android/gfx/nvn_vk.c',
+                        TOTK / 'third_party/d2r_gfx/gfx/nvn/totk_vpool.c'],
             'swizzle': [FIXTURE / 'swizzle.c',
                         TOTK / 'third_party/d2r_gfx/gfx/nvn/nvn_tex.c',
                         TOTK / 'third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c'],
         }
         for name, paths in sources.items():
             executable = cls.directory / name
-            command = [*compiler, *flags, *(str(p) for p in paths),
+            fixture_flags = ['-DTOTK_VK_ALIAS_FIXTURE=1'] if name == 'backend' else []
+            command = [*compiler, *flags, *fixture_flags, *(str(p) for p in paths),
                        '-Wl,--gc-sections', '-pthread', '-ldl', '-lm',
                        '-o', str(executable)]
             result = subprocess.run(command, env=build_environment, capture_output=True,
@@ -122,6 +127,28 @@ class WritebackAlias(unittest.TestCase):
                 self.assertIn('SITE2 PASS uncontended same-thread-trylock second-thread-trylock', result.stdout)
                 self.assertIn('LIFETIME PASS pinned-token removal-excluded', result.stdout)
                 self.assertEqual('write-back alias: enabled' in result.stderr, switch == '1')
+
+    def test_production_mapvirtual_replacement_contents(self):
+        for lag in ('0', '1'):
+            digests = []
+            for switch in ('0', '1'):
+                with self.subTest(lag=lag, alias=switch):
+                    result = self.run_fixture('backend', switch, lag=lag)
+                    for marker in (
+                        'MAPVIRTUAL_ANONYMOUS PASS real-batch two-batch fresh-zero current-guest',
+                        'donor-untouched other-alias resolver-hole',
+                        'MAPVIRTUAL_FALLBACK PASS real-mremap unsupported-current-source',
+                        'MAPVIRTUAL_REBACK PASS owner-destroy stale-identity same-VA-new-fd',
+                        'MAPVIRTUAL_PARTIAL PASS real-private-source-EINVAL fatal-batch conservative-authority',
+                        'PINNED_MAPVIRTUAL PASS real-remap real-unmap admission-blocked',
+                    ):
+                        self.assertIn(marker, result.stdout)
+                    digest = re.search(r'MAPVIRTUAL_CONTENTS digest=([0-9a-f]+)', result.stdout)
+                    if digest is None:
+                        self.fail('missing complete production mapping content digest: ' + result.stdout)
+                    digests.append(digest.group(1))
+            if len(digests) == 2:  # a failed subtest already reports its fixture failure
+                self.assertEqual(digests[0], digests[1], 'off/on real MapVirtual guest/donor/other-alias contents differ')
 
     def test_i915_nonmerging_guest_rows(self):
         digests = []

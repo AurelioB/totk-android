@@ -40,6 +40,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   unsupported backing and contended report/event/uniform publications keep the old path. This closes the
   protected-page temporary-RW race, not already-writable/unwatched aliases. Cost is extra mappings/VA, not copied backing.
   Off preserves the original path and logs; device performance and VMA-growth qualification remain pending.
+- Correct the experimental private writer's virtual-mapping authority across production MapVirtual replacements,
+  including anonymous unmaps and fallback remaps; serialize replacement and invalidation with borrowed writers.
+  Watch-slot-exhausted synchronous records keep the original no-token guest-store path rather than bypass ownership.
 - Fix shader translation for compute texture gathers with runtime offsets.
   The translator now lowers those offsets before emitting SPIR-V instead of putting runtime values in constants.
   Existing generated shader seeds need replacement to receive the corrected modules.

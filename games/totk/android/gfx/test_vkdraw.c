@@ -1748,6 +1748,55 @@ static void settled_guest_alias(uint8_t *memory, size_t bytes, int fd) {
     CHECK(vk_wb_test_alias_attach(memory, bytes, fd, 0), "real fd-backed private alias attaches to lavapipe owner");
     close(fd);
 }
+/* Exhaust the real watch registry, not a substituted tracked flag. Full
+   synchronous invalidate still admits this record, but must keep the legacy
+   guest destination because no recorded watch/ownership eligibility exists. */
+static int wb_alias_watch_exhaustion(void) {
+    enum { POOL_BYTES = 2 << 20, WATCHES = 4096 };
+    setenv("TOTK_VK_WRITEBACK", "1", 1); setenv("TOTK_VK_OFF", "settledwb", 1);
+    int fd; uint8_t *memory = settled_guest_memory(POOL_BYTES, &fd);
+    if (memory == MAP_FAILED) DIE("watch exhaustion mapping");
+    pool_t pool = {.mem = memory, .size = POOL_BYTES,
+        .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    mtl_init(); mtl_pool_add(memory, pool.size); settled_guest_alias(memory, pool.size, fd);
+    nvn_dirty_add_range(memory, pool.size);
+    tex_t texture = {.d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0xd,
+        .width = 8, .height = 8, .depth = 1, .levels = 1}, .mem = memory + 128, .pool = &pool, .serial = 75500};
+    nvn_tex_layout(&texture.d, &texture.L);
+    memset(memory, 0x39, pool.size);
+    uint8_t *expected = malloc(texture.L.size); settled_expected(&texture, expected);
+    void **watches = calloc(WATCHES, sizeof *watches); unsigned used = 0;
+    uint64_t stamp = nvn_dirty_now();
+    for (; used < WATCHES; used++) {
+        watches[used] = nvn_dirty_wb_watch(memory + (1 << 20), 1, stamp);
+        if (!watches[used]) break;
+    }
+    CHECK(used == WATCHES, "all 4096 real watch slots held");
+    void *extra = nvn_dirty_wb_watch(texture.mem, texture.L.size, stamp);
+    CHECK(!extra, "target cannot allocate a rendering watch when slots exhausted");
+    nvn_dirty_wb_unwatch(extra);
+    nvn_dirty_protect(texture.mem, texture.L.size);
+    settled_render(&texture);
+    CHECK(mtl_wait(run(), 5000000000ull), "watch-exhausted GPU producer completes");
+    uint64_t before[7], after[7], faults0, preps0, faults1, preps1;
+    vk_wb_test_stats(before); nvn_dirty_stats(&faults0, &preps0); stamp = nvn_dirty_now();
+    mtl_pool_invalidate(&pool, (uint64_t)(texture.mem - memory), texture.L.size);
+    nvn_dirty_stats(&faults1, &preps1); vk_wb_test_stats(after);
+    CHECK(before[2] == 1 && !after[2] && !after[5], "full synchronous invalidate consumes the no-watch record and staging");
+    CHECK(!memcmp(texture.mem, expected, texture.L.size), "no-watch legacy landing retains exact contents and padding");
+    CHECK(faults1 > faults0 && nvn_dirty_since(texture.mem, texture.L.size, stamp),
+        "no-token landing uses protected guest VA and ordinary fault/generation path, never unowned private alias");
+    CHECK(!nvn_dirty_wb_written(watches[0]), "unrelated exhausted-slot watch remains armed");
+    uint64_t latest = nvn_dirty_now(); lag_guest_store(texture.mem, texture.mem[0]);
+    CHECK(nvn_dirty_now() == latest, "legacy no-token landing leaves originally faulted destination writable");
+    for (unsigned i = 0; i < used; i++) nvn_dirty_wb_unwatch(watches[i]);
+    free(watches); free(expected); mtl_tex_release(&texture);
+    nvn_dirty_remove_range(memory); mtl_pool_del(memory); munmap(memory, pool.size);
+    printf("%s: watch-exhausted synchronous landing alias=%d slots=%u checks=%d failed=%d\n",
+        fails ? "FAILED" : "ok", vk_wb_alias_enabled(), used, checks, fails);
+    return fails != 0;
+}
+
 static int settled_child(int disabled) {
     const char *setting = getenv("TOTK_VK_SETTLED_WB_SUBS");
     unsigned quiet = setting ? (unsigned)strtoul(setting, NULL, 10) : 60;
@@ -2839,6 +2888,7 @@ static int nativeui_geometry(void) {
 #endif
 }
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--wb-alias-watch-exhaustion")) return wb_alias_watch_exhaustion();
     if (argc == 2 && !strcmp(argv[1], "--nativeui-geometry")) return nativeui_geometry();
     if (argc == 2 && !strcmp(argv[1], "--settled-wb-service")) return settled_service();
     if (argc == 2 && !strcmp(argv[1], "--settled-wb-budget")) return settled_budget();

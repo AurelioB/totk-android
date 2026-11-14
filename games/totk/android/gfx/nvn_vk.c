@@ -12,9 +12,13 @@
      heap    a dma-buf from /dev/dma_heap, imported, mmap'd the same way
    With export / heap, registering a pool moves its contents into the dma-buf and maps the dma-buf at the same address,
    so the game keeps its pointers; removing the pool moves the contents back into ordinary shared memory. Virtual pools
-   (totk_vpool.c) alias physical pool pages with a second mmap of the dma-buf (mtl_pool_alias).
+   (totk_vpool.c) alias physical pool pages with a second dma-buf mmap; enabled private writers share
+   one locked replacement/release path with those guest mapping syscalls (mtl_vpool_replace/release).
 
    The driver is the system one, or the file named by TOTK_VK_DRIVER (a Turnip build, android/gfx/vk_load.h). */
+#if defined(TOTK_VK_ALIAS_FIXTURE) && !defined(TOTK_VK_TESTS)
+#error "TOTK_VK_ALIAS_FIXTURE requires TOTK_VK_TESTS"
+#endif
 #include <malloc.h>
 #include "vk_int.h"
 #include "vk_record.h"
@@ -958,7 +962,18 @@ static void vk_init_once(void) {
          V.has_bc ? "yes" : "no", V.has_custom_border ? "yes" : "no", V.has_index_u8 ? "yes" : "no", V.has_null_descriptor ? "yes" : "no");
 }
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
-void mtl_init(void) { pthread_once(&g_once, vk_init_once); }
+#ifdef TOTK_VK_TESTS
+static int g_wb_test_registry;
+static void (*g_wb_test_replace_hook)(void *);
+static void *g_wb_test_replace_opaque;
+#endif
+void mtl_init(void) {
+#ifdef TOTK_VK_ALIAS_FIXTURE
+    if (!g_wb_test_registry) DIE("alias fixture requires explicit registry initialization");
+#else
+    pthread_once(&g_once, vk_init_once);
+#endif
+}
 
 /* ---------- dma-buf heap ---------- */
 struct dma_heap_alloc { uint64_t len; uint32_t fd, fd_flags; uint64_t heap_flags; };
@@ -983,6 +998,7 @@ typedef struct pool_ent {
     uint8_t *wb_alias;             /* backend-private RW dma-buf mapping; never a registered guest range */
     uint64_t identity;             /* registration lifetime, not a guest pool object's reusable address */
     struct pool_ent *owner; uint64_t off;   /* VIEW: owner pool, offset of base in owner's buffer */
+    int guest_unknown;            /* enabled: this guest mapping was replaced; owner buffer can still serve aliases */
 #ifdef TOTK_VK_TESTS
     int test_backing; uint64_t test_fd_offset;   /* synthetic fd-backed registry fixtures, no Vulkan objects */
 #endif
@@ -1011,6 +1027,68 @@ static pool_ent *own_containing(uintptr_t a, uintptr_t b) {   /* caller holds g_
 static int own_overlapping(uintptr_t a, uintptr_t b) {
     for (int i = 0; i < g_npool; i++) { pool_ent *p = g_pools[i]; if (p->kind == K_OWN && a < p->end && b > p->base) return 1; }
     return 0;
+}
+static void alias_replace(uintptr_t va, uintptr_t end, pool_ent *owner, uint64_t off);
+/* Replacing any part loses the whole physical/view guest proof. This deliberately permits false
+   negatives: the retained owner fd/private writer is still valid for separately recorded aliases. */
+static void guest_mapping_unknown(uintptr_t va, uintptr_t end) {
+    if (!g_wb_alias_enabled) return;
+    int changed = 0;
+    for (int i = 0; i < g_npool; i++) {
+        pool_ent *p = g_pools[i];
+        if ((p->kind == K_OWN || p->kind == K_VIEW) && va < p->end && end > p->base && !p->guest_unknown) {
+            p->guest_unknown = 1; changed = 1;
+        }
+    }
+    if (changed) span_changed();
+}
+static void mapping_forget(uintptr_t va, uintptr_t end) {
+    if (!g_wb_alias_enabled) return;
+    guest_mapping_unknown(va, end);
+    alias_replace(va, end, NULL, 0);
+}
+/* Current guest-map proof, not merely an allocation containing the address. All callers hold
+   g_pool_mu. An unrecorded virtual byte cannot fall through to an overlapping physical owner. */
+static pool_ent *mapped_owner(uintptr_t guest, uintptr_t *end, uint64_t *off) {
+    for (int i = 0; i < g_nalias; i++) {
+        const alias_ent *a = &g_alias[i];
+        if (guest >= a->va && guest < a->end) {
+            if (a->end < *end) *end = a->end;
+            *off = a->off + (guest - a->va);
+            return a->owner;
+        }
+        if (a->va > guest && a->va < *end) *end = a->va;
+    }
+    for (int i = 0; i < g_npool; i++) {
+        const pool_ent *p = g_pools[i];
+        if (p->kind != K_VIRT) continue;
+        if (guest >= p->base && guest < p->end) {
+            if (p->end < *end) *end = p->end;
+            return NULL;
+        }
+        if (p->base > guest && p->base < *end) *end = p->base;
+    }
+    for (int i = 0; i < g_npool; i++) {
+        pool_ent *p = g_pools[i];
+        if (p->kind != K_OWN && p->kind != K_VIEW) continue;
+        if (guest >= p->base && guest < p->end) {
+            if (p->end < *end) *end = p->end;
+            if (p->guest_unknown) continue;
+            *off = p->kind == K_OWN ? guest - p->base : p->off + (guest - p->base);
+            return p->kind == K_OWN ? p : p->owner;
+        }
+        if (p->base > guest && p->base < *end) *end = p->base;
+    }
+    return NULL;
+}
+static pool_ent *mapped_source(const void *src, uint64_t size, uint64_t *off) {
+    uintptr_t a = (uintptr_t)src;
+    if (!size || size > UINTPTR_MAX - a) return NULL;
+    uintptr_t end = a + size;
+    pool_ent *owner = mapped_owner(a, &end, off);
+    if (!owner || end != a + size || *off > owner->end - owner->base ||
+        size > owner->end - owner->base - *off) return NULL;
+    return owner;
 }
 static VkBuffer make_buffer(VkDeviceSize size, VkExternalMemoryHandleTypeFlags ht, VkMemoryRequirements *req) {
     VkExternalMemoryBufferCreateInfo eb = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, .handleTypes = ht};
@@ -1061,6 +1139,7 @@ static int back_pool(pool_ent *e) {
     void *tmp = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (tmp == MAP_FAILED) DIE("pool %#llx+%#zx: mapping the dma-buf: %s", (unsigned long long)e->base, size, strerror(errno));
     memcpy(tmp, (void *)e->base, size);
+    mapping_forget(e->base, e->end);   /* MAP_FIXED failure may already have changed the old mapping */
     if (mmap((void *)e->base, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) != (void *)e->base)
         DIE("pool %#llx+%#zx: mapping the dma-buf at the guest address: %s", (unsigned long long)e->base, size, strerror(errno));
     if (g_wb_alias_enabled) {
@@ -1075,6 +1154,7 @@ static void unback_pool(pool_ent *e) {
         void *fresh = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (fresh == MAP_FAILED) DIE("pool %#llx: fresh pages: %s", (unsigned long long)e->base, strerror(errno));
         memcpy(fresh, (void *)e->base, size);
+        mapping_forget(e->base, e->end);
         if (mremap(fresh, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)e->base) != (void *)e->base)
             DIE("pool %#llx: restoring guest pages: %s", (unsigned long long)e->base, strerror(errno));
         close(e->fd); e->fd = -1;
@@ -1083,10 +1163,14 @@ static void unback_pool(pool_ent *e) {
         munmap(e->wb_alias, size); e->wb_alias = NULL;
         g_wb_alias_maps--; g_wb_alias_bytes -= size;
     }
+#ifdef TOTK_VK_ALIAS_FIXTURE
+    if (!e->test_backing) DIE("alias fixture cannot destroy Vulkan backing");
+#else
 #ifdef TOTK_VK_TESTS
     if (e->test_backing) return;
 #endif
     vkDestroyBuffer(g_dev, e->buf, NULL); vk_memory_release(e->mem, VK_MEMORY_POOL);
+#endif
 }
 static void pool_insert(pool_ent *e) {
     span_changed();
@@ -1103,26 +1187,46 @@ static void add_range(const void *mem, uint64_t size, int virt) {
     e->lo = lo; e->hi = hi; e->base = lo & ~(pg - 1); e->end = (hi + pg - 1) & ~(pg - 1); e->fd = -1;
     pthread_mutex_lock(&g_pool_mu);
     pool_ent *owner = own_containing(e->base, e->end);
-    if (virt && g_pool_mode != POOLS_HOST) e->kind = K_VIRT;
-    else if (owner) { e->kind = K_VIEW; e->owner = owner; e->off = e->base - owner->base; }
+    uint64_t owner_off = owner ? e->base - owner->base : 0;
+    if (g_wb_alias_enabled) owner = mapped_source((void *)e->base, e->end - e->base, &owner_off);
+    if (virt && g_pool_mode != POOLS_HOST) {
+        e->kind = K_VIRT;
+        guest_mapping_unknown(e->base, e->end);
+    } else if (owner) { e->kind = K_VIEW; e->owner = owner; e->off = owner_off; }
     else if (own_overlapping(e->base, e->end)) e->kind = K_CPU;
-    else e->kind = back_pool(e) ? K_OWN : K_CPU;
+    else {
+#ifdef TOTK_VK_ALIAS_FIXTURE
+        DIE("alias fixture physical pools require explicit fd-backed owner registration");
+#else
+        e->kind = back_pool(e) ? K_OWN : K_CPU;
+#endif
+    }
+#ifdef TOTK_VK_ALIAS_FIXTURE
+    e->test_backing = 1;
+#endif
     if (e->kind == K_CPU) { static int said; if (said++ < 8) LOGV("【红】pool %p+%#llx gets no GPU memory (overlaps another pool or allocation failed): its GPU work runs on the CPU", mem, (unsigned long long)size); g_pool_cpu++; }
     if (e->kind == K_OWN) g_pool_bytes += e->end - e->base;
     pool_insert(e);
     pthread_mutex_unlock(&g_pool_mu);
 }
 static int pool_gpu_quiet(void);
-static void del_range(const void *mem, int wait_gpu) {
-    pthread_mutex_lock(&g_pool_mu);
+static pool_ent *pool_remove_locked(const void *mem, int wait_gpu) {
     int idx = -1;
     for (int i = g_npool - 1; i >= 0; i--) if (g_pools[i]->lo == (uintptr_t)mem) { idx = i; break; }
-    if (idx < 0) { pthread_mutex_unlock(&g_pool_mu); return; }
+    if (idx < 0) return NULL;
     /* Finalize owns recording and has waited outside the registry; no producer
        can reserve another ticket before destruction. MapVirtual keeps its old path. */
+#ifndef TOTK_VK_ALIAS_FIXTURE
     if (!wait_gpu && !pool_gpu_quiet()) DIE("pool finalize lost recording exclusion");
+#else
+    (void)wait_gpu;
+#endif
     pool_ent *e = g_pools[idx]; g_pools[idx] = g_pools[--g_npool]; span_changed();
-    if (e->kind == K_VIRT) {   /* its aliases go with it (MapVirtual re-adds the pool after remapping) */
+    /* Removing a VIEW/CPU registration changes no guest mapping: its owner's
+       physical proof remains valid. OWN unbacks; VIRT retires its alias table. */
+    if (g_wb_alias_enabled && (e->kind == K_OWN || e->kind == K_VIRT))
+        mapping_forget(e->base, e->end);
+    else if (!g_wb_alias_enabled && e->kind == K_VIRT) {
         for (int i = 0; i < g_nalias; ) { if (g_alias[i].va >= e->base && g_alias[i].end <= e->end) g_alias[i] = g_alias[--g_nalias]; else i++; }
     }
     if (e->kind == K_OWN) {
@@ -1130,15 +1234,28 @@ static void del_range(const void *mem, int wait_gpu) {
         /* Pools inside it and virtual pages mapped from it lose their GPU backing; the CPU still sees the same bytes. */
         for (int i = 0; i < g_npool; i++) if (g_pools[i]->owner == e) { g_pools[i]->kind = K_CPU; g_pools[i]->owner = NULL; }
         for (int i = 0; i < g_nalias; ) { if (g_alias[i].owner == e) g_alias[i] = g_alias[--g_nalias]; else i++; }
+#ifndef TOTK_VK_ALIAS_FIXTURE
         if (wait_gpu) vk_gpu_idle();
         HK_ADD(idle_pool, 1);
+#endif
         unback_pool(e);
         g_pool_bytes -= e->end - e->base;
     }
-    pthread_mutex_unlock(&g_pool_mu);
+    return e;
+}
+static void pool_retired(pool_ent *e) {
+    if (!e) return;
+#ifndef TOTK_VK_ALIAS_FIXTURE
     vk_wb_range_gone(e->base, e->end);
-    if (e->kind == K_OWN) vk_tex_pool_gone(e->base, e->end);   /* after the pool lock: texture code takes the locks the other way round */
+    if (e->kind == K_OWN) vk_tex_pool_gone(e->base, e->end);   /* texture code takes the locks the other way round */
+#endif
     free(e);
+}
+static void del_range(const void *mem, int wait_gpu) {
+    pthread_mutex_lock(&g_pool_mu);
+    pool_ent *e = pool_remove_locked(mem, wait_gpu);
+    pthread_mutex_unlock(&g_pool_mu);
+    pool_retired(e);
 }
 void mtl_pool_add(const void *mem, uint64_t size) { add_range(mem, size, 0); }
 void mtl_pool_del(const void *mem) { del_range(mem, 1); }
@@ -1176,28 +1293,8 @@ void *vk_wb_alias_span_locked(uintptr_t guest, size_t requested, size_t *availab
     if (available) *available = 0;
     if (!g_wb_alias_enabled || !requested || requested > UINTPTR_MAX - guest) return NULL;
     uintptr_t end = guest + requested;
-    const pool_ent *owner = NULL; uint64_t off = 0;
-    for (int i = 0; i < g_nalias; i++) {
-        const alias_ent *a = &g_alias[i];
-        if (guest >= a->va && guest < a->end) {
-            owner = a->owner; off = a->off + (guest - a->va);
-            if (a->end < end) end = a->end;
-            goto mapped;
-        }
-        if (a->va > guest && a->va < end) end = a->va;
-    }
-    for (int i = 0; i < g_npool; i++) {
-        const pool_ent *p = g_pools[i];
-        if (p->kind != K_OWN && p->kind != K_VIEW) continue;
-        if (guest >= p->base && guest < p->end) {
-            owner = p->kind == K_OWN ? p : p->owner;
-            off = p->kind == K_OWN ? guest - p->base : p->off + (guest - p->base);
-            if (p->end < end) end = p->end;
-            break;
-        }
-        if (p->base > guest && p->base < end) end = p->base;
-    }
-mapped:
+    uint64_t off = 0;
+    const pool_ent *owner = mapped_owner(guest, &end, &off);
     if (available) *available = end - guest;
     if (!owner || !owner->wb_alias || off >= owner->end - owner->base) return NULL;
     size_t left = (size_t)(owner->end - owner->base - off);
@@ -1257,11 +1354,16 @@ int vk_wb_test_alias_store(void *guest, const void *data, size_t size, int event
 #endif
 /* totk_vpool.c: a virtual pool's range, and its page aliases. */
 void mtl_vpool_add(const void *mem, uint64_t size) { add_range(mem, size, 1); }
-void mtl_vpool_del(const void *mem) { del_range(mem, 1); }
+void mtl_vpool_del(const void *mem) {
+#ifdef TOTK_VK_TESTS
+    if (g_wb_test_replace_hook) g_wb_test_replace_hook(g_wb_test_replace_opaque);
+#endif
+    del_range(mem, 1);
+}
 /* MapVirtual accepts overlapping requests in one batch: mmap replaces the old pages. Keep disjoint aliases matching
    that last-writer order, otherwise the alias-first scan and furthest-end index can select different (stale) mappings. */
 static void alias_replace(uintptr_t va, uintptr_t end, pool_ent *owner, uint64_t off) {
-    if (g_nalias + 2 > g_capalias) { g_capalias = g_capalias ? 2 * g_capalias : 256; g_alias = VK_REALLOC(g_alias, (size_t)g_capalias * sizeof *g_alias); }
+    if ((owner || g_nalias) && g_nalias + 2 > g_capalias) { g_capalias = g_capalias ? 2 * g_capalias : 256; g_alias = VK_REALLOC(g_alias, (size_t)g_capalias * sizeof *g_alias); }
     for (int i = 0; i < g_nalias; ) {
         alias_ent x = g_alias[i];
         if (va >= x.end || end <= x.va) { i++; continue; }
@@ -1275,15 +1377,82 @@ static void alias_replace(uintptr_t va, uintptr_t end, pool_ent *owner, uint64_t
     if (owner) g_alias[g_nalias++] = (alias_ent){va, end, owner, off};
     span_changed();
 }
+static uint64_t pool_fd_offset(const pool_ent *owner, uint64_t off) {
+#ifdef TOTK_VK_TESTS
+    off += owner->test_fd_offset;
+#else
+    (void)owner;
+#endif
+    return off;
+}
+/* Every enabled MapVirtual mutation, including anonymous holes and mremap fallback, owns
+   g_pool_mu across both authority retirement and the syscall. Failure never restores old proof:
+   MAP_FIXED/mremap need not leave the destination intact when a later step fails. */
+int mtl_vpool_replace(void *dst, const void *src, uint64_t size) {
+    if (!g_wb_alias_enabled) return 0;
+    uintptr_t va = (uintptr_t)dst;
+    if (!size || size > SIZE_MAX || size > UINTPTR_MAX - va) { errno = EINVAL; return -1; }
+#ifdef TOTK_VK_TESTS
+    if (g_wb_test_replace_hook) g_wb_test_replace_hook(g_wb_test_replace_opaque);
+#endif
+    pthread_mutex_lock(&g_pool_mu);
+    uint64_t off = 0;
+    pool_ent *owner = src ? mapped_source(src, size, &off) : NULL;
+    mapping_forget(va, va + size);
+    void *got = MAP_FAILED;
+    if (!src)
+        got = mmap(dst, (size_t)size, PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    else {
+        if (owner && owner->fd >= 0) {
+            got = mmap(dst, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                       owner->fd, (off_t)pool_fd_offset(owner, off));
+            if (got == dst) alias_replace(va, va + size, owner, off);
+            else {
+                int error = errno;
+                LOGV("【红】virtual pool alias at %p (+%#llx): %s", dst, (unsigned long long)size, strerror(error));
+                errno = error;
+            }
+        }
+        /* An unproved source or failed fd mmap can still use the legacy shared-page fallback.
+           Its current backing is not proved by an allocation range, so it publishes no alias. */
+        if (got != dst) got = mremap((void *)src, 0, (size_t)size, MREMAP_MAYMOVE | MREMAP_FIXED, dst);
+    }
+    int error = errno, ok = got == dst;
+    pthread_mutex_unlock(&g_pool_mu);
+    errno = error;
+    return ok ? 1 : -1;
+}
+/* Host-owned pool release can also follow a GPU_NO_ACCESS virtual pool whose MapVirtual calls
+   registered it. Retire that identity and all destination authority under the same lock as munmap. */
+int mtl_vpool_release(void *dst, uint64_t size) {
+    if (!g_wb_alias_enabled) return 0;
+    uintptr_t va = (uintptr_t)dst;
+    if (!size || size > SIZE_MAX || size > UINTPTR_MAX - va) { errno = EINVAL; return -1; }
+    /* Normal HLE finalization already retires dirty state. GPU_NO_ACCESS pools that acquired it
+       through MapVirtual, and direct host-owned fini callers, need the same remove-before-unmap. */
+    nvn_dirty_remove_range(dst);
+    pthread_mutex_lock(&g_pool_mu);
+    pool_ent *retired = pool_remove_locked(dst, 1);
+    mapping_forget(va, va + size);
+    int result = munmap(dst, (size_t)size), error = errno;
+    pthread_mutex_unlock(&g_pool_mu);
+    pool_retired(retired);
+    errno = error;
+    return result ? -1 : 1;
+}
 int mtl_pool_alias(void *dst, const void *src, uint64_t size) {
     mtl_init();
     if (g_pool_mode == POOLS_HOST) return 0;   /* plain shared pages: totk_vpool.c's mremap aliases them */
     pthread_mutex_lock(&g_pool_mu);
-    pool_ent *o = own_containing((uintptr_t)src, (uintptr_t)src + size);
+    uint64_t off = 0;
+    pool_ent *o = g_wb_alias_enabled ? mapped_source(src, size, &off) :
+        own_containing((uintptr_t)src, (uintptr_t)src + size);
+    if (g_wb_alias_enabled) mapping_forget((uintptr_t)dst, (uintptr_t)dst + size);
     int ok = 0;
     if (o && o->fd >= 0) {
-        uint64_t off = (uintptr_t)src - o->base;
-        if (mmap(dst, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, o->fd, (off_t)off) == dst) {
+        if (!g_wb_alias_enabled) off = (uintptr_t)src - o->base;
+        if (mmap(dst, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, o->fd, (off_t)pool_fd_offset(o, off)) == dst) {
             alias_replace((uintptr_t)dst, (uintptr_t)dst + size, o, off);
             ok = 1;
         } else LOGV("【红】virtual pool alias at %p (+%#llx): %s", dst, (unsigned long long)size, strerror(errno));
@@ -1305,8 +1474,12 @@ void vk_record_test_alias(void *address, uint64_t source, uint64_t size) {
 void vk_wb_test_alias_init(void) {
     pthread_mutex_lock(&g_pool_mu);
     if (g_npool) DIE("alias fixture initialization requires an empty pool registry");
+    g_wb_test_registry = 1;
     wb_alias_init();
     pthread_mutex_unlock(&g_pool_mu);
+}
+void vk_wb_test_alias_replace_hook(void (*hook)(void *), void *opaque) {
+    g_wb_test_replace_hook = hook; g_wb_test_replace_opaque = opaque;
 }
 static pool_ent *wb_test_pool(void *guest) {
     for (int i = g_npool; i-- > 0; ) if (g_pools[i]->lo == (uintptr_t)guest) return g_pools[i];
@@ -1355,13 +1528,20 @@ uint64_t vk_wb_test_alias_view(void *guest, size_t size, void *owner_guest, uint
     pthread_mutex_lock(&g_pool_mu);
     pool_ent *owner = wb_test_pool(owner_guest); uint64_t identity = 0;
     if (owner && owner->kind == K_OWN && owner->test_backing && !wb_test_pool(guest) &&
-        owner_offset <= owner->end - owner->base && size <= owner->end - owner->base - owner_offset &&
-        mmap(guest, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, owner->fd,
-             (off_t)(owner->test_fd_offset + owner_offset)) == guest) {
-        pool_ent *p = VK_CALLOC(1, sizeof *p);
-        p->lo = p->base = (uintptr_t)guest; p->hi = p->end = p->base + size;
-        p->kind = K_VIEW; p->fd = -1; p->owner = owner; p->off = owner_offset; p->test_backing = 1;
-        pool_insert(p); identity = p->identity;
+        owner_offset <= owner->end - owner->base && size <= owner->end - owner->base - owner_offset) {
+        uint64_t off = owner_offset;
+        pool_ent *source = g_wb_alias_enabled ?
+            mapped_source((void *)(owner->base + owner_offset), size, &off) : owner;
+        if (source && source->fd >= 0) {
+            mapping_forget((uintptr_t)guest, (uintptr_t)guest + size);
+            if (mmap(guest, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                     source->fd, (off_t)pool_fd_offset(source, off)) == guest) {
+                pool_ent *p = VK_CALLOC(1, sizeof *p);
+                p->lo = p->base = (uintptr_t)guest; p->hi = p->end = p->base + size;
+                p->kind = K_VIEW; p->fd = -1; p->owner = source; p->off = off; p->test_backing = 1;
+                pool_insert(p); identity = p->identity;
+            }
+        }
     }
     pthread_mutex_unlock(&g_pool_mu);
     return identity;
@@ -1374,41 +1554,11 @@ uint64_t vk_wb_test_alias_virtual(void *guest, size_t size) {
         pool_ent *p = VK_CALLOC(1, sizeof *p);
         p->lo = p->base = (uintptr_t)guest; p->hi = p->end = p->base + size;
         p->kind = K_VIRT; p->fd = -1; p->test_backing = 1;
+        guest_mapping_unknown(p->base, p->end);
         pool_insert(p); identity = p->identity;
     }
     pthread_mutex_unlock(&g_pool_mu);
     return identity;
-}
-int vk_wb_test_alias_map(void *virtual_guest, size_t virtual_offset, void *owner_guest, size_t owner_offset, size_t size) {
-    if (!wb_test_bounds(virtual_guest, size, virtual_offset) || owner_offset % page_sz()) return 0;
-    pthread_mutex_lock(&g_pool_mu);
-    pool_ent *v = wb_test_pool(virtual_guest), *owner = wb_test_pool(owner_guest);
-    int ok = v && v->kind == K_VIRT && v->test_backing && owner && owner->kind == K_OWN && owner->test_backing &&
-             virtual_offset <= v->end - v->base && size <= v->end - v->base - virtual_offset &&
-             owner_offset <= owner->end - owner->base && size <= owner->end - owner->base - owner_offset;
-    if (ok) {
-        uintptr_t address = v->base + virtual_offset;
-        ok = mmap((void *)address, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, owner->fd,
-                  (off_t)(owner->test_fd_offset + owner_offset)) == (void *)address;
-        if (ok) alias_replace(address, address + size, owner, owner_offset);
-    }
-    pthread_mutex_unlock(&g_pool_mu);
-    return ok;
-}
-int vk_wb_test_alias_unmap(void *virtual_guest, size_t virtual_offset, size_t size) {
-    if (!wb_test_bounds(virtual_guest, size, virtual_offset)) return 0;
-    pthread_mutex_lock(&g_pool_mu);
-    pool_ent *v = wb_test_pool(virtual_guest);
-    int ok = v && v->kind == K_VIRT && v->test_backing &&
-             virtual_offset <= v->end - v->base && size <= v->end - v->base - virtual_offset;
-    if (ok) {
-        uintptr_t address = v->base + virtual_offset;
-        ok = mmap((void *)address, size, PROT_READ | PROT_WRITE,
-                  MAP_SHARED | MAP_FIXED | MAP_ANONYMOUS, -1, 0) == (void *)address;
-        if (ok) alias_replace(address, address + size, NULL, 0);
-    }
-    pthread_mutex_unlock(&g_pool_mu);
-    return ok;
 }
 int vk_wb_test_alias_registry_trylock(void) {
     if (pthread_mutex_trylock(&g_pool_mu)) return 0;
@@ -1418,23 +1568,9 @@ int vk_wb_test_alias_registry_trylock(void) {
 void vk_wb_test_alias_remove(void *guest) {
     pthread_mutex_lock(&g_pool_mu);
     pool_ent *p = wb_test_pool(guest);
-    if (p && p->test_backing) {
-        for (int i = 0; i < g_npool; i++) if (g_pools[i] == p) { g_pools[i] = g_pools[--g_npool]; break; }
-        for (int i = 0; i < g_nalias; ) {
-            if (g_alias[i].owner == p || (p->kind == K_VIRT && g_alias[i].va >= p->base && g_alias[i].end <= p->end))
-                g_alias[i] = g_alias[--g_nalias];
-            else i++;
-        }
-        if (p->kind == K_OWN) {
-            for (int i = 0; i < g_npool; i++) if (g_pools[i]->owner == p) {
-                g_pools[i]->owner = NULL; g_pools[i]->kind = K_CPU;
-            }
-            atomic_fetch_add_explicit(&g_owner_gen, 1, memory_order_release);
-            unback_pool(p); g_pool_bytes -= p->end - p->base;
-        }
-        span_changed(); free(p);
-    }
+    pool_ent *retired = p && p->test_backing ? pool_remove_locked(guest, 1) : NULL;
     pthread_mutex_unlock(&g_pool_mu);
+    pool_retired(retired);
 }
 void vk_wb_test_alias_memory(uint64_t out[2]) {
     pthread_mutex_lock(&g_pool_mu);
@@ -1452,6 +1588,7 @@ static void span_rebuild(void) {   /* caller holds g_pool_mu */
     for (int i = 0; i < g_nalias; i++) { const alias_ent *x = &g_alias[i]; g_span[g_nspan++] = (span_t){x->va, x->end, x->owner->buf, x->off}; }
     for (int i = 0; i < g_npool; i++) {
         const pool_ent *p = g_pools[i];
+        if (g_wb_alias_enabled && p->guest_unknown) continue;
         if (p->kind == K_OWN) g_span[g_nspan++] = (span_t){p->base, p->end, p->buf, 0};
         else if (p->kind == K_VIEW) g_span[g_nspan++] = (span_t){p->base, p->end, p->owner->buf, p->off};
     }
@@ -1514,6 +1651,7 @@ static int resolve_span(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *of
         for (int i = 0; i < g_nalias; i++) { const alias_ent *x = &g_alias[i]; if (a >= x->va && b <= x->end) { *buf = x->owner->buf; *off = x->off + (a - x->va); if (avail) *avail = x->end - a; return 1; } }
         for (int i = 0; i < g_npool; i++) {
             const pool_ent *p = g_pools[i];
+            if (g_wb_alias_enabled && p->guest_unknown) continue;
             if (a < p->base || b > p->end) continue;
             if (p->kind == K_OWN) { *buf = p->buf; *off = a - p->base; if (avail) *avail = p->end - a; return 1; }
             if (p->kind == K_VIEW) { *buf = p->owner->buf; *off = p->off + (a - p->base); if (avail) *avail = p->end - a; return 1; }
@@ -1616,6 +1754,7 @@ const vk_record_spans *vk_record_spans_capture(unsigned slot) {
         s->span = VK_MALLOC((size_t)(g_nalias + g_npool) * sizeof *s->span);
         for (int i = 0; i < g_nalias; i++) { const alias_ent *a = &g_alias[i]; s->span[s->count++] = (span_t){a->va, a->end, a->owner->buf, a->off}; }
         for (int i = 0; i < g_npool; i++) { const pool_ent *p = g_pools[i];
+            if (g_wb_alias_enabled && p->guest_unknown) continue;
             if (p->kind == K_OWN) s->span[s->count++] = (span_t){p->base, p->end, p->buf, 0};
             else if (p->kind == K_VIEW) s->span[s->count++] = (span_t){p->base, p->end, p->owner->buf, p->off};
         }

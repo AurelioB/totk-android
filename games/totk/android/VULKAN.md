@@ -3396,9 +3396,16 @@ unmapping it. Guest and private mappings use the same fd, offsets and exporter-s
 pins backing through the last store and dirty-token end; deletion/remapping cannot recycle an alias mid-landing.
 Cross-owner landings split at every backing transition. The span encoder receives pointers inside each real
 mapping, handles arbitrary byte-clipped splits and leaves padding untouched, without another staging allocation.
+Enabled production MapVirtual replacements (including anonymous unmap and mremap fallback) retire old
+destination authority under the same registry lock as the actual mapping syscall. Only a proved successful
+fd mapping installs a private-writer translation; anonymous/unproved pages use the current guest destination.
+Failed potentially partial replacements never revive stale donor metadata. Host-owned final release uses the
+same serialized retirement; deleting only a VIEW registration does not invalidate its unchanged owner mapping.
 
-For a texture landing extent, **all** bytes must have supported backing and dirty tracking before selecting aliases;
-mixed, untracked, host-import or CPU-only extents retain the whole extent's original protocol. Report, event and
+For a texture landing extent, **all** bytes must have supported backing and dirty tracking, and the record must
+have its existing tracked-watch/ownership eligibility before selecting aliases. Watch-slot exhaustion and other
+no-token synchronous records retain the legacy guest destination; range registration alone grants no ownership.
+Mixed, untracked, host-import or CPU-only extents likewise retain the whole extent's original protocol. Report, event and
 uniform publications attempt the same backing pin with a nonblocking registry trylock, then use per-owner spans
 and the old store path for unsupported segments. On registry contention they immediately use the exact original
 whole-operation store without borrowing an alias pointer; that fallback may still change guest protections.
@@ -3420,6 +3427,8 @@ overhead, not another pool-sized physical/RSS backing allocation. Procfs RSS acc
 pages through multiple mappings; the reported alias byte count is mapped VA, not extra physical memory.
 This avoids these write-back permission flips, not all dirty-tracker/runtime `mprotect` calls, existing fragments
 or every source of VMA growth. It is not a replacement for mapping-pressure safeguards.
+Retention does not add an alias-creation recovery path: the original mandatory population/fixed mmap failures
+remain fatal. Extra live VA/VMA pressure therefore needs explicit device headroom/failure qualification.
 
 **Cache/coherency:** on arm64, two CPU mappings of the same physical pages with identical memory type, cacheability
 and shareability need no additional CPU-alias cache maintenance. RO versus RW access permission is independent.

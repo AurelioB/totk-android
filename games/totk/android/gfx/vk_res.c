@@ -1242,9 +1242,10 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
     if (settled) nvn_dirty_test_wb_phase(t->mem, NVN_DIRTY_TEST_WB_BEFORE_OWNERSHIP);
 #endif
     void *token = NULL;
-    /* Mixed/unsupported backing retains the original protocol for this landing
-       extent. A fully supported virtual extent can span several physical owners. */
-    int private_alias = vk_wb_alias_enabled() &&
+    /* Mixed/unsupported backing and records without watch/ownership eligibility
+       retain the original protocol for this landing extent. Range registration
+       alone must not select a private destination for a no-token synchronous record. */
+    int private_alias = vk_wb_alias_enabled() && e->tracked &&
         nvn_dirty_tracked(t->mem + offset, span) &&
         vk_wb_alias_range_locked((uintptr_t)t->mem + offset, (size_t)span);
     if (mode == WB_IDLE || mode == WB_INVALIDATE_TRY) {

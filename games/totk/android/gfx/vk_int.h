@@ -525,17 +525,18 @@ int vk_wb_alias_enabled(void);
 void *vk_wb_alias_span_locked(uintptr_t guest, size_t requested, size_t *available);
 int vk_wb_alias_range_locked(uintptr_t guest, size_t size);
 #ifdef TOTK_VK_TESTS
-/* Synthetic registry fixtures: init requires an empty registry and parses the exact startup switch without
-   creating Vulkan. Guest mappings are caller-owned and already share fd/offset before owner/attach.
-   Returned registration identities work with vk_wb_pool_lock. Remove restores owned guest pages and unmaps
-   the private alias under that same lock. View/map replace caller-owned page-aligned guest mappings. */
+/* Explicit registry fixtures: init requires an empty registry and parses the exact startup switch.
+   TOTK_VK_ALIAS_FIXTURE (with TOTK_VK_TESTS) omits only unrelated Vulkan initialization/allocation/
+   callbacks; real mtl_vpool_add/del, totk_vpool_map and replacement/release syscalls stay shared.
+   Guest mappings are caller-owned and already share fd/offset before owner/attach. Returned
+   identities work with vk_wb_pool_lock; remove restores owners through the production retirement. */
 void vk_wb_test_alias_init(void);
+/* Set/clear without concurrent mapping calls. Called just before MapVirtual registry retirement
+   and enabled replacement try to acquire g_pool_mu; callback may observe but must not mutate it. */
+void vk_wb_test_alias_replace_hook(void (*hook)(void *), void *opaque);
 uint64_t vk_wb_test_alias_owner(void *guest, size_t size, int fd, uint64_t offset);
 uint64_t vk_wb_test_alias_view(void *guest, size_t size, void *owner_guest, uint64_t owner_offset);
 uint64_t vk_wb_test_alias_virtual(void *guest, size_t size);
-int vk_wb_test_alias_map(void *virtual_guest, size_t virtual_offset, void *owner_guest, size_t owner_offset, size_t size);
-/* Replace a virtual subrange with fresh anonymous pages and remove its alias metadata. */
-int vk_wb_test_alias_unmap(void *virtual_guest, size_t virtual_offset, size_t size);
 int vk_wb_test_alias_registry_trylock(void); /* success means acquired and immediately released */
 void vk_wb_test_alias_remove(void *guest);
 void vk_wb_test_alias_memory(uint64_t out[2]); /* private mapping count/bytes */
