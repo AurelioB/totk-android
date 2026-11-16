@@ -336,11 +336,14 @@ def package(*, out, dex, libs, translator, turnip, assets, key, key_pass_env=Non
         libs[-1] = staged
     # The launcher images are rendered once from the app's artwork and committed (apk/render_launcher.py), so this build
     # needs no Pillow; a stale render (artwork changed since) is refused.
-    icons = HERE / 'apk/launcher'
+    # Another game's build has its own recolour of the artwork (app-assets/icon/recolour_icon.py), named as its java-<game>.
+    game = '' if VERSION == 'v143' else VERSION.rstrip('0123456789')
+    icons = HERE / (f'apk/launcher-{game}' if game else 'apk/launcher')
     stamp = icons / 'source.sha256'
-    art = HERE / 'app-assets/icon/totk-native-1024.png'
+    art = HERE / f"app-assets/icon/{game or 'totk'}-native-1024.png"
     if not stamp.is_file() or not art.is_file() or stamp.read_text().split()[0] != sha256(art):
-        raise BuildError(f'{icons} is missing or older than {art}: rerun python3 games/totk/android/apk/render_launcher.py (needs Pillow)')
+        raise BuildError(f'{icons} is missing or older than {art}: rerun python3 games/totk/android/apk/render_launcher.py'
+                         + (f' --icon {art} --out {icons}' if game else '') + ' (needs Pillow)')
     cmd = [sys.executable, HERE / 'apk/build_apk.py', '--dex', dex, *sum((['--lib', str(p)] for p in libs), []),
            '--ondevice-xlate', translator, '--assets', assets, '--launcher-mipmaps', icons, '--out', out, '--key', key,
            '--version-code', str(version_code), '--version-name', version_name, '--min-sdk', str(API), '--target-sdk', str(API)]

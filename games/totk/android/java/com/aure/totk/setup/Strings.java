@@ -7,7 +7,7 @@ import java.util.Locale;
 final class Strings {
     private Strings() { }
 
-    static final String APP = "TotK Native";
+    static final String APP = GameBuild.APP;
     static final String SUBTITLE = "UNOFFICIAL ANDROID PORT";
     static final String LEGAL = "You must own the game. Your files stay on this device; nothing is uploaded.";
     /** The project's public home; one constant so the release can point it elsewhere. */
@@ -25,7 +25,7 @@ final class Strings {
     static final String UPDATE_GAME_BODY = "The game is paused. Your saves and game data stay on this device.";
     static final String UPDATE_MENU_BODY = "Download and install the new version? Your saves and game data will be kept. A network connection is needed to download.";
     static final String UPDATE_ALLOW = "Allow app updates";
-    static final String UPDATE_ALLOW_BODY = "Android needs permission for TotK Native to install its own update. Enable “Allow from this source”, then return here to continue. You will still confirm the installation.";
+    static final String UPDATE_ALLOW_BODY = "Android needs permission for " + APP + " to install its own update. Enable “Allow from this source”, then return here to continue. You will still confirm the installation.";
     static String updateAvailable(String version) { return "TotK Native " + version + " is available"; }
     // Button prompts
     static final String P_SELECT = "Select", P_QUIT = "Quit", P_START = "Start game", P_DEFAULTS = "Defaults", P_CHANGE = "Change";
@@ -43,7 +43,7 @@ final class Strings {
     static final String ABOUT = "About";
     static final String ABOUT_HINT = "Version, open-source licences";
     static final String SKIP_MENU = "Open the game directly next time";
-    static final String INSTALLED_CHIP = "Game 1.4.3 installed";
+    static final String INSTALLED_CHIP = "Game " + GameBuild.VERSION_LABEL + " installed";
     static final String SHADERS_NONE = "Shaders not built";
     // An install without a usable shader seed: the game would draw nothing, so Home offers Build shaders instead.
     static final String BUILD_SHADERS = "Build shaders";
@@ -320,7 +320,7 @@ final class Strings {
     static final String NEEDS_SETUP = "Finish setup first";
     static final String MEASURING = "measuring…", SIZE_UNKNOWN = "size unknown";
     static final String DATA_TEXT = "The game data imported from your own files: rewritten game code, the game's data image and its "
-            + "index, fonts and the shader seed, plus optional second-screen art. The import was checked against the pinned digests of version 1.4.3.";
+            + "index, fonts and the shader seed, plus optional second-screen art. The import was checked against the pinned digests of version " + GameBuild.VERSION_LABEL + ".";
     static final String COMPANION_TEXT = "Pictures for the second-screen companion (map, inventory, shortcuts), generated on this device "
             + "from your game data. Optional: the game runs without them. Setup skips them without a built-in second screen; you can build them here.";
     static final String SHADERS_TEXT = "The seed of translated GPU shaders generated from your game data. The game needs it: without "
@@ -355,7 +355,7 @@ final class Strings {
     static final String MOVING_TITLE = "Moving game data";
     static final String MOVE_TIP = "If the app closes, the game data stays where it was; start the move again from Game data.";
     static final String STAGE_MOVE = "Moving game data";
-    static final String NOTIFY_MOVING = "Moving TotK Native game data", NOTIFY_MOVED = "Game data moved", NOTIFY_MOVE_FAILED = "Moving the game data stopped";
+    static final String NOTIFY_MOVING = "Moving " + APP + " game data", NOTIFY_MOVED = "Game data moved", NOTIFY_MOVE_FAILED = "Moving the game data stopped";
     static String moved(String name) { return "Game data moved to " + name + "."; }
     static String moveFailed(String code, String name) {
         String why = "cancelled".equals(code) ? "Moving was cancelled." : "no_space".equals(code) ? "Not enough free space on the new storage."
@@ -384,17 +384,17 @@ final class Strings {
     static final String ACCESS_HINT = "Optional · open your game files directly, keep game data in any folder";
     static final String ACCESS_ON = "Allowed", ACCESS_OFF = "Off · Allow";
     static final String ACCESS_TITLE = "Allow All files access?";
-    static final String ACCESS_TEXT = "With All files access, TotK Native opens the files you pick directly instead of through "
+    static final String ACCESS_TEXT = "With All files access, " + APP + " opens the files you pick directly instead of through "
             + "the file picker (faster, and large files can be read in parallel), and it can keep the game data in a folder "
             + "you choose. It is optional: without it everything works through the file picker. Android opens its settings "
             + "page; switch on \"Allow access to manage all files\", then come back.";
-    static final String ACCESS_ALLOW = "Open the settings", ACCESS_ALLOW_HINT = "Turn on \"Allow access to manage all files\" for TotK Native";
+    static final String ACCESS_ALLOW = "Open the settings", ACCESS_ALLOW_HINT = "Turn on \"Allow access to manage all files\" for " + APP;
     static final String ACCESS_SKIP = "Not now", ACCESS_SKIP_HINT = "Keep using the file picker";
     static final String FOLDER_CARD = "A folder you choose";
     static final String FOLDER_CARD_LINE = "On internal storage or the SD card";
     static final String NEEDS_ACCESS = "Needs All files access";
     static String accessLost(String name) {
-        return "Game data is in " + name + ", and TotK Native no longer has All files access. Allow it again to play, or set up again elsewhere.";
+        return "Game data is in " + name + ", and " + APP + " no longer has All files access. Allow it again to play, or set up again elsewhere.";
     }
     static final String ACCESS_LOST_CHIP = "All files access is off";
     static final String ACCESS_START_HINT = "Allow All files access to continue";
@@ -409,7 +409,7 @@ final class Strings {
         }
     }
     static final String MIGRATE_TITLE = "Moving game data to faster storage";
-    static final String MIGRATE_BODY = "TotK Native now keeps the game data in its own internal storage, which loads faster. "
+    static final String MIGRATE_BODY = APP + " now keeps the game data in its own internal storage, which loads faster. "
             + "Your installed game is still in the old location and stays playable there until the move has finished and "
             + "been checked. Saves are not affected.";
     static final String MIGRATE_NOW = "Move now", MIGRATE_NOW_HINT = "Takes a few minutes; the copy is checked before the old one is removed";
@@ -524,7 +524,7 @@ final class Strings {
     }
 
     // About
-    static final String ABOUT_TEXT = "An unofficial port that runs Tears of the Kingdom 1.4.3 natively on Android handhelds from "
+    static final String ABOUT_TEXT = "An unofficial port that runs " + GameBuild.TITLE + " " + GameBuild.VERSION_LABEL + " natively on Android handhelds from "
             + "your own game files. It is not affiliated with or endorsed by Nintendo.";
     static final String VERSION_ROW = "Version";
     static final String LICENCES_ROW = "Open-source licences";
@@ -699,7 +699,7 @@ final class Strings {
     static final String CLOSING_GAME = "Closing the game…";
     static final String SAVE_WAIT_TIMEOUT = "The game is still saving after 30 seconds. It was not closed. Let it finish saving, then try again.";
     static final String CLOSE_GAME_TIMEOUT = "The game did not finish closing. Return to the game and close it, then try again.";
-    static String gameRunning(String action) { return "TotK Native's game is still running in the background. " + action + " needs it closed."; }
+    static String gameRunning(String action) { return APP + "'s game is still running in the background. " + action + " needs it closed."; }
     static String gameLockError(String reason) { return "Could not check or close the game: " + reason; }
 
     static String error(String code) {
@@ -736,9 +736,9 @@ final class Strings {
 
     // Notification and launcher
     static final String CHANNEL = "Setup progress";
-    static final String NOTIFY_RUNNING = "Setting up TotK Native";
-    static final String NOTIFY_DONE = "TotK Native is ready";
-    static final String NOTIFY_FAILED = "TotK Native setup stopped";
+    static final String NOTIFY_RUNNING = "Setting up " + APP;
+    static final String NOTIFY_DONE = APP + " is ready";
+    static final String NOTIFY_FAILED = APP + " setup stopped";
     static final String SHORTCUT_SETTINGS = "Settings";
 
     static String stage(String name) {
@@ -771,10 +771,10 @@ final class Strings {
     static String rate(double bytesPerSecond) { return bytes((long) bytesPerSecond) + "/s"; }
     static String variants(int count) { return String.format(Locale.US, "%,d shaders", count); }
     static String version(String app, long code) { return "App " + app + " (" + code + ")"; }
-    static final String GAME_VERSION = "1.4.3";
+    static final String GAME_VERSION = GameBuild.VERSION_LABEL;
     static String build(String commit) { return commit == null || commit.isEmpty() ? "unknown" : commit; }
     static String setupFormat(int setupVersion, String route) {
-        return "Install format " + setupVersion + (route.isEmpty() ? "" : " · " + route + " route") + " · game 1.4.3";
+        return "Install format " + setupVersion + (route.isEmpty() ? "" : " · " + route + " route") + " · game " + GameBuild.VERSION_LABEL;
     }
     static String library(boolean present) { return "Setup library " + (present ? "present" : "missing"); }
     static String doneIn(long seconds) { return seconds <= 0 ? DONE : DONE + " · " + (seconds < 120 ? seconds + " s" : (seconds + 30) / 60 + " min"); }
