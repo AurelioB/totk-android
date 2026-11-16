@@ -391,7 +391,11 @@ void runtime_fs_probe(void) {
  /* Audio stream paths include an extra slash after the mount root. Verify
     actual resource lookup and bytes, while still rejecting path traversal. */
  {
+#ifdef GAME_BOTW
+  const char *name="Sound/Resource/Stream/BGM_Castle.bfstm";   /* Breath of the Wild's streams are .bfstm */
+#else
   const char *name="Sound/Resource/Stream/Dm_OP_0001.bwav";
+#endif
   char path[256];uint8_t expected[257],actual[257];uint64_t h,n;
   snprintf(path,sizeof path,"rom:/%s",name);
   need(!runtime_romfs_open(&h,path,1),"open normal audio path");
@@ -402,7 +406,7 @@ void runtime_fs_probe(void) {
    need(!runtime_romfs_open(&h,path,1),"open normalized audio stream path");
    need(!runtime_romfs_read(&n,h,0,actual,sizeof actual)&&n==sizeof actual&&!memcmp(actual,expected,sizeof actual),"normalized audio stream bytes");runtime_romfs_close(h);
   }
-  need(runtime_romfs_open(&h,"rom://../Sound/Resource/Stream/Dm_OP_0001.bwav",1)!=0,"reject traversal after repeated root separator");
+  {char t[256];snprintf(t,sizeof t,"rom://../%s",name);need(runtime_romfs_open(&h,t,1)!=0,"reject traversal after repeated root separator");}
  }
  for(uint64_t i=0;i<file_count;i+=file_count/64){Entry e=entry(i);uint32_t ov=overlay_slot(i);uint64_t expected_size=ov?overlays[ov-1].size:e.size;char p[4096];need(snprintf(p,sizeof(p),"rom:/%s",entry_name(e))<(int)sizeof(p),"probe path");uint64_t h=0,n=0;int64_t size;need(!runtime_romfs_open(&h,p,1)&&!runtime_romfs_size(&size,h)&&(uint64_t)size==expected_size,"probe open/size");need(!runtime_romfs_read(&n,h,0,buffer,sizeof(buffer)),"probe partial read");for(uint64_t j=0;j<n;j++)sum=sum*131+buffer[j];need(!runtime_romfs_read(&n,h,size,buffer,1)&&n==0,"probe EOF");runtime_romfs_close(h);count++;}
  for(size_t k=0;k<noverlay;k++){char p[4096];need(snprintf(p,sizeof(p),"rom:/%s",overlays[k].name)<(int)sizeof(p),"probe overlay path");

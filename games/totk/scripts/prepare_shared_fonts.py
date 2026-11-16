@@ -5,7 +5,7 @@ The on-device setup writes the same file for the bundled open font (android/setu
 import argparse,json
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
-parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--version', choices=('v0','v112','v121','v143'), default='v0')
+parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--version', choices=('v0','v112','v121','v143','botw160'), default='v0')
 parser.add_argument('--out', type=Path, help='game data folder (default build/game-data/<version>)')
 args=parser.parse_args()
 folder=root/'extracted/firmware/shared-fonts';manifest=json.loads((folder/'manifest.json').read_text())

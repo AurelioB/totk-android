@@ -81,6 +81,11 @@ ifeq ($(VERSION),v0)
 else ifeq ($(VERSION),v143)
   VDEF := -DTOTK_GAME_V143=1
   PATCHES := runtime/game_patches_v143.c
+else ifeq ($(VERSION),botw160)
+  # Breath of the Wild 1.6.0: the shared runtime and graphics layer compiled with GAME_BOTW; game_patches_botw.c replaces
+  # game_patches.c and the nn::settings service its SDK asks for is linked in.
+  VDEF := -DGAME_BOTW=1 -DGAME_BOTW160=1
+  PATCHES := runtime/game_patches_botw.c runtime/settings_service.c runtime/aoc_romfs.c
 else
   VDEF := -DTOTK_GAME_$(shell echo $(VERSION) | tr a-z A-Z)=1
   PATCHES := runtime/game_patches.c
