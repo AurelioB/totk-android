@@ -14,7 +14,7 @@ final class InstallState {
      *  game needs CORE and the shader seed (without it nothing is drawn); the companion art is the only optional stage. */
     static final String[] CORE = {"code", "romfs", "index", "fonts"}, PAIR = {"companion", "shaders"};
     static final String OPTIONAL = "companion";
-    static final long ROMFS_SIZE = 17_052_625_232L;
+    static final long ROMFS_SIZE = GameBuild.ROMFS_SIZE;
     // Rough output sizes for the free-space check; staging covers temporary files inside <game>/.import.
     private static final long CODE_BYTES = 300_000_000L, COMPANION_BYTES = 400_000_000L, SHADER_BYTES = 300_000_000L, STAGING_BYTES = 1_000_000_000L;
 
@@ -63,12 +63,12 @@ final class InstallState {
     /** The base import is in place: the manifest's stages plus a cheap check that the big outputs are still there (users
      * can delete files by hand). The shader seed may still be missing (installs from before it was required). */
     boolean installed() {
-        if (json.optInt("format") != 1 || !"totk".equals(json.optString("game")) || !"v143".equals(json.optString("version"))) return false;
+        if (json.optInt("format") != 1 || !GameBuild.GAME.equals(json.optString("game")) || !GameBuild.VERSION.equals(json.optString("version"))) return false;
         for (String name : CORE) if (!done(name)) return false;
-        if (new File(game, "extracted/v143/romfs/romfs.bin").length() != ROMFS_SIZE) return false;
+        if (new File(game, "extracted/" + GameBuild.VERSION + "/romfs/romfs.bin").length() != ROMFS_SIZE) return false;
         for (String module : new String[]{"main", "sdk", "subsdk0"})
-            if (!new File(game, "rewritten/v143/" + module + ".patched.bin").isFile()) return false;
-        return new File(game, "game-data/v143/runtime-tables.bin").isFile();
+            if (!new File(game, "rewritten/" + GameBuild.VERSION + "/" + module + ".patched.bin").isFile()) return false;
+        return new File(game, "game-data/" + GameBuild.VERSION + "/runtime-tables.bin").isFile();
     }
     /** Installed with the shader seed built, and the manifest's word. */
     boolean playable() { return installed() && done("shaders") && json.optBoolean("playable"); }
@@ -79,7 +79,7 @@ final class InstallState {
      * from a TOTKVKP1 seed.vkpack or loose files); without one the game starts on a black screen. Checked right before
      * the game starts, so a seed removed or emptied by hand is refused with a message. */
     boolean seedUsable() {
-        File dir = new File(game, "shaders/v143");
+        File dir = new File(game, "shaders/" + GameBuild.VERSION);
         if (packHasModule(new File(dir, "seed.vkpack"))) return true;
         String[] names = dir.list();
         if (names == null) return false;
@@ -115,7 +115,7 @@ final class InstallState {
     /** Bytes still to be written by the pending stages, plus staging headroom; leftover staging is discarded on resume. */
     long neededBytes() {
         long need = STAGING_BYTES;
-        if (!done("romfs")) need += ROMFS_SIZE - Math.max(0, Math.min(ROMFS_SIZE, new File(game, "extracted/v143/romfs/romfs.bin").length()));
+        if (!done("romfs")) need += ROMFS_SIZE - Math.max(0, Math.min(ROMFS_SIZE, new File(game, "extracted/" + GameBuild.VERSION + "/romfs/romfs.bin").length()));
         if (!done("code") || !done("index") || !done("fonts")) need += CODE_BYTES;
         if (!done("companion")) need += COMPANION_BYTES;
         if (!done("shaders")) need += SHADER_BYTES;
