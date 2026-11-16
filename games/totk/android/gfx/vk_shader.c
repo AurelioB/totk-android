@@ -605,11 +605,13 @@ static void answers_json(const answers_t *a, char *out, size_t cap) {
     PUT("}");
 #undef PUT
 }
+static char g_miss_variant[80];   /* the variant request_miss last named (recording thread; miss_wait) */
 static void request_miss(const char *key, int st, const uint8_t *control, const uint8_t *code, const answers_t *a) {
     char aj[16384]; answers_json(a, aj, sizeof aj);
     unsigned char md[32]; host_sha256(aj, strlen(aj), md);
     char variant[80]; snprintf(variant, sizeof variant, "%.64s-", key);
     for (int i = 0; i < 6; i++) snprintf(variant + 65 + 2 * i, 3, "%02x", md[i]);
+    memcpy(g_miss_variant, variant, sizeof g_miss_variant);
     static nvn_hmap missed = {.klen = 80}; char k[80] = {0}; memcpy(k, variant, strlen(variant));
     if (nvn_hm_get(&missed, k)) return;
     nvn_hm_put(&missed, k, (void *)1);
@@ -637,6 +639,20 @@ static void request_miss(const char *key, int st, const uint8_t *control, const 
     if (n <= 20 || n % 100 == 0) LOGV("[shader-miss] %s %s is not in the seed: its draws are skipped (request %llu %s in %s)", st == 0 ? "vs" : st == 1 ? "ps" : "cs", variant, (unsigned long long)n, background ? "queued" : "saved", dir);
 }
 
+/* 0 = never wait (the draw is skipped until the service publishes the variant). Default: 4000 for Breath of the Wild,
+   which has no prepared seed yet; 0 otherwise. */
+static long miss_wait_ms(void) {
+    static long ms = -1;
+    if (ms < 0) { const char *e = getenv("TOTK_XLATE_WAIT_MS");
+#ifdef GAME_BOTW
+        ms = e && *e ? atol(e) : 4000;
+#else
+        ms = e && *e ? atol(e) : 0;
+#endif
+        if (ms < 0) ms = 0; if (ms > 60000) ms = 60000;
+        LOGV("TOTK_XLATE_WAIT_MS=%ld: a draw whose shader is missing %s", ms, ms ? "waits for the on-device translator" : "is skipped until the translator publishes it"); }
+    return ms;
+}
 /* ---------- programs ---------- */
 /* Lookout Landing: vk_treg_kind was 8.6% of recording. Binding hooks and the registry revision cover every signature input. */
 static uint64_t g_stage_sig[6], g_stage_sig_revision[6];
@@ -748,7 +764,27 @@ int vk_prog_resolve(const prog_t *p, vk_shader *out[6]) {
             variant_list *vl = variants_of(pr->key[st]);
             vk_shader *sh = NULL;
             for (int i = 0; i < vl->n && !sh; i++) if (deps_match(vl->v[i].deps, &a)) sh = shader_load(vl->v[i].name, vk_nvn_early_tests(pr->ctl[st], ctl_key_len(pr->ctl[st]), st));
-            if (!sh) request_miss(pr->key[st], st, pr->ctl[st], pr->code[st], &a);
+            if (!sh) {
+                request_miss(pr->key[st], st, pr->ctl[st], pr->code[st], &a);
+                /* TOTK_XLATE_WAIT_MS: wait for the on-device service instead of skipping the draw. A skipped draw is
+                   harmless in a scene drawn again every frame, but Breath of the Wild also draws things once and keeps
+                   them (the pause menu's captured background, images its water and lighting read): skipped there, they
+                   stayed black or held another image until the game was restarted with the shader in the seed. */
+                long wait_ms = miss_wait_ms();
+                if (wait_ms > 0 && vk_shader_xlate_available()) {
+                    uint64_t t0 = host_now_ns(), seen = vk_shader_xlate_epoch(); int tried = 0;
+                    while (!sh && (host_now_ns() - t0) / 1000000 < (uint64_t)wait_ms && !vk_shader_xlate_rejected(g_miss_variant) && vk_shader_xlate_available()) {
+                        uint64_t now = vk_shader_xlate_epoch();
+                        if (now == seen && tried) { usleep(500); continue; }
+                        seen = now; tried = 1;
+                        vl = variants_of(pr->key[st]);
+                        for (int i = 0; i < vl->n && !sh; i++) if (deps_match(vl->v[i].deps, &a)) sh = shader_load(vl->v[i].name, vk_nvn_early_tests(pr->ctl[st], ctl_key_len(pr->ctl[st]), st));
+                    }
+                    static uint64_t waits, lost; static double total; double ms = (double)(host_now_ns() - t0) / 1e6;
+                    waits++; total += ms; if (!sh) lost++;
+                    if (waits <= 10 || waits % 200 == 0 || !sh) LOGV("[shader-wait] %s %s after %.1f ms (%llu waits, %.0f ms in all, %llu not translated)", g_miss_variant, sh ? "ready" : "not translated: its draws are skipped", ms, (unsigned long long)waits, total, (unsigned long long)lost);
+                }
+            }
             if (pr->nalt[st] == pr->capalt[st]) { pr->capalt[st] = pr->capalt[st] ? 2 * pr->capalt[st] : 2; pr->alt[st] = realloc(pr->alt[st], (size_t)pr->capalt[st] * sizeof *pr->alt[st]); }
             pr->alt[st][pr->nalt[st]++] = (alt_t){sg, sh, !sh};
             hit = &pr->alt[st][pr->nalt[st] - 1];

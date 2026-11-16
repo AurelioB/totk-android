@@ -3753,6 +3753,20 @@ static unsigned pipe_wait_max(void) {
     if (n < 0) { const char *v = getenv("TOTK_VK_PIPE_WAIT_MAX"); n = v && *v ? atoi(v) : 90; n = n < 0 ? 0 : n > 10000 ? 10000 : n; }
     return (unsigned)n;   /* zero disables the bound; count distinct game submissions, not draws or GPU chunks */
 }
+/* TOTK_VK_PIPE_SYNC=1: a draw whose pipeline is still compiling waits for it instead of being skipped. Default 1 for
+   Breath of the Wild, which draws some images once and keeps them (the pause menu's captured background): a skipped draw
+   there is wrong until the game restarts. 0 elsewhere (a hitch-free skip, bounded by TOTK_VK_PIPE_WAIT_MAX). */
+static int pipe_sync_all(void) {
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("TOTK_VK_PIPE_SYNC");
+#ifdef GAME_BOTW
+        on = v && *v ? atoi(v) != 0 : 1;
+#else
+        on = v && *v ? atoi(v) != 0 : 0;
+#endif
+        LOGV("TOTK_VK_PIPE_SYNC=%d: draws %s for a pipeline that is still compiling", on, on ? "wait" : "are skipped"); }
+    return on;
+}
 static int topo_class(int prim) { return prim == 0 ? 0 : prim == 1 || prim == 2 || prim == 3 ? 1 : 2; }
 static VkPrimitiveTopology topology(int prim) {
     switch (prim) {
@@ -4363,9 +4377,10 @@ static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLay
         /* Only opt-in prediction-origin entries join at their first demand (upstream pso_pend_take).
            Skipping one could hide a draw that the original cache-only probe would have satisfied.
            Ordinary screen misses retain async/skipped-submission bounds; captures always join/build. */
-        if (pipe_pending(s) && (e->predicted || capture || (bound && e->wait_sub != sub && e->skipped >= bound))) {
+        int sync_all = pipe_sync_all();
+        if (pipe_pending(s) && (e->predicted || capture || sync_all || (bound && e->wait_sub != sub && e->skipped >= bound))) {
             uint64_t t0 = host_now_ns();
-            if (!capture && !e->predicted) { HK_ADD(pipe_bounds, 1); LOGV("pipeline key %p reached %u skipped submissions: build/join synchronously", (void *)e, e->skipped); }
+            if (!capture && !e->predicted && !sync_all) { HK_ADD(pipe_bounds, 1); LOGV("pipeline key %p reached %u skipped submissions: build/join synchronously", (void *)e, e->skipped); }
             pipe_predict_maybe(vk_exec_draw_next());
             s = pipe_build_now(e);
             uint64_t dt = host_now_ns() - t0; g_win_prewarm_wait++; g_win_prewarm_wait_ns += dt; g_cum_pipe_ns += dt;
