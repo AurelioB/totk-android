@@ -3471,6 +3471,8 @@ unregistered retired ranges are consequently `other`; landing's blocking lifetim
 Counters are lock-free relaxed atomics; snapshots are nontransactional and never reset. Reporting runs only
 in ordinary thread context, not the fault handler. Off adds no counters or new log lines. Abrupt `_exit`,
 abort, fatal signals and process kills do not promise an exit snapshot.
+An independent relaxed atomic reporting latch permits an early UI pause during Vulkan startup without reading
+the game-thread-only switch flag or waiting for/initializing Vulkan; reporting needs no other published state.
 
 ## Finding rendering errors: the frame dump
 

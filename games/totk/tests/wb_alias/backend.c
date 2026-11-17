@@ -522,8 +522,35 @@ static int counter_paths(int enabled) {
            failures ? "FAIL" : "PASS", enabled, unit);
     return failures != 0;
 }
+static pthread_barrier_t pause_init_start;
+static void *pause_during_init(void *unused) {
+    (void)unused;
+    vk_wb_alias_report("pause"); /* Real reporter before initialization must be safe and silent. */
+    pthread_barrier_wait(&pause_init_start);
+    for (unsigned i = 0; i < 256; i++) vk_wb_alias_report("pause");
+    return NULL;
+}
+static int pause_init_race(int enabled) {
+    required(!pthread_barrier_init(&pause_init_start, NULL, 2), "create pause/init rendezvous");
+    pthread_t reporter;
+    required(!pthread_create(&reporter, NULL, pause_during_init, NULL), "start real pause reporter");
+    pthread_barrier_wait(&pause_init_start);
+    vk_wb_test_alias_init(); /* Calls the actual wb_alias_init, without initializing Vulkan. */
+    required(!pthread_join(reporter, NULL), "join pause reporter after concurrent initialization");
+    required(!pthread_barrier_destroy(&pause_init_start), "retire pause/init rendezvous");
+    CHECK(vk_wb_alias_enabled() == enabled, "concurrent reporter does not change switch selection");
+    vk_wb_alias_report("pause");
+    path_counts counts; vk_wb_test_alias_counts(counts);
+    for (int site = 0; site < VK_WB_ALIAS_SITE_COUNT; site++)
+        for (int reason = 0; reason < VK_WB_ALIAS_PATH_COUNT; reason++)
+            CHECK(!counts[site][reason][0] && !counts[site][reason][1], "pause/init does not invent writer traffic");
+    printf("WB_ALIAS_PAUSE_INIT %s alias=%d real-reporter concurrent-real-init\n",
+           failures ? "FAIL" : "PASS", enabled);
+    return failures != 0;
+}
 int main(int argc, char **argv) {
     int gem = argc > 1 && !strcmp(argv[1], "i915"); const char *option = getenv("TOTK_WB_ALIAS"); int enabled = option && !strcmp(option, "1");
+    if (argc > 1 && !strcmp(argv[1], "pause-init")) return pause_init_race(enabled);
     CHECK(!vk_wb_alias_enabled(), "backend getter does not lazily initialize switch"); vk_wb_test_alias_init();
     CHECK(vk_wb_alias_enabled() == enabled, "backend exact startup environment switch");
     required(!setenv("TOTK_WB_ALIAS", enabled ? "0" : "1", 1), "change post-init environment");

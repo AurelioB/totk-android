@@ -208,6 +208,22 @@ class WritebackAlias(unittest.TestCase):
                     if enabled else [],
                     'explicit report and exit must each emit exactly one identical cumulative line')
 
+    def test_real_pause_reporter_concurrent_initialization(self):
+        for switch in (None, '0', '1'):
+            with self.subTest(switch=switch):
+                result = self.run_fixture('backend', switch, args=('pause-init',))
+                enabled = switch == '1'
+                self.assertIn(f'WB_ALIAS_PAUSE_INIT PASS alias={int(enabled)} '
+                              'real-reporter concurrent-real-init', result.stdout)
+                lines = [line for line in result.stderr.splitlines()
+                         if 'memory write-back alias paths:' in line]
+                self.assertEqual(bool(lines), enabled)
+                if enabled:
+                    self.assertTrue(any('phase=pause cumulative=1' in line for line in lines))
+                    self.assertIn('phase=exit cumulative=1', lines[-1])
+                    for line in lines:
+                        self.assertNotRegex(line, r':(?!0/0(?:,| |$))\d+/\d+')
+
     def test_i915_nonmerging_guest_rows(self):
         digests = []
         for switch in ('0', '1'):

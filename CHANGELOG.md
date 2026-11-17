@@ -8,6 +8,7 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ### Developer tools
 - Add enabled-only `TOTK_WB_ALIAS=1` path coverage: cumulative operations/bytes by landing, report/event store
   and publication, separated into alias and fallback reasons at periodic memory reports, Android pause and normal exit.
+  Publish pause-report enablement atomically so early Android lifecycle callbacks can race Vulkan initialization safely.
 - Add launch-only, default-off `TOTK_BENCH_TIME=HH:MM` for restored-save benchmark arms.
   It pins the native effective clock, overriding timeline/sleep/day progression; weather and randomness remain uncontrolled.
   Host guards and ARM64 state fixtures do not establish device HUD/sky or unchanged-save behavior.

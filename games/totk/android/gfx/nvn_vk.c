@@ -538,6 +538,8 @@ static void ts_clock_init(void);
 enum { POOLS_HOST = 1, POOLS_EXPORT, POOLS_HEAP };
 static int g_pool_mode; static const char *g_pool_mode_name;
 static int g_wb_alias_enabled;   /* frozen by vk_init_once before any pool or backend worker exists */
+/* Android pause may precede Vulkan initialization; reporting never reads the worker-only flag. */
+static _Atomic int g_wb_alias_report_enabled;
 _Static_assert(__atomic_always_lock_free(sizeof(uint64_t), 0), "write-back alias counters must be lock-free");
 static _Atomic uint64_t g_wb_alias_counts[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
 void vk_wb_alias_account(vk_wb_alias_site site, vk_wb_alias_reason reason, uint64_t bytes) {
@@ -552,7 +554,7 @@ static void wb_alias_counts(uint64_t out[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PAT
                 out[site][reason][value] = atomic_load_explicit(&g_wb_alias_counts[site][reason][value], memory_order_relaxed);
 }
 void vk_wb_alias_report(const char *phase) {
-    if (!g_wb_alias_enabled) return;
+    if (!atomic_load_explicit(&g_wb_alias_report_enabled, memory_order_relaxed)) return;
     static const char *const labels[VK_WB_ALIAS_PATH_COUNT] = {
         "alias", "registry", "ownership", "mixed", "non-dmabuf", "retired", "other"
     };
@@ -573,6 +575,8 @@ static void wb_alias_exit(void) { vk_wb_alias_report("exit"); }
 int vk_wb_alias_enabled(void) { return g_wb_alias_enabled; }
 static void wb_alias_init(void) {
     const char *e = getenv("TOTK_WB_ALIAS"); g_wb_alias_enabled = e && !strcmp(e, "1");
+    /* Only the atomic counters/static labels are read by the reporter: no other state is published. */
+    atomic_store_explicit(&g_wb_alias_report_enabled, g_wb_alias_enabled, memory_order_relaxed);
     if (g_wb_alias_enabled) {
         static int exit_registered;
         if (!exit_registered) {
