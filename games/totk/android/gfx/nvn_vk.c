@@ -538,11 +538,49 @@ static void ts_clock_init(void);
 enum { POOLS_HOST = 1, POOLS_EXPORT, POOLS_HEAP };
 static int g_pool_mode; static const char *g_pool_mode_name;
 static int g_wb_alias_enabled;   /* frozen by vk_init_once before any pool or backend worker exists */
+_Static_assert(__atomic_always_lock_free(sizeof(uint64_t), 0), "write-back alias counters must be lock-free");
+static _Atomic uint64_t g_wb_alias_counts[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
+void vk_wb_alias_account(vk_wb_alias_site site, vk_wb_alias_reason reason, uint64_t bytes) {
+    if (!g_wb_alias_enabled) return;
+    atomic_fetch_add_explicit(&g_wb_alias_counts[site][reason][0], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_wb_alias_counts[site][reason][1], bytes, memory_order_relaxed);
+}
+static void wb_alias_counts(uint64_t out[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2]) {
+    for (int site = 0; site < VK_WB_ALIAS_SITE_COUNT; site++)
+        for (int reason = 0; reason < VK_WB_ALIAS_PATH_COUNT; reason++)
+            for (int value = 0; value < 2; value++)
+                out[site][reason][value] = atomic_load_explicit(&g_wb_alias_counts[site][reason][value], memory_order_relaxed);
+}
+void vk_wb_alias_report(const char *phase) {
+    if (!g_wb_alias_enabled) return;
+    static const char *const labels[VK_WB_ALIAS_PATH_COUNT] = {
+        "alias", "registry", "ownership", "mixed", "non-dmabuf", "retired", "other"
+    };
+    uint64_t counts[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
+    char paths[VK_WB_ALIAS_SITE_COUNT][512]; /* seven labels and uint64 pairs fit even at UINT64_MAX */
+    wb_alias_counts(counts);
+    for (int site = 0; site < VK_WB_ALIAS_SITE_COUNT; site++) {
+        size_t used = 0;
+        for (int reason = 0; reason < VK_WB_ALIAS_PATH_COUNT; reason++)
+            used += (size_t)snprintf(paths[site] + used, sizeof paths[site] - used, "%s%s:%llu/%llu",
+                reason ? "," : "", labels[reason], (unsigned long long)counts[site][reason][0],
+                (unsigned long long)counts[site][reason][1]);
+    }
+    LOGV("memory write-back alias paths: phase=%.16s cumulative=1 landing=%s store=%s publication=%s",
+        phase, paths[VK_WB_ALIAS_LANDING], paths[VK_WB_ALIAS_STORE], paths[VK_WB_ALIAS_PUBLICATION]);
+}
+static void wb_alias_exit(void) { vk_wb_alias_report("exit"); }
 int vk_wb_alias_enabled(void) { return g_wb_alias_enabled; }
 static void wb_alias_init(void) {
     const char *e = getenv("TOTK_WB_ALIAS"); g_wb_alias_enabled = e && !strcmp(e, "1");
-    if (g_wb_alias_enabled)
+    if (g_wb_alias_enabled) {
+        static int exit_registered;
+        if (!exit_registered) {
+            if (atexit(wb_alias_exit)) LOGV("write-back alias: exit summary registration failed");
+            else exit_registered = 1;
+        }
         LOGV("write-back alias: enabled (TOTK_WB_ALIAS=1); backend-private RW dma-buf mapping per owned pool; host-import/CPU ranges use existing path");
+    }
 }
 static VkDeviceSize g_host_align = 4096;
 static int g_lookup_stats;   /* immutable after vk_init_once: one predictable branch per lookup when disabled */
@@ -1310,6 +1348,47 @@ int vk_wb_alias_range_locked(uintptr_t guest, size_t size) {
     }
     return 1;
 }
+/* Use exactly the writer's current guest-map proof. Unsupported metadata only refines the
+   reason; it never grants a mapping, consults procfs, or changes alias_span/range selection. */
+static vk_wb_alias_reason wb_alias_span_reason(uintptr_t guest, size_t requested, size_t *available) {
+    uintptr_t end = guest + requested;
+    uint64_t off = 0;
+    const pool_ent *owner = mapped_owner(guest, &end, &off);
+    if (owner) {
+        uint64_t capacity = owner->end - owner->base;
+        *available = end - guest;
+        if (off >= capacity) return VK_WB_ALIAS_PATH_OTHER;
+        if (!owner->wb_alias) return VK_WB_ALIAS_PATH_NON_DMABUF;
+        if (capacity - off < *available) *available = (size_t)(capacity - off);
+        return VK_WB_ALIAS_PATH_ALIAS;
+    }
+    int retired = 0, cpu = 0;
+    for (int i = 0; i < g_npool; i++) {
+        const pool_ent *p = g_pools[i];
+        int unknown = (p->kind == K_OWN || p->kind == K_VIEW) && p->guest_unknown;
+        if (p->kind != K_CPU && p->kind != K_VIRT && !unknown) continue;
+        if (p->base > guest && p->base < end) end = p->base;
+        if (guest >= p->base && guest < p->end) {
+            if (p->end < end) end = p->end;
+            retired |= p->kind == K_VIRT || unknown;
+            cpu |= p->kind == K_CPU;
+        }
+    }
+    *available = end - guest;
+    return retired ? VK_WB_ALIAS_PATH_RETIRED : cpu ? VK_WB_ALIAS_PATH_NON_DMABUF : VK_WB_ALIAS_PATH_OTHER;
+}
+vk_wb_alias_reason vk_wb_alias_reason_locked(uintptr_t guest, size_t size) {
+    if (!g_wb_alias_enabled || !guest || !size || size > UINTPTR_MAX - guest) return VK_WB_ALIAS_PATH_OTHER;
+    vk_wb_alias_reason reason = VK_WB_ALIAS_PATH_COUNT;
+    while (size) {
+        size_t available;
+        vk_wb_alias_reason next = wb_alias_span_reason(guest, size, &available);
+        if (reason != VK_WB_ALIAS_PATH_COUNT && reason != next) return VK_WB_ALIAS_PATH_MIXED;
+        reason = next;
+        guest += available; size -= available;
+    }
+    return reason;
+}
 /* Site2 publication keeps the same gates/dirty ownership as the ordinary store. Enabled callers
    pin the registry only when immediately available; contention retains the original unpinned store. */
 static int wb_store_legacy(void *guest, const void *data, size_t size, int event32, int add32, int guarded) {
@@ -1322,34 +1401,58 @@ static int wb_store_legacy(void *guest, const void *data, size_t size, int event
     else memcpy(guest, data, size);
     return 1;
 }
-static int wb_alias_store(void *guest, const void *data, size_t size, int event32, int add32, int guarded) {
+static int wb_alias_store(vk_wb_alias_site site, void *guest, const void *data, size_t size,
+                          int event32, int add32, int guarded) {
     uintptr_t address = (uintptr_t)guest; const uint8_t *src = data;
     int ok = 1;
+    uint64_t alias_bytes = 0, legacy_bytes = 0;
     /* Legacy owner destruction can hold the registry while waiting for this completion cursor.
        No alias pointer exists yet: contention must use the original whole-operation store, not wait. */
-    if (pthread_mutex_trylock(&g_pool_mu))
+    if (pthread_mutex_trylock(&g_pool_mu)) {
+        if (size) vk_wb_alias_account(site, VK_WB_ALIAS_PATH_REGISTRY, size);
         return wb_store_legacy(guest, data, size, event32, add32, guarded);
+    }
+    vk_wb_alias_reason reason = vk_wb_alias_reason_locked(address, size);
     if (event32) {
         size_t available; void *alias = vk_wb_alias_span_locked(address, size, &available);
         /* Never split the read/modify/write word (or its volatile assignment) between owners. */
-        if (alias && available == size)
+        if (alias && available == size) {
+            alias_bytes = size;
             ok = nvn_dirty_lag_store_alias(guest, alias, src, size, add32);
-        else ok = wb_store_legacy(guest, src, size, 1, add32, guarded);
+        } else {
+            legacy_bytes = size;
+            if (reason == VK_WB_ALIAS_PATH_ALIAS) reason = VK_WB_ALIAS_PATH_MIXED;
+            ok = wb_store_legacy(guest, src, size, 1, add32, guarded);
+        }
     } else while (size) {
         size_t available; void *alias = vk_wb_alias_span_locked(address, size, &available);
         size_t n = available ? available : size;
-        if (alias) ok = nvn_dirty_lag_store_alias((void *)address, alias, src, n, 0);
-        else ok = wb_store_legacy((void *)address, src, n, 0, 0, guarded);
+        if (alias) {
+            alias_bytes += n;
+            ok = nvn_dirty_lag_store_alias((void *)address, alias, src, n, 0);
+        } else {
+            legacy_bytes += n;
+            ok = wb_store_legacy((void *)address, src, n, 0, 0, guarded);
+        }
         if (!ok) break;
         address += n; src += n; size -= n;
     }
     pthread_mutex_unlock(&g_pool_mu);
+    if (alias_bytes) vk_wb_alias_account(site, VK_WB_ALIAS_PATH_ALIAS, alias_bytes);
+    if (legacy_bytes) vk_wb_alias_account(site, reason, legacy_bytes);
     return ok;
 }
 #ifdef TOTK_VK_TESTS
-int vk_wb_test_alias_store(void *guest, const void *data, size_t size, int event32, int add32, int guarded) {
-    return g_wb_alias_enabled ? wb_alias_store(guest, data, size, event32, add32, guarded) :
+int vk_wb_test_alias_store_site(vk_wb_alias_site site, void *guest, const void *data, size_t size,
+                               int event32, int add32, int guarded) {
+    return g_wb_alias_enabled ? wb_alias_store(site, guest, data, size, event32, add32, guarded) :
                                wb_store_legacy(guest, data, size, event32, add32, guarded);
+}
+int vk_wb_test_alias_store(void *guest, const void *data, size_t size, int event32, int add32, int guarded) {
+    return vk_wb_test_alias_store_site(VK_WB_ALIAS_STORE, guest, data, size, event32, add32, guarded);
+}
+void vk_wb_test_alias_counts(uint64_t out[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2]) {
+    wb_alias_counts(out);
 }
 #endif
 /* totk_vpool.c: a virtual pool's range, and its page aliases. */
@@ -1556,6 +1659,19 @@ uint64_t vk_wb_test_alias_virtual(void *guest, size_t size) {
         p->kind = K_VIRT; p->fd = -1; p->test_backing = 1;
         guest_mapping_unknown(p->base, p->end);
         pool_insert(p); identity = p->identity;
+    }
+    pthread_mutex_unlock(&g_pool_mu);
+    return identity;
+}
+uint64_t vk_wb_test_alias_cpu(void *guest, size_t size) {
+    if (!wb_test_bounds(guest, size, 0)) return 0;
+    pthread_mutex_lock(&g_pool_mu);
+    uint64_t identity = 0;
+    if (!wb_test_pool(guest) && !own_overlapping((uintptr_t)guest, (uintptr_t)guest + size)) {
+        pool_ent *p = VK_CALLOC(1, sizeof *p);
+        p->lo = p->base = (uintptr_t)guest; p->hi = p->end = p->base + size;
+        p->kind = K_CPU; p->fd = -1; p->test_backing = 1;
+        pool_insert(p); identity = p->identity; g_pool_cpu++;
     }
     pthread_mutex_unlock(&g_pool_mu);
     return identity;
@@ -2373,7 +2489,7 @@ static void apply_posts(slot_t *owner, const vk_gpu_time_slot *last_slot, int la
     for (int i = 0; i < n; i++) {
         post_op *o = &p[i];
         if (o->kind == 1) {
-            if (g_wb_alias_enabled) { if (!wb_alias_store((void *)o->val, &o->v, sizeof o->v, 1, o->mode == 1, lag_wait_on())) DIE("lag event store could not restore protection"); }
+            if (g_wb_alias_enabled) { if (!wb_alias_store(VK_WB_ALIAS_STORE, (void *)o->val, &o->v, sizeof o->v, 1, o->mode == 1, lag_wait_on())) DIE("lag event store could not restore protection"); }
             else if (lag_wait_on()) { if (!nvn_dirty_lag_store32(o->val, o->v, o->mode == 1)) DIE("lag event store could not restore protection"); }
             else if (o->mode == 1) *o->val += o->v; else *o->val = o->v;
         }
@@ -2435,7 +2551,7 @@ static void apply_posts(slot_t *owner, const vk_gpu_time_slot *last_slot, int la
             }
             if (o->tsq1) atomic_store(&g_tsq_busy[o->tsq1 - 1], 0);
             uint64_t rec[2] = {o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? (g_occl_on ? occl_result(o->occl) : o->cval) : 0, ts};
-            if (g_wb_alias_enabled) { if (!wb_alias_store((void *)(uintptr_t)o->addr, rec, sizeof rec, 0, 0, lag_wait_on())) DIE("lag counter store could not restore protection"); }
+            if (g_wb_alias_enabled) { if (!wb_alias_store(VK_WB_ALIAS_STORE, (void *)(uintptr_t)o->addr, rec, sizeof rec, 0, 0, lag_wait_on())) DIE("lag counter store could not restore protection"); }
             else if (lag_wait_on()) { if (!nvn_dirty_lag_store((void *)(uintptr_t)o->addr, rec, sizeof rec)) DIE("lag counter store could not restore protection"); }
             else memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
             cpend_pop(o->addr);
@@ -4151,7 +4267,7 @@ static void ub_publish(void) {
     for (int k = 0; k < n; k++) {
         ub_ent *e = &g_ub[order[k]];
         if (!(g_wb_alias_enabled ?
-              wb_alias_store((void *)(uintptr_t)e->lo, e->data, (size_t)(e->hi - e->lo), 0, 0, 1) :
+              wb_alias_store(VK_WB_ALIAS_PUBLICATION, (void *)(uintptr_t)e->lo, e->data, (size_t)(e->hi - e->lo), 0, 0, 1) :
               nvn_dirty_lag_store((void *)(uintptr_t)e->lo, e->data, (size_t)(e->hi - e->lo))))
             DIE("lag uniform publication could not restore protection");
     }
@@ -6388,6 +6504,7 @@ void vk_mem_report(void) {
         LOGV("memory write-back aliases: mappings %llu, bytes %llu (backend-private RW dma-buf; not guest pools)",
             (unsigned long long)maps, (unsigned long long)bytes);
     }
+    vk_wb_alias_report("periodic");
     uint64_t chunk = 0, nchunk = 0, ndp = 0, posts = 0;
     for (int i = 0; i < RING; i++) { slot_t *s = &g_ring[i]; nchunk += (uint64_t)s->ar.nchunk; ndp += (uint64_t)s->ndpool; posts += (uint64_t)s->cap; for (int c = 0; c < s->ar.nchunk; c++) chunk += s->ar.chunks[c].size; }
     uint64_t slot_chunks = chunk;

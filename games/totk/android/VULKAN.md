@@ -3449,6 +3449,29 @@ where N/B are current live retained mappings/page-rounded owner bytes. These are
 Off adds neither line and leaves existing logs unchanged. The earlier eight-run settled-write-back qualification
 above predates this switch; it is not alias-path device evidence or a frame-rate/VMA-reduction guarantee.
 
+With the switch enabled, one additional cumulative path-coverage line is emitted at the existing periodic
+memory-report cadence, on each effective Android pause edge, and at normal `atexit`:
+```
+[nvn-vk] memory write-back alias paths: phase=PHASE cumulative=1 landing=alias:O/B,registry:O/B,ownership:O/B,mixed:O/B,non-dmabuf:O/B,retired:O/B,other:O/B store=alias:O/B,registry:O/B,ownership:O/B,mixed:O/B,non-dmabuf:O/B,retired:O/B,other:O/B publication=alias:O/B,registry:O/B,ownership:O/B,mixed:O/B,non-dmabuf:O/B,retired:O/B,other:O/B
+```
+`PHASE` is `periodic`, `pause` or `exit`; each decimal `O/B` is operation incidences / requested bytes.
+`landing` covers dispatched texture encoders (including padding in their logical span), `store` covers report/event
+stores, and `publication` covers uniform-buffer publications. Freshness-rejected/deferred work without a writer
+dispatch is not counted. Multiple supported owners count once per logical operation, not once per owner.
+A split store can contribute one `alias` incidence plus one `mixed` fallback incidence, with bytes partitioned
+between those paths; therefore summing incidences is not a unique-call count. Bytes describe attempted spans,
+not the number of texels changed or completed writes.
+
+Reasons are `registry` (nonblocking pin contention), `ownership` (landing lacks its existing tracked-watch/token
+eligibility or dirty containment), `mixed` (unsupported/mixed backing classes, or an unsplittable event word
+crossing owners), `non-dmabuf` (known HOST/CPU backing without a retained private mapping), `retired`
+(known virtual hole or invalidated guest-translation proof), and `other` (unregistered/invalid extent or no
+more specific proof). Classification uses current registry authority, not a kernel/exporter query. Entirely
+unregistered retired ranges are consequently `other`; landing's blocking lifetime pin never reports `registry`.
+Counters are lock-free relaxed atomics; snapshots are nontransactional and never reset. Reporting runs only
+in ordinary thread context, not the fault handler. Off adds no counters or new log lines. Abrupt `_exit`,
+abort, fatal signals and process kills do not promise an exit snapshot.
+
 ## Finding rendering errors: the frame dump
 
 `TOTK_VK_PASS_DUMP=<frame>[-<last frame>][,<min width>]` copies the attachments of every pass of one frame (or a range) and logs, in recording

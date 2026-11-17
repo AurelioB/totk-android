@@ -376,12 +376,159 @@ static uint64_t pinned_replacements(backing *a, backing *b, int enabled, uint64_
     }
     puts("PINNED_MAPVIRTUAL PASS real-remap real-unmap admission-blocked token-end registry-release"); return digest;
 }
+typedef uint64_t path_counts[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
+static const char *const counter_sites[] = {"landing", "store", "publication"};
+static const char *const counter_reasons[] = {"alias", "registry", "ownership", "mixed", "non-dmabuf", "retired", "other"};
+static void counter_delta(const path_counts before, const path_counts after, const path_counts expected,
+                          int enabled, const char *label) {
+    for (int site = 0; site < VK_WB_ALIAS_SITE_COUNT; site++)
+        for (int reason = 0; reason < VK_WB_ALIAS_PATH_COUNT; reason++)
+            for (int metric = 0; metric < 2; metric++) {
+                uint64_t delta = after[site][reason][metric] - before[site][reason][metric];
+                uint64_t want = enabled ? expected[site][reason][metric] : 0;
+                if (delta != want)
+                    fprintf(stderr, "counter %s %s/%s/%s: got=%" PRIu64 " expected=%" PRIu64 "\n",
+                            label, counter_sites[site], counter_reasons[reason], metric ? "bytes" : "ops", delta, want);
+                CHECK(delta == want, "snapshot delta contains only the selected logical operation and byte partition");
+            }
+}
+static void counter_store(vk_wb_alias_site site, uint8_t *guest, const void *data, size_t size,
+                          int event32, int add32, int enabled, size_t alias_bytes,
+                          vk_wb_alias_reason fallback, size_t fallback_bytes, const char *label) {
+    path_counts before, after, expected = {0};
+    CHECK(alias_bytes + fallback_bytes == size, "counter oracle partitions every requested store byte");
+    if (alias_bytes) { expected[site][VK_WB_ALIAS_PATH_ALIAS][0] = 1; expected[site][VK_WB_ALIAS_PATH_ALIAS][1] = alias_bytes; }
+    if (fallback_bytes) { expected[site][fallback][0] = 1; expected[site][fallback][1] = fallback_bytes; }
+    uint32_t word = 0;
+    if (event32) { memcpy(&word, data, sizeof word); if (add32) word += word_at(guest); }
+    vk_wb_test_alias_counts(before);
+    int ok = site == VK_WB_ALIAS_STORE ?
+        vk_wb_test_alias_store(guest, data, size, event32, add32, 1) :
+        vk_wb_test_alias_store_site(site, guest, data, size, event32, add32, 1);
+    vk_wb_test_alias_counts(after);
+    CHECK(ok, "actual production Site2 selector completes counter sample");
+    CHECK(event32 ? word_at(guest) == word : !memcmp(guest, data, size),
+          "counter sample publishes every exact requested guest byte");
+    counter_delta(before, after, expected, enabled, label);
+}
+static int counter_paths(int enabled) {
+    path_counts initial, zero = {0};
+    memset(initial, 0xa5, sizeof initial); vk_wb_test_alias_counts(initial);
+    counter_delta(zero, initial, zero, enabled, "initial");
+    size_t unit = TOTK_VPOOL_PAGE;
+    backing a, b, old;
+    required(!backing_open(&a, 8 * unit, 0, 0) && !backing_open(&b, 8 * unit, 0, 0) &&
+             !backing_open(&old, unit, 0, 0), "create no-device counter donors");
+    memset(a.guest, 0x31, a.bytes); memset(b.guest, 0x52, b.bytes); memset(old.guest, 0x73, old.bytes);
+    uint64_t aid = vk_wb_test_alias_owner(a.guest, a.bytes, a.fd, a.offset);
+    uint64_t bid = vk_wb_test_alias_owner(b.guest, b.bytes, b.fd, b.offset);
+    uint64_t old_id = vk_wb_test_alias_owner(old.guest, old.bytes, old.fd, old.offset);
+    required(aid && bid && old_id, "register real fd owners for path counters");
+    void *alt = reserve(128 * 1024); stack_t stack = {.ss_sp = alt, .ss_size = 128 * 1024};
+    required(!sigaltstack(&stack, NULL), "counter alternate signal stack");
+    struct sigaction action = {.sa_sigaction = handle_fault, .sa_flags = SA_SIGINFO | SA_ONSTACK};
+    sigemptyset(&action.sa_mask); required(!sigaction(SIGSEGV, &action, NULL), "counter real dirty fault hook");
+    nvn_dirty_lag_enable();
+    pool_t pa = physical_pool(a.guest, a.bytes), pb = physical_pool(b.guest, b.bytes);
+    pool_t po = physical_pool(old.guest, old.bytes), v = virtual_open(8 * unit), stale = virtual_open(unit);
+    totk_mapping_request requests[] = {
+        mapping(&pa, 0, 0, unit), mapping(&pb, 0, unit, unit),
+        mapping(&pa, unit, 2 * unit, unit), mapping(&pb, unit, 3 * unit, unit),
+        mapping(NULL, 0, 4 * unit, unit), mapping(&pa, 2 * unit, 5 * unit, unit),
+        mapping(NULL, 0, 6 * unit, unit), mapping(&pa, 3 * unit, 7 * unit, unit),
+    };
+    uint64_t vid = map_requests(&v, sizeof requests / sizeof requests[0], requests);
+    totk_mapping_request old_request = mapping(&po, 0, 0, unit);
+    uint64_t stale_id = map_requests(&stale, 1, &old_request);
+    vk_wb_test_alias_remove(old.guest); retired(old_id, old.guest, old.bytes);
+    uint8_t *cpu = reserve(3 * unit);
+    uint64_t cpu_id = vk_wb_test_alias_cpu(cpu, unit);
+    required(cpu_id != 0, "register actual known-CPU range without private alias");
+    required(vk_wb_pool_lock(vid, v.mem, v.size), "pin real virtual range for full-extent classifier");
+    if (enabled) {
+        CHECK(vk_wb_alias_reason_locked((uintptr_t)v.mem, 4 * unit) == VK_WB_ALIAS_PATH_ALIAS,
+              "full supported extent remains alias across four owner segments");
+        CHECK(vk_wb_alias_reason_locked((uintptr_t)v.mem, v.size) == VK_WB_ALIAS_PATH_MIXED,
+              "full extent classifier sees alternating supported and anonymous segments");
+        CHECK(vk_wb_alias_reason_locked((uintptr_t)v.mem + 4 * unit, unit) == VK_WB_ALIAS_PATH_RETIRED,
+              "real MapVirtual anonymous hole is retired rather than inferred non-dmabuf");
+        CHECK(vk_wb_alias_reason_locked(UINTPTR_MAX - 3, 8) == VK_WB_ALIAS_PATH_OTHER &&
+              vk_wb_alias_reason_locked((uintptr_t)v.mem, 0) == VK_WB_ALIAS_PATH_OTHER,
+              "overflow and empty classifier extents remain other");
+    }
+    vk_wb_pool_unlock();
+    required(vk_wb_pool_lock(cpu_id, cpu, unit), "pin actual known-CPU registration");
+    if (enabled) {
+        CHECK(vk_wb_alias_reason_locked((uintptr_t)cpu, unit) == VK_WB_ALIAS_PATH_NON_DMABUF,
+              "known CPU registry proof classifies non-dmabuf");
+        CHECK(vk_wb_alias_reason_locked((uintptr_t)cpu + 2 * unit, unit) == VK_WB_ALIAS_PATH_OTHER,
+              "valid unregistered address has no owner/backing proof");
+        CHECK(vk_wb_alias_reason_locked((uintptr_t)cpu + unit - 13, 97) == VK_WB_ALIAS_PATH_MIXED,
+              "different unsupported classes classify as a mixed full extent");
+    }
+    vk_wb_pool_unlock();
+    required(vk_wb_pool_lock(stale_id, stale.mem, stale.size), "pin surviving virtual registration after donor retirement");
+    if (enabled) CHECK(vk_wb_alias_reason_locked((uintptr_t)stale.mem, stale.size) == VK_WB_ALIAS_PATH_RETIRED,
+                       "removed physical donor leaves known retired virtual authority");
+    vk_wb_pool_unlock();
+    size_t capacity = 4 * unit + 42; uint8_t *data = malloc(capacity);
+    required(data != NULL, "allocate full logical counter store span");
+    for (size_t i = 0; i < capacity; i++) data[i] = (uint8_t)(i * 17 + 9);
+    for (vk_wb_alias_site site = VK_WB_ALIAS_STORE; site <= VK_WB_ALIAS_PUBLICATION; site++) {
+        uint32_t value = 0x571c8a23, add = 19;
+        counter_store(site, a.guest + 128, data, 0, 0, 0, enabled, 0, VK_WB_ALIAS_PATH_OTHER, 0, "empty-no-store");
+        counter_store(site, a.guest + 128, data, 97, 0, 0, enabled, 97, VK_WB_ALIAS_PATH_OTHER, 0, "fd-report");
+        counter_store(site, a.guest + 256, &value, sizeof value, 1, 0, enabled, sizeof value, VK_WB_ALIAS_PATH_OTHER, 0, "fd-event");
+        counter_store(site, a.guest + 256, &add, sizeof add, 1, 1, enabled, sizeof add, VK_WB_ALIAS_PATH_OTHER, 0, "fd-add32");
+        counter_store(site, v.mem + unit - 31, data, 2 * unit + 62, 0, 0, enabled, 2 * unit + 62,
+                      VK_WB_ALIAS_PATH_OTHER, 0, "four-supported-owner-segments");
+        CHECK(!memcmp(a.guest + unit - 31, data, 31) && !memcmp(b.guest, data + 31, unit) &&
+              !memcmp(a.guest + unit, data + unit + 31, unit) &&
+              !memcmp(b.guest + unit, data + 2 * unit + 31, 31), "cross-owner counter sample reaches every donor offset");
+        counter_store(site, v.mem + 3 * unit - 13, data, capacity, 0, 0, enabled, 2 * unit + 42,
+                      VK_WB_ALIAS_PATH_MIXED, 2 * unit, "alternating-alias-hole-once-per-path");
+        counter_store(site, v.mem + 4 * unit + 128, data, 97, 0, 0, enabled, 0,
+                      VK_WB_ALIAS_PATH_RETIRED, 97, "real-anonymous-hole");
+        counter_store(site, stale.mem + 128, data, 97, 0, 0, enabled, 0,
+                      VK_WB_ALIAS_PATH_RETIRED, 97, "retired-physical-owner");
+        CHECK(bytes_are(old.guest, old.bytes, 0x73), "retired publication never writes the restored former owner guest");
+        counter_store(site, cpu + 128, data, 97, 0, 0, enabled, 0,
+                      VK_WB_ALIAS_PATH_NON_DMABUF, 97, "known-cpu");
+        counter_store(site, cpu + 2 * unit + 128, data, 97, 0, 0, enabled, 0,
+                      VK_WB_ALIAS_PATH_OTHER, 97, "valid-unregistered");
+        counter_store(site, cpu + unit - 13, data, 97, 0, 0, enabled, 0,
+                      VK_WB_ALIAS_PATH_MIXED, 97, "cpu-and-unregistered-once-per-fallback");
+        required(vk_wb_pool_lock(aid, a.guest, a.bytes), "hold actual registry throughout contended counter samples");
+        counter_store(site, a.guest + 256, &add, sizeof add, 1, 1, enabled, 0,
+                      VK_WB_ALIAS_PATH_REGISTRY, sizeof add, "held-registry-event");
+        counter_store(site, a.guest + 512, data, 97, 0, 0, enabled, 0,
+                      VK_WB_ALIAS_PATH_REGISTRY, 97, "held-registry-report");
+        vk_wb_pool_unlock();
+    }
+    free(data); virtual_close(&v); virtual_close(&stale);
+    vk_wb_test_alias_remove(cpu); required(!munmap(cpu, 3 * unit), "release known CPU and unregistered spans");
+    vk_wb_test_alias_remove(a.guest); vk_wb_test_alias_remove(b.guest);
+    backing_close(&old); backing_close(&a); backing_close(&b);
+    stack.ss_flags = SS_DISABLE; required(!sigaltstack(&stack, NULL), "disable counter alternate signal stack");
+    required(!munmap(alt, 128 * 1024), "release counter alternate signal stack");
+    path_counts counts, after; vk_wb_test_alias_counts(counts);
+    for (int site = 0; site < VK_WB_ALIAS_SITE_COUNT; site++)
+        for (int reason = 0; reason < VK_WB_ALIAS_PATH_COUNT; reason++)
+            printf("WB_ALIAS_COUNTS_SNAPSHOT %s %s %" PRIu64 " %" PRIu64 "\n",
+                   counter_sites[site], counter_reasons[reason], counts[site][reason][0], counts[site][reason][1]);
+    vk_wb_alias_report("periodic"); vk_wb_test_alias_counts(after);
+    counter_delta(counts, after, zero, enabled, "report-does-not-reset-cumulative");
+    printf("WB_ALIAS_COUNTERS %s alias=%d unit=%zu actual-selector store-publication cross-owner mixed-once retired-hole known-cpu held-registry\n",
+           failures ? "FAIL" : "PASS", enabled, unit);
+    return failures != 0;
+}
 int main(int argc, char **argv) {
     int gem = argc > 1 && !strcmp(argv[1], "i915"); const char *option = getenv("TOTK_WB_ALIAS"); int enabled = option && !strcmp(option, "1");
     CHECK(!vk_wb_alias_enabled(), "backend getter does not lazily initialize switch"); vk_wb_test_alias_init();
     CHECK(vk_wb_alias_enabled() == enabled, "backend exact startup environment switch");
     required(!setenv("TOTK_WB_ALIAS", enabled ? "0" : "1", 1), "change post-init environment");
     CHECK(vk_wb_alias_enabled() == enabled, "backend switch frozen after initialization");
+    if (argc > 1 && !strcmp(argv[1], "counters")) return counter_paths(enabled);
     size_t bytes = 16 * TOTK_VPOOL_PAGE; backing a, b; int result = backing_open(&a, bytes, gem, 0);
     if (result) { backing_close(&a); return result; }
     result = backing_open(&b, bytes, gem, 0); if (result) { backing_close(&a); backing_close(&b); return result; }

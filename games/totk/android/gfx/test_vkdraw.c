@@ -1780,8 +1780,23 @@ static int wb_alias_watch_exhaustion(void) {
     CHECK(mtl_wait(run(), 5000000000ull), "watch-exhausted GPU producer completes");
     uint64_t before[7], after[7], faults0, preps0, faults1, preps1;
     vk_wb_test_stats(before); nvn_dirty_stats(&faults0, &preps0); stamp = nvn_dirty_now();
+    uint64_t paths_before[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
+    uint64_t paths_after[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
+    vk_wb_test_alias_counts(paths_before);
     mtl_pool_invalidate(&pool, (uint64_t)(texture.mem - memory), texture.L.size);
     nvn_dirty_stats(&faults1, &preps1); vk_wb_test_stats(after);
+    vk_wb_test_alias_counts(paths_after);
+    if (vk_wb_alias_enabled()) {
+        CHECK(paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_OWNERSHIP][0] ==
+                  paths_before[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_OWNERSHIP][0] + 1 &&
+              paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_OWNERSHIP][1] ==
+                  paths_before[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_OWNERSHIP][1] + texture.L.size,
+            "actual no-watch landing counts one ownership fallback and its exact logical bytes");
+        CHECK(paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][0] ==
+                  paths_before[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][0],
+            "no-watch fallback is not mislabeled as an alias operation");
+    } else CHECK(!paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_OWNERSHIP][0],
+        "disabled telemetry stays empty for the no-token legacy landing");
     CHECK(before[2] == 1 && !after[2] && !after[5], "full synchronous invalidate consumes the no-watch record and staging");
     CHECK(!memcmp(texture.mem, expected, texture.L.size), "no-watch legacy landing retains exact contents and padding");
     CHECK(faults1 > faults0 && nvn_dirty_since(texture.mem, texture.L.size, stamp),
@@ -1822,6 +1837,9 @@ static int settled_child(int disabled) {
     uint64_t landing_stamp = nvn_dirty_now();
     nvn_dirty_mp_count mp_before[NVN_DIRTY_MP_REASON_COUNT], mp_after[NVN_DIRTY_MP_REASON_COUNT];
     nvn_dirty_mp_reason_stats(mp_before);
+    uint64_t paths_before[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
+    uint64_t paths_after[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
+    vk_wb_test_alias_counts(paths_before);
     settled_idle(quiet + 2); vk_wb_test_stats(after);
     if (!disabled) { settled_wait_landed(before[0] + 1); vk_wb_test_stats(after); }
     if (disabled) {
@@ -1830,6 +1848,15 @@ static int settled_child(int disabled) {
             "TOTK_VK_OFF=settledwb preserves every uploaded byte and allocates no staging");
     } else {
         CHECK(!memcmp(memory, expected, t.L.size), "all nine levels and padding equal the rendered NVN-layout reference without invalidate");
+        vk_wb_test_alias_counts(paths_after);
+        if (vk_wb_alias_enabled()) CHECK(
+            paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][0] >
+                paths_before[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][0] &&
+            paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][1] -
+                paths_before[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][1] == t.L.size,
+            "real nine-level landing reports alias path operations and exact logical span bytes");
+        else CHECK(!paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][0],
+            "disabled telemetry records no alias landing operations");
         CHECK(after[0] == before[0] + 1 && after[1] == before[1] + t.L.size && !after[2] && !after[5],
             "exactly one settled rendering lands and releases staging/image record (%llu bytes)", (unsigned long long)t.L.size);
         CHECK(!nvn_dirty_since(memory, t.L.size, landing_stamp), "GPU landing changes no CPU dirty generation");

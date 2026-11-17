@@ -6,6 +6,9 @@ Artifacts stay below the checkout's enclosing .scratch, never in /tmp.
 The backend links totk_vpool.c directly: anonymous replacements, overlapping
 last writers, mremap fallback, fatal partial failure and pinned remap/unmap
 threads all use production operations, not synthetic alias metadata repairs.
+Counter snapshots exercise the real Site2 selector for STORE and PUBLICATION,
+including byte partitions across real owner/anonymous MapVirtual boundaries.
+The counter-only mode needs no Vulkan and emits one explicit report plus exit.
 """
 from pathlib import Path
 import os
@@ -20,6 +23,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 TOTK = ROOT / 'games/totk'
 FIXTURE = TOTK / 'tests/wb_alias'
+COUNTER_SITES = ('landing', 'store', 'publication')
+COUNTER_REASONS = ('alias', 'registry', 'ownership', 'mixed',
+                   'non-dmabuf', 'retired', 'other')
 
 
 class WritebackAlias(unittest.TestCase):
@@ -74,7 +80,7 @@ class WritebackAlias(unittest.TestCase):
                                      + '\n' + result.stdout + result.stderr)
             cls.executables[name] = executable
 
-    def run_fixture(self, name, switch, *, lag='1', gem=False):
+    def run_fixture(self, name, switch, *, lag='1', gem=False, args=()):
         environment = os.environ.copy()
         environment['TMPDIR'] = str(self.directory)
         for key in ('TOTK_WB_ALIAS', 'TOTK_FRAME_LAG', 'TOTK_DIRTY_UNIT',
@@ -87,6 +93,7 @@ class WritebackAlias(unittest.TestCase):
         command = [str(self.executables[name])]
         if gem:
             command.append('i915')
+        command.extend(args)
         result = subprocess.run(command, env=environment, capture_output=True,
                                 text=True, timeout=45)
         if gem and result.returncode == 77:
@@ -149,6 +156,57 @@ class WritebackAlias(unittest.TestCase):
                     digests.append(digest.group(1))
             if len(digests) == 2:  # a failed subtest already reports its fixture failure
                 self.assertEqual(digests[0], digests[1], 'off/on real MapVirtual guest/donor/other-alias contents differ')
+
+    def test_site2_counter_deltas_snapshots_and_cumulative_reports(self):
+        for switch in (None, '', '0', '01', 'true', '1 ', '1'):
+            with self.subTest(switch=switch):
+                result = self.run_fixture('backend', switch, args=('counters',))
+                marker = re.search(r'WB_ALIAS_COUNTERS PASS alias=(\d) unit=(\d+)', result.stdout)
+                if marker is None:
+                    self.fail('missing counter selector summary: ' + result.stdout)
+                enabled = switch == '1'
+                self.assertEqual(int(marker.group(1)), enabled)
+                unit = int(marker.group(2))
+                rows = re.findall(
+                    r'^WB_ALIAS_COUNTS_SNAPSHOT (\S+) (\S+) (\d+) (\d+)$',
+                    result.stdout, re.MULTILINE)
+                self.assertEqual(len(rows), len(COUNTER_SITES) * len(COUNTER_REASONS))
+                snapshot = {(site, reason): (int(ops), int(size))
+                            for site, reason, ops, size in rows}
+                self.assertEqual(len(snapshot), len(rows), 'duplicate snapshot bucket')
+                selected = {
+                    'alias': (5, 4 * unit + 209),
+                    'registry': (2, 101),
+                    'ownership': (0, 0),
+                    'mixed': (2, 2 * unit + 97),
+                    'non-dmabuf': (1, 97),
+                    'retired': (2, 194),
+                    'other': (1, 97),
+                }
+                expected = {
+                    (site, reason): selected[reason] if enabled and site != 'landing' else (0, 0)
+                    for site in COUNTER_SITES for reason in COUNTER_REASONS
+                }
+                self.assertEqual(snapshot, expected, result.stdout + result.stderr)
+                for site in ('store', 'publication'):
+                    self.assertEqual(sum(snapshot[site, reason][1] for reason in COUNTER_REASONS),
+                                     6 * unit + 795 if enabled else 0,
+                                     'logical store bytes must be partitioned, never duplicated')
+                prefix = 'memory write-back alias paths: '
+                lines = [line for line in result.stderr.splitlines() if prefix in line]
+                self.assertEqual(len(lines), 2 if enabled else 0, result.stderr)
+                for line in lines:
+                    self.assertLessEqual(len(line.encode()), 3 * 1024)
+                payload = ' '.join(
+                    site + '=' + ','.join(
+                        f'{reason}:{snapshot[site, reason][0]}/{snapshot[site, reason][1]}'
+                        for reason in COUNTER_REASONS)
+                    for site in COUNTER_SITES)
+                self.assertEqual(
+                    [line.split(prefix, 1)[1] for line in lines],
+                    [f'phase={phase} cumulative=1 {payload}' for phase in ('periodic', 'exit')]
+                    if enabled else [],
+                    'explicit report and exit must each emit exactly one identical cumulative line')
 
     def test_i915_nonmerging_guest_rows(self):
         digests = []

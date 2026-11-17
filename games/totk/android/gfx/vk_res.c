@@ -1245,9 +1245,14 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
     /* Mixed/unsupported backing and records without watch/ownership eligibility
        retain the original protocol for this landing extent. Range registration
        alone must not select a private destination for a no-token synchronous record. */
-    int private_alias = vk_wb_alias_enabled() && e->tracked &&
-        nvn_dirty_tracked(t->mem + offset, span) &&
-        vk_wb_alias_range_locked((uintptr_t)t->mem + offset, (size_t)span);
+    int alias_enabled = vk_wb_alias_enabled();
+    vk_wb_alias_reason alias_reason = VK_WB_ALIAS_PATH_OTHER;
+    if (alias_enabled) {
+        alias_reason = !e->tracked || !nvn_dirty_tracked(t->mem + offset, span) ?
+            VK_WB_ALIAS_PATH_OWNERSHIP :
+            vk_wb_alias_reason_locked((uintptr_t)t->mem + offset, (size_t)span);
+    }
+    int private_alias = alias_enabled && alias_reason == VK_WB_ALIAS_PATH_ALIAS;
     if (mode == WB_IDLE || mode == WB_INVALIDATE_TRY) {
         int ready = private_alias ?
             nvn_dirty_gpu_write_alias_try_begin((void *)(t->mem + offset), span, &token) :
@@ -1275,12 +1280,14 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
         totk_texcopy_log(vk_submit_serial(), "phase=res event=invalidate-freshness ser=%llu image=%#llx result=%s",
             (unsigned long long)t->serial, (unsigned long long)(uintptr_t)e->im->img, fresh ? "gpu-authoritative" : "skip-cpu-newer");
     int ok = 1;
+    uint64_t dispatched_bytes = 0;
     if (fresh) do {
         unsigned l = e->land_level;
         uint64_t level = nvn_tex_level_offset(&t->d, l);
         uint64_t end = l + 1 < s.levels ? nvn_tex_level_offset(&t->d, l + 1) : t->L.layer_size;
         uint64_t n = mode == WB_IDLE ? span : end - level - e->land_pos;
         size_t pitch = (size_t)((MAXV(e->im->w >> l, 1u) + s.bw - 1) / s.bw) * s.bpb;
+        if (alias_enabled) dispatched_bytes += n;
         int encoded = private_alias ?
             wb_swizzle_alias(t, l, e->land_layer, e->bytes + e->land_src, pitch, e->land_pos, n) :
             nvn_swizzle_span(&t->d, l, e->land_layer, e->bytes + e->land_src, pitch, (void *)t->mem, e->land_pos, n);
@@ -1292,6 +1299,8 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
         }
         if (mode == WB_IDLE) break;
     } while (e->land_level < s.levels);
+    if (alias_enabled && dispatched_bytes)
+        vk_wb_alias_account(VK_WB_ALIAS_LANDING, alias_reason, dispatched_bytes);
     nvn_dirty_gpu_write_end(token);
 #ifdef TOTK_VK_TESTS
     if (settled) nvn_dirty_test_wb_phase(t->mem, NVN_DIRTY_TEST_WB_RESTORED);
