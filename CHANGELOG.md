@@ -30,6 +30,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Refresh the shared shader list with seven more upstream variants applicable to game 1.4.3
+  (`5fb080496ab7`, V rows only). Fresh host translation prepares 25,039 modules instead of 25,032,
+  with zero failures and about 430 KiB of additional packed data. Existing shader packs stay valid;
+  run a full shader rebuild to receive the added coverage.
 - Fix shader translation for compute texture gathers with runtime offsets.
   The translator now lowers those offsets before emitting SPIR-V instead of putting runtime values in constants.
   Existing generated shader seeds need replacement to receive the corrected modules.
