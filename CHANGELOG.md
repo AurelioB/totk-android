@@ -42,7 +42,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   making protected guest pages writable. Preserve CPU-write detection, GPU synchronization and zero-on-recommit;
   unsupported backing and contended report/event/uniform publications keep the old path. This closes the
   protected-page temporary-RW race, not already-writable/unwatched aliases. Cost is extra mappings/VA, not copied backing.
-  Off preserves the original path and logs; device performance and VMA-growth qualification remain pending.
+  Off preserves the original path and logs. First AYN Thor device evidence, over five common completed loads:
+  texture GPU-unprotect boundaries 0 versus 17,214; whole-process row growth averaged +1,025 versus +4,535/load.
+  No switch-attributable picture corruption was observed. Pooled standing frame tails were SAME, but some individual
+  phases had worse tails; this one ordered alias/legacy pair is not a speed proof. Odin and Duo remain untested.
+  Keep the switch default off; it prevents this fragmentation source, not all mapping growth.
 - Correct the experimental private writer's virtual-mapping authority across production MapVirtual replacements,
   including anonymous unmaps and fallback remaps; serialize replacement and invalidation with borrowed writers.
   Watch-slot-exhausted synchronous records keep the original no-token guest-store path rather than bypass ownership.

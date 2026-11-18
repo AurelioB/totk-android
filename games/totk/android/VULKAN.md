@@ -3389,6 +3389,7 @@ cancellation between chunks, plus a point-address swizzle oracle covering2D/arra
 
 ### Private write-back aliases (`TOTK_WB_ALIAS=1`, experimental)
 
+Launch-only and **default off**; only the exact value `1` enables it.
 This does not enable write-back or frame lag; their existing policies remain in force. It retains the original
 temporary `MAP_SHARED`, `PROT_READ | PROT_WRITE` mapping made when each `K_OWN` dma-buf is populated, instead of
 unmapping it. Guest and private mappings use the same fd, offsets and exporter-selected memory attributes.
@@ -3448,6 +3449,18 @@ The existing memory report additionally emits `[nvn-vk] memory write-back aliase
 where N/B are current live retained mappings/page-rounded owner bytes. These are not guest-pool counts.
 Off adds neither line and leaves existing logs unchanged. The earlier eight-run settled-write-back qualification
 above predates this switch; it is not alias-path device evidence or a frame-rate/VMA-reduction guarantee.
+
+**First alias-enabled device evidence (AYN Thor):** fix `7129293`, attribution integration `8945e9f`,
+same APK with attribution enabled in both arms, alias first then legacy. Across five common completed loads,
+texture GPU-unprotect new boundaries were **0 versus 17,214** and mean whole-process row growth was
+**+1,025 versus +4,535/load** (legacy +4,534.8 before rounding). Enabled completed a sixth load; legacy
+stopped input during load six at the planned mapping-pressure safety threshold, then closed normally.
+Sampled pictures showed no switch-attributable corruption; this is not exhaustive rendering/cache-coherency proof.
+All pooled metrics for thirteen admitted standing window pairs, including frame tails, were SAME. Some
+individual Hateno phases had tool-WORSE tails, and no pan pairs were admitted: the ordered pair is not a
+causal speed proof or grounds to enable by default. Odin and Duo have **not** been tested with this switch.
+Other watch/fault/host and non-pool mapping growth remains. Full controls, limitations and picture evidence:
+`.scratch/perf/map-limit/wb-alias/thor/report.md`. Earlier settled-write-back evidence above remains distinct.
 
 With the switch enabled, one additional cumulative path-coverage line is emitted at the existing periodic
 memory-report cadence, on each effective Android pause edge, and at normal `atexit`:
