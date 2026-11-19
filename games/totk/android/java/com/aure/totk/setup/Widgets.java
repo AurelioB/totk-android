@@ -110,7 +110,7 @@ final class Widgets {
                     path.close();
                     paths.add(path);
                     boolean major = i % 5 == 4;
-                    int color = major ? Theme.alpha(0xffaabe96, .12f * op) : Theme.alpha(0xff96af8c, .055f * op);
+                    int color = major ? Theme.alpha(Theme.tint(0xffaabe96), .12f * op) : Theme.alpha(Theme.tint(0xff96af8c), .055f * op);
                     styles.add(new int[]{color, major ? 14 : 10});
                 }
             }
@@ -123,7 +123,7 @@ final class Widgets {
             float w = getWidth(), h = getHeight(), s = Theme.scale;
             float ox = (w - Theme.DESIGN_W * s) / 2, oy = (h - Theme.DESIGN_H * s) / 2;
             // radial-gradient(ellipse 70% 80% at 68% 42%, #1c2c26 0, #101915 48%, #070b0a 100%)
-            RadialGradient vignette = new RadialGradient(0, 0, 1, new int[]{0xff1c2c26, 0xff101915, 0xff070b0a}, new float[]{0, .48f, 1}, Shader.TileMode.CLAMP);
+            RadialGradient vignette = new RadialGradient(0, 0, 1, new int[]{Theme.tint(0xff1c2c26), Theme.tint(0xff101915), Theme.tint(0xff070b0a)}, new float[]{0, .48f, 1}, Shader.TileMode.CLAMP);
             Matrix m = new Matrix();
             m.setScale(Theme.DESIGN_W * s * .7f, Theme.DESIGN_H * s * .8f);
             m.postTranslate(ox + Theme.DESIGN_W * s * .68f, oy + Theme.DESIGN_H * s * .42f);
@@ -144,14 +144,14 @@ final class Widgets {
                 RectF inner = new RectF(box); inner.inset(8 + i * 8, 8 + i * 8);
                 c.drawRoundRect(inner, Math.max(4, 34 - i * 8), Math.max(4, 34 - i * 8), paint);
             }
-            paint.setStrokeWidth(5); paint.setColor(0xe6121b17);
+            paint.setStrokeWidth(5); paint.setColor(Theme.tint(0xe6121b17));
             RectF band = new RectF(box); band.inset(4, 4); c.drawRoundRect(band, 30, 30, paint);
-            paint.setStrokeWidth(1); paint.setColor(0xff26332c);
+            paint.setStrokeWidth(1); paint.setColor(Theme.tint(0xff26332c));
             band.inset(3, 3); c.drawRoundRect(band, 27, 27, paint);
             paint.setColor(0x99000000); band.set(box); band.inset(1.5f, 1.5f); c.drawRoundRect(band, 32, 32, paint);
-            paint.setStrokeWidth(2); paint.setColor(0xff2f3c35); c.drawRoundRect(box, 34, 34, paint);
+            paint.setStrokeWidth(2); paint.setColor(Theme.tint(0xff2f3c35)); c.drawRoundRect(box, 34, 34, paint);
             paint.setStyle(Paint.Style.FILL);
-            paint.setShader(new LinearGradient(900, 0, 1020, 0, new int[]{0, 0xff4b5c52, 0}, null, Shader.TileMode.CLAMP));
+            paint.setShader(new LinearGradient(900, 0, 1020, 0, new int[]{0, Theme.tint(0xff4b5c52), 0}, null, Shader.TileMode.CLAMP));
             c.drawRoundRect(900, 23, 1020, 27, 2, 2, paint);
             c.drawRoundRect(900, Theme.DESIGN_H - 27, 1020, Theme.DESIGN_H - 23, 2, 2, paint);
             paint.setShader(null);
@@ -178,7 +178,7 @@ final class Widgets {
             float cc = size / 2, r = cc - 8, g = 5 * size / 360f;
             paint.reset(); paint.setAntiAlias(true);
             paint.setStyle(Paint.Style.FILL);
-            paint.setShader(new RadialGradient(cc, size * .45f, size * .6f, 0xff1f3a31, 0xff0c1411, Shader.TileMode.CLAMP));
+            paint.setShader(new RadialGradient(cc, size * .45f, size * .6f, Theme.tint(0xff1f3a31), Theme.tint(0xff0c1411), Shader.TileMode.CLAMP));
             c.drawCircle(cc, cc, r, paint);
             paint.setShader(null);
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeCap(Paint.Cap.ROUND); paint.setStrokeJoin(Paint.Join.ROUND);
@@ -202,7 +202,7 @@ final class Widgets {
             paint.setStrokeCap(Paint.Cap.ROUND);
             Path island = new Path();
             island.moveTo(cc - 70, cc - 52); island.lineTo(cc + 70, cc - 52); island.lineTo(cc + 34, cc - 18); island.lineTo(cc, cc + 2); island.lineTo(cc - 34, cc - 18); island.close();
-            paint.setStyle(Paint.Style.FILL); paint.setColor(0xff14231e); c.drawPath(island, paint);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xff14231e)); c.drawPath(island, paint);
             paint.setStyle(Paint.Style.STROKE); paint.setColor(Theme.GOLD); paint.setStrokeWidth(4); paint.setShadowLayer(g, 0, 0, Theme.GOLD);
             c.drawPath(island, paint);
             paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.ZONAI); paint.setShadowLayer(g, 0, 0, Theme.ZONAI);
@@ -264,7 +264,7 @@ final class Widgets {
             c.drawRoundRect(box, r, r, paint);
             paint.clearShadowLayer();
             paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(Theme.f(4)); paint.setColor(0x590a100e);
+            paint.setStrokeWidth(Theme.f(4)); paint.setColor(Theme.tint(0x590a100e));
             box.inset(Theme.f(2.5f), Theme.f(2.5f)); c.drawRoundRect(box, r - Theme.f(2), r - Theme.f(2), paint);
             paint.setStrokeWidth(Theme.f(1)); paint.setColor(0x0affffff);
             c.drawLine(r, Theme.f(1.5f), w - r, Theme.f(1.5f), paint);
@@ -295,7 +295,7 @@ final class Widgets {
             c.drawLine(0, y, w, y, paint);
             if (!joint) return;
             paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.DEEP); Theme.diamond(c, w / 2, y, Theme.f(6), paint);
-            paint.setStyle(Paint.Style.STROKE); paint.setColor(0xff6f7d62); Theme.diamond(c, w / 2, y, Theme.f(6), paint);
+            paint.setStyle(Paint.Style.STROKE); paint.setColor(Theme.tint(0xff6f7d62)); Theme.diamond(c, w / 2, y, Theme.f(6), paint);
         }
     }
 
@@ -330,7 +330,7 @@ final class Widgets {
             c.save(); c.translate(getScrollX(), getScrollY());
             box.set(Theme.f(.5f), Theme.f(.5f), getWidth() - Theme.f(.5f), getHeight() - Theme.f(.5f));
             float r = box.height() / 2;
-            paint.setStyle(Paint.Style.FILL); paint.setColor(0xcc101815); c.drawRoundRect(box, r, r, paint);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xcc101815)); c.drawRoundRect(box, r, r, paint);
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Theme.f(1)); paint.setColor(Theme.RULE); c.drawRoundRect(box, r, r, paint);
             paint.setStyle(Paint.Style.FILL); paint.setColor(dot());
             if (kind != IDLE) paint.setShadowLayer(Theme.f(6), 0, 0, Theme.alpha(dot(), .5f));
@@ -413,11 +413,11 @@ final class Widgets {
         void set(boolean on) { if (this.on != on) { this.on = on; invalidate(); } }
         @Override protected void onDraw(Canvas c) {
             float w = getWidth(), h = getHeight(), r = h / 2;
-            paint.setStyle(Paint.Style.FILL); paint.setColor(on ? 0xff4d5a2c : 0xff26312c);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(on ? Theme.tint(0xff4d5a2c) : Theme.tint(0xff26312c));
             c.drawRoundRect(0, 0, w, h, r, r, paint);
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Theme.f(1)); paint.setColor(on ? Theme.SEL_DIM : Theme.RULE);
             c.drawRoundRect(Theme.f(.5f), Theme.f(.5f), w - Theme.f(.5f), h - Theme.f(.5f), r, r, paint);
-            paint.setStyle(Paint.Style.FILL); paint.setColor(on ? Theme.SEL : 0xff79806f);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(on ? Theme.SEL : Theme.tint(0xff79806f));
             if (on) paint.setShadowLayer(Theme.f(8), 0, 0, Theme.SEL_GLOW);
             float knob = h - Theme.f(10);
             c.drawCircle(on ? w - Theme.f(5) - knob / 2 : Theme.f(5) + knob / 2, h / 2, knob / 2, paint);
@@ -550,11 +550,11 @@ final class Widgets {
                 float cx = icon.getLeft() + icon.getWidth() / 2f, cy = icon.getTop() + icon.getHeight() / 2f, r = Theme.f(circle / 2);
                 boolean lit = lit();
                 paint.setStyle(Paint.Style.FILL);
-                paint.setShader(new RadialGradient(cx, cy, r, new int[]{0x1a57dfbf, 0}, new float[]{0, .7f}, Shader.TileMode.CLAMP));
+                paint.setShader(new RadialGradient(cx, cy, r, new int[]{Theme.withAlpha(Theme.ZONAI, 0x1a), 0}, new float[]{0, .7f}, Shader.TileMode.CLAMP));
                 c.drawCircle(cx, cy, r, paint);
                 paint.setShader(null);
                 paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Theme.f(1.5f));
-                paint.setColor(lit ? 0xb3d4ea74 : 0xff3f5149);
+                paint.setColor(lit ? Theme.withAlpha(Theme.SEL, 0xb3) : Theme.tint(0xff3f5149));
                 if (lit) paint.setShadowLayer(Theme.f(8), 0, 0, Theme.SEL_GLOW);
                 c.drawCircle(cx, cy, r, paint);
                 paint.clearShadowLayer();
@@ -665,7 +665,7 @@ final class Widgets {
                 Path p = new Path();
                 p.moveTo(x + skew, y); p.lineTo(x + w, y); p.lineTo(x + w - skew, y + h); p.lineTo(x, y + h); p.close();
                 boolean lit = i < on;
-                paint.setColor(lit ? (low ? Theme.ZONAI : Theme.AMBER) : 0xff2f3b35);
+                paint.setColor(lit ? (low ? Theme.ZONAI : Theme.AMBER) : Theme.tint(0xff2f3b35));
                 if (lit) paint.setShadowLayer(Theme.f(5), 0, 0, low ? Theme.ZONAI_GLOW : 0x59e3ad55);
                 c.drawPath(p, paint);
                 paint.clearShadowLayer();
@@ -694,11 +694,11 @@ final class Widgets {
             if (!on) return;
             float w = getWidth(), h = getHeight() - Theme.f(16), r = Theme.f(14);
             paint.setStyle(Paint.Style.FILL);
-            paint.setShader(new LinearGradient(0, 0, 0, h, 0x24d4ea74, 0x05d4ea74, Shader.TileMode.CLAMP));
+            paint.setShader(new LinearGradient(0, 0, 0, h, Theme.withAlpha(Theme.SEL, 0x24), Theme.withAlpha(Theme.SEL, 0x05), Shader.TileMode.CLAMP));
             c.drawRoundRect(0, 0, w, h, r, r, paint);
             paint.setShader(null);
-            paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Theme.f(1.5f)); paint.setColor(0x8cd4ea74);
-            paint.setShadowLayer(Theme.f(11), 0, 0, 0x2ed4ea74);
+            paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Theme.f(1.5f)); paint.setColor(Theme.withAlpha(Theme.SEL, 0x8c));
+            paint.setShadowLayer(Theme.f(11), 0, 0, Theme.withAlpha(Theme.SEL, 0x2e));
             c.drawRoundRect(Theme.f(.75f), Theme.f(.75f), w - Theme.f(.75f), h - Theme.f(.75f), r, r, paint);
             paint.clearShadowLayer();
             paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.SEL); paint.setShadowLayer(Theme.f(5), 0, 0, Theme.SEL_GLOW);
@@ -748,14 +748,14 @@ final class Widgets {
             box.set(l, 0, w, h);
             boolean lit = isFocused() || isPressed();
             paint.setStyle(Paint.Style.FILL);
-            if (active) paint.setShader(new LinearGradient(0, 0, 0, h, 0x1f57dfbf, 0xcc141f1b, Shader.TileMode.CLAMP));
+            if (active) paint.setShader(new LinearGradient(0, 0, 0, h, Theme.withAlpha(Theme.ZONAI, 0x1f), Theme.tint(0xcc141f1b), Shader.TileMode.CLAMP));
             else paint.setColor(Theme.GLASS2);
             c.drawRoundRect(box, r, r, paint);
             paint.setShader(null);
             if (lit) Theme.selection(c, box, r, paint);
             else {
-                paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Theme.f(active ? 1.5f : 1)); paint.setColor(active ? 0xb357dfbf : Theme.RULE);
-                if (active) paint.setShadowLayer(Theme.f(11), 0, 0, 0x2657dfbf);
+                paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Theme.f(active ? 1.5f : 1)); paint.setColor(active ? Theme.withAlpha(Theme.ZONAI, 0xb3) : Theme.RULE);
+                if (active) paint.setShadowLayer(Theme.f(11), 0, 0, Theme.withAlpha(Theme.ZONAI, 0x26));
                 c.drawRoundRect(l + e, e, w - e, h - e, r, r, paint);
                 paint.clearShadowLayer();
             }
@@ -787,8 +787,8 @@ final class Widgets {
             float cx = Theme.f(22), cy = Theme.f(22), r = Theme.f(21);
             if (!last) {
                 paint.setStyle(Paint.Style.FILL);
-                if (state == DONE) paint.setShader(new LinearGradient(0, cy + Theme.f(28), 0, getHeight(), Theme.ZONAI, 0xff2f6f60, Shader.TileMode.CLAMP));
-                else paint.setColor(0xff33433b);
+                if (state == DONE) paint.setShader(new LinearGradient(0, cy + Theme.f(28), 0, getHeight(), Theme.ZONAI, Theme.tint(0xff2f6f60), Shader.TileMode.CLAMP));
+                else paint.setColor(Theme.tint(0xff33433b));
                 c.drawRect(cx - Theme.f(1), cy + Theme.f(28), cx + Theme.f(1), getHeight() - Theme.f(6), paint);
                 paint.setShader(null);
             }
@@ -798,7 +798,7 @@ final class Widgets {
             c.drawCircle(cx, cy, r, paint);
             paint.clearShadowLayer();
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Theme.f(2));
-            int ring = state == DONE ? Theme.ZONAI : state == CURRENT ? Theme.SEL : state == FAILED ? Theme.WARN : 0xff44554c;
+            int ring = state == DONE ? Theme.ZONAI : state == CURRENT ? Theme.SEL : state == FAILED ? Theme.WARN : Theme.tint(0xff44554c);
             paint.setColor(ring);
             if (state == DONE) paint.setShadowLayer(Theme.f(6), 0, 0, Theme.ZONAI_GLOW);
             c.drawCircle(cx, cy, r, paint);
@@ -882,10 +882,10 @@ final class Widgets {
             float ix = icon.getLeft() - icon.getPaddingLeft() + icon.getPaddingLeft(), iy = icon.getTop();
             RectF ib = new RectF(ix, iy, ix + icon.getWidth(), iy + icon.getHeight());
             paint.setStyle(Paint.Style.FILL);
-            paint.setShader(new RadialGradient(ib.centerX(), ib.centerY(), ib.width() / 2, new int[]{0x1f57dfbf, 0}, new float[]{0, .7f}, Shader.TileMode.CLAMP));
+            paint.setShader(new RadialGradient(ib.centerX(), ib.centerY(), ib.width() / 2, new int[]{Theme.withAlpha(Theme.ZONAI, 0x1f), 0}, new float[]{0, .7f}, Shader.TileMode.CLAMP));
             c.drawRoundRect(ib, Theme.f(16), Theme.f(16), paint);
             paint.setShader(null);
-            paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Theme.f(1.5f)); paint.setColor(lit ? 0xb3d4ea74 : 0xff3f5149);
+            paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Theme.f(1.5f)); paint.setColor(lit ? Theme.withAlpha(Theme.SEL, 0xb3) : Theme.tint(0xff3f5149));
             ib.inset(Theme.f(.75f), Theme.f(.75f));
             c.drawRoundRect(ib, Theme.f(16), Theme.f(16), paint);
         }
@@ -907,10 +907,10 @@ final class Widgets {
             float w = getWidth(), h = getHeight(), r = h / 2;
             c.save();
             Path clip = new Path(); clip.addRoundRect(0, 0, w, h, r, r, Path.Direction.CW); c.clipPath(clip);
-            paint.setStyle(Paint.Style.FILL); paint.setColor(0xff26312c); c.drawRect(0, 0, w, h, paint);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xff26312c)); c.drawRect(0, 0, w, h, paint);
             paint.setColor(Theme.ZONAI); c.drawRect(0, 0, w * used, h, paint);
             float x0 = w * used, x1 = w * (used + adding);
-            paint.setColor(enough ? 0xff9fb257 : Theme.WARN); c.drawRect(x0, 0, x1, h, paint);
+            paint.setColor(enough ? Theme.tint(0xff9fb257) : Theme.WARN); c.drawRect(x0, 0, x1, h, paint);
             paint.setColor(enough ? Theme.SEL : 0xfff0a080); paint.setStrokeWidth(Theme.f(6)); paint.setStyle(Paint.Style.STROKE);
             c.clipRect(x0, 0, x1, h);
             for (float x = x0 - h; x < x1 + h; x += Theme.f(17)) c.drawLine(x, h, x + h, 0, paint);
@@ -935,20 +935,20 @@ final class Widgets {
             boolean sweep = fraction < 0;
             float p = sweep ? 0 : Math.min(1, fraction);
             paint.setStyle(Paint.Style.FILL);
-            paint.setShader(new RadialGradient(cx, cy, r - 30 * k, 0xff1d3830, 0x000d1512, Shader.TileMode.CLAMP));
+            paint.setShader(new RadialGradient(cx, cy, r - 30 * k, Theme.tint(0xff1d3830), Theme.tint(0x000d1512), Shader.TileMode.CLAMP));
             c.drawCircle(cx, cy, r - 30 * k, paint);
             paint.setShader(null);
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeCap(Paint.Cap.ROUND); paint.setStrokeWidth(3 * k);
             for (int i = 0; i < 72; i++) {
                 double a = i / 72.0 * Math.PI * 2 - Math.PI / 2;
                 float l = (i % 6 == 0 ? 18 : 9) * k, cos = (float) Math.cos(a), sin = (float) Math.sin(a);
-                paint.setColor(i / 72f < p ? Theme.ZONAI : 0xff33433b);
+                paint.setColor(i / 72f < p ? Theme.ZONAI : Theme.tint(0xff33433b));
                 c.drawLine(cx + cos * r, cy + sin * r, cx + cos * (r - l), cy + sin * (r - l), paint);
             }
             paint.setStrokeWidth(2 * k); paint.setColor(Theme.alpha(Theme.GOLD_DIM, .6f));
             c.drawCircle(cx, cy, r - 40 * k, paint);
             float ar = r - 56 * k;
-            paint.setStrokeWidth(10 * k); paint.setColor(0xff26332d); c.drawCircle(cx, cy, ar, paint);
+            paint.setStrokeWidth(10 * k); paint.setColor(Theme.tint(0xff26332d)); c.drawCircle(cx, cy, ar, paint);
             RectF oval = new RectF(cx - ar, cy - ar, cx + ar, cy + ar);
             paint.setColor(Theme.SEL); paint.setShadowLayer(8 * k, 0, 0, Theme.SEL_GLOW);
             if (sweep) {   // unknown total: a slow rotating segment
@@ -964,7 +964,7 @@ final class Widgets {
             // font's line box, so descenders do not make them jump.
             paint.setStyle(Paint.Style.FILL); paint.setTextAlign(Paint.Align.LEFT);
             paint.setTypeface(Theme.semibold); paint.setTextSize(96 * k); paint.setColor(0xfff6f0d8);
-            paint.setShadowLayer(30 * k, 0, 0, 0x5957dfbf);
+            paint.setShadowLayer(30 * k, 0, 0, Theme.ZONAI_GLOW);
             centred(c, big, cx, cy - 26 * k, true);
             paint.clearShadowLayer();
             paint.setTypeface(Theme.regular); paint.setTextSize(22 * k); paint.setColor(Theme.TEXT2);
@@ -1007,7 +1007,7 @@ final class Widgets {
             mini = new View(context) {
                 @Override protected void onDraw(Canvas c) {
                     float w = getWidth(), h = getHeight();
-                    paint.setStyle(Paint.Style.FILL); paint.setColor(0xff2a3530); c.drawRoundRect(0, 0, w, h, h / 2, h / 2, paint);
+                    paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xff2a3530)); c.drawRoundRect(0, 0, w, h, h / 2, h / 2, paint);
                     float end = fraction < 0 ? w : w * Math.min(1, fraction);
                     float start = 0;
                     if (fraction < 0) {
@@ -1037,7 +1037,7 @@ final class Widgets {
         @Override protected void onDraw(Canvas c) {
             float cx = Theme.f(20), cy = getHeight() / 2f, r = Theme.f(19);
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Theme.f(2));
-            int ring = state == DONE ? Theme.ZONAI : state == ACTIVE ? Theme.SEL : state == FAILED ? Theme.WARN : state == SKIPPED ? Theme.AMBER : 0xff44554c;
+            int ring = state == DONE ? Theme.ZONAI : state == ACTIVE ? Theme.SEL : state == FAILED ? Theme.WARN : state == SKIPPED ? Theme.AMBER : Theme.tint(0xff44554c);
             paint.setColor(ring);
             if (state == ACTIVE) paint.setShadowLayer(Theme.f(7), 0, 0, Theme.SEL_GLOW);
             c.drawCircle(cx, cy, r, paint);

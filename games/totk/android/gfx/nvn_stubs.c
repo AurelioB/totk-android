@@ -115,6 +115,7 @@ void dm_gfx_set_flag(const char *name, int v) { (void)name; (void)v; }
 void dm_gfx_shot_at(long k, const char *path) { (void)k; (void)path; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_window_shot(const char *path) { (void)path; }
+void dm_gfx_ashot(const char *path) { (void)path; }   /* Breath of the Wild's "ashot" diagnostic (input.c): Metal only */
 void dm_gfx_querylog_next(long n) { (void)n; }
 #ifndef GPU_VK
 void dm_gfx_passdump_next(long n) { (void)n; }   /* vk_draw.c */

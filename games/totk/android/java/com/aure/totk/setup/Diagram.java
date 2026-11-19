@@ -79,16 +79,16 @@ final class Diagram extends View {
     private void mini(Canvas c, RectF r, float islandX) {
         c.save(); c.clipRect(r); c.translate(r.left, r.top); c.scale(r.width() / 180f, r.height() / 150f);
         paint.setStyle(Paint.Style.FILL);
-        paint.setShader(new LinearGradient(0, 0, 0, 150, new int[]{0xff24443c, 0xff1a2f29, 0xff13201c}, new float[]{0, .55f, 1}, Shader.TileMode.CLAMP));
+        paint.setShader(new LinearGradient(0, 0, 0, 150, new int[]{Theme.tint(0xff24443c), Theme.tint(0xff1a2f29), Theme.tint(0xff13201c)}, new float[]{0, .55f, 1}, Shader.TileMode.CLAMP));
         c.drawRect(0, 0, 180, 150, paint);
         paint.setShader(null);
         Path ground = new Path();
         ground.moveTo(0, 118); ground.lineTo(40, 92); ground.lineTo(70, 104); ground.lineTo(110, 80); ground.lineTo(150, 100); ground.lineTo(180, 90);
         ground.lineTo(180, 150); ground.lineTo(0, 150); ground.close();
-        paint.setColor(0xff0f1a17); c.drawPath(ground, paint);
+        paint.setColor(Theme.tint(0xff0f1a17)); c.drawPath(ground, paint);
         Path island = new Path();
         island.moveTo(islandX - 30, 52); island.lineTo(islandX + 30, 52); island.lineTo(islandX + 16, 66); island.lineTo(islandX, 74); island.lineTo(islandX - 16, 66); island.close();
-        paint.setColor(0xff2c4a40); c.drawPath(island, paint);
+        paint.setColor(Theme.tint(0xff2c4a40)); c.drawPath(island, paint);
         paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(1.5f); paint.setColor(Theme.ZONAI); c.drawPath(island, paint);
         paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.SEL); c.drawCircle(islandX, 38, 5, paint);
         paint.setColor(Theme.alpha(Theme.AMBER, .5f)); c.drawCircle(150, 28, 10, paint);
@@ -203,7 +203,7 @@ final class Diagram extends View {
             box.set(start + i * (bw + gap), cy - bh / 2, start + i * (bw + gap) + bw, cy + bh / 2);
             boolean used = i >= 3 - slots;
             if (used) { c.save(); Path clip = new Path(); clip.addRoundRect(box, s(8), s(8), Path.Direction.CW); c.clipPath(clip); mini(c, box, 60 + i * 30); c.restore(); }
-            frameBorder(c, box, s(8), used ? Theme.SEL : 0xff33433b, s(used ? 1.5f : 1), !used);
+            frameBorder(c, box, s(8), used ? Theme.SEL : Theme.tint(0xff33433b), s(used ? 1.5f : 1), !used);
         }
         paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.SEL);
         Path arrow = new Path();
@@ -264,7 +264,7 @@ final class Diagram extends View {
             else if (aa.equals("fxaa")) cover = Math.round(cover * 2) / 2.0;
             int a = (int) Math.round(cover * 255);
             paint.setStyle(Paint.Style.FILL);
-            paint.setColor(0xff1a2a25);
+            paint.setColor(Theme.tint(0xff1a2a25));
             c.drawRect(x0 + x * cell, y0 + y * cell, x0 + (x + 1) * cell - s(1), y0 + (y + 1) * cell - s(1), paint);
             paint.setColor((a << 24) | (Theme.SEL & 0xffffff));
             c.drawRect(x0 + x * cell, y0 + y * cell, x0 + (x + 1) * cell - s(1), y0 + (y + 1) * cell - s(1), paint);
@@ -309,18 +309,18 @@ final class Diagram extends View {
         float cy = h / 2;
         RectF hand = new RectF(w * .06f, cy - s(60), w * .44f, cy + s(60));
         RectF tv = new RectF(w * .54f, cy - s(95), w * .94f, cy + s(70));
-        paint.setStyle(Paint.Style.FILL); paint.setColor(0xff0d1412);
+        paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xff0d1412));
         c.drawRoundRect(hand, s(30), s(30), paint);
-        frameBorder(c, hand, s(30), docked ? 0xff34433b : Theme.SEL, s(docked ? 2 : 3), false);
+        frameBorder(c, hand, s(30), docked ? Theme.tint(0xff34433b) : Theme.SEL, s(docked ? 2 : 3), false);
         RectF hs = new RectF(hand.left + s(44), hand.top + s(14), hand.right - s(44), hand.bottom - s(14));
         c.save(); Path clip = new Path(); clip.addRoundRect(hs, s(8), s(8), Path.Direction.CW); c.clipPath(clip); mini(c, hs, 90); c.restore();
-        paint.setStyle(Paint.Style.FILL); paint.setColor(0xff1d2824);
+        paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xff1d2824));
         c.drawCircle(hand.left + s(22), cy - s(12), s(12), paint); c.drawCircle(hand.right - s(22), cy + s(12), s(12), paint);
-        paint.setColor(0xff0d1412); c.drawRoundRect(tv, s(10), s(10), paint);
-        frameBorder(c, tv, s(10), docked ? Theme.SEL : 0xff34433b, s(docked ? 3 : 2), false);
+        paint.setColor(Theme.tint(0xff0d1412)); c.drawRoundRect(tv, s(10), s(10), paint);
+        frameBorder(c, tv, s(10), docked ? Theme.SEL : Theme.tint(0xff34433b), s(docked ? 3 : 2), false);
         RectF ts = new RectF(tv.left + s(10), tv.top + s(10), tv.right - s(10), tv.bottom - s(10));
         c.save(); clip = new Path(); clip.addRoundRect(ts, s(4), s(4), Path.Direction.CW); c.clipPath(clip); mini(c, ts, 90); c.restore();
-        paint.setStyle(Paint.Style.FILL); paint.setColor(0xff34433b);
+        paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xff34433b));
         c.drawRect(tv.centerX() - s(30), tv.bottom + s(6), tv.centerX() + s(30), tv.bottom + s(10), paint);
         label(c, Strings.DIAG_HANDHELD_RES, hand.centerX(), hand.bottom + s(36), 18, docked ? Theme.TEXT3 : Theme.SEL, Paint.Align.CENTER);
         label(c, Strings.DIAG_DOCKED_RES, tv.centerX(), tv.bottom + s(40), 18, docked ? Theme.SEL : Theme.TEXT3, Paint.Align.CENTER);
@@ -360,16 +360,16 @@ final class Diagram extends View {
         float dw = Math.min(w * .88f, s(520)), dh = dw * 300 / 520, x0 = (w - dw) / 2, y0 = (h - dh) / 2;
         RectF dev = new RectF(x0, y0, x0 + dw, y0 + dh);
         float k = dw / 520;
-        paint.setStyle(Paint.Style.FILL); paint.setColor(0xff0d1412); paint.setShadowLayer(s(15), 0, s(10), 0x66000000);
+        paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xff0d1412)); paint.setShadowLayer(s(15), 0, s(10), 0x66000000);
         c.drawRoundRect(dev, 30 * k, 30 * k, paint); paint.clearShadowLayer();
-        frameBorder(c, dev, 30 * k, 0xff34433b, 3 * k, false);
+        frameBorder(c, dev, 30 * k, Theme.tint(0xff34433b), 3 * k, false);
         RectF inner = new RectF(dev); inner.inset(6 * k, 6 * k);
-        frameBorder(c, inner, 26 * k, 0xff121b18, 8 * k, false);
+        frameBorder(c, inner, 26 * k, Theme.tint(0xff121b18), 8 * k, false);
         RectF scr = new RectF(dev.left + 56 * k, dev.top + 22 * k, dev.right - 56 * k, dev.bottom - 22 * k);
         c.save(); Path clip = new Path(); clip.addRoundRect(scr, 10 * k, 10 * k, Path.Direction.CW); c.clipPath(clip);
         c.save(); c.translate(scr.left, scr.top); landscape(c, scr.width(), scr.height()); c.restore();
         c.restore();
-        paint.setStyle(Paint.Style.FILL); paint.setColor(0xff1d2824);
+        paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xff1d2824));
         c.drawCircle(dev.left + 29 * k, dev.top + 137 * k, 17 * k, paint); c.drawCircle(dev.right - 29 * k, dev.top + 187 * k, 17 * k, paint);
         String pos = value("overlay_pos"), mode = value("overlay");
         boolean showPos = key.equals("overlay_pos");
@@ -384,7 +384,7 @@ final class Diagram extends View {
                 for (String line : lines) tw = Math.max(tw, paint.measureText(line));
                 float bw = tw + 20 * k, bh = lines.length * 18 * k * Theme.scale + 12 * k;
                 RectF b = new RectF(right ? cx - bw : cx, bottom ? cy - bh : cy, right ? cx : cx + bw, bottom ? cy : cy + bh);
-                paint.setStyle(Paint.Style.FILL); paint.setColor(0xc7080c0b); c.drawRoundRect(b, 6 * k, 6 * k, paint);
+                paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xc7080c0b)); c.drawRoundRect(b, 6 * k, 6 * k, paint);
                 paint.setShadowLayer(s(7), 0, 0, Theme.SEL_GLOW);
                 frameBorder(c, b, 6 * k, Theme.alpha(Theme.SEL, mode.equals("off") ? .3f : .6f), s(1), mode.equals("off"));
                 paint.clearShadowLayer();
@@ -404,16 +404,16 @@ final class Diagram extends View {
         boolean on = value("second_screen").equals("on");
         float dw = Math.min(w * .6f, h * 1.1f), x0 = (w - dw) / 2;
         RectF top = new RectF(x0, 0, x0 + dw, h * .48f), bottom = new RectF(x0 + dw * .08f, h * .52f, x0 + dw * .92f, h);
-        paint.setStyle(Paint.Style.FILL); paint.setColor(0xff0d1412);
+        paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xff0d1412));
         c.drawRoundRect(top, s(16), s(16), paint); c.drawRoundRect(bottom, s(16), s(16), paint);
-        frameBorder(c, top, s(16), 0xff34433b, s(2), false);
-        frameBorder(c, bottom, s(16), on ? Theme.SEL : 0xff34433b, s(on ? 2.5f : 2), false);
+        frameBorder(c, top, s(16), Theme.tint(0xff34433b), s(2), false);
+        frameBorder(c, bottom, s(16), on ? Theme.SEL : Theme.tint(0xff34433b), s(on ? 2.5f : 2), false);
         RectF ts = new RectF(top); ts.inset(s(12), s(12));
         c.save(); Path clip = new Path(); clip.addRoundRect(ts, s(6), s(6), Path.Direction.CW); c.clipPath(clip); mini(c, ts, 90); c.restore();
         RectF bs = new RectF(bottom); bs.inset(s(12), s(12));
-        paint.setStyle(Paint.Style.FILL); paint.setColor(on ? 0xff1b2c26 : 0xff080c0b); c.drawRoundRect(bs, s(6), s(6), paint);
+        paint.setStyle(Paint.Style.FILL); paint.setColor(on ? Theme.tint(0xff1b2c26) : Theme.tint(0xff080c0b)); c.drawRoundRect(bs, s(6), s(6), paint);
         if (on) {
-            paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(s(1)); paint.setColor(0x4057dfbf);
+            paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(s(1)); paint.setColor(Theme.withAlpha(Theme.ZONAI, 0x40));
             for (float x = bs.left + s(18); x < bs.right; x += s(18)) c.drawLine(x, bs.top, x, bs.bottom, paint);
             for (float y = bs.top + s(18); y < bs.bottom; y += s(18)) c.drawLine(bs.left, y, bs.right, y, paint);
             paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.SEL); paint.setShadowLayer(s(6), 0, 0, Theme.SEL_GLOW);
@@ -438,7 +438,7 @@ final class Diagram extends View {
         int switchA = 2;
         for (int i = 0; i < 4; i++) {
             boolean lit = i == switchA;
-            paint.setStyle(Paint.Style.FILL); paint.setColor(lit ? Theme.KEY : 0xff26312c);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(lit ? Theme.KEY : Theme.tint(0xff26312c));
             if (lit) paint.setShadowLayer(s(14), 0, 0, Theme.SEL_GLOW);
             c.drawCircle(at[i][0], at[i][1], r, paint);
             paint.clearShadowLayer();
@@ -471,9 +471,9 @@ final class Diagram extends View {
             float bx = wx - s(18) - (i + 1) * (bw + gap) + gap;
             box.set(bx, cy - s(26), bx + bw, cy + s(26));
             boolean used = i < blocks;
-            paint.setStyle(Paint.Style.FILL); paint.setColor(used ? 0x33d4ea74 : 0);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(used ? Theme.withAlpha(Theme.SEL, 0x33) : 0);
             c.drawRoundRect(box, s(5), s(5), paint);
-            frameBorder(c, box, s(5), used ? Theme.SEL : 0xff33433b, s(used ? 1.5f : 1), !used);
+            frameBorder(c, box, s(5), used ? Theme.SEL : Theme.tint(0xff33433b), s(used ? 1.5f : 1), !used);
         }
         label(c, Strings.buffer(blocks * 5), wx - s(18) - blocks * (bw + gap) / 2f, cy + s(64), 18, Theme.TEXT2, Paint.Align.CENTER);
     }
@@ -481,7 +481,7 @@ final class Diagram extends View {
     private void language(Canvas c, float w, float h) {
         String lang = value("game_language");
         box.set(w * .12f, h * .08f, w * .88f, h * .72f);
-        paint.setStyle(Paint.Style.FILL); paint.setColor(0xff17221e); c.drawRoundRect(box, s(18), s(18), paint);
+        paint.setStyle(Paint.Style.FILL); paint.setColor(Theme.tint(0xff17221e)); c.drawRoundRect(box, s(18), s(18), paint);
         Path tail = new Path();
         tail.moveTo(box.left + s(60), box.bottom - s(1)); tail.lineTo(box.left + s(48), h * .95f); tail.lineTo(box.left + s(100), box.bottom - s(1)); tail.close();
         c.drawPath(tail, paint);

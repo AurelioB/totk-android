@@ -71,6 +71,7 @@ static void xlate_at_exit(void) {
 }
 /* Parent pipe ends are nonblocking: a broken/hung service cannot trap the worker forever.
    SIGPIPE is blocked in this worker only; the game's signal dispositions are untouched. */
+static void xlate_note_bad(const char *variant);
 static int xlate_spawn(int *input, int *output) {
     int in[2], out[2];
     if (pipe2(in, O_CLOEXEC)) return -1;
@@ -178,13 +179,32 @@ static void *xlate_worker(void *unused) {
             }
             free(request);
         }
-        if (job) { free(job->request); free(job); }
+        if (job) { xlate_note_bad(job->variant); free(job->request); free(job); }
     }
     if (input >= 0) close(input);
     if (output >= 0) close(output);
     int pid = atomic_exchange(&xlate_pid, 0);
     if (pid > 0) { kill(pid, SIGKILL); while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {} }
     return NULL;
+}
+/* Variants the service could not translate (rejected, unreadable request, service failure): a waiting caller stops. */
+static char (*xlate_bad)[80]; static size_t xlate_nbad, xlate_capbad;
+static void xlate_note_bad(const char *variant) {
+    pthread_mutex_lock(&xlate_mu);
+    if (xlate_nbad == xlate_capbad) { size_t cap = xlate_capbad ? 2 * xlate_capbad : 64; void *v = realloc(xlate_bad, cap * sizeof *xlate_bad); if (v) { xlate_bad = v; xlate_capbad = cap; } }
+    if (xlate_nbad < xlate_capbad) snprintf(xlate_bad[xlate_nbad++], 80, "%s", variant);
+    pthread_mutex_unlock(&xlate_mu);
+}
+int vk_shader_xlate_rejected(const char *variant) {
+    int hit = 0;
+    pthread_mutex_lock(&xlate_mu);
+    for (size_t i = 0; i < xlate_nbad && !hit; i++) hit = !strcmp(xlate_bad[i], variant);
+    pthread_mutex_unlock(&xlate_mu);
+    return hit;
+}
+int vk_shader_xlate_available(void) {
+    pthread_once(&xlate_once, xlate_config);
+    return xlate_exe[0] && !atomic_load(&xlate_stopped);
 }
 void vk_shader_xlate_enqueue(const char *request, const char *variant, const char *seed) {
     pthread_once(&xlate_once, xlate_config);

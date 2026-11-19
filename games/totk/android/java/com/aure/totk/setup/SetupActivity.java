@@ -3166,7 +3166,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 if (isDestroyed() || screen != Screen.ERROR) return;
                 render();
                 Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain")
-                        .putExtra(Intent.EXTRA_SUBJECT, "TotK Native setup details")
+                        .putExtra(Intent.EXTRA_SUBJECT, Strings.APP + " setup details")
                         .putExtra(Intent.EXTRA_TEXT, report);
                 try { startActivity(Intent.createChooser(send, Strings.SHARE_DETAILS)); }
                 catch (ActivityNotFoundException unavailable) { showNote(Strings.SHARE_DETAILS_MISSING); }
