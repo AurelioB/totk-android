@@ -24,6 +24,8 @@ final class MapRenderer {
     boolean automaticLayer = true;
     private float cx, cy;
     private double minX, maxX, minZ, maxZ;
+    /** Decoded size of one tile per detail level (1: 840 px, 2: 300 px squares, ARGB), for the cache budget. */
+    private static final long[] TILE_BYTES = {0, 840L * 840 * 4, 300L * 300 * 4};
 
     MapRenderer(AssetStore assets, float density) { this.assets = assets; this.density = density; }
     void setUnit(float unit) { density = unit; }
@@ -77,8 +79,15 @@ final class MapRenderer {
             int lastCol = Math.min(cols - 1, (int)Math.floor((centerX + (bounds.right - cx) / pixelsPerWorld - minX) / tw));
             int firstRow = Math.max(0, (int)Math.floor((centerZ + (bounds.top - cy) / pixelsPerWorld - minZ) / th));
             int lastRow = Math.min(rows - 1, (int)Math.floor((centerZ + (bounds.bottom - cy) / pixelsPerWorld - minZ) / th));
+            // Room for every tile on screen at this detail level and the other one (the screen switches between them
+            // while zooming); a full LRU would evict visible tiles and reload them in turn.
+            long visible = (long)(lastCol - firstCol + 1) * (lastRow - firstRow + 1);
+            assets.tileBudget(visible * TILE_BYTES[lod] + 16L * 1024 * 1024);
             for (int r = firstRow; r <= lastRow; r++) for (int c = firstCol; c <= lastCol; c++) {
-                Bitmap image = assets.bitmap("map/" + layer + "/" + lod + "/" + c + "_" + r + ".webp", true);
+                String name = c + "_" + r + ".webp";
+                Bitmap image = assets.bitmap("map/" + layer + "/" + lod + "/" + name, true);
+                // still loading: the other detail level's tile if it is decoded, else the overview below shows through
+                if (image == null) image = assets.cachedTile("map/" + layer + "/" + (3 - lod) + "/" + name);
                 if (image == null) continue;
                 tile.set(x(minX + c * tw), y(minZ + r * th), x(minX + (c + 1) * tw), y(minZ + (r + 1) * th));
                 canvas.drawBitmap(image, null, tile, paint);

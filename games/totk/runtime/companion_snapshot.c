@@ -281,6 +281,63 @@ static uint64_t player_actor(Ctx *c) {
     }
     return 0;
 }
+
+/* The map layer of a position, as the game's map works it out (UI query SeqQueryCalcMapLayer, main+0x200440c, calls
+   main+0x401ad0 with Link's position; 0 Sky, 1 Ground, 2 Underground). MapData.CurrentLayer is only the layer the map was
+   last left on: it kept saying Sky on the surface after teleports and map openings (seen 2026-11-11).
+   E = *(*(main + 0x3a83968) + 0xb8), its parameters S = *(*(E + 0x28) + 0x150):
+   - Depths (E vtable +0x290 = main+0x22acf4): (S.f104 - y) / S.f108 > 0.5.
+   - Sky (E vtable +0x270 = main+0x402180): the sky rate clamp(1 - (H - y) / F, 0, 1) >= 0.4, with F = S.fec (150 without
+     S) and H = max(A, B + F): A the sky floor on a 500 m grid, B the ground top on a 100 m grid, both u16 metres indexed
+     from (x + 5000, z + 4000). The grids hang off G = *(E + 0x218): header / data pointers at +0x340 / +0x348 (A) and
+     +0x360 / +0x368 (B), header bytes 2 and 3 = width and height; a missing grid reads 1000 everywhere. Per axis a grid
+     is sampled between the cell and its nearer neighbour; A blends only towards a lower neighbour, B only towards a
+     higher one (as the game does).
+   The game resolves S through an override chain when S's own flags (+0x126..+0x128 bit 0) are clear; that chain is not
+   followed here (plain S values). Returns NULL when E or its vtable is not as expected. */
+enum { ENV_SLOT = 0x3a83968, ENV = 0xb8, ENV_PARAM_OWNER = 0x28, ENV_PARAM = 0x150, ENV_GRIDS = 0x218,
+       ENV_VT_DEPTH = 0x290, ENV_DEPTH_FN = 0x22acf4, ENV_VT_SKY = 0x270, ENV_SKY_FN = 0x402180 };
+static void grid_axis(float u, int n, int *i, int *j, float *t) {
+    float fl = floorf(u), f = u - fl;
+    int a = (int)fl, b = f < 0.5f ? a - 1 : a + 1;
+    *t = f < 0.5f ? 1 - 2 * f : 2 * (f - 0.5f);
+    *i = a < 0 ? 0 : a < n - 1 ? a : n - 1;
+    *j = b < 0 ? 0 : b < n - 1 ? b : n - 1;
+}
+static float grid_blend(float p, float q, float t, int higher) {
+    return (higher ? p > q : p < q) ? p : p + (q - p) * t;
+}
+static int grid_sample(Ctx *c, uint64_t grids, uint32_t at, float cell, const float pos[3], int higher, float *out) {
+    uint64_t hdr = rd64(c, grids + at);
+    if (!hdr) { *out = 1000; return 1; }
+    uint8_t dim[2]; uint64_t data = rd64(c, grids + at + 8);
+    if (!rd(c, hdr + 2, dim, 2) || !dim[0] || !dim[1] || !data) return 0;
+    int xi, xj, zi, zj; float tx, tz;
+    grid_axis((pos[0] + 5000) / cell, dim[0], &xi, &xj, &tx);
+    grid_axis((pos[2] + 4000) / cell, dim[1], &zi, &zj, &tz);
+    uint16_t a, b, d, e;
+    if (!rd(c, data + 2ull * ((uint64_t)zi * dim[0] + xi), &a, 2) || !rd(c, data + 2ull * ((uint64_t)zi * dim[0] + xj), &b, 2) ||
+        !rd(c, data + 2ull * ((uint64_t)zj * dim[0] + xi), &d, 2) || !rd(c, data + 2ull * ((uint64_t)zj * dim[0] + xj), &e, 2)) return 0;
+    *out = grid_blend(grid_blend(a, b, tx, higher), grid_blend(d, e, tx, higher), tz, higher);
+    return 1;
+}
+static const char *map_layer(Ctx *c, const float pos[3], float *sky_line) {
+    uint64_t mgr = rd64(c, c->main + ENV_SLOT), env = mgr ? rd64(c, mgr + ENV) : 0, vt = env ? rd64(c, env) : 0;
+    if (!vt || rd64(c, vt + ENV_VT_DEPTH) != c->main + ENV_DEPTH_FN || rd64(c, vt + ENV_VT_SKY) != c->main + ENV_SKY_FN) return NULL;
+    uint64_t owner = rd64(c, env + ENV_PARAM_OWNER), s = owner ? rd64(c, owner + ENV_PARAM) : 0;
+    float depth[2], band = 150;
+    if (!s || !rd(c, s + 0x104, depth, sizeof depth)) return NULL;
+    float ratio = (depth[0] - pos[1]) / depth[1];
+    if (ratio >= 0 && (ratio > 1 ? 1 : ratio) > 0.5f) return "UnderGround";
+    uint64_t grids = rd64(c, env + ENV_GRIDS);
+    if (!grids) return "Ground";   /* the game's sky rate is 0 without the grids */
+    if (!rd(c, s + 0xec, &band, 4) || !isfinite(band) || band <= 0) return NULL;
+    float a, b;
+    if (!grid_sample(c, grids, 0x340, 500, pos, 0, &a) || !grid_sample(c, grids, 0x360, 100, pos, 1, &b)) return NULL;
+    float h = a > b + band ? a : b + band, rate = 1 - (h - pos[1]) / band;
+    if (sky_line) *sky_line = h - 0.6f * band;
+    return (rate > 1 ? 1 : rate) >= 0.4f ? "Sky" : "Ground";
+}
 #endif
 
 /* ---------- snapshot sections ---------- */
@@ -321,11 +378,24 @@ static void player(Ctx *c, Json *j, uint64_t actor) {
 #else
     (void)rot;
 #endif
-    /* The map layer the game shows (MapData.CurrentLayer), corrected by height for the Depths, which lie far below
-       any surface point. */
-    const char *layer = gd_enum(c, "MapData.CurrentLayer", &E_LAYER);
-    if (live && p[1] < -400) layer = "UnderGround";
-    else if (live && layer && !strcmp(layer, "UnderGround") && p[1] > -100) layer = "Ground";
+    /* The map layer Link is on, worked out as the game's map does (map_layer). Without it: MapData.CurrentLayer (the
+       layer the map was last left on), corrected by height for the Depths, which lie far below any surface point. */
+    const char *layer = NULL;
+#if COMPANION_SUPPORTED
+    float sky_line = NAN;
+    if (live) layer = map_layer(c, p, &sky_line);
+    static atomic_int fallback_logged;
+    if (live && !layer && !atomic_exchange(&fallback_logged, 1))
+        fprintf(stderr, "[companion] map layer: environment not as expected, using MapData.CurrentLayer\n");
+    static _Atomic(const char *) logged;   /* one log line per change of the computed layer */
+    if (layer && atomic_exchange(&logged, layer) != layer)
+        fprintf(stderr, "[companion] map layer %s at (%.0f, %.0f, %.0f), sky from y %.0f\n", layer, p[0], p[1], p[2], sky_line);
+#endif
+    if (!layer) {
+        layer = gd_enum(c, "MapData.CurrentLayer", &E_LAYER);
+        if (live && p[1] < -400) layer = "UnderGround";
+        else if (live && layer && !strcmp(layer, "UnderGround") && p[1] > -100) layer = "Ground";
+    }
     if (layer) jstr(j, "layer", layer);
     end_obj(j);
 }

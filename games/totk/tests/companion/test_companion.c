@@ -300,6 +300,51 @@ int main(void) {
     reject(b.data, "\"pouch\"");
     printf("live: %s\n", b.data);
 
+    /* the map layer as the game's map works it out: environment E = *(*(main+0x3a83968)+0xb8), parameters
+       S = *(*(E+0x28)+0x150), height grids at *(E+0x218); MapData.CurrentLayer still says Ground */
+    {
+        enum { ENV_SLOT = 0x3a83968 };
+        uint8_t *mgr = alloc(0xc0), *env = alloc(0x220), *vt = alloc(0x298), *owner = alloc(0x158), *s = alloc(0x130),
+                *grids = alloc(0x370), *ha = alloc(4), *hb = alloc(4);
+        uint16_t *ga = alloc(8), *gb = alloc(8);
+        put64(main_ + ENV_SLOT, (uintptr_t)mgr); put64(mgr + 0xb8, (uintptr_t)env); put64(env, (uintptr_t)vt);
+        put64(vt + 0x290, (uintptr_t)main_ + 0x22acf4); put64(vt + 0x270, (uintptr_t)main_ + 0x402180);
+        put64(env + 0x28, (uintptr_t)owner); put64(owner + 0x150, (uintptr_t)s); put64(env + 0x218, (uintptr_t)grids);
+        putf(s + 0xec, 150); putf(s + 0x104, -100); putf(s + 0x108, 400);   /* Depths from y < -300 */
+        ha[2] = ha[3] = hb[2] = hb[3] = 2;   /* 2 x 2 cells each */
+        put64(grids + 0x340, (uintptr_t)ha); put64(grids + 0x348, (uintptr_t)ga);
+        put64(grids + 0x360, (uintptr_t)hb); put64(grids + 0x368, (uintptr_t)gb);
+        for (int k = 0; k < 4; k++) { ga[k] = 1500; gb[k] = 400; }   /* sky floor 1500, ground top 400: sky from y 1410 */
+        static const struct { float y; const char *layer; } CASES[] = {
+            {-900, "UnderGround"}, {-250, "Ground"}, {500, "Ground"}, {1400, "Ground"}, {1420, "Sky"}, {1600, "Sky"}};
+        for (unsigned k = 0; k < sizeof CASES / sizeof *CASES; k++) {
+            putf(actor + 0x2b8, CASES[k].y);
+            companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b);
+            char want[48]; snprintf(want, sizeof want, "\"layer\":\"%s\"", CASES[k].layer); expect(b.data, want);
+        }
+        /* ground top + F above the sky floor: the sky starts from there (1400 + 150 - 90) */
+        for (int k = 0; k < 4; k++) gb[k] = 1400;
+        putf(actor + 0x2b8, 1450); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Ground\"");
+        putf(actor + 0x2b8, 1470); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Sky\"");
+        /* the cell and its nearer neighbour: the sky floor blends only towards a lower neighbour. x = -254.5 is 9.491
+           cells of 500 m: cell 9, nearer neighbour 8 at weight 1 - 2 * 0.491, so 1500 - 500 * 0.018 = 1491 and the sky
+           starts at 1401 (1410 unblended) */
+        for (int k = 0; k < 4; k++) gb[k] = 0;
+        ha[2] = ha[3] = 20; uint16_t *wide = alloc(2 * 20 * 20);
+        for (int k = 0; k < 400; k++) wide[k] = 1500;
+        for (int z = 0; z < 20; z++) wide[z * 20 + 8] = 1000;   /* x cell 8, the nearer neighbour of 9.49 */
+        put64(grids + 0x348, (uintptr_t)wide);
+        putf(actor + 0x2b8, 1405); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Sky\"");
+        putf(actor + 0x2b8, 1398); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Ground\"");
+        /* a higher neighbour is not blended in */
+        for (int z = 0; z < 20; z++) wide[z * 20 + 8] = 2000;
+        putf(actor + 0x2b8, 1405); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Ground\"");
+        /* an environment the game would not take the plain path for: back to MapData.CurrentLayer */
+        put64(vt + 0x270, 0);
+        putf(actor + 0x2b8, 1600); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Ground\"");
+        put64(main_ + ENV_SLOT, 0); putf(actor + 0x2b8, -900);
+    }
+
     companion_snapshot((uintptr_t)main_, COMPANION_FULL, fake_read, &b);
     printf("full: %s\n", b.data);
     expect(b.data, "\"partition\":1");
