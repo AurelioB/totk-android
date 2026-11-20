@@ -26,6 +26,7 @@
 #include "vk_subgroup.h"
 #include "vk_position.h"
 #include "vk_int_fold.h"
+#include "vk_varyings.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <sys/stat.h>
@@ -49,6 +50,17 @@ static void int_fold_init(void) {
     const char *s = getenv("TOTK_VK_INT_FOLD");
     g_int_fold = !s || strcmp(s, "0");
     LOGV("[nvn-vk] TOTK_VK_INT_FOLD requested=%s effective=%d (startup-only): proven scalar integer address bits", s ? s : "unset", g_int_fold);
+}
+
+/* Fragment inputs the paired vertex shader never declares read (0, 0, 0, 1) on Maxwell and are undefined in Vulkan;
+   Adreno shows the wind ribbons (updrafts, Tulin, fans) as white boxes (issue #4). Default on; =0 is the control. */
+static pthread_once_t g_varying_once = PTHREAD_ONCE_INIT;
+static int g_varying_fix;
+static void varying_init(void) {
+    const char *s = getenv("TOTK_VK_VARYING_FIX");
+    g_varying_fix = !s || strcmp(s, "0");
+    LOGV("[nvn-vk] TOTK_VK_VARYING_FIX requested=%s effective=%d (startup-only): default fragment inputs the vertex shader does not write",
+         s ? s : "unset", g_varying_fix);
 }
 
 /* Folder selection is process-lifetime. Preserve legacy cache paths for the
@@ -393,6 +405,7 @@ static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c
 static vk_shader *shader_load(const char *variant, int early_tests) {
     pthread_once(&g_position_once, position_init);
     pthread_once(&g_int_fold_once, int_fold_init);
+    pthread_once(&g_varying_once, varying_init);
     shader_key key = {0}; snprintf(key.variant, sizeof key.variant, "%s", variant);
     key.early_tests = (uint32_t)early_tests; key.position_policy = g_position_policy;
     vk_shader *sh = nvn_hm_get(&g_shaders, &key);
@@ -433,6 +446,13 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
       sh->load_position_attr = proof.position_attr; sh->load_full_outputs = proof.full_outputs; }
     { static uint64_t nmark; int m = spirv_mark_stores(sh, (const uint32_t *)spv, spv_len / 4);
       if (m && ++nmark <= 8) LOGV("shader %s writes %d storage binding(s) (from its SPIR-V)", variant, m); }
+    if (g_varying_fix && (sh->stage == 0 || sh->stage == 1)) {   /* the seed's own interface, before any rewrite */
+        vk_varying_io io;
+        if (!vk_spirv_io((const uint32_t *)spv, spv_len / 4, sh->stage == 0 ? 3 : 1, &io)) {
+            sh->vary_mask = io.mask; sh->vary_array = io.array; memcpy(sh->vary_kind, io.kind, sizeof sh->vary_kind);
+            sh->vary_known = 1;
+        }
+    }
     if (sh->stage == 1) {   /* kept for a live TOTK_VK_UNWRITTEN_MASK; the launch switch also extends fout_mask, as before */
         sh->fout_span = spirv_fout_locations((const uint32_t *)spv, spv_len / 4);
         if (vk_unwritten_mask_on()) sh->fout_mask |= sh->fout_span;
@@ -537,6 +557,68 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
     HK_ADD(shloads, 1); HK_ADD(shbytes, spv_len + vk_len);
     if (sh->stage == 5) vk_compute_prepare(sh);
     return sh;
+}
+/* ---------- fragment inputs the vertex shader does not write (vk_varyings.h, issue #4) ---------- */
+typedef struct vk_vary_fix { uint32_t missing; uint64_t kinds; VkShaderModule mod; struct vk_vary_fix *next; } vk_vary_fix;
+static pthread_mutex_t g_vary_mu = PTHREAD_MUTEX_INITIALIZER;   /* vary_fix lists; pipelines compile on workers */
+static _Atomic uint32_t g_vary_logged;
+uint32_t vk_vs_varyings_missing(const vk_shader *vs, const vk_shader *fs) {
+    if (!vs || !fs || !vs->vary_known || !fs->vary_known || vs->stage != 0 || fs->stage != 1) return 0;
+    vk_varying_io vo = {.mask = vs->vary_mask, .array = vs->vary_array}, fi = {.mask = fs->vary_mask, .array = fs->vary_array};
+    memcpy(vo.kind, vs->vary_kind, sizeof vo.kind); memcpy(fi.kind, fs->vary_kind, sizeof fi.kind);
+    return vk_varyings_missing(&vo, &fi);
+}
+/* The vertex words exactly as shader_load hands them to Vulkan, with the extra outputs added first.
+   Keep this in step with shader_load's vertex rewrites (position policy, logical subgroups, integer folding). */
+static uint32_t *vary_vertex_words(const vk_shader *vs, uint32_t missing, const uint8_t kind[32], size_t *out_n) {
+    char path[1024]; size_t len = 0;
+    snprintf(path, sizeof path, "%s/%s.spv", seed_dir(), vs->key);
+    const char *name = strrchr(path, '/'); name = name ? name + 1 : path;
+    /* not read_file: its stall counters belong to the recording thread, and this may run on a pipeline worker */
+    char *spv = vk_seed_io_active() ? vk_seed_io_read(name, &len) : vk_seed_file_read(path, &len);
+    if (!spv || len % 4 || len < 20) { free(spv); return NULL; }
+    size_t nw = 0; uint32_t *words = vk_spirv_add_outputs((const uint32_t *)spv, len / 4, missing, kind, &nw);
+    free(spv);
+    if (!words) return NULL;
+    if (g_position_policy && vk_spirv_position(&words, &nw, g_position_policy) < 0) { free(words); return NULL; }
+    if (V.subgroup_fix && vk_spirv_subgroup32(&words, &nw) < 0) { free(words); return NULL; }
+    if (g_int_fold) (void)vk_spirv_int_fold(words, nw);   /* in place; a refused proof keeps the words, as in shader_load */
+    *out_n = nw; return words;
+}
+VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs) {
+    uint32_t missing = vk_vs_varyings_missing(vs, fs);
+    if (!missing) return vs->mod;
+    uint64_t kinds = 0;
+    for (unsigned l = 0; l < 32; l++) if (missing >> l & 1) kinds |= (uint64_t)(fs->vary_kind[l] & 3) << (2 * l);
+    pthread_mutex_lock(&g_vary_mu);
+    for (vk_vary_fix *f = vs->vary_fix; f; f = f->next)
+        if (f->missing == missing && f->kinds == kinds) { VkShaderModule m = f->mod; pthread_mutex_unlock(&g_vary_mu); return m; }
+    pthread_mutex_unlock(&g_vary_mu);
+    /* Build outside the lock; a racing builder for the same pair is resolved below (the loser's module is dropped). */
+    size_t nw = 0; uint32_t *words = vary_vertex_words(vs, missing, fs->vary_kind, &nw);
+    VkShaderModule mod = VK_NULL_HANDLE;
+    if (words) {
+        VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4, .pCode = words};
+        if (vkCreateShaderModule(V.dev, &mci, NULL, &mod)) mod = VK_NULL_HANDLE;
+        free(words);
+    }
+    if (!mod) {
+        RED(16, "[varyings] vertex %s + fragment %s: cannot add defaults for locations %#x; original module kept", vs->key, fs->key, missing);
+        mod = vs->mod;   /* cached too, so a refusal is not retried on every pipeline */
+    }
+    pthread_mutex_lock(&g_vary_mu);
+    for (vk_vary_fix *f = vs->vary_fix; f; f = f->next) if (f->missing == missing && f->kinds == kinds) {
+        VkShaderModule won = f->mod; pthread_mutex_unlock(&g_vary_mu);
+        if (mod != vs->mod) vkDestroyShaderModule(V.dev, mod, NULL);
+        return won;
+    }
+    vk_vary_fix *f = calloc(1, sizeof *f);
+    if (f) { *f = (vk_vary_fix){missing, kinds, mod, vs->vary_fix}; vs->vary_fix = f; }
+    pthread_mutex_unlock(&g_vary_mu);
+    if (!f && mod != vs->mod) { vkDestroyShaderModule(V.dev, mod, NULL); return vs->mod; }
+    if (mod != vs->mod && atomic_fetch_add(&g_vary_logged, 1) < 40)
+        LOGV("[varyings] vertex %s + fragment %s: default (0,0,0,1) for unwritten input locations %#x", vs->key, fs->key, missing);
+    return mod;
 }
 vk_shader *vk_shader_alpha(vk_shader *base, unsigned func) {
     if (!base || base->stage!=1 || !func || func==NVN_ALPHA_FUNC_ALWAYS) return base;

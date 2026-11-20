@@ -3788,7 +3788,7 @@ static void pipe_key_fill(pipe_key *k, const vk_state *state, vk_shader *vs, vk_
 static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipeline *out, uint64_t frame, int synchronous, int part) {
     vk_shader *vs = k->vs, *fs = k->fs; VkPipeline p = VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo st[2] = {
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs->mod, .pName = "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vk_vs_module_for(vs, fs), .pName = "main"},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs ? fs->mod : VK_NULL_HANDLE, .pName = "main"}};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = vs->required_subgroup_size},
@@ -3933,6 +3933,8 @@ static pipe_library_key pipe_library_key_for(const pipe_key *k, VkPipelineLayout
         memcpy(key.k.attr, k->attr, sizeof k->attr); memcpy(key.k.stream, k->stream, sizeof k->stream);
     } else if (part == PL_PRE_RASTER) {
         key.k.vs = k->vs; key.layout = layout; key.k.poly_mode = k->poly_mode; key.k.depth_clamp = k->depth_clamp;
+        /* a vertex module patched for this fragment's unwritten inputs (vk_varyings.h) is not shared with other pairs */
+        if (vk_vs_varyings_missing(k->vs, k->fs)) key.k.fs = k->fs;
     } else if (part == PL_FRAGMENT) {
         key.k.fs = k->fs; key.layout = layout; key.k.dfmt = k->dfmt; key.k.sfmt = k->sfmt;
         key.k.samples = k->samples; key.k.a2c = k->a2c;

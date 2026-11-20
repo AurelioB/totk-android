@@ -2437,6 +2437,31 @@ uniform/read memos retain their full mapping/lifetime/content/ticket authority; 
 an unchanged address means unchanged bytes. The owner-cache stress and the mixed host timing deltas are not
 substitutes for an on-device route/profile comparison of the integrated changes.
 
+### White wind boxes: unwritten fragment inputs (2026-11-20, fix written, device confirmation pending)
+
+Issue #4: strong wind (fire/burning-grass updrafts, Tulin's gust, fans and propellers, e.g. Gatakis Shrine) draws
+as bright white rectangles blowing outward. Reported on SD 8 Gen 2 (Thor, Retroid Pocket 6, Pad 6S Pro), 8s Gen 3
+and 8 Elite, with the bundled, Rutabaga and Apex Turnip builds alike; one K11MCH1 build happens to hide it.
+
+Cause: the wind ribbon's fragment shader multiplies its alpha by an input (`v6.w`) that the paired vertex shader has
+no output for. Maxwell reads (0, 0, 0, 1) from any attribute the vertex stage did not write. Translator patch 0005
+reproduces that only for outputs a vertex shader *declares*; a location it does not declare at all is undefined in
+Vulkan, and Adreno returns whatever the varying storage holds (the driver-dependence matches the reports).
+
+Fix (`gfx/vk_varyings.h`, `vk_vs_module_for` in `vk_shader.c`): shader load records each vertex shader's Output and
+each fragment shader's Input locations from the seed SPIR-V. `pipe_create_kind` asks for the vertex module of the
+(vs, fs) pair: if the fragment reads locations the vertex does not declare, a copy of the vertex module gets one vec4
+Output per missing location (the fragment's component type), stored as (0, 0, 0, 1.0f bits) first thing in `main`,
+then the usual vertex rewrites (position policy, subgroups, integer folding). Patched modules are cached per vertex
+shader and missing pattern; the pre-rasterization pipeline library key includes the fragment shader for those pairs
+only. Fragment inputs declared as arrays (indexed attributes) and mixed component types are left alone. No seed
+rebuild. Log: `TOTK_VK_VARYING_FIX requested=... effective=...` once, then up to 40 `[varyings]` lines naming the
+patched pairs. `TOTK_VK_VARYING_FIX=0` in `totk.env` (restart) is the control.
+
+Host: `python3 -m unittest discover -s tests -p test_vk_varyings.py` (glslc + spirv-val, NDK shader-tools work)
+validates the rewrite. Device A/B to do: Gatakis Shrine fans and a burning-grass updraft, fix on vs `=0`, and confirm
+the `[varyings]` pairs include the wind effect's shaders.
+
 ### Dark water (2026-10-22, fixed)
 
 The dark "patches" are water (the user's observation): water surfaces render dark and unfogged. Passdump of a hilltop
