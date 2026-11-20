@@ -273,6 +273,13 @@ $(OUT)/vkpositiontest: $(TOTK)/android/gfx/test_vk_position.c $(TOTK)/android/gf
 	@mkdir -p $(dir $@)
 	$(CC) -std=c11 -D_GNU_SOURCE -O1 -g $(WARN) -o $@ $<
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest vkrectest vkcanvastest): $(TOTK)/android/gfx/vk_position.h
+vktest: $(OUT)/vkvaryingstest
+.PHONY: vkvaryingstest
+vkvaryingstest: $(OUT)/vkvaryingstest
+$(OUT)/vkvaryingstest: $(TOTK)/android/gfx/test_vk_varyings.c $(TOTK)/android/gfx/vk_varyings.h
+	@mkdir -p $(dir $@)
+	$(CC) -std=c11 -O1 -g $(WARN) -o $@ $<
+$(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest vkrectest vkcanvastest): $(TOTK)/android/gfx/vk_varyings.h
 vktest: $(OUT)/vkintfoldtest
 .PHONY: vkintfoldtest
 vkintfoldtest: $(OUT)/vkintfoldtest

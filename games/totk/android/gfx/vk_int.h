@@ -647,7 +647,14 @@ typedef struct vk_shader {
     uint8_t framegen_plane; /* audited VS view-position or FS plane-depth convention, not unconditional admission */
     uint8_t framegen_uncertified_plane; /* exact experimental VS candidate; no authority unless opt-in and runtime checks */
     uint64_t xlate_miss_ns; /* recorder clears after its first emitted draw/dispatch; not a GPU-completion timestamp */
+    /* user varyings (vk_varyings.h): vertex Output / fragment Input locations from the seed SPIR-V; immutable */
+    uint32_t vary_mask, vary_array; uint8_t vary_kind[32]; uint8_t vary_known;
+    struct vk_vary_fix *vary_fix;   /* vertex only: modules with defaults for a fragment's unwritten inputs (g_vary_mu) */
 } vk_shader;
+/* Fragment input locations of fs the vertex shader vs never declares (zero when off or unknown); no I/O. */
+uint32_t vk_vs_varyings_missing(const vk_shader *vs, const vk_shader *fs);
+/* The vertex module to pair with fs: vs->mod, or a cached copy with (0,0,0,1) defaults for the missing inputs. */
+VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs);
 
 /* ---------- opt-in per-slot GPU pass profiler (vk_gpuprof.c) ---------- */
 typedef struct vk_gpuprof_slot vk_gpuprof_slot;

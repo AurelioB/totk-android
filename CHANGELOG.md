@@ -33,6 +33,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Strong wind (fire and burning-grass updrafts, Tulin's gust, fans) no longer draws as bright white boxes (#4).
+  Its fragment shaders read inputs the paired vertex shader never writes; the Switch GPU reads those as
+  (0, 0, 0, 1), Vulkan leaves them undefined and Adreno returns garbage. When a pipeline pairs such shaders, its
+  vertex module now gets the missing outputs with that default (`vk_varyings.h`); every other pipeline keeps the
+  original module. No shader rebuild needed. `TOTK_VK_VARYING_FIX=0` in `totk.env` is the control.
+  Host-validated (`tests/test_vk_varyings.py`, spirv-val); device confirmation pending.
 - Refresh the shared shader list with seven more upstream variants applicable to game 1.4.3
   (`5fb080496ab7`, V rows only). Fresh host translation prepares 25,039 modules instead of 25,032,
   with zero failures and about 430 KiB of additional packed data. Existing shader packs stay valid;
