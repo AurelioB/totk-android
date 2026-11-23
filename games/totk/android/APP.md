@@ -444,16 +444,24 @@ frame identity or optical quality. API admission remains limited to the internal
 
 
 **Docked (`TOTK_OPERATION_MODE=docked`):** unset/empty `TOTK_APP_WIDTH` becomes process-only effective `guest`
-whether `TOTK_NATIVE_UI` is unset, `0`, or `1`. Both front-buffer dimensions follow the current guest canvas/crop,
+whether `TOTK_NATIVE_UI` is unset, `0`, or `1`. The render-buffer fit follows the current guest canvas/crop,
 aspect-fit without upsampling and capped by the live render-window extent; ordinary docked play no longer
-downscales a shipping 1920×1080 canvas through the handheld 1280×720 default.
+downscales a shipping 1920×1080 canvas through the handheld 1280×720 default. The displayed rectangle is separate:
+if neither fitted dimension reaches the window, it is enlarged to aspect-fit the window. For a 1920×1080 canvas
+on a 2400×1504 panel, the buffer fit stays 1920×1080 while the picture becomes 2400×1350 at `(0,77)`.
+A fit already touching either window edge is unchanged, including 1920×1080, 1920×1200, 1280×800 and 2560×1080
+windows with that canvas. This is relative to the effective canvas/crop: a deliberately smaller canvas is enlarged too.
 If `TOTK_NATIVE_UI=1` was requested, startup also logs `requested=1 effective=0`: the shipping docked canvas
 already has native UI and must not require a handheld promoted sibling. Only in that requested-native-UI path,
 unset/empty/`auto` `TOTK_OUTPUT_RES` becomes effective `0` (shipping canvas, no larger output heap);
 explicit `0` or dimensions remain authoritative. A smaller/non-16:9 panel is fitted and
-letterboxed; no fixed Odin/Thor width is assumed. AHB uses the fitted buffer and centered destination; copy
-fallback paints its bars into a full window-sized buffer. A missing/zero window defers work; subsequent
-resize/recreation uses an event-refreshed extent, not a fixed startup size or per-frame native-window polling.
+letterboxed; no fixed Odin/Thor width is assumed. AHB uses the fitted buffer and the separate centered display
+destination; copy fallback paints its bars into an already full-window-sized buffer and uses a linear blit by default.
+Optional copy-path `TOTK_POST_SCALE=fsr|sgsr` instead runs at the enlarged picture size; see `VULKAN.md`,
+"Zero-copy presentation", for its pixel/memory cost. We do not select the AHB compositor's scaling filter;
+SurfaceControl enlargement is not an FSR-quality or HWC-admission guarantee.
+A missing/zero window defers work; subsequent resize/recreation uses an event-refreshed extent,
+not a fixed startup size or per-frame native-window polling.
 Create/recreate, resize/redraw, content/configuration and focus/resume notifications refresh the atomic width/height
 cache. Guest canvas/crop changes refresh the cached aspect-fit geometry; steady real/generated frames reuse it.
 Attachment epochs reject stale callbacks, and a changed guest-window extent advances the queued-frame generation
@@ -1518,6 +1526,28 @@ other than exactly `0` retain the existing default-on behavior; an eligible seco
 This is a startup option, not a live file watcher: edit `totk.env` before restarting the app. `--no-companion`
 instead omits the companion Java and assets at build time and keeps the original `android.app.NativeActivity`.
 
+The companion uses an opaque, non-interactive cover beneath the unchanged Presentation on built-in secondary
+displays by default. Exact `TOTK_COMPANION_COVER=0` in `totk.env` turns it off; unset, `1` and other values keep
+it on. It requires the companion enabled and does nothing for single-screen or external displays.
+Start waits for owner window focus and top-resumed readiness.
+Ordinary touch/game-input reclaim keeps its window-focus guard; separate one-use, token-bound 1000 ms startup recovery
+may front the verified, still-resumed game task after the cover takes top-resumed state. Creation waits for no gesture;
+recovery stays within its deadline and is checked on final UP/CANCEL. Pause, close, competing top-resumed loss, or a
+stale/expired token suppresses it. The cover remains non-focusable and non-interactive.
+
+Tested only with Cocoon: the launcher was stopped in every cover-on launch on Retroid Pocket Duo and AYN Thor.
+Duo launches started from the launcher pooled 28.70 → 29.22 fps and 101 → 40 frames over 50 ms per 24 windows;
+the frame-rate difference is inside the comparison tool's tolerance, while the tool rates the pooled result better.
+Thor launcher CPU use fell from about 27% of one core to about 0.05%, and compositor CPU use from about 19% to
+about 17%, with no frame-rate change (44.80 → 45.32 fps standing; 44.65 → 44.69 fps panning).
+Cover start/finish/refusal/restart/policy/recovery diagnostics use `[TotkCompanion] cover ...` in canonical
+`<game>/totk.log`, independently of Android INFO filtering. The policy line retains the raw startup request:
+`requested=unset effective=true` for an eligible default-on launch, or `requested=0 effective=false` for opt-out.
+The existing `TOTK_LOGCAT=1` opt-in mirrors the file to Android logcat under tag `totk`, where platform filtering may
+still drop INFO; inspect `totk.log`. With the switch off, the native query, disabled CoverSession allocation and
+policy log remain, but no cover activity/window, reclaim or cover lifecycle callback registration occurs.
+Owner stop/dismiss/close and process teardown clean up the cover. This startup setting requires restarting the app.
+
 Startup ordering is deliberate: `TotkActivity.onCreate` first calls `NativeActivity.super.onCreate`, which invokes
 `ANativeActivity_onCreate`; its `start_game` reads `totk.env` synchronously. Only after `super.onCreate` returns does
 Java query the native runtime switch and, if enabled, construct the controller. There is no second environment-file
@@ -1747,6 +1777,50 @@ the script checks `run-as` before creating an export and reports the limitation 
 To export data while preserving it, install a dev APK signed with the same key over the release APK **without
 uninstalling**, run the export, then install the release APK again if wanted. Do not uninstall between builds: that
 deletes app data, including saves. Both builds must use the same signing key for an in-place update.
+`cache-import FILE...` only stages public import files and still works with a release APK; it does not use `run-as`.
+Keep each exported cache's original basename: the suffix, not the host's environment, identifies its shader-policy arm.
+
+### November 11 list-only shader update
+
+The current list adds 301 applicable V rows from MacNativeGames `a8ff9bc429bf451dd1040807c6dae6fa2a0cba55`,
+selected through switch2mac's engine pin. `UPSTREAM_MERGE.md` records the exact provenance, exclusions
+and previous import. All existing R/S/C and V rows remain; no upstream packed R or A/B/T/S rows are imported.
+The list digest is now `9b00d9a9083df6d2d8667969f9b105192851fd7e52d7fa93874ff0a7e5eb90b9`.
+The October 27 identity/count tables below are historical, not the identity of this refreshed list.
+
+Installing an updated APK alone keeps an already completed seed usable: there is no automatic
+shader-list epoch gate in `InstallState`. Use the setup UI's explicit shader rebuild to gain the
+new coverage; it rebuilds the full default-plus-listed seed from the player's existing game files,
+not just the added rows. The changed digest prevents reuse of an interrupted old-list preparation.
+The translation chain remains `totk-native-v5-unverified`; no translator update or forced cache wipe
+is part of this data refresh. Driver pipeline caches are keyed by driver/TU_DEBUG/Vulkan identity,
+not the APK/list digest. Seed-bound warm-run comparisons must nevertheless use the same rebuilt seed;
+new variants/pipelines can still need first-use work. Preserve saves and never uninstall to refresh.
+For desktop-generated seeds, retain existing exact loose variant names and use explicit `--shaders`
+as described below; these host measurements do not replace that retention/deployment gate.
+
+Fresh host runs of the production Android C seed stage (four services, current-source isolated
+Linux Vulkan translator, same authenticated 1.4.3 inputs) measure:
+
+| Quantity | Before | Refreshed |
+|---|---:|---:|
+| Default translation requests / completed default variants | 12,456 | 12,456 |
+| Listed translation requests | 24,864 | 25,165 |
+| Completed listed variants after dependency deduplication | 12,327 | 12,576 |
+| SPIR-V modules / total completed variants | 24,783 | 25,032 |
+| Packed bytes | 1,479,997,164 | 1,509,968,940 |
+| Full generation wall time (seconds, one run each) | 37.43 | 40.56 |
+
+That is **249 net modules and 29,971,776 bytes** more, not 301 modules. Both runs have zero
+failed translations; these are not the historical Metal/SPIRV-Cross seed or a retained deployed seed.
+Fresh dependency deduplication selects two different listed representative names; their old SPIR-V
+and reflection bytes have identical same-key replacements. Desktop deployment must still retain
+persisted exact names. Host timings are observations, not phone update-time estimates or a controlled
+performance benchmark. Source/prebuilt translators, installed seeds and caches were not replaced.
+
+Device qualification remains required: time the update's cold full shader rebuild and scratch/storage
+cost, compare first-use hitches on the same cold-area route, and inspect the picture (depth/alpha,
+textures, effects and UI). No steady-state FPS gain or hitch elimination is promised.
 
 ### Refresh the shader seed after the October 27 upstream additions
 
@@ -3935,6 +4009,7 @@ HUD/sky through load, static, pan and reload; unchanged save behavior is not yet
 | `TOTK_VK_CHUNK_DRAWS` | `75` by default; `600` when resolved lag is on and native VMA pressure is absent | Explicit positive value or `0` wins (`0` disables automatic chunking). The resolved startup policy is logged once. |
 | `TOTK_VK_SPLIT_PASS_DRAWS` | `0` (off) | `n > 0` ends a still-open pass after `n` draws, submits that part through the chunk path and reopens the same targets with `loadOp=LOAD`. Each split adds a store and load of every attachment on tiled GPUs; try 512 or 256 and read `[split-pass]` every 300 presents (VULKAN.md). |
 | `TOTK_VK_REC_THREADS` | `2` on Android; `0` on other platforms | Explicit `0` keeps the synchronous recorder for A/B; positive overrides select up to four workers. `TOTK_VK_GPU_PROFILE` retains workers, including when pass sampling is enabled; other diagnostic guards still force inline recording. Keep profiler and sample/statistics settings fixed when comparing worker counts (VULKAN.md). |
+| `TOTK_VK_REC_ONE_PRIMARY` | `0` (off) | Experimental, startup-only: exact `1` records each submitted chunk into one main command buffer instead of one per render pass. Auxiliary command buffers retain their order; diagnostic fallbacks and recorder details are documented in VULKAN.md. |
 | `TOTK_VK_GPU_PROFILE` | `0` (off) | `1` collects pass-part timings with recorder workers; `2` also logs every split; `3` also retains a per-frame ring and dumps every over-threshold frame's observed passes. Every 300-frame window writes schema-3 aggregates by exact key + scene reference + scene role; ordinal `0` means all frame ordinals. Without `GPU_PROFILE_SAMPLE`, every pass is timed as before. Absolute areas remain available for driver joins and DRS-aware families (VULKAN.md). Compare profiling-off/on separately before interpreting performance. |
 | `TOTK_VK_GPU_PROFILE_SAMPLE` | `0` (full profiling unchanged) | With `GPU_PROFILE=1/2/3`, a strict positive integer `1`–`16` limits timestamped/statistics-enabled pass parts per frame; recommended **`2`**, initially with stats off. Deterministic ordinal rotation retains all observed keys, draws and scene metadata. Each frame also has one completion-accurate whole-main-frame timestamp pair; actual profiler-owned `vkCmdWriteTimestamp2` `timestamp_count` (including deferred assembly ends, excluding independent game reports) is at most `2k+2`, without pre/slot envelopes. If Android has already submitted the final command buffer before CPU present, SAMPLE adds **one small marker-only main submission** for the real end timestamp; the query-count bound still holds, but that extra submission has explicit cost. Pass `gpu_ms` is sampled-only, never an extrapolated total. Use the analyzer's whole-interval coverage, sampled mean and histogram percentiles; absent/`0` keeps the old full mode. |
 | `TOTK_VK_GPU_PROFILE_PIPELINES` | `0` (off) | With `GPU_PROFILE=1/2/3`, `1`–`16` adds at most `2k` GPU timestamp writes/frame for contiguous actual-pipeline + full VS/FS-variant groups (compute separate), independently of pass sampling. Start with `GPU_PROFILE=1 SAMPLE=2 PIPELINES=4 STATS=0`. Default output is sampled-key 300-frame compact windows with interned exact variants, actual inclusion weights and explicit coverage/loss; global per-frame JSON rows are suppressed, pass/window aggregates remain. Estimates are withheld on true loss/missing authority. Calibrate off/on with the same APK in ABBA order (VULKAN.md). |
@@ -4946,6 +5021,21 @@ first option). Neither has device measurements yet; extra pass boundaries can co
 
 ### Packed shader IO and learned demand warming
 
+Exact integer shader-address folding is now on by default. For an unfurled A/B control, put
+`TOTK_VK_INT_FOLD=0` in `totk.env` and restart; removing it restores the default. It is read once
+and logs `requested=... effective=... (startup-only)` once. Floating-point math/NaN guards are unchanged.
+The loader folds the original seed SPIR-V immediately before creating each Vulkan shader module.
+Shared guest/bind-state variant hashes, `.vk` reflection, `.vv` indexes, `seed-id.txt` and `seed.vkpack`
+do not change; existing packs and newly prepared seeds work in both arms. Do not pre-fold the seed.
+No full shader rebuild/import is required for this update, and the APK does not bundle game-derived packs.
+The enabled arm uses `.intfold-v1` driver-pipeline, prewarm/import, compute-history and learned-IO
+namespaces; explicit paths and alternate seeds are isolated too. The first default launch after updating
+therefore has cold driver pipelines: expect possible one-time loading/first-visit stutter while they compile
+and learn, rather than the full shader-setup wait. Exact seconds/minutes depend on the device/route and are
+not yet measured for this update. Later starts reuse the newly warmed namespace. The opt-out can still
+reuse its old unfurled caches; old files are not deleted.
+
+
 Android now defaults to indexed seed IO (`TOTK_VK_SEED_IO=0` retains legacy loose IO for diagnosis).
 The build machine, not the APK or device, translates the user's own verified RomFS with
 `scripts/prepare_shader_seed.py --keep-spirv`; `build_android.py --shaders` then stages the `.spv`,
@@ -5527,9 +5617,26 @@ capture-correctness rule. Dimension-based policy is conservative inference, not 
 lifetime oracle: verify persistent Gerudo lighting and actual target traces before attributing
 a capture-sync label to a real cached probe.
 
-The cache lives in the app's private storage (`state/vk-pipeline-cache.bin`) and grows as you play.
-`sh install_app.sh cache-export` copies it to the computer; `sh install_app.sh cache-import FILE` gives it to the app
-(on this or another device), which merges it at its next start and renames the file to `vk-pipeline-cache.bin.imported`.
+At the standard base, the cache grows in private app storage as `state/vk-pipeline-cache.bin<namespace>`.
+Default-on integer folding appends `.intfold-v1`; only exact `TOTK_VK_INT_FOLD=0` keeps the unsuffixed off-arm name.
+An alternate seed's folder/content hash and any `.pos-v1-10`, `.pos-v1-01` or `.pos-v1-11` precision suffix come
+before `.intfold-v1`. `sh install_app.sh cache-export` copies **all existing recognized cache names** from private
+`files/state` into a new `cache-export-<date>-<pid>/` folder on the computer. Basenames and bytes, including the
+context envelope, stay unchanged; stale/imported/temp files and graphics-key/resume sidecars are not exported.
+
+`sh install_app.sh cache-import FILE...` stages one or more such files in the standard external game folder,
+under each file's **unchanged basename**, including on a release APK. The runtime consumes only its exact selected
+namespace, validates context, and renames a successfully merged file to `<selected path>.imported`.
+An opposite integer-fold arm is left unconsumed with a startup diagnostic; it is never promoted into the selected arm.
+The script does not infer the phone's configuration from host variables or execute `totk.env`. It accepts only the
+standard basename grammar, including the existing seed/position suffixes. Timestamp-renamed old exports have lost
+that filename provenance and are refused; never relabel an off-arm cache as `.intfold-v1`, even for the same driver.
+
+These convenience handlers cover the standard private cache and external import bases. Custom
+`TOTK_VK_PIPELINE_CACHE` / `TOTK_VK_PIPELINE_CACHE_IMPORT` bases or another selected game-data folder still require
+manual transfer to the runtime-selected full paths, retaining the complete seed/position/fold namespace. No automatic
+path discovery or compatibility fallback is promised for those overrides.
+
 Both primary and import paths validate the same **app context envelope**: exact effective `TU_DEBUG` string
 (unset and empty normalize to empty), SHA256 of the actual private copied `driver.so` when selected, and
 the opaque Vulkan payload's vendor/device/cache UUID. Context is captured after `totk.env`, the A722 default
@@ -5637,8 +5744,9 @@ MAY-read is conservative, not a shader texel-fetch measurement; double-buffered 
 neither transience nor history. No half/quarter classification relaxation follows merely from dimensions.
 No extra game-derived seed/cache payload is required by this change. The APK carries the native saver code; existing
 shader provisioning remains `sh install_app.sh data` (or `data-packed` with its existing packed-seed prerequisites).
-The cache is learned in private app storage; optional same-driver `cache-import FILE` remains supported. Never commit
-or redistribute the generated cache/seed/game data with this code.
+The cache is learned in private app storage; optional same-driver `cache-import FILE...` remains supported at the
+standard import base, preserving each exported namespace basename as described above. Never commit or redistribute
+the generated cache/seed/game data with this code.
 
 `TOTK_PSO_COLLECT=1` records all successful graphics pipeline keys (screen, capture, async and
 cache hits) off the render thread through the existing pcache saver. Collections are portable

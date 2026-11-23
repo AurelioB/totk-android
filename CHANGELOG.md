@@ -6,6 +6,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Add enabled-only `TOTK_WB_ALIAS=1` path coverage: cumulative operations/bytes by landing, report/event store
+  and publication, separated into alias and fallback reasons at periodic memory reports, Android pause and normal exit.
+  Publish pause-report enablement atomically so early Android lifecycle callbacks can race Vulkan initialization safely.
 - Add launch-only, default-off `TOTK_BENCH_TIME=HH:MM` for restored-save benchmark arms.
   It pins the native effective clock, overriding timeline/sleep/day progression; weather and randomness remain uncontrolled.
   Host guards and ARM64 state fixtures do not establish device HUD/sky or unchanged-save behavior.
@@ -30,6 +33,47 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Refresh the shared shader list with seven more upstream variants applicable to game 1.4.3
+  (`5fb080496ab7`, V rows only). Fresh host translation prepares 25,039 modules instead of 25,032,
+  with zero failures and about 430 KiB of additional packed data. Existing shader packs stay valid;
+  run a full shader rebuild to receive the added coverage.
+- Add experimental, launch-only `TOTK_WB_ALIAS=1` (default off): use a retained same-backing private CPU mapping
+  for supported dirty-tracked write-back extents and eligible report/event/uniform stores, without temporarily
+  making protected guest pages writable. Preserve CPU-write detection, GPU synchronization and zero-on-recommit;
+  unsupported backing and contended report/event/uniform publications keep the old path. This closes the
+  protected-page temporary-RW race, not already-writable/unwatched aliases. Cost is extra mappings/VA, not copied backing.
+  Off preserves the original path and logs. First AYN Thor device evidence, over five common completed loads:
+  texture GPU-unprotect boundaries 0 versus 17,214; whole-process row growth averaged +1,025 versus +4,535/load.
+  No switch-attributable picture corruption was observed. Pooled standing frame tails were SAME, but some individual
+  phases had worse tails; this one ordered alias/legacy pair is not a speed proof. Odin and Duo remain untested.
+  Keep the switch default off; it prevents this fragmentation source, not all mapping growth.
+- Correct the experimental private writer's virtual-mapping authority across production MapVirtual replacements,
+  including anonymous unmaps and fallback remaps; serialize replacement and invalidation with borrowed writers.
+  Watch-slot-exhausted synchronous records keep the original no-token guest-store path rather than bypass ownership.
+- Fix shader translation for compute texture gathers with runtime offsets.
+  The translator now lowers those offsets before emitting SPIR-V instead of putting runtime values in constants.
+  Existing generated shader seeds need replacement to receive the corrected modules.
+  Replace seeds while the game is stopped; stale loose shader files must not override the corrected pack.
+- Enable the companion's opaque cover by default on devices with a built-in second screen;
+  `TOTK_COMPANION_COVER=0` turns it off. A companion window alone does not make Android stop the app
+  underneath it; an opaque activity does. Tested only with the Cocoon launcher: it was stopped in every
+  cover-on launch on both the Retroid Pocket Duo and AYN Thor.
+  On Duo, launches started from the launcher pooled 28.70 fps and 101 frames over 50 ms per 24 windows
+  without the cover, versus 29.22 fps and 40 with it. The frame-rate difference is inside the comparison
+  tool's tolerance; the tool rates the pooled result better.
+  On Thor, launcher CPU use during gameplay fell from about 27% of one core to about 0.05%, and compositor
+  CPU use from about 19% to about 17%, with no frame-rate change (44.80 → 45.32 fps standing;
+  44.65 → 44.69 fps panning).
+- Add experimental `TOTK_VK_REC_ONE_PRIMARY=1`, off by default: record each submitted chunk into one main
+  command buffer instead of one per render pass. On the AYN Thor, measured GPU time per frame was about 5% lower:
+  18.67 → 17.65 ms standing and 18.64 → 17.63 ms while panning. Frame rate was about 2% higher
+  (45.20 → 46.04 fps standing; 44.45 → 45.34 fps panning), which is inside the comparison tool's tolerance,
+  so it is not counted as confirmed. The AYN Odin 3 showed no frame-rate change;
+  adoption remains undecided on the Retroid Pocket Duo.
+- Fill screens larger than the docked 1920×1080 canvas instead of showing it 1:1 inside black bars (e.g. a
+  2400×1504 tablet used 57% of the panel, now 90%). The front buffer keeps the canvas size; the compositor
+  destination (or the copy fallback's blit) is aspect-fitted to the window. Panels no larger than the canvas,
+  such as the Odin's 1920×1080, are unchanged. Thanks to @kestrelshader42 ([#21](https://github.com/AurelioB/totk-android/pull/21)).
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
   Normal launches no longer start its tail thread or wake logd for every frame log. Crash reports remain enabled.
 - Let the live-control reader sleep when `totk.ctl` is absent, including after unrelated files are created or deleted.
@@ -55,6 +99,26 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   shutdown authority, retaining unavailable endpoints as outstanding. Profiling remains default-off.
   Limit qualified pipeline captures to ≤30 fps (Duo or capped Thor); 45-fps/uncapped captures remain
   unqualified and must fail closed on footer drops/missing coverage. The fixed lease pool is not enlarged.
+- Refresh the shared shader list with the 301 upstream variant rows that apply to game 1.4.3
+  (upstream list commit `a8ff9bc429bf`, V rows only): a full shader rebuild now prepares 25,032 variants
+  instead of 24,783 and the shader pack grows by about 29 MiB. Existing shader packs stay valid; the added
+  variants arrive when the user runs the full shader rebuild. Upstream's new compressed pipeline-row and
+  recipe-row formats are not imported.
+- Enable exact integer shader-address folding by default (`TOTK_VK_INT_FOLD=0` turns it off).
+  Earlier tests reduced total native shader instructions by 6.58%; capped GPU-work estimates fell about
+  2.3% on Duo and 4–5% on Odin (not confirmed battery savings), while Thor throughput stayed the same.
+  Odin's uncapped standing sample rose from
+  61.93 to 63.81 fps; these are workload-specific results, not a general frame-rate promise.
+  With this port: pictures were correct on the Odin (six scenes) and the Duo (15 minutes). On the Duo, uncapped,
+  frame rate was unchanged (31.81 → 31.85 fps standing, 30.67 → 30.52 panning) and GPU time per frame fell from
+  24.61 to 23.93 ms and from 25.08 to 24.47 ms; no measured value was worse, but the comparison counts as
+  inconclusive because the GPU clock differed by 3.3% between the two settings. On the Thor, on against off:
+  45.44 → 48.24 fps standing and 45.03 → 46.84 fps panning, GPU time 18.57 → 18.00 ms and 18.53 → 17.94 ms
+  (both rated better); the slowest 1% of frames changed by -1.3 / +1.4 ms, inside this device's
+  launch-to-launch spread. On the Odin: 75.68 → 75.88 fps standing and 71.65 → 71.99 fps panning (same),
+  GPU time 9.36 → 8.87 ms and 9.46 → 9.00 ms, nothing worse. The driver's pipeline cache is rebuilt once in
+  the background after this change (about 5 minutes on the Odin, about 17 minutes on the Thor, much longer on
+  the Duo while playing); the shipped shader set stays valid.
 
 ### Menu
 - Add **Unlimited** to Frame rate: variable real-game updates up to the existing 120 fps safety ceiling, with
