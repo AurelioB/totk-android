@@ -40,7 +40,7 @@ public final class AssetStore {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService decoder = Executors.newSingleThreadExecutor();
     private final LruCache<String, Bitmap> images, tiles, overviews, decorImages;
-    private final int tileFloor;
+    private final int tileFloor, tileCeiling;
     private final Set<String> pending = new HashSet<>(), missing = new HashSet<>();
     private final Runnable changed;
     public volatile JSONObject index = new JSONObject(), text = new JSONObject();
@@ -109,10 +109,11 @@ public final class AssetStore {
         int budget = Math.min(32, Math.max(8, memory / 12)) * 1024 * 1024;
         images = cache(budget);
         tileFloor = Math.max(24 * 1024 * 1024, budget);
+        // Use Android's existing per-app heap class, not guessed physical RAM or a device-name table.
+        tileCeiling = Math.min(64, Math.max(32, memory / 8)) * 1024 * 1024;
         tiles = cache(tileFloor);
-        // A layer's whole-map image (2400 x 2000, 19 MB decoded) shared the tile cache and left room for one detailed
-        // tile, so zoomed-in tiles evicted each other while on screen and reloaded in turn: flashing squares. It has its
-        // own cache, for one layer at a time.
+        // A 19,200,000-byte overview used to leave room for only two 840 px tiles in a 24 MiB cache,
+        // causing a stationary viewport to decode and evict its visible tiles repeatedly.
         overviews = cache(24 * 1024 * 1024);
         // Full-screen frames must not evict one another or every redraw re-decodes the menu.
         decorImages = cache(48 * 1024 * 1024);
@@ -345,11 +346,13 @@ public final class AssetStore {
     }
     /** A map tile only if it is already decoded; never starts a load. */
     public Bitmap cachedTile(String path) { return closed ? null : tiles.get(path); }
-    /** Lets the tile cache hold at least `bytes` (what is on screen plus a margin), so visible tiles never evict each
-        other; never below the starting size, at most 64 MB. */
+    /** Retain the visible working set plus a margin, bounded by the memory-class ceiling.
+        Oversized decoded images can raise this ceiling; budget updates must never shrink that exception. */
     public void tileBudget(long bytes) {
-        int size = (int)Math.max(tileFloor, Math.min(64L * 1024 * 1024, bytes));
-        if (size > tiles.maxSize()) tiles.resize(size);
+        int size = (int)Math.max(tileFloor, Math.min((long)tileCeiling, bytes));
+        synchronized (pending) {
+            if (size > tiles.maxSize()) tiles.resize(size);
+        }
     }
     private Bitmap bitmap(String path, LruCache<String, Bitmap> cache) {
         if (closed) return null;

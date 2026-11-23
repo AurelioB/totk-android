@@ -20,6 +20,52 @@ The pictures (map, icons, item art) are made on your device from your own game d
 and can be rebuilt from *Game data*. They are optional: the game runs without them. Art made by an earlier version of
 the app is updated on its own when the menu opens; the game stays playable meanwhile.
 
+## Map coordinates and loading
+
+Automatic mode uses Link's position and the 1.4.3 environment's depth line and terrain/sky grids, rather than
+the layer last selected in the game map. If parameters are inherited, invalid or replaced during the read, it falls
+back to that last-selected layer, corrected for depth (below −400 m is Depths; a stale Depths selection above −100 m
+becomes surface). This fallback can still show an old sky selection during loads. These are guarded background
+reads, not a synchronized game snapshot.
+
+Coordinates read **x, north (−z), height above 105.5 m**, truncated toward zero, with at least four digits and no plus
+sign. Native JSON preserves the position float before the Java display conversion.
+
+Map overviews have a separate cache, so they do not evict detailed tiles. While a requested detail level loads, an
+already-decoded tile at the other level can fill the same area; otherwise the overview shows through. A stationary
+viewport fitting its cache should settle, but cold loads and fast layer/zoom changes can still show loading.
+
+### Bitmap memory limits
+
+All values below are **MiB (1,048,576 bytes)** of retained decoded bitmap cache capacity, not allocations made up
+front or process RSS. `M` is Android's existing `ActivityManager.getMemoryClass()` in MiB, **not physical device RAM**
+(128 if unavailable). For every memory class:
+
+- ordinary images: `B = min(32, max(8, floor(M / 12)))`;
+- detail tiles: start at `max(24, B)`, grow to at most `T = min(64, max(32, floor(M / 8)))`;
+- overviews: 24; menu decorations: 48;
+- total initial capacity: `B + max(24, B) + 72`; total nominal ceiling: `B + T + 72`.
+
+| Android memory class M | Images | Tiles start → ceiling | Overviews | Decor | Total start → ceiling | Previous total |
+|---:|---:|---:|---:|---:|---:|---:|
+| 96 | 8 | 24 → 32 | 24 | 48 | 104 → 112 | 80 |
+| 128 (also unavailable) | 10 | 24 → 32 | 24 | 48 | 106 → 114 | 82 |
+| 192 | 16 | 24 → 32 | 24 | 48 | 112 → 120 | 88 |
+| 256 | 21 | 24 → 32 | 24 | 48 | 117 → 125 | 93 |
+| 384 | 32 | 32 → 48 | 24 | 48 | 136 → 152 | 112 |
+| 512 or more | 32 | 32 → 64 | 24 | 48 | 136 → 168 | 112 |
+
+Previously there was no separate overview cache; detail tiles and overviews shared `max(24, B)` MiB. The tile
+working-set request is visible tile count × decoded bytes at that LOD + 16 MiB, capped at T and never shrinking.
+This gives smaller heap classes less of the increase; an 8 GB device is not assumed to have any particular M.
+
+**Oversized-image exception:** if a decoded image exceeds its selected cache's current capacity, that cache grows
+to the image's allocation byte count **plus 1 MiB**, even above the nominal ceilings above. Later tile budget calls
+cannot shrink that exception. This applies separately to all four caches; there is no universal hard total ceiling
+in that case. Standard generated overviews (19,200,000 bytes) and tiles (2,822,400 / 360,000 bytes) do not trigger it.
+In-flight decodes, decoration-held references and GPU copies are outside these sums. Device checks must still
+measure companion memory and decoder CPU on dual-screen hardware; host convergence is not a performance claim.
+
 ## Item actions
 
 While playing (no game menu open), the selected item offers the actions the game itself would allow:

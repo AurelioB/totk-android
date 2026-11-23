@@ -33,6 +33,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Follow Link's environment-based map layer, display in-game map coordinates without losing integer-boundary
+  precision, and separate overview/detail caches to stop stationary tile eviction loops. Reject inherited, invalid
+  or replaced layer samples using the previous layer heuristic; scale detail-cache growth by Android memory class
+  and serialize resize decisions. Thanks to @Dorkington ([#47](https://github.com/AurelioB/totk-android/pull/47)).
+  Host regressions cover native layer guards, native JSON → Java coordinates and deterministic cache convergence;
+  surface/sky/Depths transitions, zoom appearance, memory and decoder CPU still need dual-screen device checks.
 - Refresh the shared shader list with seven more upstream variants applicable to game 1.4.3
   (`5fb080496ab7`, V rows only). Fresh host translation prepares 25,039 modules instead of 25,032,
   with zero failures and about 430 KiB of additional packed data. Existing shader packs stay valid;

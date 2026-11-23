@@ -94,6 +94,8 @@ static void jnum(Json *j, const char *k, double v) {
     val(j, k);
     if (isfinite(v)) putf(j, "%.6g", v); else put(j, "null", 4);
 }
+/* Nine significant digits round-trip a guest float; six can cross an integer display boundary. */
+static void jpos(Json *j, float v) { val(j, NULL); putf(j, "%.9g", (double)v); }
 static void jbool(Json *j, const char *k, int v) { val(j, k); put(j, v ? "true" : "false", v ? 4 : 5); }
 static void jstr(Json *j, const char *k, const char *v) { val(j, k); quoted(j, v); }
 
@@ -287,17 +289,20 @@ static uint64_t player_actor(Ctx *c) {
    last left on: it kept saying Sky on the surface after teleports and map openings (seen 2026-11-11).
    E = *(*(main + 0x3a83968) + 0xb8), its parameters S = *(*(E + 0x28) + 0x150):
    - Depths (E vtable +0x290 = main+0x22acf4): (S.f104 - y) / S.f108 > 0.5.
-   - Sky (E vtable +0x270 = main+0x402180): the sky rate clamp(1 - (H - y) / F, 0, 1) >= 0.4, with F = S.fec (150 without
-     S) and H = max(A, B + F): A the sky floor on a 500 m grid, B the ground top on a 100 m grid, both u16 metres indexed
+   - Sky (E vtable +0x270 = main+0x402180): the sky rate clamp(1 - (H - y) / F, 0, 1) >= 0.4, with F = S.fec
+     and H = max(A, B + F): A the sky floor on a 500 m grid, B the ground top on a 100 m grid, both u16 metres indexed
      from (x + 5000, z + 4000). The grids hang off G = *(E + 0x218): header / data pointers at +0x340 / +0x348 (A) and
      +0x360 / +0x368 (B), header bytes 2 and 3 = width and height; a missing grid reads 1000 everywhere. Per axis a grid
      is sampled between the cell and its nearer neighbour; A blends only towards a lower neighbour, B only towards a
      higher one (as the game does).
    The game resolves S through an override chain when S's own flags (+0x126..+0x128 bit 0) are clear; that chain is not
-   followed here (plain S values). Returns NULL when E or its vtable is not as expected. */
+   followed here. Inherited, invalid or replaced samples return NULL for the old-layer fallback, not a constant band.
+   Pointer revalidation detects replacements, not in-place updates or ABA; these reads are not synchronized. */
 enum { ENV_SLOT = 0x3a83968, ENV = 0xb8, ENV_PARAM_OWNER = 0x28, ENV_PARAM = 0x150, ENV_GRIDS = 0x218,
        ENV_VT_DEPTH = 0x290, ENV_DEPTH_FN = 0x22acf4, ENV_VT_SKY = 0x270, ENV_SKY_FN = 0x402180 };
+typedef struct { uint64_t header, data; uint8_t dim[2]; } GridSample;
 static void grid_axis(float u, int n, int *i, int *j, float *t) {
+    u = fmaxf(-1, fminf(u, (float)n));   /* clamp before the float-to-int cast, including world-edge cells */
     float fl = floorf(u), f = u - fl;
     int a = (int)fl, b = f < 0.5f ? a - 1 : a + 1;
     *t = f < 0.5f ? 1 - 2 * f : 2 * (f - 0.5f);
@@ -307,11 +312,14 @@ static void grid_axis(float u, int n, int *i, int *j, float *t) {
 static float grid_blend(float p, float q, float t, int higher) {
     return (higher ? p > q : p < q) ? p : p + (q - p) * t;
 }
-static int grid_sample(Ctx *c, uint64_t grids, uint32_t at, float cell, const float pos[3], int higher, float *out) {
-    uint64_t hdr = rd64(c, grids + at);
-    if (!hdr) { *out = 1000; return 1; }
-    uint8_t dim[2]; uint64_t data = rd64(c, grids + at + 8);
-    if (!rd(c, hdr + 2, dim, 2) || !dim[0] || !dim[1] || !data) return 0;
+static int grid_sample(Ctx *c, uint64_t grids, uint32_t at, float cell, const float pos[3], int higher,
+                       GridSample *sample, float *out) {
+    sample->header = rd64(c, grids + at);
+    sample->data = rd64(c, grids + at + 8);
+    if (!sample->header) { *out = 1000; return 1; }
+    if (!rd(c, sample->header + 2, sample->dim, 2) || !sample->dim[0] || !sample->dim[1] || !sample->data) return 0;
+    const uint8_t *dim = sample->dim;
+    uint64_t data = sample->data;
     int xi, xj, zi, zj; float tx, tz;
     grid_axis((pos[0] + 5000) / cell, dim[0], &xi, &xj, &tx);
     grid_axis((pos[2] + 4000) / cell, dim[1], &zi, &zj, &tz);
@@ -321,22 +329,41 @@ static int grid_sample(Ctx *c, uint64_t grids, uint32_t at, float cell, const fl
     *out = grid_blend(grid_blend(a, b, tx, higher), grid_blend(d, e, tx, higher), tz, higher);
     return 1;
 }
+static int grid_stable(Ctx *c, uint64_t grids, uint32_t at, const GridSample *sample) {
+    uint8_t dim[2];
+    return rd64(c, grids + at) == sample->header && rd64(c, grids + at + 8) == sample->data &&
+        (!sample->header || (rd(c, sample->header + 2, dim, 2) && !memcmp(dim, sample->dim, 2)));
+}
 static const char *map_layer(Ctx *c, const float pos[3], float *sky_line) {
+    if (!pos_ok(pos)) return NULL;
     uint64_t mgr = rd64(c, c->main + ENV_SLOT), env = mgr ? rd64(c, mgr + ENV) : 0, vt = env ? rd64(c, env) : 0;
     if (!vt || rd64(c, vt + ENV_VT_DEPTH) != c->main + ENV_DEPTH_FN || rd64(c, vt + ENV_VT_SKY) != c->main + ENV_SKY_FN) return NULL;
     uint64_t owner = rd64(c, env + ENV_PARAM_OWNER), s = owner ? rd64(c, owner + ENV_PARAM) : 0;
-    float depth[2], band = 150;
-    if (!s || !rd(c, s + 0x104, depth, sizeof depth)) return NULL;
-    float ratio = (depth[0] - pos[1]) / depth[1];
-    if (ratio >= 0 && (ratio > 1 ? 1 : ratio) > 0.5f) return "UnderGround";
+    float depth[2], band;
+    uint8_t flags[3];
+    if (!s || !rd(c, s + 0x126, flags, sizeof flags) || !(flags[0] & flags[1] & flags[2] & 1) ||
+        !rd(c, s + 0x104, depth, sizeof depth) || !isfinite(depth[0]) || !isfinite(depth[1]) || depth[1] <= 0) return NULL;
     uint64_t grids = rd64(c, env + ENV_GRIDS);
-    if (!grids) return "Ground";   /* the game's sky rate is 0 without the grids */
-    if (!rd(c, s + 0xec, &band, 4) || !isfinite(band) || band <= 0) return NULL;
-    float a, b;
-    if (!grid_sample(c, grids, 0x340, 500, pos, 0, &a) || !grid_sample(c, grids, 0x360, 100, pos, 1, &b)) return NULL;
-    float h = a > b + band ? a : b + band, rate = 1 - (h - pos[1]) / band;
-    if (sky_line) *sky_line = h - 0.6f * band;
-    return (rate > 1 ? 1 : rate) >= 0.4f ? "Sky" : "Ground";
+    float ratio = (depth[0] - pos[1]) / depth[1];
+    const char *layer = ratio > 0.5f ? "UnderGround" : "Ground";
+    GridSample a_sample = {0}, b_sample = {0};
+    int sampled = 0;
+    if (ratio <= 0.5f && grids) {
+        if (!rd(c, s + 0xec, &band, 4) || !isfinite(band) || band <= 0) return NULL;
+        float a, b;
+        if (!grid_sample(c, grids, 0x340, 500, pos, 0, &a_sample, &a) ||
+            !grid_sample(c, grids, 0x360, 100, pos, 1, &b_sample, &b)) return NULL;
+        sampled = 1;
+        float h = fmaxf(a, b + band), rate = 1 - (h - pos[1]) / band;
+        if (sky_line) *sky_line = h - 0.6f * band;
+        layer = rate >= 0.4f ? "Sky" : "Ground";
+    }
+    /* Same read/compare pattern as the outer snapshot: never publish a known mixed pointer generation. */
+    if (rd64(c, c->main + ENV_SLOT) != mgr || rd64(c, mgr + ENV) != env || rd64(c, env) != vt ||
+        rd64(c, env + ENV_PARAM_OWNER) != owner || rd64(c, owner + ENV_PARAM) != s ||
+        rd64(c, env + ENV_GRIDS) != grids ||
+        (sampled && (!grid_stable(c, grids, 0x340, &a_sample) || !grid_stable(c, grids, 0x360, &b_sample)))) return NULL;
+    return layer;
 }
 #endif
 
@@ -367,7 +394,10 @@ static void player(Ctx *c, Json *j, uint64_t actor) {
     int live = 0; (void)actor;
 #endif
     if (!live) live = gd_vec3(c, "World_PlayerPos", p);   /* the game's own published position, if no actor */
-    if (live) { arr(j, "pos"); jnum(j, NULL, p[0]); jnum(j, NULL, p[1]); jnum(j, NULL, p[2]); end_arr(j); }
+#if COMPANION_SUPPORTED
+    if (live && !pos_ok(p)) live = 0;   /* World_PlayerPos must obey the same bounds as the actor position */
+#endif
+    if (live) { arr(j, "pos"); jpos(j, p[0]); jpos(j, p[1]); jpos(j, p[2]); end_arr(j); }
 #if COMPANION_SUPPORTED
     if (actor && rd(c, actor + GAME_ACTOR_ROT, rot, sizeof rot) && isfinite(rot[2]) && isfinite(rot[8]) &&
         fabsf(rot[2]) <= 2 && fabsf(rot[8]) <= 2 && (rot[2] != 0 || rot[8] != 0)) {
@@ -699,6 +729,13 @@ static const char GUARD_SHA256[] = "0a2d05de9f11934c5e775c1d61b344fe609fdb9336a8
 #ifdef COMPANION_ACTIONS_TEST
 static char test_guard[65];
 void companion_snapshot_test_expect_guard(const void *words, size_t n) { companion_sha256_hex(words, n, test_guard); }
+/* Exercise the real actor-less World_PlayerPos path even though the outer ready gate normally needs an actor. */
+void companion_snapshot_test_player(uintptr_t main_base, uint64_t g, companion_read_fn read, CompanionBuf *out) {
+    out->len = 0; out->failed = 0;
+    Ctx c = {.rd = read, .main = main_base, .g = g};
+    Json j = {.b = out};
+    obj(&j, NULL); player(&c, &j, 0); end_obj(&j);
+}
 static const char *guard_expected(void) { return *test_guard ? test_guard : GUARD_SHA256; }
 #else
 static const char *guard_expected(void) { return GUARD_SHA256; }
