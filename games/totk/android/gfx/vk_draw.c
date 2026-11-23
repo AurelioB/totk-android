@@ -4603,6 +4603,11 @@ enum { DS_CACHE = 2048 };
 static struct { uint64_t sub, hash[2]; VkDescriptorSetLayout dsl; size_t n; VkDescriptorSet set; } g_dsc[DS_CACHE];
 static struct { uint64_t sub; VkPipelineLayout layout; VkDescriptorSet set; } g_bound_set[2][6];   /* [graphics, compute][set index] */
 static void descriptor_unbind(void) { memset(g_bound_set, 0, sizeof g_bound_set); }
+/* A fresh walker secondary inherits no pipeline, dynamic or descriptor state.
+ * Descriptor contents remain cached; only binding-elision state is invalid. */
+void vk_draw_secondary_reset(void) {
+    descriptor_unbind(); g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1;
+}
 static uint64_t g_stat_sets_new, g_stat_sets_reused;
 /* Hash both identities in one word-wise pass over the zero-filled infos. The second uses add/multiply/rotate rather
    than the first's xor/multiply/shift, not just another seed of the same hash. */
@@ -9331,7 +9336,8 @@ static void *presenter(void *arg) {
                     ARect src = {0, 0, (int32_t)g_ahb[i].w, (int32_t)g_ahb[i].h};
                     ARect dst = {0, 0, (int32_t)pw, (int32_t)ph};
                     if (g_pres_guest_output) {
-                        vk_present_rect fit=g_guest_extent_cached ? b->guest_fit : vk_present_guest_fit(b->w,b->h,pw,ph);
+                        vk_present_rect fit=vk_present_guest_display(g_guest_extent_cached ? b->guest_fit :
+                            vk_present_guest_fit(b->w,b->h,pw,ph),pw,ph);
                         dst=(ARect){fit.x,fit.y,fit.x+(int32_t)fit.w,fit.y+(int32_t)fit.h};
                     }
                     int use_timeline=g_pres_timeline && b->timeline_role && b->display_timeline.vsync_id>=0 &&
@@ -9641,7 +9647,8 @@ static void present_generated(const tex_t *t, vk_tex *x, int srgb, const pres_bu
     if (g_pres_guest_output) {
         dw=(int32_t)real->guest_fit.w; dh=(int32_t)real->guest_fit.h; dx=dy=0;
         if (ow==real->guest_window.w && oh==real->guest_window.h) {
-            dx=real->guest_fit.x; dy=real->guest_fit.y;
+            vk_present_rect shown=vk_present_guest_display(real->guest_fit,ow,oh);
+            dx=shown.x; dy=shown.y; dw=(int32_t)shown.w; dh=(int32_t)shown.h;
         }
     } else {
         vk_present_rect fit=vk_present_fit_shown(w,h,pres_shown_aspect(),ow,oh);
@@ -9681,15 +9688,9 @@ static void present_generated(const tex_t *t, vk_tex *x, int srgb, const pres_bu
         }
         if (!extent.w || !extent.h) { output_ok=0; goto generated_enqueue; }
         ow=extent.w; oh=extent.h;
-        if (g_guest_extent_cached) {
-            dw=(int32_t)real->guest_fit.w; dh=(int32_t)real->guest_fit.h;
-            dx=real->guest_fit.x; dy=real->guest_fit.y;
-        } else {
-            uint32_t sw=vk_present_shown_width(w,h,pres_shown_aspect());
-            double sc=fmin(1.0,fmin((double)ow/sw,(double)oh/h));
-            dw=(int32_t)(sw*sc+0.5); dh=(int32_t)(h*sc+0.5);
-            dx=((int32_t)ow-dw)/2; dy=((int32_t)oh-dh)/2;
-        }
+        vk_present_rect shown=vk_present_guest_display(g_guest_extent_cached ? real->guest_fit :
+            vk_present_guest_fit(vk_present_shown_width(w,h,pres_shown_aspect()),h,ow,oh),ow,oh);
+        dw=(int32_t)shown.w; dh=(int32_t)shown.h; dx=shown.x; dy=shown.y;
     }
     if (!pres_image(ow,oh,srgb?VK_FORMAT_R8G8B8A8_SRGB:VK_FORMAT_R8G8B8A8_UNORM) ||
         !pres_alloc(b,(VkDeviceSize)ow*oh*4)) {
@@ -10054,7 +10055,10 @@ static void present_window(const tex_t *t, double period, const int crop[4]) {
     int32_t dw, dh, dx, dy;
     if (g_pres_guest_output) {
         dw=(int32_t)guest_fit.w; dh=(int32_t)guest_fit.h; dx=dy=0;
-        if (ow==pw && oh==ph) { dx=guest_fit.x; dy=guest_fit.y; }
+        if (ow==pw && oh==ph) {
+            vk_present_rect shown=vk_present_guest_display(guest_fit,pw,ph);
+            dx=shown.x; dy=shown.y; dw=(int32_t)shown.w; dh=(int32_t)shown.h;
+        }
     } else {
         vk_present_rect fit = vk_present_fit_shown(w, h, pres_shown_aspect(), ow, oh);
         dw = (int32_t)fit.w; dh = (int32_t)fit.h; dx = fit.x; dy = fit.y;
@@ -10100,8 +10104,8 @@ static void present_window(const tex_t *t, double period, const int crop[4]) {
 #endif
     if (g_pres_guest_output && (ow!=pw || oh!=ph)) {
         ow=pw; oh=ph;
-        dw=(int32_t)guest_fit.w; dh=(int32_t)guest_fit.h;
-        dx=guest_fit.x; dy=guest_fit.y;
+        vk_present_rect shown=vk_present_guest_display(guest_fit,pw,ph);
+        dw=(int32_t)shown.w; dh=(int32_t)shown.h; dx=shown.x; dy=shown.y;
     }
     VkFormat of = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     if (!pres_image(ow, oh, of)) goto cancel;

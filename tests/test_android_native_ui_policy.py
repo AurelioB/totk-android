@@ -231,7 +231,77 @@ int main(int argc,char **argv) {
                                 capture_output=True, text=True)
         if result.returncode:
             raise AssertionError(result.stdout + result.stderr)
+        cls.build_guest_geometry_probe(directory, compiler, flags)
         cls.build_f3_trace_probes(directory, compiler, flags)
+
+    @classmethod
+    def build_guest_geometry_probe(cls, directory, compiler, flags):
+        # Compile the presenter's actual source/destination setup and consuming
+        # setGeometry call. The sink observes geometry, not Android/HWC scaling.
+        start = cls.draw_source.index('                    ARect src = {0, 0,')
+        end = cls.draw_source.index('                    int use_timeline=', start)
+        consume = cls.draw_source.index('                    ASurfaceTransaction_setGeometry(', end)
+        consume_end = cls.draw_source.index(';', consume) + 1
+        source = directory / 'guest_geometry.c'
+        source.write_text(r'''#include <stdio.h>
+#include <stdlib.h>
+#include "vk_present_policy.h"
+typedef struct { int32_t left,top,right,bottom; } ARect;
+static struct { uint32_t w,h; } g_ahb[1];
+static int g_pres_guest_output=1,g_guest_extent_cached;
+static void ASurfaceTransaction_setGeometry(void *tx,void *surface,
+        const ARect *src,const ARect *dst,int transform) {
+    (void)tx;(void)surface;
+    printf("%d %d %d %d %d %d %d %d %d\n",src->left,src->top,src->right,src->bottom,
+        dst->left,dst->top,dst->right,dst->bottom,transform);
+}
+int main(int argc,char **argv) {
+    if (argc!=8) return 2;
+    g_guest_extent_cached=atoi(argv[1]);
+    uint32_t pw=strtoul(argv[2],NULL,10),ph=strtoul(argv[3],NULL,10);
+    unsigned rotation=(unsigned)atoi(argv[4]);
+    vk_present_rect fit=vk_present_guest_fit(strtoul(argv[5],NULL,10),strtoul(argv[6],NULL,10),pw,ph);
+    g_pres_guest_output=atoi(argv[7]);
+    struct { uint32_t w,h; vk_present_rect guest_fit; unsigned rotation; } frame={
+        fit.w,fit.h,fit,rotation},*b=&frame;
+    vk_present_extent physical=vk_present_rotate_extent(fit.w,fit.h,rotation);
+    g_ahb[0].w=physical.w;g_ahb[0].h=physical.h;
+    int i=0; void *tx=NULL,*surface=NULL;
+''' + cls.draw_source[start:end] + cls.draw_source[consume:consume_end] + r'''
+    return 0;
+}
+''')
+        cls.guest_geometry = directory / 'guest_geometry'
+        result = subprocess.run([*compiler, '-std=c11', '-O1', '-Wall', '-Wextra', '-Werror',
+                                 *flags, '-I', str(ROOT / 'games/totk/android/gfx'),
+                                 str(source), '-o', str(cls.guest_geometry)], capture_output=True, text=True)
+        if result.returncode:
+            raise AssertionError(result.stdout + result.stderr)
+
+    def test_ahb_guest_destination_consumer_enlarges_only_when_both_axes_fit(self):
+        cases = (
+            (2400, 1504, 1920, 1080, (1920, 1080), (0, 77, 2400, 1427)),
+            (1920, 1080, 1920, 1080, (1920, 1080), (0, 0, 1920, 1080)),
+            (1920, 1200, 1920, 1080, (1920, 1080), (0, 60, 1920, 1140)),
+            (1280, 800, 1920, 1080, (1280, 720), (0, 40, 1280, 760)),
+            (2560, 1080, 1920, 1080, (1920, 1080), (320, 0, 2240, 1080)),
+            (1920, 1080, 1280, 720, (1280, 720), (0, 0, 1920, 1080)),
+            # The queued fit already contains the effective 2:1 shown aspect.
+            (2400, 1504, 2160, 1080, (2160, 1080), (0, 152, 2400, 1352)),
+        )
+        for cached in (0, 1):
+            for rotation, inverse in enumerate((0, 7, 3, 4)):
+                for ww, wh, gw, gh, buffer, destination in cases:
+                    with self.subTest(cache=cached, rotation=rotation, window=(ww, wh), canvas=(gw, gh)):
+                        result = subprocess.run([str(self.guest_geometry),
+                                                 *map(str, (cached, ww, wh, rotation, gw, gh, 1))],
+                                                capture_output=True, text=True, check=True)
+                        bw, bh = buffer[::-1] if rotation & 1 else buffer
+                        self.assertEqual(tuple(map(int, result.stdout.split())),
+                                         (0, 0, bw, bh, *destination, inverse))
+        result = subprocess.run([str(self.guest_geometry), '1', '2400', '1504', '0', '1920', '1080', '0'],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(tuple(map(int, result.stdout.split())), (0, 0, 1920, 1080, 0, 0, 2400, 1504, 0))
 
     @classmethod
     def build_f3_trace_probes(cls, directory, compiler, flags):
