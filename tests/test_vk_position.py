@@ -40,7 +40,7 @@ class PositionPrecisionTests(unittest.TestCase):
         output.mkdir()
         subprocess.run([str(self.probe), str(output)], check=True)
         modules = sorted(output.glob('*.spv'))
-        self.assertEqual(len(modules), 8)
+        self.assertEqual(len(modules), 10)  # eight position arms plus both rewritten varying fixtures
         for module in modules:
             with self.subTest(module=module.name):
                 subprocess.run(['spirv-val', '--target-env', 'vulkan1.1', str(module)], check=True)

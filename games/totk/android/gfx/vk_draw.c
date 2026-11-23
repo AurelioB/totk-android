@@ -3741,6 +3741,9 @@ static uint32_t pipe_write_mask(const pipe_key *k) {   /* the key's channel mask
     for (unsigned i = 0; i < 8; i++) if (!(outputs >> i & 1)) mask &= ~(0xfu << (4 * i));
     return mask;
 }
+static int pipe_prewarm_cached(pipe_ent *e);
+static VkResult pipe_create(const pipe_key *k, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipeline *out, uint64_t frame, int synchronous);
+static vk_lend pipe_publish(pipe_ent *e, VkResult r, VkPipeline p, uint64_t dt);
 #include "vk_pso_runtime.inc"
 static void pipe_enqueue(pipe_ent *e) {
     pthread_mutex_lock(&g_pq_mu);
@@ -3787,8 +3790,10 @@ static void pipe_key_fill(pipe_key *k, const vk_state *state, vk_shader *vs, vk_
 /* the pipeline of a key; flags VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT asks the pipeline cache alone */
 static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipeline *out, uint64_t frame, int synchronous, int part) {
     vk_shader *vs = k->vs, *fs = k->fs; VkPipeline p = VK_NULL_HANDLE;
+    VkShaderModule vertex = vk_vs_module_for(vs, fs, !(flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT));
+    if (!vertex) { *out = VK_NULL_HANDLE; return VK_PIPELINE_COMPILE_REQUIRED; }
     VkPipelineShaderStageCreateInfo st[2] = {
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs->mod, .pName = "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vertex, .pName = "main"},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs ? fs->mod : VK_NULL_HANDLE, .pName = "main"}};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = vs->required_subgroup_size},
@@ -4042,6 +4047,16 @@ static vk_lend pipe_publish(pipe_ent *e, VkResult r, VkPipeline p, uint64_t dt) 
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     return lend;
+}
+/* Migration has a warm driver cache but deliberately no trusted completion bits. Resolve hits
+ * before replay starts, rather than putting ready work in a queue that demand must join/take over.
+ * This is cache-only: changed/missing modules and any probe failure stay on the ordinary workers. */
+static int pipe_prewarm_cached(pipe_ent *e) {
+    VkPipeline p;
+    if (pipe_create(&e->k, e->layout, VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, &p, 0, 0))
+        return 0;
+    pipe_publish(e, VK_SUCCESS, p, 0);
+    return 1;
 }
 static int pipe_pending(int state) { return state == PE_QUEUED || state == PE_BUILDING; }
 /* Remove a queued entry to build it on the walk. An in-flight build is joined, never duplicated or overwritten. */
@@ -4305,6 +4320,7 @@ void vk_pipeline_prewarm(void) {
     const char *cache = vk_pcache_current_path();
     if (cache) snprintf(g_pw_path, sizeof g_pw_path, "%s.pso-state", cache);
     g_pw_started = host_now_ns();
+    unsigned cache_hits = 0;
     pso_restore();
     pipe_ent *head = NULL, *tail = NULL;
     if (records && g_pw_total > g_pw_completed && compile_threads()) {
@@ -4321,11 +4337,13 @@ void vk_pipeline_prewarm(void) {
             e->k = k; e->layout = vk_layout_of(k.vs, k.fs); e->list_index = i+1;
             e->capture = r->capture; e->predicted = 1; /* first demand must build/join, never skip a formerly cached draw */
             nvn_hm_put(&g_pipes, &k, e);
+            if (V.has_cache_control && (vk_pcache_seeded() || vk_pcache_loaded_path()) &&
+                pipe_prewarm_cached(e)) { cache_hits++; continue; }
             if (tail) tail->next = e; else head = e; tail = e;
         }
     }
     free(records);
-    if (path) LOGV("[pso-prewarm] list=%s resumed=%u/%u missing=%u startup_ms=%.1f; background_worker_limit=1, demand first", path, g_pw_completed, g_pw_total, g_pw_missing, (host_now_ns()-g_pw_started)/1e6);
+    if (path) LOGV("[pso-prewarm] list=%s resumed=%u/%u missing=%u startup_ms=%.1f; cache_hits=%u background_worker_limit=1, demand first", path, g_pw_completed-cache_hits, g_pw_total, g_pw_missing, (host_now_ns()-g_pw_started)/1e6, cache_hits);
     pthread_mutex_lock(&g_pq_mu);
     g_pw_head = head; g_pw_tail = tail;
     atomic_store_explicit(&g_pso_warming, head != NULL, memory_order_relaxed);

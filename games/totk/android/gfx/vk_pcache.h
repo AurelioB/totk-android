@@ -4,6 +4,9 @@
 #include <stddef.h>
 /* Startup-only: shared validation/quarantine for both initial data and one-shot import. */
 void *vk_pcache_load(const char *path, size_t *size, int primary);
+/* Before workers: seed an absent primary from a matching policy arm, read-only; consume exact imports as before. */
+void vk_pcache_imports(const char *cache_base, const char *import_base);
+int vk_pcache_seeded(void); /* immutable after startup imports; predecessor completion is never admitted */
 void vk_pcache_start(const char *path, size_t loaded_size);
 void vk_pcache_background(int background); /* pause/stop request an immediate asynchronous flush */
 void vk_pcache_flush(void);                /* synchronous rendezvous with the single saver owner */

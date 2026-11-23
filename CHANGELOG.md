@@ -33,6 +33,20 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Correct fragment inputs that their vertex shader never writes, targeting wind/air-flow white boxes
+  ([#4](https://github.com/AurelioB/totk-android/issues/4)). Thanks to @Dorkington
+  ([#43](https://github.com/AurelioB/totk-android/pull/43)); keep the credited MIT adaptation.
+  The varying correction is on by default (`TOTK_VK_VARYING_FIX=0` opts out); integer folding and all
+  other module postprocessing still apply. New cache namespaces seed unchanged driver entries from a
+  context-matched predecessor without reusing its prewarm completion bits or changing shader packs.
+  Startup cache-only probes publish hits before play; only misses queue for compilation. Rollback files
+  remain untouched. Worker seed-IO accounting is thread-safe and session logs count patched/fallback
+  shader pairs. The contributor's independent NaN min/max/clamp rewrite is retained as
+  **default-off** `TOTK_VK_NAN_MINMAX=1`, pending separate device qualification. Host checks cannot establish
+  the wind picture, ordinary-scene regressions, prewarm time or frame-time effects on devices.
+  Keep presentation-time varying statistics independent of module creation. Cache-only probes now defer
+  absent/in-flight replacements without IO or a shader-module wait; unrelated interfaces build concurrently.
+  Mandatory synchronous builds can still wait for required driver work; no device latency bound is claimed.
 - Refresh the shared shader list with seven more upstream variants applicable to game 1.4.3
   (`5fb080496ab7`, V rows only). Fresh host translation prepares 25,039 modules instead of 25,032,
   with zero failures and about 430 KiB of additional packed data. Existing shader packs stay valid;

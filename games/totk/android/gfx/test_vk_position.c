@@ -2,6 +2,7 @@
    driver validate real seed modules with spirv-val, without a Vulkan device. */
 #include <assert.h>
 #include "vk_position.h"
+#include "vk_varyings.h"
 #include "vk_seed_pack.h"
 #define OP(n, op) ((uint32_t)(n) << 16 | (op))
 
@@ -165,6 +166,67 @@ int main(int argc, char **argv) {
     for (unsigned a = 0; a < 4; a++) for (unsigned b = a + 1; b < 4; b++)
         assert(strcmp(vk_position_cache_suffix(a), vk_position_cache_suffix(b)));
     check_fixture(0, argc == 2 ? argv[1] : NULL); check_fixture(1, argc == 2 ? argv[1] : NULL);
-    puts("vertex position policy, decorations, slices, idempotence and failure atomicity passed");
+    {   /* NaN-safe min / max / clamp: GLSL.std.450 37/40/43 -> 79/80/81 in place; other sets and instructions untouched */
+        uint32_t m[] = {0x07230203, 0x00010300, 0, 40, 0,
+            OP(6, 11), 1, 0x4c534c47, 0x6474732e, 0x3035342e, 0,            /* %1 = OpExtInstImport "GLSL.std.450" */
+            OP(6, 11), 2, 0x45505553, 0x52, 0, 0,                          /* %2 = another set */
+            OP(7, 12), 3, 10, 1, 37, 20, 21,                               /* FMin */
+            OP(7, 12), 3, 11, 1, 40, 20, 21,                               /* FMax */
+            OP(8, 12), 3, 12, 1, 43, 20, 21, 22,                           /* FClamp */
+            OP(7, 12), 3, 13, 1, 39, 20, 21,                               /* SMin: unchanged */
+            OP(7, 12), 3, 14, 2, 37, 20, 21};                              /* same number, other set: unchanged */
+        assert(vk_spirv_nan_minmax(m, sizeof m / 4) == 3);
+        assert(m[21] == 79 && m[28] == 80 && m[35] == 81 && m[43] == 39 && m[50] == 37);
+        assert(vk_spirv_nan_minmax(m, sizeof m / 4) == 0);
+        uint32_t bad[] = {0x07230203, 0x00010300, 0, 8, 0, OP(9, 17)};
+        assert(vk_spirv_nan_minmax(bad, sizeof bad / 4) == -1);
+    }
+    for (int block = 0; block < 2; block++) {   /* missing varyings: added as Outputs, in the interface, stored first in main */
+        module m = fixture(block);
+        uint32_t before, after; uint8_t kinds[32] = {0};
+        assert(!vk_spirv_io(m.words, m.count, 3, &before, NULL));
+        kinds[5] = VK_VARY_FLOAT; kinds[6] = VK_VARY_UINT; kinds[9] = VK_VARY_SINT;
+        uint32_t missing = (1u << 5 | 1u << 6 | 1u << 9) & ~before;
+        assert(missing);
+        size_t n = 0; uint32_t *o = vk_spirv_add_outputs(m.words, m.count, missing, kinds, &n);
+        assert(o && n > m.count && o[3] > m.words[3]);
+        uint8_t got[32]; assert(!vk_spirv_io(o, n, 3, &after, got));
+        assert(after == (before | missing));
+        for (int l = 0; l < 32; l++) if (missing >> l & 1) assert(got[l] == kinds[l]);
+        size_t ep = 0, stores = 0;
+        for (size_t i = 5; i < n; i += o[i] >> 16) { if ((o[i] & 0xffff) == 15) ep = o[i] >> 16; if ((o[i] & 0xffff) == 62) stores++; }
+        size_t ep0 = 0;
+        for (size_t i = 5; i < m.count; i += m.words[i] >> 16) if ((m.words[i] & 0xffff) == 15) ep0 = m.words[i] >> 16;
+        assert(ep == ep0 + (size_t)__builtin_popcount(missing) && stores >= (size_t)__builtin_popcount(missing));
+        if (argc == 2) {
+            char path[4096]; snprintf(path, sizeof path, "%s/vary-%d.spv", argv[1], block);
+            FILE *f = fopen(path, "wb"); assert(f); assert(fwrite(o, 4, n, f) == n); assert(!fclose(f));
+        }
+        /* Every truncated instruction/function must fail without touching input. */
+        for (size_t cut = 0; cut < m.count; cut++) {
+            size_t ignored = 0;
+            assert(!vk_spirv_add_outputs(m.words, cut, missing, kinds, &ignored));
+        }
+        const uint32_t short_ep[] = {0x07230203, 0x00010300, 0, 8, 0, OP(1,15)};
+        const uint32_t short_fn[] = {0x07230203, 0x00010300, 0, 8, 0, OP(1,54)};
+        assert(!vk_spirv_add_outputs(short_ep, sizeof short_ep / 4, missing, kinds, &n));
+        assert(!vk_spirv_add_outputs(short_fn, sizeof short_fn / 4, missing, kinds, &n));
+        assert(!vk_spirv_add_outputs(m.words, SIZE_MAX, missing, kinds, &n));
+        module bad = clone(m.words, m.count); bad.words[5] = OP(65535,17);
+        assert(!vk_spirv_add_outputs(bad.words, bad.count, missing, kinds, &n)); free(bad.words);
+        bad = clone(m.words, m.count); bad.words[5] = 0;
+        assert(!vk_spirv_add_outputs(bad.words, bad.count, missing, kinds, &n)); free(bad.words);
+        size_t ep_at = 5;
+        while ((m.words[ep_at] & 0xffff) != 15) ep_at += m.words[ep_at] >> 16;
+        size_t ep_words = m.words[ep_at] >> 16, padding = UINT16_MAX - ep_words;
+        module huge = {calloc(m.count + padding, 4), m.count + padding}; assert(huge.words);
+        memcpy(huge.words, m.words, (ep_at + ep_words) * 4);
+        huge.words[ep_at] = OP(UINT16_MAX,15);
+        memcpy(huge.words + ep_at + UINT16_MAX, m.words + ep_at + ep_words, (m.count - ep_at - ep_words) * 4);
+        assert(!vk_spirv_add_outputs(huge.words, huge.count, missing, kinds, &n)); free(huge.words);
+        assert(!vk_spirv_add_outputs(m.words, m.count, 0, kinds, &n));   /* nothing missing: nothing to do */
+        free(o); free(m.words);
+    }
+    puts("vertex position policy, decorations, slices, idempotence and failure atomicity passed; nan-minmax and varyings passed");
     return 0;
 }
