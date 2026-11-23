@@ -49,6 +49,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Mandatory synchronous builds can still wait for required driver work; no device latency bound is claimed.
 - Pack multi-element direct and frame-generation descriptor writes into fixed Vulkan-typed scratch arrays.
   Singleton direct writes retain the existing batched path; descriptor hashing and immutable ownership are unchanged.
+- Retry transient image creation/allocation OOM failures after 1–64 submissions, with at most four retry attempts
+  per submission across recorder threads. Permanent unsupported-format/type failures remain failed; retry logs are bounded.
 - Refresh the shared shader list with seven more upstream variants applicable to game 1.4.3
   (`5fb080496ab7`, V rows only). Fresh host translation prepares 25,039 modules instead of 25,032,
   with zero failures and about 430 KiB of additional packed data. Existing shader packs stay valid;

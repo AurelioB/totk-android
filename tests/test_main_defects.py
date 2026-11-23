@@ -1,9 +1,8 @@
-"""Known main-branch defects: execute production C slices, without game/device data.
+"""Main-branch defect regressions: execute production C slices without game data.
 
-Only the behavioral assertions are expected failures. Compilation, probe execution
-and negative controls run outside expectedFailure, so broken fixtures fail normally.
-Vulkan entry points below are deterministic lifetime/allocation observers, not a
-GPU simulator or evidence of pixels, driver crashes, or shipped scene frequency.
+Only unresolved pacing policy E remains an expected failure. Compilation and probe
+execution fail normally. Vulkan entry points are deterministic lifetime/allocation
+observers, not evidence of GPU synchronization, pixels or shipped scene frequency.
 """
 import json
 import os
@@ -57,6 +56,8 @@ int vk_canvas_on, vk_rec_timing_on;
 _Atomic int vk_lag_capture_state;
 static uint64_t submission=1;
 static int allocation_attempts, fail_allocation, destroyed_images;
+static VkResult g_mem_failure, create_failure, allocation_failure=VK_ERROR_OUT_OF_DEVICE_MEMORY;
+static int fail_creates, create_attempts, unsupported_format;
 static int live_views, destroy_with_view, resolve_calls;
 static VkBuffer resolved_buffer;
 static vk_treg registration;
@@ -76,7 +77,7 @@ int vk_lag_capture_init(void) { return 0; }
 int nvn_dirty_tracked(const void *p,size_t n) { (void)p;(void)n;return 1; }
 int nvn_dirty_since(const void *p,size_t n,uint64_t stamp) { (void)p;(void)n;(void)stamp;return 0; }
 int vk_fmt(int format,VkFormat *out,VkComponentMapping *swz) {
-    (void)format;(void)swz;*out=VK_FORMAT_R8G8B8A8_UNORM;return 1;
+    (void)format;(void)swz;if(unsupported_format) return 0;*out=VK_FORMAT_R8G8B8A8_UNORM;return 1;
 }
 int nvn_fmt_bpb(int format,int *w,int *h) { (void)format;*w=*h=1;return 4; }
 int vk_fmt_is_depth(int format) { (void)format;return 0; }
@@ -93,7 +94,9 @@ static VkFormatFeatureFlags fmt_features(VkFormat f) {
 }
 static VKAPI_ATTR VkResult VKAPI_CALL create_image(VkDevice d,const VkImageCreateInfo *ci,
         const VkAllocationCallbacks *a,VkImage *image) {
-    (void)d;(void)ci;(void)a;*image=(VkImage)(uintptr_t)(1000+allocation_attempts);return VK_SUCCESS;
+    (void)d;(void)ci;(void)a;create_attempts++;
+    if(fail_creates) { fail_creates--;return create_failure; }
+    *image=(VkImage)(uintptr_t)(1000+allocation_attempts);return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL destroy_image(VkDevice d,VkImage i,const VkAllocationCallbacks *a) {
     (void)d;(void)i;(void)a;destroyed_images++;
@@ -110,7 +113,7 @@ PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements=image_requirements
 PFN_vkBindImageMemory vkBindImageMemory=bind_image;
 int vk_mem_alloc(const VkMemoryRequirements *r,VkMemoryPropertyFlags flags,vk_alloc *out) {
     (void)r;(void)flags;allocation_attempts++;
-    if (fail_allocation) { fail_allocation=0;return 0; }
+    if (fail_allocation) { fail_allocation--;g_mem_failure=allocation_failure;return 0; }
     *out=(vk_alloc){.mem=(VkDeviceMemory)(uintptr_t)2000};return 1;
 }
 VkCommandBuffer vk_pre_cb(void) { return VK_NULL_HANDLE; }
@@ -178,6 +181,11 @@ static tex_t texture(unsigned serial,int mirrored) {
         .d={.width=8,.height=8,.depth=1,.levels=1,.target=1,.format=0x25},.L={.size=4096}};
     return t;
 }
+static void *lookup_thread(void *arg) {
+    const tex_t *t=arg;
+    for(unsigned i=0;i<100;i++) (void)tex_get_inner(t);
+    return NULL;
+}
 int main(int argc,char **argv) {
     assert(argc==2);
     if(!strcmp(argv[1],"pool-view") || !strcmp(argv[1],"arena-view")) {
@@ -207,6 +215,50 @@ int main(int argc,char **argv) {
         printf("{\"same_image\":%d,\"allocations\":%d,\"retired\":%d}\n",
             nu->im==original,allocation_attempts,retired_images);
     } else {
+        if(!strcmp(argv[1],"retry-edges")) {
+            for(int mirrored=0;mirrored<2;mirrored++) {
+                tex_t t=texture(100+mirrored,mirrored);t.mem+=mirrored*16;
+                create_failure=VK_ERROR_OUT_OF_HOST_MEMORY;fail_creates=1;
+                assert(!tex_get_inner(&t));
+                int n=create_attempts;
+                for(int i=0;i<100;i++) assert(!tex_get_inner(&t));
+                assert(create_attempts==n);
+                submission++;
+                pthread_t a,b;assert(!pthread_create(&a,NULL,lookup_thread,&t));
+                assert(!pthread_create(&b,NULL,lookup_thread,&t));
+                pthread_join(a,NULL);pthread_join(b,NULL);
+                assert(tex_get_inner(&t) && create_attempts==n+1);
+            }
+            for(int kind=0;kind<3;kind++) {
+                tex_t t=texture(200+kind,1);t.mem+=kind*16;
+                unsupported_format=kind==0;
+                create_failure=VK_ERROR_FORMAT_NOT_SUPPORTED;fail_creates=kind==1;
+                allocation_failure=VK_ERROR_FEATURE_NOT_PRESENT;fail_allocation=kind==2;
+                assert(!tex_get_inner(&t));int n=create_attempts,m=allocation_attempts;
+                unsupported_format=0;fail_creates=fail_allocation=0;
+                for(int i=0;i<100;i++) { submission++;assert(!tex_get_inner(&t)); }
+                assert(create_attempts==n && allocation_attempts==m);
+            }
+            tex_t buffer=texture(300,0);buffer.d.target=10;
+            int n=create_attempts;assert(tex_get_inner(&buffer));
+            submission++;(void)tex_get_inner(&buffer);assert(create_attempts==n);
+            puts("{\"edge_cases\":1}");return 0;
+        }
+        if(!strcmp(argv[1],"retry-storm")) {
+            tex_t tex[64];allocation_failure=VK_ERROR_OUT_OF_DEVICE_MEMORY;fail_allocation=10000;
+            for(unsigned i=0;i<64;i++) { tex[i]=texture(i+1,0);tex[i].mem+=16*i;assert(!tex_get_inner(&tex[i])); }
+            for(unsigned round=0;round<20;round++) {
+                submission++;int before=allocation_attempts;
+                for(unsigned j=0;j<100;j++) for(unsigned i=0;i<64;i++) assert(!tex_get_inner(&tex[i]));
+                assert(allocation_attempts-before<=IMAGE_RETRIES_PER_SUB);
+                assert(g_image_retry_count<=IMAGE_RETRIES_PER_SUB);
+            }
+            fail_allocation=0;
+            for(unsigned round=0;round<100;round++) { submission++;for(unsigned i=0;i<64;i++) (void)tex_get_inner(&tex[i]); }
+            for(unsigned i=0;i<64;i++) assert(tex_get_inner(&tex[i]));
+            assert(g_stat_image_retry_ok==64 && g_by_storage.n==64);
+            puts("{\"bounded\":1}");return 0;
+        }
         int mirrored=!strcmp(argv[1],"retry-mirrored");
         tex_t t=texture(1,mirrored);fail_allocation=1;
         assert(!tex_get_inner(&t) && allocation_attempts==1 && destroyed_images==1);
@@ -393,7 +445,8 @@ class MainDefectReproductions(unittest.TestCase):
         cls.observed = {}
         for probe, scenarios in (
                 ('resources', ('pool-view', 'arena-view', 'storage-ref', 'storage-wbref',
-                               'storage-unpinned', 'retry-shared', 'retry-mirrored', 'retry-recreated')),
+                               'storage-unpinned', 'retry-shared', 'retry-mirrored', 'retry-recreated',
+                               'retry-edges', 'retry-storm')),
                 ('descriptors', ('',)),
                 ('pacing', ('default', '60hz', 'legacy', 'display', 'acquire', '40', 'unlimited'))):
             for scenario in scenarios:
@@ -429,13 +482,17 @@ class MainDefectReproductions(unittest.TestCase):
     def test_c_array_writes_use_contiguous_vulkan_elements(self):
         self.assertEqual(self.observed['descriptors'], {'immediate': 0, 'replay': 0, 'terminal': 0})
 
-    @unittest.expectedFailure
     def test_d_shared_texture_retries_transient_allocation_failure(self):
         self.assertEqual(self.observed['retry-shared'], {'available': 1, 'allocations': 2})
 
-    @unittest.expectedFailure
     def test_d_mirrored_texture_retries_transient_allocation_failure(self):
         self.assertEqual(self.observed['retry-mirrored'], {'available': 1, 'allocations': 2})
+
+    def test_d_failure_classes_threads_and_buffer_textures(self):
+        self.assertEqual(self.observed['retry-edges'], {'edge_cases': 1})
+
+    def test_d_memory_pressure_retry_budget(self):
+        self.assertEqual(self.observed['retry-storm'], {'bounded': 1})
 
     def test_d_new_serial_control_can_allocate_after_failure(self):
         self.assertEqual(self.observed['retry-recreated'], {'available': 1, 'allocations': 2})
