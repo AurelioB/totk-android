@@ -1260,6 +1260,15 @@ static pool_ent *pool_remove_locked(const void *mem, int wait_gpu) {
         if (wait_gpu) vk_gpu_idle();
         HK_ADD(idle_pool, 1);
 #endif
+#ifndef TOTK_VK_ALIAS_FIXTURE
+        /* Match arena chunk_release after the existing GPU-use wait: active
+           and deferred views of this exact buffer must go before unback.
+           Resolution takes resource -> pool; do not invert those locks. The
+           removed entry stays private until synchronous unback completes. */
+        pthread_mutex_unlock(&g_pool_mu);
+        vk_res_buffer_released(e->buf);
+        pthread_mutex_lock(&g_pool_mu);
+#endif
         unback_pool(e);
         g_pool_bytes -= e->end - e->base;
     }

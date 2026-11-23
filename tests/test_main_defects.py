@@ -58,6 +58,8 @@ static uint64_t submission=1;
 static int allocation_attempts, fail_allocation, destroyed_images;
 static VkResult g_mem_failure, create_failure, allocation_failure=VK_ERROR_OUT_OF_DEVICE_MEMORY;
 static int fail_creates, create_attempts, unsupported_format;
+static int dirty_written, upload_calls, last_uploaded_byte, destroyed_buffers;
+static VkBuffer view_buffers[4096];
 static int live_views, destroy_with_view, resolve_calls;
 static VkBuffer resolved_buffer;
 static vk_treg registration;
@@ -75,7 +77,7 @@ VkImageAspectFlags vk_fmt_aspect(int format) { (void)format;return VK_IMAGE_ASPE
 int vk_tex_memo_on(void) { return 0; }
 int vk_lag_capture_init(void) { return 0; }
 int nvn_dirty_tracked(const void *p,size_t n) { (void)p;(void)n;return 1; }
-int nvn_dirty_since(const void *p,size_t n,uint64_t stamp) { (void)p;(void)n;(void)stamp;return 0; }
+int nvn_dirty_since(const void *p,size_t n,uint64_t stamp) { (void)p;(void)n;(void)stamp;return dirty_written; }
 int vk_fmt(int format,VkFormat *out,VkComponentMapping *swz) {
     (void)format;(void)swz;if(unsupported_format) return 0;*out=VK_FORMAT_R8G8B8A8_UNORM;return 1;
 }
@@ -123,13 +125,15 @@ static void image_barrier_init(VkCommandBuffer cb,VkImage image,VkImageAspectFla
 static VKAPI_ATTR VkResult VKAPI_CALL create_view(VkDevice d,const VkBufferViewCreateInfo *ci,
         const VkAllocationCallbacks *a,VkBufferView *view) {
     (void)d;(void)a;assert(ci->buffer==resolved_buffer);live_views++;
-    *view=(VkBufferView)(uintptr_t)++next_view;return VK_SUCCESS;
+    assert(next_view+1<4096);*view=(VkBufferView)(uintptr_t)++next_view;
+    view_buffers[next_view]=ci->buffer;return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL destroy_view(VkDevice d,VkBufferView v,const VkAllocationCallbacks *a) {
-    (void)d;(void)v;(void)a;live_views--;
+    (void)d;(void)a;assert(view_buffers[(uintptr_t)v]);view_buffers[(uintptr_t)v]=VK_NULL_HANDLE;live_views--;
 }
 static VKAPI_ATTR void VKAPI_CALL destroy_buffer(VkDevice d,VkBuffer b,const VkAllocationCallbacks *a) {
-    (void)d;(void)b;(void)a;if(live_views) destroy_with_view++;
+    (void)d;(void)a;destroyed_buffers++;
+    for(unsigned i=0;i<4096;i++) if(view_buffers[i]==b) destroy_with_view++;
 }
 PFN_vkCreateBufferView vkCreateBufferView=create_view;
 PFN_vkDestroyBufferView vkDestroyBufferView=destroy_view;
@@ -155,7 +159,7 @@ static pthread_mutex_t g_tex_mu=PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_stat_uploads,g_stat_reuploads,g_stat_images,g_stat_shared_hits,g_stat_switched;
 static uint64_t g_stat_xfmt,g_stat_compsplit;
 static nvn_hmap g_comp_owner={.klen=sizeof(stor_key)};
-static void upload(vk_tex *x) { (void)x; }
+static void upload(vk_tex *x) { last_uploaded_byte=*x->t.mem;upload_calls++; }
 static void texcopy_resource(const char *event,vk_tex *x) { (void)event;(void)x; }
 static int retired_images;
 static void retire_img(vk_img *im) { (void)im;retired_images++; }
@@ -166,12 +170,44 @@ static void native_index_remove(vk_img *im) { (void)im; }
 
 RESOURCE_MAIN = r'''
 #define g_dev V.dev
-static uint64_t g_wb_alias_maps,g_wb_alias_bytes;
+static uint64_t g_wb_alias_maps,g_wb_alias_bytes,g_pool_bytes,g_pool_identity;
+static pthread_mutex_t g_pool_mu=PTHREAD_MUTEX_INITIALIZER;
+typedef struct { uintptr_t va,end;pool_ent *owner;uint64_t off; } alias_ent;
+static pool_ent *pool_slots[8],**g_pools=pool_slots;
+static int g_npool,g_nalias,g_wb_alias_enabled;
+static int g_cappool=8,g_pool_cpu;
+enum { POOLS_HOST=1,POOLS_EXPORT,POOLS_HEAP };
+static int g_pool_mode=POOLS_HOST;
+static uint64_t g_host_align=4096;
+void mtl_init(void) {}
+static uintptr_t page_sz(void) { return 4096; }
+static int backing_failure;
+static int back_pool(pool_ent *e) {
+    if(backing_failure) return 0;
+    e->buf=(VkBuffer)(uintptr_t)++next_view;e->fd=-1;return 1;
+}
+#undef VK_CALLOC
+#undef VK_REALLOC
+#define VK_CALLOC calloc
+#define VK_REALLOC realloc
+static alias_ent *g_alias;
+static _Atomic uint64_t g_owner_gen;
+static void span_changed(void) {}
+static int pool_gpu_quiet(void) { return 1; }
+void vk_gpu_idle(void) {}
+#undef HK_ADD
+#define HK_ADD(kind,n) ((void)0)
+void nvn_dirty_remove_range(const void *mem) { (void)mem; }
+void nvn_dirty_add_range(const void *mem,size_t n) { (void)mem;(void)n; }
 static void mapping_forget(uintptr_t lo,uintptr_t hi) { (void)lo;(void)hi; }
+static void guest_mapping_unknown(uintptr_t lo,uintptr_t hi) { (void)lo;(void)hi; }
+static pool_ent *mapped_source(const void *mem,uint64_t size,uint64_t *off) {
+    (void)mem;(void)size;(void)off;return NULL;
+}
 void vk_memory_release(VkDeviceMemory mem,vk_memory_purpose purpose) { (void)mem;(void)purpose; }
-/* These cases have no writeback work. B's wbref case invokes pool_gone alone;
- * the real pool retirement cancels writeback before calling it (report explains). */
-void vk_wb_range_gone(uintptr_t lo,uintptr_t hi) { (void)lo;(void)hi; }
+/* The notification selection/order is production; cancellation is an observer. */
+static int wb_cancel_calls;
+void vk_wb_range_gone(uintptr_t lo,uintptr_t hi) { (void)lo;(void)hi;wb_cancel_calls++; }
 '''
 
 RESOURCE_SCENARIOS = r'''
@@ -194,9 +230,10 @@ int main(int argc,char **argv) {
         resolved_buffer=(VkBuffer)(uintptr_t)1;
         VkBufferView before=tbuf_by_id(1,0,NULL,NULL);assert(before && live_views==1);
         pool_ent *pool=calloc(1,sizeof *pool);pool->kind=K_OWN;pool->fd=-1;
-        pool->base=(uintptr_t)registration.t.mem;pool->end=pool->base+4096;pool->buf=resolved_buffer;
+        pool->lo=pool->base=(uintptr_t)registration.t.mem;pool->end=pool->base+4096;pool->buf=resolved_buffer;
+        g_pools[g_npool++]=pool;
         if(!strcmp(argv[1],"arena-view")) vk_res_buffer_released(pool->buf);
-        unback_pool(pool);pool_retired(pool);
+        del_range((void *)pool->lo,0);
         resolved_buffer=(VkBuffer)(uintptr_t)2;
         VkBufferView after=tbuf_by_id(1,0,NULL,NULL);
         printf("{\"destroy_with_view\":%d,\"same_view\":%d,\"resolves\":%d}\n",
@@ -275,9 +312,9 @@ int main(int argc,char **argv) {
 '''
 
 
-def resource_probe():
-    resources = (GFX / 'vk_res.c').read_text()
-    pools = (GFX / 'nvn_vk.c').read_text()
+def resource_probe(resources=None, pools=None, scenarios=RESOURCE_SCENARIOS):
+    resources = resources if resources is not None else (GFX / 'vk_res.c').read_text()
+    pools = pools if pools is not None else (GFX / 'nvn_vk.c').read_text()
     code = RESOURCE_PREFIX
     code += section(resources, 'typedef struct tex_generation', 'static _Atomic uint64_t g_native_extent')
     code += RESOURCE_AFTER_TYPES
@@ -289,8 +326,11 @@ def resource_probe():
         code += function(resources, name)
     code += section(pools, 'enum { K_OWN = 1', 'typedef struct { uintptr_t va, end; pool_ent *owner;')
     code += RESOURCE_MAIN
-    code += function(pools, 'unback_pool') + function(pools, 'pool_retired')
-    return code + RESOURCE_SCENARIOS
+    for name in ('own_containing', 'own_overlapping', 'pool_insert', 'add_range',
+                 'unback_pool', 'pool_remove_locked', 'pool_retired', 'del_range',
+                 'mtl_pool_add', 'mtl_pool_del', 'mtl_vpool_add', 'mtl_vpool_del'):
+        code += function(pools, name)
+    return code + scenarios
 
 
 def descriptor_probe():
@@ -458,7 +498,6 @@ class MainDefectReproductions(unittest.TestCase):
                     raise AssertionError(f'{probe}/{scenario}: {result.stdout}{result.stderr}')
                 cls.observed[scenario or probe] = json.loads(result.stdout)
 
-    @unittest.expectedFailure
     def test_a_pool_views_retire_before_buffer_destruction(self):
         self.assertEqual(self.observed['pool-view'],
                          {'destroy_with_view': 0, 'same_view': 0, 'resolves': 2})
@@ -467,6 +506,9 @@ class MainDefectReproductions(unittest.TestCase):
         self.assertEqual(self.observed['arena-view'],
                          {'destroy_with_view': 0, 'same_view': 0, 'resolves': 2})
 
+    # B remains conditional/open: see .scratch/perf/main-defects/fix/review-r1.md,
+    # review-r2.md, review-2nd.md and review-r3.md. Do not reintroduce their
+    # storage/image invalidation changes as part of the exact-buffer A fix.
     @unittest.expectedFailure
     def test_b_finalized_storage_with_texture_ref_has_new_identity(self):
         self.assertEqual(self.observed['storage-ref']['same_image'], 0)
@@ -497,6 +539,7 @@ class MainDefectReproductions(unittest.TestCase):
     def test_d_new_serial_control_can_allocate_after_failure(self):
         self.assertEqual(self.observed['retry-recreated'], {'available': 1, 'allocations': 2})
 
+    # E awaits a maintainer decision; this split does not change pacing.
     @unittest.expectedFailure
     def test_e_default_shipping30_retains_guest60_units_on_120hz(self):
         self.assertEqual(self.observed['default']['slots'], 4)

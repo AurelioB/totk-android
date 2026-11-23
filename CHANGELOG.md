@@ -47,6 +47,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Keep presentation-time varying statistics independent of module creation. Cache-only probes now defer
   absent/in-flight replacements without IO or a shader-module wait; unrelated interfaces build concurrently.
   Mandatory synchronous builds can still wait for required driver work; no device latency bound is claimed.
+- Retire cached and deferred texel-buffer views of an owning pool's exact Vulkan buffer before unbacking destroys it,
+  using the existing arena-buffer release mechanism and existing GPU-use wait. Image/storage invalidation is unchanged.
 - Pack multi-element direct and frame-generation descriptor writes into fixed Vulkan-typed scratch arrays.
   Singleton direct writes retain the existing batched path; descriptor hashing and immutable ownership are unchanged.
 - Retry transient image creation/allocation OOM failures after 1–64 submissions, with at most four retry attempts
