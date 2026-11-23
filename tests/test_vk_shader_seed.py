@@ -42,14 +42,16 @@ class ShaderSeedTests(unittest.TestCase):
             env.pop('TOTK_VK_POS_INVARIANT', None)
             env.pop('TOTK_VK_POS_NOCONTRACT', None)
             env['TOTK_VK_INT_FOLD'] = '0'
+            env['TOTK_VK_VARYING_FIX'] = env['TOTK_VK_NAN_MINMAX'] = '0'
             env['TEST_GAME_DIR'] = str(root)
             launch = root / 'unrelated-working-directory'
             launch.mkdir()
 
-            def run(folder, marker, indexed=False, position=('0', '0'), mutate=False, fold: str | None = '0'):
+            def run(folder, marker, indexed=False, position=('0', '0'), mutate=False, fold: str | None = '0', vary='0', nan='0'):
                 e = dict(env)
                 e['TOTK_VK_SEED_IO'] = '1' if indexed else '0'
                 e['TOTK_VK_POS_INVARIANT'], e['TOTK_VK_POS_NOCONTRACT'] = position
+                e['TOTK_VK_VARYING_FIX'], e['TOTK_VK_NAN_MINMAX'] = vary, nan
                 if fold is None:
                     e.pop('TOTK_VK_INT_FOLD', None)
                 else:
@@ -97,6 +99,14 @@ class ShaderSeedTests(unittest.TestCase):
                             if fold != '0':
                                 suffix += '.intfold-v1'
                             self.assertEqual(arm[1:4], [path + suffix for path in baseline[1:4]])
+                policies = []
+                for vary, nan in (('0', '0'), ('1', '0'), ('0', '1'), ('1', '1')):
+                    arm = run(folder, marker, mutate=True, vary=vary, nan=nan)
+                    suffix = ('.vary-v1' if vary == '1' else '') + ('.nan-v1' if nan == '1' else '')
+                    self.assertEqual(arm[1:4], [path + suffix for path in baseline[1:4]])
+                    self.assertEqual(arm[-1], arm[1] + '.pso-state')
+                    policies.append(tuple(arm[1:4]) + (arm[-1],))
+                self.assertEqual(len(set(policies)), 4)
             for folder in ('', 'shaders', './shaders', str(root / 'shaders')):
                 with self.subTest(default_alias=folder):
                     self.assertEqual(run(folder, 'original')[1:4], legacy)

@@ -329,11 +329,13 @@ require_run_as() {{
     exit 1
   fi
 }}
-# The runtime-produced basename carries seed/position/integer-fold identity. Never
+# The runtime-produced basename carries seed and rewrite-policy identity. Never
 # infer the active arm from the host, source totk.env, strip a suffix or relabel bytes.
 cache_name() {{
   case "$1" in vk-pipeline-cache.bin*) ;; *) return 1 ;; esac
   suffix=${{1#vk-pipeline-cache.bin}}
+  case "$suffix" in *.nan-v1) suffix=${{suffix%.nan-v1}} ;; esac
+  case "$suffix" in *.vary-v1) suffix=${{suffix%.vary-v1}} ;; esac
   case "$suffix" in *.intfold-v1) suffix=${{suffix%.intfold-v1}} ;; esac
   case "$suffix" in
     *.pos-v1-10) suffix=${{suffix%.pos-v1-10}} ;;

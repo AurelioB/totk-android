@@ -248,6 +248,20 @@ int vk_pipeline_test_keys(void) {
     pso_restore_from("pso-cache.bin");
     KTEST(g_pw_completed==3 && g_pw_done[0]==5 && g_pw_done[1]==1);
     KTEST(!vk_pipeline_keys_dirty());
+    /* An old completed marker and identical cache/list digests must not make a
+       newly selected rewrite arm complete. Each arm saves/resumes its own file. */
+    const char *rewrite[] = {".vary-v1", ".nan-v1", ".vary-v1.nan-v1"};
+    for (unsigned arm = 0; arm < 3; arm++) {
+        snprintf(g_pw_path, sizeof g_pw_path, "pso-marker.bin%s.pso-state", rewrite[arm]);
+        memset(g_pw_done,0,sizeof g_pw_done); g_pw_completed=0;
+        pso_restore_from("pso-cache.bin"); KTEST(g_pw_completed==0);
+        g_pw_done[0]=5; g_pw_done[1]=1;
+        vk_pipeline_keys_saved("pso-cache.bin",vk_pipeline_keys_snapshot());
+        memset(g_pw_done,0,sizeof g_pw_done); g_pw_completed=0;
+        pso_restore_from("pso-cache.bin"); KTEST(g_pw_completed==3);
+        unlink(g_pw_path);
+    }
+    strcpy(g_pw_path,"pso-marker.bin");
     memset(g_pw_done,0,sizeof g_pw_done); g_pw_completed=0; g_pw_digest[0]^=1;
     pso_restore_from("pso-cache.bin"); KTEST(g_pw_completed==0); /* changed list */
     g_pw_digest[0]^=1;

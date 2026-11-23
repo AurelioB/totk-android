@@ -73,6 +73,8 @@ static const char *const totk_live_startup_only[][2] = {
     {"TOTK_VK_POS_INVARIANT", "shader modules and cache identity are fixed at startup"},
     {"TOTK_VK_POS_NOCONTRACT", "shader modules and cache identity are fixed at startup"},
     {"TOTK_VK_INT_FOLD", "shader modules and cache identity are fixed at startup"},
+    {"TOTK_VK_VARYING_FIX", "shader modules and cache identity are fixed at startup"},
+    {"TOTK_VK_NAN_MINMAX", "shader modules and cache identity are fixed at startup"},
     {"TOTK_VK_SUBGROUP_FIX", "device subgroup features and immutable shader modules/pipelines are chosen at startup"},
     {"TOTK_THERMAL_STEP", "guest controller veneers and thermal sampling are installed only at startup"},
 };

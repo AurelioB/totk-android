@@ -198,6 +198,24 @@ int main(int argc, char **argv) {
         size_t ep0 = 0;
         for (size_t i = 5; i < m.count; i += m.words[i] >> 16) if ((m.words[i] & 0xffff) == 15) ep0 = m.words[i] >> 16;
         assert(ep == ep0 + (size_t)__builtin_popcount(missing) && stores >= (size_t)__builtin_popcount(missing));
+        if (argc == 2) {
+            char path[4096]; snprintf(path, sizeof path, "%s/vary-%d.spv", argv[1], block);
+            FILE *f = fopen(path, "wb"); assert(f); assert(fwrite(o, 4, n, f) == n); assert(!fclose(f));
+        }
+        /* Every truncated instruction/function must fail without touching input. */
+        for (size_t cut = 0; cut < m.count; cut++) {
+            size_t ignored = 0;
+            assert(!vk_spirv_add_outputs(m.words, cut, missing, kinds, &ignored));
+        }
+        const uint32_t short_ep[] = {0x07230203, 0x00010300, 0, 8, 0, OP(1,15)};
+        const uint32_t short_fn[] = {0x07230203, 0x00010300, 0, 8, 0, OP(1,54)};
+        assert(!vk_spirv_add_outputs(short_ep, sizeof short_ep / 4, missing, kinds, &n));
+        assert(!vk_spirv_add_outputs(short_fn, sizeof short_fn / 4, missing, kinds, &n));
+        assert(!vk_spirv_add_outputs(m.words, SIZE_MAX, missing, kinds, &n));
+        module bad = clone(m.words, m.count); bad.words[5] = OP(65535,17);
+        assert(!vk_spirv_add_outputs(bad.words, bad.count, missing, kinds, &n)); free(bad.words);
+        bad = clone(m.words, m.count); bad.words[5] = 0;
+        assert(!vk_spirv_add_outputs(bad.words, bad.count, missing, kinds, &n)); free(bad.words);
         assert(!vk_spirv_add_outputs(m.words, m.count, 0, kinds, &n));   /* nothing missing: nothing to do */
         free(o); free(m.words);
     }

@@ -11,7 +11,8 @@
    whatever the type (attribute memory is untyped). Translator patch 0005 already does this for the unwritten components
    of outputs the vertex shader does write.
 
-   Plain C over SPIR-V words, no Vulkan: android/gfx/test_vk_varyings.c. */
+   Plain C over SPIR-V words, no Vulkan: android/gfx/test_vk_position.c.
+   Full MIT notice: games/totk/third_party/licenses/totk-pc-recomp.txt. */
 #ifndef TOTK_VK_VARYINGS_H
 #define TOTK_VK_VARYINGS_H
 #include <stdint.h>
@@ -24,12 +25,12 @@ enum { VK_VARY_FLOAT = 0, VK_VARY_SINT = 1, VK_VARY_UINT = 2 };
    (built-ins, blocks and arrays are skipped), with each one's numeric kind (VK_VARY_*). 0 = ok, -1 = malformed. */
 static inline int vk_spirv_io(const uint32_t *w, size_t nw, uint32_t storage, uint32_t *mask, uint8_t kind[32]) {
     *mask = 0;
-    if (nw < 5 || w[0] != 0x07230203 || !w[3] || w[3] > (1u << 22)) return -1;
+    if (!w || nw > SIZE_MAX / sizeof *w || nw < 5 || w[0] != 0x07230203 || !w[3] || w[3] > (1u << 22)) return -1;
     uint32_t bound = w[3];
     int32_t *loc = malloc(bound * sizeof *loc); uint8_t *builtin = calloc(bound, 1);
-    uint32_t *ptype = calloc(bound, sizeof *ptype), *pclass = calloc(bound, sizeof *pclass);
+    uint32_t *ptype = calloc(bound, sizeof *ptype);
     uint8_t *tkind = malloc(bound);   /* scalar / vector numeric kind of a type id; 255 = not a scalar or vector */
-    if (!loc || !builtin || !ptype || !pclass || !tkind) { free(loc); free(builtin); free(ptype); free(pclass); free(tkind); return -1; }
+    if (!loc || !builtin || !ptype || !tkind) { free(loc); free(builtin); free(ptype); free(tkind); return -1; }
     memset(tkind, 255, bound);
     for (uint32_t i = 0; i < bound; i++) loc[i] = -1;
     int rc = 0;
@@ -38,17 +39,17 @@ static inline int vk_spirv_io(const uint32_t *w, size_t nw, uint32_t storage, ui
         if (!n || n > nw - i) { rc = -1; break; }
         if (op == 71 && n >= 4 && w[i + 1] < bound && w[i + 2] == 30) loc[w[i + 1]] = (int32_t)w[i + 3];   /* Location */
         if (op == 71 && n >= 3 && w[i + 1] < bound && w[i + 2] == 11) builtin[w[i + 1]] = 1;               /* BuiltIn */
-        if (op == 22 && n == 3 && w[i + 1] < bound) tkind[w[i + 1]] = VK_VARY_FLOAT;
-        if (op == 21 && n == 4 && w[i + 1] < bound) tkind[w[i + 1]] = w[i + 3] ? VK_VARY_SINT : VK_VARY_UINT;
+        if (op == 22 && n == 3 && w[i + 1] < bound && w[i + 2] == 32) tkind[w[i + 1]] = VK_VARY_FLOAT;
+        if (op == 21 && n == 4 && w[i + 1] < bound && w[i + 2] == 32) tkind[w[i + 1]] = w[i + 3] ? VK_VARY_SINT : VK_VARY_UINT;
         if (op == 23 && n == 4 && w[i + 1] < bound && w[i + 2] < bound) tkind[w[i + 1]] = tkind[w[i + 2]];
-        if (op == 32 && n == 4 && w[i + 1] < bound) { pclass[w[i + 1]] = w[i + 2]; ptype[w[i + 1]] = w[i + 3]; }
+        if (op == 32 && n == 4 && w[i + 1] < bound) ptype[w[i + 1]] = w[i + 3];
         if (op == 59 && n >= 4 && w[i + 1] < bound && w[i + 2] < bound && w[i + 3] == storage) {
             uint32_t id = w[i + 2], t = ptype[w[i + 1]];
             if (builtin[id] || loc[id] < 0 || loc[id] >= 32 || !t || t >= bound || tkind[t] == 255) continue;
             *mask |= 1u << loc[id]; if (kind) kind[loc[id]] = tkind[t];
         }
     }
-    free(loc); free(builtin); free(ptype); free(pclass); free(tkind);
+    free(loc); free(builtin); free(ptype); free(tkind);
     if (rc) *mask = 0;
     return rc;
 }
@@ -57,27 +58,46 @@ static inline int vk_spirv_io(const uint32_t *w, size_t nw, uint32_t storage, ui
    the entry point; NULL when the module does not have the expected layout or memory runs out (the caller keeps the
    original). Existing scalar, vector and pointer types are reused (SPIR-V forbids duplicates of those). */
 static inline uint32_t *vk_spirv_add_outputs(const uint32_t *w, size_t nw, uint32_t missing, const uint8_t kind[32], size_t *out_n) {
-    if (!missing || nw < 5 || w[0] != 0x07230203 || !w[3] || w[3] > (1u << 22)) return NULL;
-    size_t ep_at = 0, ann_end = 0, fn_at = 0, store_at = 0;
+    if (!w || !kind || !out_n || nw > SIZE_MAX / sizeof *w || !missing || nw < 5 ||
+        w[0] != 0x07230203 || !w[3] || w[3] > (1u << 22)) return NULL;
+    size_t ep_at = 0, ann_end = 0, fn_at = 0, store_at = 0, entry_end = 0;
+    int in_entry = 0;
     uint32_t bound = w[3], entry = 0, scalar[3] = {0, 0, 0}, vec[3] = {0, 0, 0}, ptr[3] = {0, 0, 0};
     for (size_t i = 5; i < nw; i += w[i] >> 16) {
         uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
         if (!n || n > nw - i) return NULL;
-        if (op == 15) { if (ep_at) return NULL; ep_at = i; entry = w[i + 2]; }   /* one entry point */
+        if ((op == 15 && n < 4) || (op == 54 && n < 5)) return NULL;
+        if (op == 15) {
+            if (ep_at || w[i + 1] != 0 || !w[i + 2] || w[i + 2] >= bound ||
+                !memchr(w + i + 3, 0, (n - 3) * sizeof *w)) return NULL;
+            ep_at = i; entry = w[i + 2];
+        }
         if (!ann_end && ((op >= 19 && op <= 39) || (op >= 41 && op <= 52) || op == 59 || op == 54)) ann_end = i;
         if (op == 22 && n == 3 && w[i + 2] == 32) scalar[VK_VARY_FLOAT] = w[i + 1];
         if (op == 21 && n == 4 && w[i + 2] == 32) scalar[w[i + 3] ? VK_VARY_SINT : VK_VARY_UINT] = w[i + 1];
         if (op == 54 && !fn_at) fn_at = i;
+        if (op == 54) in_entry = w[i + 2] == entry;
+        if (op == 56 && in_entry) { entry_end = i; in_entry = 0; }
         if (op == 54 && w[i + 2] == entry && !store_at) {   /* the entry function: after its first label and OpVariables */
             size_t j = i;
-            while (j < nw && (w[j] & 0xffff) != 248) { if (!(w[j] >> 16)) return NULL; j += w[j] >> 16; }
-            if (j >= nw) return NULL;
-            j += w[j] >> 16;
-            while (j < nw && ((w[j] & 0xffff) == 59 || (w[j] & 0xffff) == 8 || (w[j] & 0xffff) == 317)) { if (!(w[j] >> 16)) return NULL; j += w[j] >> 16; }
+            while (j < nw && (w[j] & 0xffff) != 248) {
+                uint32_t step = w[j] >> 16;
+                if (!step || step > nw - j) return NULL;
+                j += step;
+            }
+            if (j >= nw || w[j] >> 16 != 2 || nw - j < 2) return NULL;
+            j += 2;
+            while (j < nw && ((w[j] & 0xffff) == 59 || (w[j] & 0xffff) == 8 || (w[j] & 0xffff) == 317)) {
+                uint32_t step = w[j] >> 16;
+                if (!step || step > nw - j) return NULL;
+                j += step;
+            }
             store_at = j;
         }
     }
-    if (!ep_at || !ann_end || !fn_at || !store_at || !(ep_at < ann_end && ann_end <= fn_at && fn_at < store_at)) return NULL;
+    if (!ep_at || !ann_end || !fn_at || !store_at || !entry_end ||
+        !(ep_at < ann_end && ann_end <= fn_at && fn_at < store_at && store_at < entry_end) ||
+        (w[ep_at] >> 16) > ann_end - ep_at) return NULL;
     for (size_t i = 5; i < nw; i += w[i] >> 16) {   /* vec4 and Output pointers of the scalars, when declared */
         uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
         for (int k = 0; k < 3; k++) {
@@ -90,6 +110,7 @@ static inline uint32_t *vk_spirv_add_outputs(const uint32_t *w, size_t nw, uint3
     /* new words: types and constants (at most 3 + 4 + 4 + 4 + 7 per kind), variables 4 each, decorations 4 each,
        entry point interface 1 each, stores 3 each */
     size_t extra = 3 * (3 + 4 + 4 + 4 + 4 + 7) + (size_t)count * (4 + 4 + 1 + 3);
+    if (nw > SIZE_MAX / sizeof(uint32_t) - extra || (w[ep_at] >> 16) > UINT16_MAX - (uint32_t)count) return NULL;
     uint32_t *g = malloc((3 * 26 + (size_t)count * 4) * sizeof *g), *o = malloc((nw + extra) * sizeof *o);
     if (!g || !o) { free(g); free(o); return NULL; }
     size_t ng = 0;

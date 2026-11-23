@@ -268,6 +268,7 @@ OpStore %temp %stored
         env.update(VK_DRIVER_FILES=str(icds[0]), VK_ICD_FILENAMES=str(icds[0]),
                    TOTK_SHADER_SEED_DIR=str(seed), TOTK_FRAME_LAG='0', TOTK_VK_REC_THREADS='0',
                    TOTK_VK_PIPELINE_CACHE='0', TOTK_PSO_PREWARM='0', TOTK_VK_PIPELINE_LIBRARY='0',
+                   TOTK_VK_VARYING_FIX='0', TOTK_VK_NAN_MINMAX='0',  # isolate the existing folding arms
                    XDG_CACHE_HOME=str(self.work / 'cache'))
         pixels = []
         for arm in ('0', '1'):

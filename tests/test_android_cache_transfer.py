@@ -125,8 +125,8 @@ class AndroidCacheTransferTests(unittest.TestCase):
     def recorded_calls(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()]
 
-    def test_fresh_default_exports_and_imports_intfold_basename(self):
-        name = BASE + '.intfold-v1'
+    def test_fresh_default_exports_and_imports_rewrite_basename(self):
+        name = BASE + '.intfold-v1.vary-v1'
         self.cached(name)
         folder, result = self.export()
         self.assertEqual([path.name for path in folder.iterdir()], [name])
@@ -179,9 +179,11 @@ class AndroidCacheTransferTests(unittest.TestCase):
         for seed in ('', '.' + '0123456789abcdef' * 4):
             for position in ('', '.pos-v1-10', '.pos-v1-01', '.pos-v1-11'):
                 for fold in ('', '.intfold-v1'):
-                    name = BASE + seed + position + fold
-                    names.add(name)
-                    self.cached(name, PAYLOAD + name.encode())
+                    for varying in ('', '.vary-v1'):
+                        for nan in ('', '.nan-v1'):
+                            name = BASE + seed + position + fold + varying + nan
+                            names.add(name)
+                            self.cached(name, PAYLOAD + name.encode())
         folder, _ = self.export()
         self.assertEqual({path.name for path in folder.iterdir()}, names)
         result = self.invoke('cache-import', *(folder / name for name in sorted(names)))
@@ -196,6 +198,7 @@ class AndroidCacheTransferTests(unittest.TestCase):
             '.intfold-v1.stale', '.intfold-v1.imported', '.intfold-v1.pso-keys',
             '.intfold-v1.pso-state', '.pos-v1-00', '.pos-v1-10.pos-v1-01',
             '.intfold-v1.pos-v1-10', '.intfold-v1.intfold-v1',
+            '.vary-v1.intfold-v1', '.nan-v1.vary-v1', '.vary-v1.vary-v1', '.nan-v1.nan-v1',
             '.' + 'a' * 63, '.' + 'a' * 65, '.' + 'A' * 64,
             '.' + 'g' * 64, '.unrecognized')]
         invalid += ['vk-pipeline-cache-20260101-000000.bin', 'custom-cache.bin', 'unrelated']

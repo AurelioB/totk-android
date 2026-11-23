@@ -40,6 +40,7 @@ static pthread_once_t g_position_once = PTHREAD_ONCE_INIT;
 static unsigned g_position_policy;
 static int g_nan_minmax;       /* TOTK_VK_NAN_MINMAX (startup-only, default on; 0 = off): min / max / saturate with the Switch's NaN rules */
 static int g_varying_fix;      /* TOTK_VK_VARYING_FIX (startup-only, default on; 0 = off): vk_vs_module_for adds missing varyings */
+static void varying_report(void);
 static void position_init(void) {
     g_position_policy = vk_position_policy(getenv("TOTK_VK_POS_INVARIANT"), getenv("TOTK_VK_POS_NOCONTRACT"));
     const char *nm = getenv("TOTK_VK_NAN_MINMAX"); g_nan_minmax = !(nm && !strcmp(nm, "0"));
@@ -48,6 +49,7 @@ static void position_init(void) {
     LOGV("[nvn-vk] TOTK_VK_VARYING_FIX=%d (startup-only): fragment inputs a vertex shader does not write %s", g_varying_fix, g_varying_fix ? "read (0, 0, 0, 1) as on Maxwell" : "left undefined");
     LOGV("[nvn-vk] TOTK_VK_POS_INVARIANT=%u (startup-only): vertex Position Invariant", g_position_policy & 1);
     LOGV("[nvn-vk] TOTK_VK_POS_NOCONTRACT=%u (startup-only): position-feeding float arithmetic NoContraction", g_position_policy >> 1);
+    if (g_varying_fix) atexit(varying_report);
 }
 
 static pthread_once_t g_int_fold_once = PTHREAD_ONCE_INIT;
@@ -99,8 +101,8 @@ static void seed_init(void) {
     for (int i = 0; i < 32; i++) snprintf(g_seed_tag + 2 * i, 3, "%02x", digest[i]);
 }
 static const char *seed_dir(void) { pthread_once(&g_seed_once, seed_init); return g_seed_dir; }
-/* Alternate seeds, position precision and integer folding namespace explicit
-   cache/import paths too. Both policies off retains legacy paths. Caller owns out. */
+/* Every rewrite policy namespaces default and explicit cache/import paths.
+   All policies off retains legacy paths. Caller owns out. */
 const char *vk_shader_cache_path(const char *base, char *out, size_t size) {
     pthread_once(&g_seed_once, seed_init);
     pthread_once(&g_position_once, position_init);
@@ -108,7 +110,9 @@ const char *vk_shader_cache_path(const char *base, char *out, size_t size) {
     if (!base || !strcmp(base, "0")) return NULL;
     const char *suffix = vk_position_cache_suffix(g_position_policy);
     const char *fold = g_int_fold ? ".intfold-v1" : "";
-    int n = g_seed_default ? snprintf(out, size, "%s%s%s", base, suffix, fold) : snprintf(out, size, "%s.%s%s%s", base, g_seed_tag, suffix, fold);
+    const char *vary = g_varying_fix ? ".vary-v1" : "", *nan = g_nan_minmax ? ".nan-v1" : "";
+    int n = g_seed_default ? snprintf(out, size, "%s%s%s%s%s", base, suffix, fold, vary, nan) :
+        snprintf(out, size, "%s.%s%s%s%s%s", base, g_seed_tag, suffix, fold, vary, nan);
     return n >= 0 && (size_t)n < size ? out : NULL;
 }
 static void seed_io_start(void) {
@@ -154,9 +158,14 @@ void vk_shader_seed_startup(const char *game_dir) {
     if (vk_seed_io_enabled()) seed_io_start(); /* index/warming overlaps remaining boot work */
     else (void)vk_shaders_ready();
 }
-static uint64_t g_io_n, g_io_ns, g_io_max_ns;   /* seed files read since the last vk_shader_io_take (the stutter log) */
-static _Atomic uint64_t g_io_cum_ns;            /* all seed reads (the long-frame log) */
-void vk_shader_io_take(uint64_t *n, uint64_t *ns, uint64_t *max_ns) { *n = g_io_n; *ns = g_io_ns; *max_ns = g_io_max_ns; g_io_n = g_io_ns = g_io_max_ns = 0; vk_seed_io_report(); vk_compute_report(); }
+/* read_file() also serves pipeline workers; interval fields are independent
+   atomic samples, not a transaction, and never race with recorder resets. */
+static _Atomic uint64_t g_io_n, g_io_ns, g_io_max_ns;
+static _Atomic uint64_t g_io_cum_ns;
+void vk_shader_io_take(uint64_t *n, uint64_t *ns, uint64_t *max_ns) {
+    *n = atomic_exchange(&g_io_n, 0); *ns = atomic_exchange(&g_io_ns, 0); *max_ns = atomic_exchange(&g_io_max_ns, 0);
+    vk_seed_io_report(); vk_compute_report(); varying_report();
+}
 uint64_t vk_shader_io_cum_ns(void) { return atomic_load(&g_io_cum_ns); }
 static char *read_file_(const char *path, size_t *len);
 static char *read_file(const char *path, size_t *len) {
@@ -164,7 +173,9 @@ static char *read_file(const char *path, size_t *len) {
     const char *name = strrchr(path, '/'); if (name) name++; else name = path;
     char *r = vk_seed_io_active() ? vk_seed_io_read(name, len) : read_file_(path, len);
     uint64_t dt = host_now_ns() - t0;
-    g_io_n++; g_io_ns += dt; g_io_cum_ns += dt; if (dt > g_io_max_ns) g_io_max_ns = dt;
+    atomic_fetch_add(&g_io_n, 1); atomic_fetch_add(&g_io_ns, dt); atomic_fetch_add(&g_io_cum_ns, dt);
+    uint64_t old = atomic_load(&g_io_max_ns);
+    while (old < dt && !atomic_compare_exchange_weak(&g_io_max_ns, &old, dt)) {}
     return r;
 }
 static char *read_file_(const char *path, size_t *len) {
@@ -397,6 +408,71 @@ static int spirv_image_features_ok(const uint32_t *w, size_t nw, int can_read, i
     return 1;
 }
 static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
+/* The only module postprocessing chain. Pair-specific vertex replacements pass
+   through here too, so integer folding and future passes cannot be bypassed. */
+static int shader_postprocess(vk_shader *sh, char **data, size_t *length) {
+    char *spv = *data; size_t spv_len = *length;
+    const char *variant = sh->key;
+    int result = -1;
+    if (sh->stage == 0 && g_position_policy) {
+        size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
+        if (vk_spirv_position(&words, &nw, g_position_policy) < 0) {
+            RED(16, "shader %s: cannot preserve requested vertex position precision; refused", variant);
+            goto done;
+        }
+        spv = (char *)words; spv_len = nw * 4;
+    }
+    if (g_nan_minmax && vk_spirv_nan_minmax((uint32_t *)spv, spv_len / 4) < 0)
+        RED(16, "shader %s: TOTK_VK_NAN_MINMAX: malformed module", variant);
+    if (sh->stage == 1) {
+        size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
+        if (vk_spirv_early_tests(&words, &nw, sh->early_tests && earlyz_on() && !sh->alpha_func) < 0) {
+            RED(16, "shader %s: invalid fragment execution modes", variant); goto done;
+        }
+        spv = (char *)words; spv_len = nw * 4;
+        size_t nnw; uint32_t *pw = spirv_depth_nudge((const uint32_t *)spv, spv_len / 4, &nnw);
+        if (pw) { free(spv); spv = (char *)pw; spv_len = nnw * 4; sh->depth_spec = 1; }
+        patch_set((uint32_t *)spv, spv_len / 4, 1);
+        if (sh->alpha_func) {
+            unsigned binding=0;
+            for (int i=0;i<sh->nb;i++) if (sh->b[i].binding>=binding) binding=sh->b[i].binding+1;
+            pw=vk_spirv_alpha_test((const uint32_t *)spv,spv_len/4,sh->alpha_func,binding,&nnw);
+            if (!pw || binding>UINT16_MAX) {
+                RED(16,"shader %s: cannot build alpha-test comparison %u",variant,sh->alpha_func);
+                free(pw); goto done;
+            }
+            free(spv); spv=(char *)pw; spv_len=nnw*4;
+            sh->b=realloc(sh->b,(size_t)(sh->nb+1)*sizeof *sh->b);
+            sh->b[sh->nb++]=(vk_bind){.binding=binding,.count=1,.kind=RB_ALPHA,
+                .dtype=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,.reg=-1,.sreg=-1,.extent=16};
+            sh->load_full_outputs=0;
+        }
+    }
+    if (V.subgroup_fix) {
+        size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
+        int fixed = vk_spirv_subgroup32(&words, &nw);
+        spv = (char *)words; spv_len = nw * 4;
+        if (fixed > 0) {
+            sh->required_subgroup_size = vk_subgroup_required(stage_flags(sh->stage), V.subgroup_control,
+                V.subgroup_sizes.requiredSubgroupSizeStages, V.subgroup_sizes.minSubgroupSize, V.subgroup_sizes.maxSubgroupSize);
+            uint32_t physical = sh->required_subgroup_size ? sh->required_subgroup_size : V.subgroup.subgroupSize;
+            if (physical < 32 || physical > 128 || (physical & (physical - 1)) ||
+                !(V.subgroup.supportedStages & stage_flags(sh->stage)) ||
+                !(V.subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT)) fixed = -1;
+            else LOGV("subgroup shader %s: logical 32, physical %u%s", variant, physical,
+                sh->required_subgroup_size ? " (pinned)" : " (fixed default)");
+        }
+        if (fixed < 0) {
+            RED(32, "subgroup shader %s: cannot preserve 32-lane semantics on this device/module; refused", variant);
+            goto done;
+        }
+    }
+    if (g_int_fold && vk_spirv_int_fold((uint32_t *)spv, spv_len / 4) < 0)
+        RED(16, "shader %s: integer proof unavailable; retaining original module", variant);
+    result = 0;
+done:
+    *data = spv; *length = spv_len; return result;
+}
 static vk_shader *shader_load(const char *variant, int early_tests) {
     pthread_once(&g_position_once, position_init);
     pthread_once(&g_int_fold_once, int_fold_init);
@@ -467,66 +543,13 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
         if (b->kind == RB_IMG) { if (b->reg >= 0 && b->reg < 32) sh->native_img_mask |= 1u << b->reg; }
         else if (b->reg >= 0 && b->reg < 128) sh->native_tex_mask[b->reg/64] |= 1ull << (b->reg&63);
     }
-    if (sh->stage == 0 && g_position_policy) {
-        size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
-        if (vk_spirv_position(&words, &nw, g_position_policy) < 0) {
-            RED(16, "shader %s: cannot preserve requested vertex position precision; refused", variant);
-            free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
-        }
-        spv = (char *)words; spv_len = nw * 4;
+    if (shader_postprocess(sh, &spv, &spv_len) < 0) {
+        free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
     }
-    if (g_nan_minmax && vk_spirv_nan_minmax((uint32_t *)spv, spv_len / 4) < 0) RED(16, "shader %s: TOTK_VK_NAN_MINMAX: malformed module", variant);
-    if (sh->stage == 1) {
-        size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
-        if (vk_spirv_early_tests(&words, &nw, sh->early_tests && earlyz_on() && !sh->alpha_func) < 0) {
-            RED(16, "shader %s: invalid fragment execution modes", variant); free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
-        }
-        spv = (char *)words; spv_len = nw * 4;
-        size_t nnw; uint32_t *pw = spirv_depth_nudge((const uint32_t *)spv, spv_len / 4, &nnw);
-        if (pw) { free(spv); spv = (char *)pw; spv_len = nnw * 4; sh->depth_spec = 1; }
-        patch_set((uint32_t *)spv, spv_len / 4, 1);
-        if (sh->alpha_func) {
-            unsigned binding=0;
-            for (int i=0;i<sh->nb;i++) if (sh->b[i].binding>=binding) binding=sh->b[i].binding+1;
-            pw=vk_spirv_alpha_test((const uint32_t *)spv,spv_len/4,sh->alpha_func,binding,&nnw);
-            if (!pw || binding>UINT16_MAX) {
-                RED(16,"shader %s: cannot build alpha-test comparison %u",variant,sh->alpha_func);
-                free(pw); free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
-            }
-            free(spv); spv=(char *)pw; spv_len=nnw*4;
-            sh->b=realloc(sh->b,(size_t)(sh->nb+1)*sizeof *sh->b);
-            sh->b[sh->nb++]=(vk_bind){.binding=binding,.count=1,.kind=RB_ALPHA,
-                .dtype=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,.reg=-1,.sreg=-1,.extent=16};
-            sh->load_full_outputs=0;
-        }
+    if (g_varying_fix) {
+        if (sh->stage == 0) sh->io_known = !vk_spirv_io((const uint32_t *)spv, spv_len / 4, 3, &sh->vout_mask, NULL);
+        else if (sh->stage == 1) sh->io_known = !vk_spirv_io((const uint32_t *)spv, spv_len / 4, 1, &sh->fin_mask, sh->fin_kind);
     }
-    if (V.subgroup_fix) {
-        size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
-        int fixed = vk_spirv_subgroup32(&words, &nw);
-        spv = (char *)words; spv_len = nw * 4;
-        if (fixed > 0) {
-            sh->required_subgroup_size = vk_subgroup_required(stage_flags(sh->stage), V.subgroup_control,
-                V.subgroup_sizes.requiredSubgroupSizeStages, V.subgroup_sizes.minSubgroupSize, V.subgroup_sizes.maxSubgroupSize);
-            uint32_t physical = sh->required_subgroup_size ? sh->required_subgroup_size : V.subgroup.subgroupSize;
-            if (physical < 32 || physical > 128 || (physical & (physical - 1)) ||
-                !(V.subgroup.supportedStages & stage_flags(sh->stage)) ||
-                !(V.subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT)) fixed = -1;
-            else LOGV("subgroup shader %s: logical 32, physical %u%s", variant, physical,
-                sh->required_subgroup_size ? " (pinned)" : " (fixed default)");
-        }
-        if (fixed < 0) {
-            RED(32, "subgroup shader %s: cannot preserve 32-lane semantics on this device/module; refused", variant);
-            free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
-        }
-    }
-    if (g_int_fold) {
-        int folded = vk_spirv_int_fold((uint32_t *)spv, spv_len / 4);
-        if (folded < 0) {
-            RED(16, "shader %s: integer proof unavailable; retaining original module", variant);
-        }
-    }
-    if (sh->stage == 0) sh->io_known = !vk_spirv_io((const uint32_t *)spv, spv_len / 4, 3, &sh->vout_mask, NULL);
-    else if (sh->stage == 1) sh->io_known = !vk_spirv_io((const uint32_t *)spv, spv_len / 4, 1, &sh->fin_mask, sh->fin_kind);
     VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = spv_len, .pCode = (const uint32_t *)spv};
     VkResult r = vkCreateShaderModule(V.dev, &mci, NULL, &sh->mod);
     free(spv);
@@ -730,20 +753,28 @@ void vk_prog_prepare(const prog_t *p) {
 }
 void mtl_prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock(&g_progs_mu); nvn_hm_del(&g_progs, &p->serial); pthread_mutex_unlock(&g_progs_mu); }   /* the vk_prog leaks a little; programs are few */
 /* ---------- varyings a fragment shader reads that the vertex shader does not write (vk_varyings.h) ---------- */
-struct vk_vfix { uint32_t missing; uint8_t kind[32]; VkShaderModule mod; struct vk_vfix *next; };
+struct vk_vfix { const vk_shader *fs; uint32_t missing; uint8_t kind[32]; VkShaderModule mod; struct vk_vfix *next; };
 static pthread_mutex_t g_vfix_mu = PTHREAD_MUTEX_INITIALIZER;
-/* The vertex module as shader_load made it, again: read from the seed (seed IO keeps it in memory) with the same
-   vertex-stage rewrites in the same order (position precision, NaN rules, 32-lane subgroups). Keep in step with
-   shader_load. NULL on failure. */
+static uint64_t g_vfix_patched, g_vfix_fallback, g_vfix_reported = UINT64_MAX;
+/* Cumulative distinct shader pairs, emitted only on change at the existing
+   stutter-report cadence and at normal exit. No per-draw logging. */
+static void varying_report(void) {
+    if (!g_varying_fix) return;
+    pthread_mutex_lock(&g_vfix_mu);
+    uint64_t patched = g_vfix_patched, fallback = g_vfix_fallback, total = patched + fallback;
+    int changed = total != g_vfix_reported; g_vfix_reported = total;
+    pthread_mutex_unlock(&g_vfix_mu);
+    if (changed) LOGV("[varyings] session shader_pairs patched=%" PRIu64 " fallback=%" PRIu64, patched, fallback);
+}
+/* No retained SPIR-V source RAM (budget: 0 bytes). Seed IO transfers ownership
+   of a mutable payload and may perform storage IO again. Its own lock and our
+   atomic accounting support workers. Never mutate published shader metadata. */
 static uint32_t *vs_words_again(const vk_shader *vs, size_t *nw) {
     char path[1024]; size_t len = 0;
     snprintf(path, sizeof path, "%s/%s.spv", seed_dir(), vs->key);
     uint32_t *words = (uint32_t *)read_file(path, &len);
     if (!words || len % 4 || len < 20) { free(words); return NULL; }
     *nw = len / 4;
-    if (g_position_policy && vk_spirv_position(&words, nw, g_position_policy) < 0) { free(words); return NULL; }
-    if (g_nan_minmax && vk_spirv_nan_minmax(words, *nw) < 0) { free(words); return NULL; }
-    if (V.subgroup_fix && vk_spirv_subgroup32(&words, nw) < 0) { free(words); return NULL; }
     return words;
 }
 /* The vertex module to draw with fs: vs->mod, or (once per vertex shader and set of missing Locations and their kinds,
@@ -756,23 +787,37 @@ VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs) {
     uint8_t kind[32] = {0};
     for (int l = 0; l < 32; l++) if (missing >> l & 1) kind[l] = fs->fin_kind[l];
     pthread_mutex_lock(&g_vfix_mu);
-    for (struct vk_vfix *f = vs->vfix; f; f = f->next)
-        if (f->missing == missing && !memcmp(f->kind, kind, sizeof kind)) { VkShaderModule m = f->mod; pthread_mutex_unlock(&g_vfix_mu); return m; }
     VkShaderModule mod = VK_NULL_HANDLE;
-    size_t nw = 0, no = 0; uint32_t *w = vs_words_again(vs, &nw), *o = w ? vk_spirv_add_outputs(w, nw, missing, kind, &no) : NULL;
-    if (o) {
-        VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = no * 4, .pCode = o};
-        if (vkCreateShaderModule(V.dev, &mci, NULL, &mod) != VK_SUCCESS) mod = VK_NULL_HANDLE;
+    for (struct vk_vfix *f = vs->vfix; f; f = f->next) {
+        if (f->fs == fs) { mod = f->mod; pthread_mutex_unlock(&g_vfix_mu); return mod; }
+        if (f->missing == missing && !memcmp(f->kind, kind, sizeof kind)) mod = f->mod;
     }
-    free(w); free(o);
     struct vk_vfix *f = calloc(1, sizeof *f);
-    if (f) { f->missing = missing; memcpy(f->kind, kind, sizeof kind); f->mod = mod ? mod : vs->mod; f->next = vs->vfix; vs->vfix = f; }
+    if (f && !mod) {
+        size_t nw = 0, no = 0; uint32_t *w = vs_words_again(vs, &nw);
+        uint32_t *o = w ? vk_spirv_add_outputs(w, nw, missing, kind, &no) : NULL;
+        /* Add outputs before the shared chain too: later passes see exactly the
+           replacement module, not just the original source. */
+        free(w);
+        if (o) {
+            vk_shader copy = {.stage = 0}; memcpy(copy.key, vs->key, sizeof copy.key);
+            char *data = (char *)o; size_t length = no * 4;
+            if (!shader_postprocess(&copy, &data, &length)) {
+                VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = length, .pCode = (const uint32_t *)data};
+                if (vkCreateShaderModule(V.dev, &mci, NULL, &mod) != VK_SUCCESS) mod = VK_NULL_HANDLE;
+            }
+            free(data);
+        }
+    }
+    if (!mod) mod = vs->mod;
+    if (f) { f->fs = fs; f->missing = missing; memcpy(f->kind, kind, sizeof kind); f->mod = mod; f->next = vs->vfix; vs->vfix = f; }
+    if (mod != vs->mod) g_vfix_patched++; else g_vfix_fallback++;
+    uint64_t total = g_vfix_patched + g_vfix_fallback;
+    if (total <= 40)
+        LOGV("[varyings] vs %.16s + fs %.16s: missing=%#x %s; session shader_pairs patched=%" PRIu64 " fallback=%" PRIu64,
+             vs->key, fs->key, missing, mod != vs->mod ? "added (0, 0, 0, 1)" : "old behaviour kept", g_vfix_patched, g_vfix_fallback);
     pthread_mutex_unlock(&g_vfix_mu);
-    static _Atomic unsigned logged;
-    if (atomic_fetch_add(&logged, 1) < 40)
-        LOGV("[varyings] vs %.16s + fs %.16s: the fragment shader reads location(s) %#x the vertex shader does not write; %s",
-             vs->key, fs->key, missing, mod ? "added as (0, 0, 0, 1)" : "could not add them (old behaviour kept)");
-    return mod ? mod : vs->mod;
+    return mod;
 }
 int vk_prog_resolve(const prog_t *p, vk_shader *out[6]) {
     memset(out, 0, 6 * sizeof *out);

@@ -1,5 +1,15 @@
 /* No Vulkan device: production shader/program caches and compact dictionary,
  * with only driver calls and unrelated renderer classification replaced. */
+/* Count actual production classification calls, including the disabled arm. */
+#define vk_spirv_io vk_spirv_io_impl
+#include "vk_varyings.h"
+#undef vk_spirv_io
+#include <stdatomic.h>
+static _Atomic unsigned io_walks;
+static int vk_spirv_io(const uint32_t *w, size_t n, uint32_t storage, uint32_t *mask, uint8_t kind[32]) {
+    atomic_fetch_add(&io_walks, 1);
+    return vk_spirv_io_impl(w, n, storage, mask, kind);
+}
 #include "vk_shader.c"
 #include "vk_shader_xlate.c"
 #include "vk_gpuprof_compact.h"
@@ -11,12 +21,33 @@ int g_hitch_on;
 vk_hitch g_hk;
 static unsigned modules, destroyed, layouts, compute_prepares;
 static int fail_module, fail_layout;
+static const uint32_t *expected_words;
+static size_t expected_count;
+static int inspect_modules;
 
 static VKAPI_ATTR VkResult VKAPI_CALL create_module(VkDevice device,
         const VkShaderModuleCreateInfo *info, const VkAllocationCallbacks *allocator, VkShaderModule *out) {
     (void)device; (void)allocator;
     assert(info->codeSize >= 20 && info->pCode[0] == 0x07230203);
     if (fail_module) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (inspect_modules) {
+        unsigned integer = 0, nan = 0, invariant = 0;
+        for (size_t i = 5; i < info->codeSize / 4; i += info->pCode[i] >> 16) {
+            const uint32_t *p = info->pCode + i; unsigned op = *p & 0xffff;
+            if ((op == 128 || op == 83) && p[2] == 15) { assert(op == (g_int_fold ? 83u : 128u)); integer++; }
+            if (op == 12 && p[2] >= 16 && p[2] <= 18) {
+                const uint32_t translated[] = {37, 40, 43}, rewritten[] = {79, 80, 81};
+                assert(p[4] == (g_nan_minmax ? rewritten : translated)[p[2] - 16]); nan++;
+            }
+            if (op == 71 && p[1] == 10 && p[2] == 18) invariant++;
+        }
+        assert(integer == 1 && nan == 3 && invariant == (g_position_policy & 1));
+        if (!g_varying_fix && !g_int_fold && !g_nan_minmax && !g_position_policy)
+            assert(info->codeSize == expected_count * 4 && !memcmp(info->pCode, expected_words, info->codeSize));
+        char path[80]; snprintf(path, sizeof path, "module-%u.spv", modules);
+        FILE *f = fopen(path, "wb"); assert(f);
+        assert(fwrite(info->pCode, 1, info->codeSize, f) == info->codeSize); assert(!fclose(f));
+    }
     *out = (VkShaderModule)(uintptr_t)++modules;
     return VK_SUCCESS;
 }
@@ -63,6 +94,8 @@ void vk_compute_prepare(vk_shader *shader) {
     compute_prepares++;
 }
 
+void vk_compute_report(void) {}
+
 /* A small empty entry point is enough for the real loader's parsing/patching.
  * The mock driver deliberately does not validate rendering semantics. */
 static void seed_variant(const char *name, int stage) {
@@ -91,7 +124,77 @@ static void variant_list_write(const char *key, const char *name) {
 }
 static gp_compact compact;
 
+static vk_shader *vary_vs;
+static vk_shader vary_fs[64];
+static void *vary_worker(void *arg) {
+    size_t start = (size_t)arg;
+    for (size_t i = start; i < 64; i += 4) {
+        VkShaderModule m = vk_vs_module_for(vary_vs, vary_fs + i);
+        assert(m && (m != vary_vs->mod) == g_varying_fix);
+        assert(vk_vs_module_for(vary_vs, vary_fs + i) == m);
+    }
+    return NULL;
+}
+static int varying_test(void) {
+#define OP(n, op) ((uint32_t)(n) << 16 | (op))
+    /* Dataless valid VS: the integer result and FMin let the mocked driver check
+       that every replacement, not merely its source, ran the complete chain. */
+    static const uint32_t words[] = {0x07230203, 0x00010300, 0, 32, 0,
+        OP(2,17), 1, OP(6,11), 20, 0x4c534c47, 0x6474732e, 0x3035342e, 0,
+        OP(3,14), 0, 1, OP(6,15), 0, 3, 0x6e69616d, 0, 10, OP(4,71), 10, 11, 0,
+        OP(2,19), 1, OP(3,33), 2, 1, OP(3,22), 5, 32, OP(4,23), 6, 5, 4,
+        OP(4,32), 7, 3, 6, OP(4,21), 8, 32, 0,
+        OP(4,43), 5, 9, 0, OP(4,43), 5, 11, 0x3f800000,
+        OP(4,43), 8, 12, 0, OP(4,43), 8, 13, 1, OP(7,44), 6, 14, 9, 9, 9, 11,
+        OP(4,59), 7, 10, 3, OP(5,54), 1, 3, 0, 2, OP(2,248), 4,
+        OP(5,128), 8, 15, 12, 13, OP(7,12), 5, 16, 20, 37, 9, 11,
+        OP(7,12), 5, 17, 20, 40, 9, 11, OP(8,12), 5, 18, 20, 43, 9, 9, 11,
+        OP(3,62), 10, 14, OP(1,253), OP(1,56)};
+#undef OP
+    assert(!setenv("TOTK_XLATE_ONDEVICE", "0", 1));
+    assert(!mkdir("shaders", 0700));
+    char key[65]; memset(key, 'a', 64); key[64] = 0;
+    seed_variant(key, 0);
+    char path[1100]; snprintf(path, sizeof path, "shaders/%s.spv", key);
+    FILE *file = fopen(path, "wb"); assert(file);
+    assert(fwrite(words, 1, sizeof words, file) == sizeof words); assert(!fclose(file));
+    char game[4096]; assert(getcwd(game, sizeof game)); vk_shader_seed_startup(game);
+    expected_words = words; expected_count = sizeof words / 4; inspect_modules = 1;
+    vary_vs = vk_shader_seed(key, 0, 0); assert(vary_vs);
+    assert(atomic_load(&io_walks) == (unsigned)g_varying_fix);
+    for (size_t i = 0; i < 64; i++) {
+        vary_fs[i].io_known = 1;
+        vary_fs[i].fin_mask = 1u << (i % 20 + 1);
+        vary_fs[i].fin_kind[i % 20 + 1] = i % 3;
+    }
+    pthread_t worker[4];
+    for (size_t i = 0; i < 4; i++) assert(!pthread_create(worker + i, NULL, vary_worker, (void *)i));
+    /* Recorder accounting/reset runs concurrently with actual worker-side reads.
+       All per-window read counts remain accounted for across resets. */
+    uint64_t accounted = 0;
+    for (unsigned i = 0; i < 128; i++) {
+        size_t length = 0; char *bytes = read_file(path, &length); assert(bytes && length == sizeof words); free(bytes);
+        uint64_t n, ns, max; vk_shader_io_take(&n, &ns, &max); accounted += n;
+    }
+    for (unsigned i = 0; i < 4; i++) assert(!pthread_join(worker[i], NULL));
+    uint64_t n, ns, max; vk_shader_io_take(&n, &ns, &max); accounted += n;
+    assert(accounted == 130 + (g_varying_fix ? 60 : 0)); /* seed spv+reflection, recorder reads, 60 mask/type sets */
+    assert(g_vfix_patched == (g_varying_fix ? 64u : 0u) && !g_vfix_fallback);
+    assert(atomic_load(&io_walks) == (unsigned)g_varying_fix); /* helper does not reclassify */
+    if (g_varying_fix) {
+        vk_shader failure = {.io_known=1, .fin_mask=1u << 31};
+        fail_module = 1; assert(vk_vs_module_for(vary_vs, &failure) == vary_vs->mod);
+        fail_module = 0; assert(vk_vs_module_for(vary_vs, &failure) == vary_vs->mod);
+        assert(g_vfix_patched == 64 && g_vfix_fallback == 1);
+        varying_report();
+    } else assert(!vary_vs->vfix && modules == 1);
+    vk_seed_io_stop();
+    puts("varying runtime chain, off-arm identity, accounting and concurrency passed");
+    return 0;
+}
+
 int main(void) {
+    if (getenv("TEST_VARYINGS")) return varying_test();
     /* Freeze precision to the ordinary arm before the production pthread_once. */
     assert(!setenv("TOTK_VK_POS_INVARIANT", "0", 1));
     assert(!setenv("TOTK_VK_POS_NOCONTRACT", "0", 1));

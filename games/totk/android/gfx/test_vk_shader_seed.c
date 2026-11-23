@@ -11,6 +11,8 @@ int main(int argc, char **argv) {
         setenv("TOTK_VK_POS_NOCONTRACT", "0", 1);
         /* Every subsequent query must retain the startup arm and log only once. */
         setenv("TOTK_VK_INT_FOLD", g_int_fold ? "0" : "1", 1);
+        setenv("TOTK_VK_VARYING_FIX", g_varying_fix ? "0" : "1", 1);
+        setenv("TOTK_VK_NAN_MINMAX", g_nan_minmax ? "0" : "1", 1);
     }
     if (!strcmp(argv[1], "--unready")) {
         assert(!vk_shaders_ready()); assert(!vk_shaders_ready());
@@ -35,5 +37,6 @@ int main(int argc, char **argv) {
     assert(spirv_image_features_ok(w, 5, 0, 0));
     assert(!spirv_image_features_ok(w, 8, 1, 1));
     puts("seed paths and formatless image capability checks passed");
+    printf("%s.pso-state\n", cache);
     return 0;
 }
