@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 uint32_t companion_hash(const char *s) {
     const uint8_t *p = (const uint8_t *)s; size_t n = strlen(s); uint32_t h = 0;
@@ -295,12 +296,31 @@ static uint64_t player_actor(Ctx *c) {
      +0x360 / +0x368 (B), header bytes 2 and 3 = width and height; a missing grid reads 1000 everywhere. Per axis a grid
      is sampled between the cell and its nearer neighbour; A blends only towards a lower neighbour, B only towards a
      higher one (as the game does).
-   The game resolves S through an override chain when S's own flags (+0x126..+0x128 bit 0) are clear; that chain is not
-   followed here. Inherited, invalid or replaced samples return NULL for the old-layer fallback, not a constant band.
+   The contributor notes the game can resolve S through an override chain when flag bits at +0x126..+0x128 are clear.
+   This reader uses the plain values without reading those flags or following the chain. On a tested Thor surface
+   scene the flags were 01,01,00 and plain values gave the right layer; scenes where overrides differ are untested.
+   Invalid, unreadable or replaced samples return NULL for the old-layer fallback, not a constant band.
    Pointer revalidation detects replacements, not in-place updates or ABA; these reads are not synchronized. */
 enum { ENV_SLOT = 0x3a83968, ENV = 0xb8, ENV_PARAM_OWNER = 0x28, ENV_PARAM = 0x150, ENV_GRIDS = 0x218,
        ENV_VT_DEPTH = 0x290, ENV_DEPTH_FN = 0x22acf4, ENV_VT_SKY = 0x270, ENV_SKY_FN = 0x402180 };
 typedef struct { uint64_t header, data; uint8_t dim[2]; } GridSample;
+static const char *layer_reject(const char **failure, const char *reason) { *failure = reason; return NULL; }
+/* One global fallback line per rolling minute, not one line per reason or per process. */
+static int layer_fallback_due(uint64_t now_ms) {
+    static _Atomic(uint64_t) last;
+    uint64_t stamp = atomic_load_explicit(&last, memory_order_relaxed);
+    for (;;) {
+        if (stamp && (now_ms < stamp - 1 || now_ms - (stamp - 1) < 60000)) return 0;
+        if (atomic_compare_exchange_weak_explicit(&last, &stamp, now_ms + 1,
+                                                 memory_order_relaxed, memory_order_relaxed)) return 1;
+    }
+}
+static void log_layer_fallback(const char *failure) {
+    struct timespec ts;
+    if (!clock_gettime(CLOCK_MONOTONIC, &ts) &&
+        layer_fallback_due((uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000))
+        fprintf(stderr, "[companion] map layer: environment not as expected, using MapData.CurrentLayer reason=%s\n", failure);
+}
 static void grid_axis(float u, int n, int *i, int *j, float *t) {
     u = fmaxf(-1, fminf(u, (float)n));   /* clamp before the float-to-int cast, including world-edge cells */
     float fl = floorf(u), f = u - fl;
@@ -313,11 +333,13 @@ static float grid_blend(float p, float q, float t, int higher) {
     return (higher ? p > q : p < q) ? p : p + (q - p) * t;
 }
 static int grid_sample(Ctx *c, uint64_t grids, uint32_t at, float cell, const float pos[3], int higher,
-                       GridSample *sample, float *out) {
+                       GridSample *sample, float *out, const char **failure) {
     sample->header = rd64(c, grids + at);
     sample->data = rd64(c, grids + at + 8);
     if (!sample->header) { *out = 1000; return 1; }
-    if (!rd(c, sample->header + 2, sample->dim, 2) || !sample->dim[0] || !sample->dim[1] || !sample->data) return 0;
+    if (!rd(c, sample->header + 2, sample->dim, 2)) return 0;
+    if (!sample->dim[0] || !sample->dim[1]) { *failure = "validation"; return 0; }
+    if (!sample->data) return 0;
     const uint8_t *dim = sample->dim;
     uint64_t data = sample->data;
     int xi, xj, zi, zj; float tx, tz;
@@ -329,31 +351,44 @@ static int grid_sample(Ctx *c, uint64_t grids, uint32_t at, float cell, const fl
     *out = grid_blend(grid_blend(a, b, tx, higher), grid_blend(d, e, tx, higher), tz, higher);
     return 1;
 }
-static int grid_stable(Ctx *c, uint64_t grids, uint32_t at, const GridSample *sample) {
-    uint8_t dim[2];
-    return rd64(c, grids + at) == sample->header && rd64(c, grids + at + 8) == sample->data &&
-        (!sample->header || (rd(c, sample->header + 2, dim, 2) && !memcmp(dim, sample->dim, 2)));
+static int grid_stable(Ctx *c, uint64_t grids, uint32_t at, const GridSample *sample, const char **failure) {
+    if (rd64(c, grids + at) != sample->header || rd64(c, grids + at + 8) != sample->data) {
+        *failure = "changed"; return 0;
+    }
+    if (sample->header) {
+        uint8_t dim[2];
+        if (!rd(c, sample->header + 2, dim, 2)) return 0;
+        if (memcmp(dim, sample->dim, 2)) { *failure = "changed"; return 0; }
+    }
+    return 1;
 }
-static const char *map_layer(Ctx *c, const float pos[3], float *sky_line) {
-    if (!pos_ok(pos)) return NULL;
+static const char *map_layer(Ctx *c, const float pos[3], float *sky_line, const char **failure) {
+    *failure = "unreadable";
+    if (!pos_ok(pos)) return layer_reject(failure, "validation");
     uint64_t mgr = rd64(c, c->main + ENV_SLOT), env = mgr ? rd64(c, mgr + ENV) : 0, vt = env ? rd64(c, env) : 0;
-    if (!vt || rd64(c, vt + ENV_VT_DEPTH) != c->main + ENV_DEPTH_FN || rd64(c, vt + ENV_VT_SKY) != c->main + ENV_SKY_FN) return NULL;
+    if (!vt) return NULL;
+    uint64_t fn = rd64(c, vt + ENV_VT_DEPTH);
+    if (!fn) return NULL;
+    if (fn != c->main + ENV_DEPTH_FN) return layer_reject(failure, "validation");
+    fn = rd64(c, vt + ENV_VT_SKY);
+    if (!fn) return NULL;
+    if (fn != c->main + ENV_SKY_FN) return layer_reject(failure, "validation");
     uint64_t owner = rd64(c, env + ENV_PARAM_OWNER), s = owner ? rd64(c, owner + ENV_PARAM) : 0;
     float depth[2], band;
-    uint8_t flags[3];
-    if (!s || !rd(c, s + 0x126, flags, sizeof flags) || !(flags[0] & flags[1] & flags[2] & 1) ||
-        !rd(c, s + 0x104, depth, sizeof depth) || !isfinite(depth[0]) || !isfinite(depth[1]) || depth[1] <= 0) return NULL;
+    if (!s || !rd(c, s + 0x104, depth, sizeof depth)) return NULL;
+    if (!isfinite(depth[0]) || !isfinite(depth[1]) || depth[1] <= 0) return layer_reject(failure, "validation");
     uint64_t grids = rd64(c, env + ENV_GRIDS);
     float ratio = (depth[0] - pos[1]) / depth[1];
-    if (!isfinite(ratio)) return NULL;   /* finite inputs can still overflow (huge numerator, subnormal denominator) */
+    if (!isfinite(ratio)) return layer_reject(failure, "validation");   /* finite inputs can still overflow */
     const char *layer = ratio > 0.5f ? "UnderGround" : "Ground";
     GridSample a_sample = {0}, b_sample = {0};
     int sampled = 0;
     if (ratio <= 0.5f && grids) {
-        if (!rd(c, s + 0xec, &band, 4) || !isfinite(band) || band <= 0) return NULL;
+        if (!rd(c, s + 0xec, &band, 4)) return NULL;
+        if (!isfinite(band) || band <= 0) return layer_reject(failure, "validation");
         float a, b;
-        if (!grid_sample(c, grids, 0x340, 500, pos, 0, &a_sample, &a) ||
-            !grid_sample(c, grids, 0x360, 100, pos, 1, &b_sample, &b)) return NULL;
+        if (!grid_sample(c, grids, 0x340, 500, pos, 0, &a_sample, &a, failure) ||
+            !grid_sample(c, grids, 0x360, 100, pos, 1, &b_sample, &b, failure)) return NULL;
         sampled = 1;
         float h = fmaxf(a, b + band), rate = 1 - (h - pos[1]) / band;
         if (sky_line) *sky_line = h - 0.6f * band;
@@ -362,8 +397,9 @@ static const char *map_layer(Ctx *c, const float pos[3], float *sky_line) {
     /* Same read/compare pattern as the outer snapshot: never publish a known mixed pointer generation. */
     if (rd64(c, c->main + ENV_SLOT) != mgr || rd64(c, mgr + ENV) != env || rd64(c, env) != vt ||
         rd64(c, env + ENV_PARAM_OWNER) != owner || rd64(c, owner + ENV_PARAM) != s ||
-        rd64(c, env + ENV_GRIDS) != grids ||
-        (sampled && (!grid_stable(c, grids, 0x340, &a_sample) || !grid_stable(c, grids, 0x360, &b_sample)))) return NULL;
+        rd64(c, env + ENV_GRIDS) != grids) return layer_reject(failure, "changed");
+    if (sampled && (!grid_stable(c, grids, 0x340, &a_sample, failure) ||
+                    !grid_stable(c, grids, 0x360, &b_sample, failure))) return NULL;
     return layer;
 }
 #endif
@@ -414,10 +450,9 @@ static void player(Ctx *c, Json *j, uint64_t actor) {
     const char *layer = NULL;
 #if COMPANION_SUPPORTED
     float sky_line = NAN;
-    if (live) layer = map_layer(c, p, &sky_line);
-    static atomic_int fallback_logged;
-    if (live && !layer && !atomic_exchange(&fallback_logged, 1))
-        fprintf(stderr, "[companion] map layer: environment not as expected, using MapData.CurrentLayer\n");
+    const char *failure = "unreadable";
+    if (live) layer = map_layer(c, p, &sky_line, &failure);
+    if (live && !layer) log_layer_fallback(failure);
     static _Atomic(const char *) logged;   /* one log line per change of the computed layer */
     if (layer && atomic_exchange(&logged, layer) != layer)
         fprintf(stderr, "[companion] map layer %s at (%.0f, %.0f, %.0f), sky from y %.0f\n", layer, p[0], p[1], p[2], sky_line);

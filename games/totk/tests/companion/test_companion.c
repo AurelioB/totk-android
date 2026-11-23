@@ -20,11 +20,14 @@ static void *alloc(size_t n) {
 }
 /* A hook that runs after every read: the tests use it to change game memory while a snapshot is being taken. */
 static void (*after_read)(uint64_t a);
+static uint64_t parameter_flags_at;
+static unsigned parameter_flag_reads;
 static int fake_read(uint64_t a, void *out, size_t n) {
     for (unsigned i = 0; i < nregions; i++) {
         uint64_t b = (uintptr_t)regions[i].p;
         if (a >= b && a - b <= regions[i].n && n <= regions[i].n - (a - b)) {
             memcpy(out, (void *)(uintptr_t)a, n);
+            if (parameter_flags_at && a < parameter_flags_at + 3 && a + n > parameter_flags_at) parameter_flag_reads++;
             if (after_read) after_read(a);
             return 1;
         }
@@ -329,7 +332,8 @@ int main(void) {
         put64(vt + 0x290, (uintptr_t)main_ + 0x22acf4); put64(vt + 0x270, (uintptr_t)main_ + 0x402180);
         put64(env + 0x28, (uintptr_t)owner); put64(owner + 0x150, (uintptr_t)s); put64(env + 0x218, (uintptr_t)grids);
         putf(s + 0xec, 150); putf(s + 0x104, -100); putf(s + 0x108, 400);   /* Depths from y < -300 */
-        s[0x126] = s[0x127] = s[0x128] = 1;   /* local parameters, not the unimplemented override chain */
+        s[0x126] = s[0x127] = 1; s[0x128] = 0;   /* observed Thor surface flags; plain-value computation still applies */
+        parameter_flags_at = (uintptr_t)s + 0x126; parameter_flag_reads = 0;
         ha[2] = ha[3] = hb[2] = hb[3] = 2;   /* 2 x 2 cells each */
         put64(grids + 0x340, (uintptr_t)ha); put64(grids + 0x348, (uintptr_t)ga);
         put64(grids + 0x360, (uintptr_t)hb); put64(grids + 0x368, (uintptr_t)gb);
@@ -341,7 +345,7 @@ int main(void) {
             companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b);
             char want[48]; snprintf(want, sizeof want, "\"layer\":\"%s\"", CASES[k].layer); expect(b.data, want);
         }
-        /* Each invalid/inherited sample must use the old flag, not a made-up computed layer. */
+        /* Invalid values still use the old flag, regardless of the unread parameter flag bytes. */
         static const float BAD_DEPTH[][2] = {
             {2000, 0}, {-2000, -1}, {NAN, 400}, {INFINITY, 400}, {-INFINITY, 400},
             {-100, NAN}, {-100, INFINITY}, {-100, -INFINITY}, {3e38f, 1e-38f}};   /* last: finite inputs, overflowing ratio */
@@ -352,12 +356,17 @@ int main(void) {
             expect(b.data, "\"layer\":\"Ground\"");
         }
         putf(s + 0x104, -100); putf(s + 0x108, 400);
-        for (int k = 0; k < 3; k++) {
-            s[0x126 + k] = 2;   /* other bits do not make the local value authoritative */
+        static const uint8_t FLAGS[][3] = {{1, 1, 0}, {0, 0, 0}, {0, 1, 1}, {1, 0, 1}, {2, 2, 2}};
+        for (unsigned k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++) {
+            memcpy(s + 0x126, FLAGS[k], 3);
+            putf(actor + 0x2b8, 1600);
             companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b);
-            expect(b.data, "\"layer\":\"Ground\"");
-            s[0x126 + k] = 1;
+            expect(b.data, "\"layer\":\"Sky\"");   /* fallback flag says Ground: plain values must actually compute */
+            putf(actor + 0x2b8, -350);
+            companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b);
+            expect(b.data, "\"layer\":\"UnderGround\"");   /* above -400: old height heuristic would say Ground */
         }
+        putf(actor + 0x2b8, 1600);
         static const float BAD_BAND[] = {0, -150, NAN, INFINITY};
         for (unsigned k = 0; k < sizeof BAD_BAND / sizeof *BAD_BAND; k++) {
             putf(s + 0xec, BAD_BAND[k]);
@@ -365,6 +374,8 @@ int main(void) {
             expect(b.data, "\"layer\":\"Ground\"");
         }
         putf(s + 0xec, 150);
+        check(parameter_flag_reads == 0, "layer reader does not read parameter flags");
+        parameter_flags_at = 0;
         /* Every traversed pointer can be replaced after sampling; none may publish the old Sky answer. */
         uint8_t *slots[] = {main_ + ENV_SLOT, mgr + 0xb8, env, env + 0x28, owner + 0x150,
                            env + 0x218, grids + 0x340, grids + 0x348, grids + 0x360, grids + 0x368};

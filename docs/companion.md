@@ -23,10 +23,17 @@ the app is updated on its own when the menu opens; the game stays playable meanw
 ## Map coordinates and loading
 
 Automatic mode uses Link's position and the 1.4.3 environment's depth line and terrain/sky grids, rather than
-the layer last selected in the game map. If parameters are inherited, invalid or replaced during the read, it falls
-back to that last-selected layer, corrected for depth (below −400 m is Depths; a stale Depths selection above −100 m
-becomes surface). This fallback can still show an old sky selection during loads. These are guarded background
-reads, not a synchronized game snapshot.
+the layer last selected in the game map. Invalid, unreadable or replaced samples fall back to that last-selected layer,
+corrected for depth (below −400 m is Depths; a stale Depths selection above −100 m becomes surface). This fallback can
+still show an old sky selection during loads. These are guarded background reads, not a synchronized game snapshot.
+
+The contributor notes that the game can take parameters through an override chain when certain flag bits are clear;
+this implementation uses the plain values, without reading the flags or resolving that chain. On the tested AYN Thor
+surface scene, flags were `01,01,00` and the plain values gave the right layer. Behaviour in scenes where an override
+differs from the plain value is untested.
+
+When falling back, `totk.log` reports a short reason class (`validation`, `unreadable` or `changed`) at most once per
+60 seconds, rather than once per process. Computed-layer changes retain their own log line.
 
 Coordinates read **x, north (−z), height above 105.5 m**, truncated toward zero, with at least four digits and no plus
 sign. Native JSON preserves the position float before the Java display conversion.
