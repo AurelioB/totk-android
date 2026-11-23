@@ -708,7 +708,8 @@ typedef struct vk_prog vk_prog;
 int vk_prog_resolve(const prog_t *p, vk_shader *out[6]);
 void vk_stage_sig_invalidate(unsigned stages);   /* recording-thread state writes: one bit per NVN stage */
 void vk_prog_prepare(const prog_t *p); /* bind-time compute compilation, no variant selection or graphics seed IO */
-VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs);   /* vs->mod, or one with fs's missing varyings added */
+/* create=0: cache-only, NULL means defer; create=1: build/join the exact interface. */
+VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs, int create);
 VkPipelineLayout vk_layout_of(vk_shader *vs, vk_shader *fs);
 VkPipeline vk_compute_pipeline(vk_shader *cs, VkPipelineLayout *layout);
 void vk_compute_start(void);

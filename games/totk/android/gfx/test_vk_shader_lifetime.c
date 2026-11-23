@@ -19,17 +19,31 @@ vk_dev V;
 vk_state S;
 int g_hitch_on;
 vk_hitch g_hk;
-static unsigned modules, destroyed, layouts, compute_prepares;
+static _Atomic unsigned modules;
+static unsigned destroyed, layouts, compute_prepares;
 static int fail_module, fail_layout;
 static const uint32_t *expected_words;
 static size_t expected_count;
 static int inspect_modules;
+/* Test hook inside the mocked driver: hold the real replacement helper in
+   vkCreateShaderModule until the reporting/probe checks have completed. */
+static pthread_mutex_t hold_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t hold_cv = PTHREAD_COND_INITIALIZER;
+static int hold_armed, hold_entered, hold_release, report_done;
+static uint64_t report_ns;
 
 static VKAPI_ATTR VkResult VKAPI_CALL create_module(VkDevice device,
         const VkShaderModuleCreateInfo *info, const VkAllocationCallbacks *allocator, VkShaderModule *out) {
     (void)device; (void)allocator;
     assert(info->codeSize >= 20 && info->pCode[0] == 0x07230203);
     if (fail_module) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    pthread_mutex_lock(&hold_mu);
+    if (hold_armed) {
+        hold_armed = 0; hold_entered = 1; pthread_cond_broadcast(&hold_cv);
+        while (!hold_release) pthread_cond_wait(&hold_cv, &hold_mu);
+    }
+    pthread_mutex_unlock(&hold_mu);
+    unsigned id = atomic_fetch_add(&modules, 1) + 1;
     if (inspect_modules) {
         unsigned integer = 0, nan = 0, invariant = 0;
         for (size_t i = 5; i < info->codeSize / 4; i += info->pCode[i] >> 16) {
@@ -44,11 +58,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL create_module(VkDevice device,
         assert(integer == 1 && nan == 3 && invariant == (g_position_policy & 1));
         if (!g_varying_fix && !g_int_fold && !g_nan_minmax && !g_position_policy)
             assert(info->codeSize == expected_count * 4 && !memcmp(info->pCode, expected_words, info->codeSize));
-        char path[80]; snprintf(path, sizeof path, "module-%u.spv", modules);
+        char path[80]; snprintf(path, sizeof path, "module-%u.spv", id - 1);
         FILE *f = fopen(path, "wb"); assert(f);
         assert(fwrite(info->pCode, 1, info->codeSize, f) == info->codeSize); assert(!fclose(f));
     }
-    *out = (VkShaderModule)(uintptr_t)++modules;
+    *out = (VkShaderModule)(uintptr_t)id;
     return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL destroy_module(VkDevice device, VkShaderModule module,
@@ -129,12 +143,65 @@ static vk_shader vary_fs[64];
 static void *vary_worker(void *arg) {
     size_t start = (size_t)arg;
     for (size_t i = start; i < 64; i += 4) {
-        VkShaderModule m = vk_vs_module_for(vary_vs, vary_fs + i);
+        VkShaderModule m = vk_vs_module_for(vary_vs, vary_fs + i, 1);
         assert(m && (m != vary_vs->mod) == g_varying_fix);
-        assert(vk_vs_module_for(vary_vs, vary_fs + i) == m);
+        assert(vk_vs_module_for(vary_vs, vary_fs + i, 1) == m);
     }
     return NULL;
 }
+static void *held_create(void *arg) {
+    assert(vk_vs_module_for(vary_vs, arg, 1) != vary_vs->mod);
+    return NULL;
+}
+static void *report_during_create(void *arg) {
+    const vk_shader *pending = arg;
+    uint64_t began = host_now_ns(), n, ns, max;
+    vk_shader_io_take(&n, &ns, &max); /* the actual 300-present statistics entry */
+    assert(vk_vs_module_for(vary_vs, pending, 0) == VK_NULL_HANDLE);
+    vk_shader cold = {.io_known=1, .fin_mask=1u << 30};
+    assert(vk_vs_module_for(vary_vs, &cold, 0) == VK_NULL_HANDLE);
+    /* Probe lock contention is another deferral, never a wait for publication. */
+    pthread_mutex_lock(&g_vfix_mu);
+    assert(vk_vs_module_for(vary_vs, pending, 0) == VK_NULL_HANDLE);
+    pthread_mutex_unlock(&g_vfix_mu);
+    report_ns = host_now_ns() - began;
+    /* An unrelated interface can finish while the first driver's call is held. */
+    assert(vk_vs_module_for(vary_vs, &cold, 1) != vary_vs->mod);
+    pthread_mutex_lock(&hold_mu);
+    report_done = 1; pthread_cond_broadcast(&hold_cv);
+    pthread_mutex_unlock(&hold_mu);
+    return NULL;
+}
+static void check_nonblocking_report(void) {
+    if (!g_varying_fix) return;
+    vk_shader pending = {.io_known=1, .fin_mask=1u << 29};
+    assert(vk_vs_module_for(vary_vs, &pending, 0) == VK_NULL_HANDLE);
+    uint64_t reads = atomic_load(&g_io_n);
+    unsigned count = atomic_load(&modules);
+    pthread_mutex_lock(&hold_mu); hold_armed = 1; pthread_mutex_unlock(&hold_mu);
+    pthread_t creator, reporter;
+    assert(!pthread_create(&creator, NULL, held_create, &pending));
+    pthread_mutex_lock(&hold_mu);
+    while (!hold_entered) pthread_cond_wait(&hold_cv, &hold_mu);
+    pthread_mutex_unlock(&hold_mu);
+    /* The reporter must finish before we let the held driver return. */
+    assert(!pthread_create(&reporter, NULL, report_during_create, &pending));
+    struct timespec deadline; assert(!clock_gettime(CLOCK_REALTIME, &deadline)); deadline.tv_sec += 2;
+    pthread_mutex_lock(&hold_mu);
+    int status = 0;
+    while (!report_done && !status) status = pthread_cond_timedwait(&hold_cv, &hold_mu, &deadline);
+    int returned_while_held = report_done;
+    hold_release = 1; pthread_cond_broadcast(&hold_cv);
+    pthread_mutex_unlock(&hold_mu);
+    assert(!pthread_join(creator, NULL) && !pthread_join(reporter, NULL));
+    assert(returned_while_held); /* never release creation just to unblock stats */
+    assert(report_ns < 250000000); /* generous host scheduling guard, not a device budget */
+    assert(atomic_load(&modules) == count + 2);
+    assert(atomic_load(&g_io_n) <= reads + 2); /* only actual builds read seed words */
+    assert(vk_vs_module_for(vary_vs, &pending, 0) != VK_NULL_HANDLE);
+    printf("held creation: statistics/probes returned in %.3f ms before release\n", report_ns / 1e6);
+}
+
 static int varying_test(void) {
 #define OP(n, op) ((uint32_t)(n) << 16 | (op))
     /* Dataless valid VS: the integer result and FMin let the mocked driver check
@@ -183,11 +250,12 @@ static int varying_test(void) {
     assert(atomic_load(&io_walks) == (unsigned)g_varying_fix); /* helper does not reclassify */
     if (g_varying_fix) {
         vk_shader failure = {.io_known=1, .fin_mask=1u << 31};
-        fail_module = 1; assert(vk_vs_module_for(vary_vs, &failure) == vary_vs->mod);
-        fail_module = 0; assert(vk_vs_module_for(vary_vs, &failure) == vary_vs->mod);
+        fail_module = 1; assert(vk_vs_module_for(vary_vs, &failure, 1) == vary_vs->mod);
+        fail_module = 0; assert(vk_vs_module_for(vary_vs, &failure, 1) == vary_vs->mod);
         assert(g_vfix_patched == 64 && g_vfix_fallback == 1);
         varying_report();
     } else assert(!vary_vs->vfix && modules == 1);
+    if (getenv("TEST_VARYING_HOLD")) check_nonblocking_report();
     vk_seed_io_stop();
     puts("varying runtime chain, off-arm identity, accounting and concurrency passed");
     return 0;

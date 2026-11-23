@@ -42,6 +42,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   patched/fallback shader pairs. The contributor's independent NaN min/max/clamp rewrite is retained as
   **default-off** `TOTK_VK_NAN_MINMAX=1`, pending separate device qualification. Host checks cannot establish
   the wind picture, ordinary-scene regressions, prewarm time or frame-time effects on devices.
+  Keep presentation-time varying statistics independent of module creation. Cache-only probes now defer
+  absent/in-flight replacements without IO or a shader-module wait; unrelated interfaces build concurrently.
+  Mandatory synchronous builds can still wait for required driver work; no device latency bound is claimed.
 - Refresh the shared shader list with seven more upstream variants applicable to game 1.4.3
   (`5fb080496ab7`, V rows only). Fresh host translation prepares 25,039 modules instead of 25,032,
   with zero failures and about 430 KiB of additional packed data. Existing shader packs stay valid;

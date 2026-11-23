@@ -756,16 +756,17 @@ void vk_prog_prepare(const prog_t *p) {
 void mtl_prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock(&g_progs_mu); nvn_hm_del(&g_progs, &p->serial); pthread_mutex_unlock(&g_progs_mu); }   /* the vk_prog leaks a little; programs are few */
 /* ---------- varyings a fragment shader reads that the vertex shader does not write (vk_varyings.h) ---------- */
 struct vk_vfix { const vk_shader *fs; uint32_t missing; uint8_t kind[32]; VkShaderModule mod; struct vk_vfix *next; };
+/* Cache lookup/claim/publication only: never held across seed IO, rewriting,
+   driver calls, or logging. Cache-only pipeline probes use trylock. */
 static pthread_mutex_t g_vfix_mu = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t g_vfix_patched, g_vfix_fallback, g_vfix_reported = UINT64_MAX;
+static pthread_cond_t g_vfix_cv = PTHREAD_COND_INITIALIZER;
+static _Atomic uint64_t g_vfix_patched, g_vfix_fallback, g_vfix_reported = UINT64_MAX;
 /* Cumulative distinct shader pairs, emitted only on change at the existing
    stutter-report cadence and at normal exit. No per-draw logging. */
 static void varying_report(void) {
     if (!g_varying_fix) return;
-    pthread_mutex_lock(&g_vfix_mu);
-    uint64_t patched = g_vfix_patched, fallback = g_vfix_fallback, total = patched + fallback;
-    int changed = total != g_vfix_reported; g_vfix_reported = total;
-    pthread_mutex_unlock(&g_vfix_mu);
+    uint64_t patched = atomic_load(&g_vfix_patched), fallback = atomic_load(&g_vfix_fallback), total = patched + fallback;
+    int changed = total != atomic_exchange(&g_vfix_reported, total);
     if (changed) LOGV("[varyings] session shader_pairs patched=%" PRIu64 " fallback=%" PRIu64, patched, fallback);
 }
 /* No retained SPIR-V source RAM (budget: 0 bytes). Seed IO transfers ownership
@@ -779,27 +780,44 @@ static uint32_t *vs_words_again(const vk_shader *vs, size_t *nw) {
     *nw = len / 4;
     return words;
 }
-/* The vertex module to draw with fs: vs->mod, or (once per vertex shader and set of missing Locations and their kinds,
-   any thread: pipelines compile on workers) a copy whose missing varyings are written (0, 0, 0, 1) as Maxwell reads
-   them. Any failure keeps vs->mod (the old behaviour) and says so once. */
-VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs) {
+/* A cache-only probe (create=0) never waits or performs IO/driver work: NULL
+   means the pipeline must use the normal compile-required path. Actual builds
+   (create=1) single-flight each VS/interface; a same-interface join can wait
+   for its seed IO/postprocessing/driver call, with no driver latency bound.
+   Different interfaces never hold the lookup mutex while creating modules. */
+VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs, int create) {
     if (!g_varying_fix || !vs || !fs || !vs->io_known || !fs->io_known) return vs ? vs->mod : VK_NULL_HANDLE;
     uint32_t missing = fs->fin_mask & ~vs->vout_mask;
     if (!missing) return vs->mod;
     uint8_t kind[32] = {0};
     for (int l = 0; l < 32; l++) if (missing >> l & 1) kind[l] = fs->fin_kind[l];
-    pthread_mutex_lock(&g_vfix_mu);
-    VkShaderModule mod = VK_NULL_HANDLE;
+    if (create) pthread_mutex_lock(&g_vfix_mu);
+    else if (pthread_mutex_trylock(&g_vfix_mu)) return VK_NULL_HANDLE;
+    struct vk_vfix *shared = NULL;
     for (struct vk_vfix *f = vs->vfix; f; f = f->next) {
-        if (f->fs == fs) { mod = f->mod; pthread_mutex_unlock(&g_vfix_mu); return mod; }
-        if (f->missing == missing && !memcmp(f->kind, kind, sizeof kind)) mod = f->mod;
+        if (f->fs == fs) { shared = f; break; }
+        if (f->missing == missing && !memcmp(f->kind, kind, sizeof kind)) shared = f;
     }
+    if (shared) {
+        /* Pending records have no module. Probes defer instead of waiting;
+           genuine builds join only this exact interface, releasing the mutex. */
+        while (!shared->mod) {
+            if (!create) { pthread_mutex_unlock(&g_vfix_mu); return VK_NULL_HANDLE; }
+            pthread_cond_wait(&g_vfix_cv, &g_vfix_mu);
+        }
+        if (shared->fs == fs) { VkShaderModule mod = shared->mod; pthread_mutex_unlock(&g_vfix_mu); return mod; }
+    } else if (!create) { pthread_mutex_unlock(&g_vfix_mu); return VK_NULL_HANDLE; }
     struct vk_vfix *f = calloc(1, sizeof *f);
+    VkShaderModule mod = shared ? shared->mod : VK_NULL_HANDLE;
+    if (f) {
+        f->fs = fs; f->missing = missing; memcpy(f->kind, kind, sizeof kind);
+        f->mod = mod; f->next = vs->vfix; vs->vfix = f;
+    }
+    pthread_mutex_unlock(&g_vfix_mu);
     if (f && !mod) {
         size_t nw = 0, no = 0; uint32_t *w = vs_words_again(vs, &nw);
         uint32_t *o = w ? vk_spirv_add_outputs(w, nw, missing, kind, &no) : NULL;
-        /* Add outputs before the shared chain too: later passes see exactly the
-           replacement module, not just the original source. */
+        /* Insert before the shared chain: every later pass sees the replacement. */
         free(w);
         if (o) {
             vk_shader copy = {.stage = 0}; memcpy(copy.key, vs->key, sizeof copy.key);
@@ -810,15 +828,17 @@ VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs) {
             }
             free(data);
         }
+        if (!mod) mod = vs->mod;
+        pthread_mutex_lock(&g_vfix_mu);
+        f->mod = mod; pthread_cond_broadcast(&g_vfix_cv);
+        pthread_mutex_unlock(&g_vfix_mu);
     }
     if (!mod) mod = vs->mod;
-    if (f) { f->fs = fs; f->missing = missing; memcpy(f->kind, kind, sizeof kind); f->mod = mod; f->next = vs->vfix; vs->vfix = f; }
-    if (mod != vs->mod) g_vfix_patched++; else g_vfix_fallback++;
-    uint64_t total = g_vfix_patched + g_vfix_fallback;
-    if (total <= 40)
+    if (mod != vs->mod) atomic_fetch_add(&g_vfix_patched, 1); else atomic_fetch_add(&g_vfix_fallback, 1);
+    uint64_t patched = atomic_load(&g_vfix_patched), fallback = atomic_load(&g_vfix_fallback);
+    if (patched + fallback <= 40)
         LOGV("[varyings] vs %.16s + fs %.16s: missing=%#x %s; session shader_pairs patched=%" PRIu64 " fallback=%" PRIu64,
-             vs->key, fs->key, missing, mod != vs->mod ? "added (0, 0, 0, 1)" : "old behaviour kept", g_vfix_patched, g_vfix_fallback);
-    pthread_mutex_unlock(&g_vfix_mu);
+             vs->key, fs->key, missing, mod != vs->mod ? "added (0, 0, 0, 1)" : "old behaviour kept", patched, fallback);
     return mod;
 }
 int vk_prog_resolve(const prog_t *p, vk_shader *out[6]) {

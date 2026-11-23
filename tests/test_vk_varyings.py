@@ -56,6 +56,11 @@ class VaryingRuntimeTests(unittest.TestCase):
         self.assertIn('TOTK_VK_NAN_MINMAX=0 (startup-only, experimental)', result.stderr)
         self.assertIn('session shader_pairs patched=64 fallback=1', result.stderr)
 
+    def test_statistics_and_probes_do_not_join_module_creation(self):
+        result = self.run_arm(TEST_VARYING_HOLD='1')
+        self.assertIn('statistics/probes returned in ', result.stdout)
+        self.assertIn(' ms before release', result.stdout)
+
     @unittest.skipUnless(shutil.which('spirv-val'), 'needs spirv-val (spirv-tools)')
     def test_all_policies_and_replacement_validation(self):
         for vary, nan, fold, position in itertools.product('01', repeat=4):
@@ -72,7 +77,7 @@ class VaryingRuntimeTests(unittest.TestCase):
             self.skipTest('compiler has no -fsanitize=thread: ' + build.stderr[-1000:])
         for indexed in ('0', '1'):
             with self.subTest(indexed=indexed):
-                self.run_arm(probe, TOTK_VK_SEED_IO=indexed, TOTK_VK_VARYING_FIX='1',
+                self.run_arm(probe, TEST_VARYING_HOLD='1', TOTK_VK_SEED_IO=indexed, TOTK_VK_VARYING_FIX='1',
                              TOTK_VK_NAN_MINMAX='0', TOTK_VK_INT_FOLD='1',
                              TSAN_OPTIONS='halt_on_error=1 exitcode=66')
 

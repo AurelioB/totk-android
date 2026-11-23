@@ -3073,9 +3073,24 @@ The off arm does not classify interfaces, allocate classification tables, reread
 Worker rereads use the seed reader's lock and atomic I/O interval counters; their maxima use CAS and
 recorder resets use exchange. Counters are independent interval samples, not a transactional snapshot.
 No extra SPIR-V source is retained (source RAM budget **0 bytes**); a seed payload may require real IO
-again after consumption. Replacement modules/per-pair records remain session-owned. Per-pair detail is
-capped at 40 lines; cumulative `[varyings] session shader_pairs patched=... fallback=...` totals update
-at IO reporting and normal exit. Reused interface modules still count each distinct VS/FS pair once.
+again after consumption. Replacement modules/per-pair records remain session-owned: one 64-byte record
+per encountered missing-output VS/FS object pair on the 64-bit target, excluding allocator overhead.
+Module reuse is by VS/missing-mask/numeric-kind set. There is no eviction or fixed record/RSS/driver-memory cap;
+early-test/alpha FS objects can add records even with matching interfaces. Repeated ready draws do not grow it.
+Per-pair detail is capped at 40 lines; atomic cumulative `[varyings] session shader_pairs patched=... fallback=...`
+totals update at IO reporting and normal exit without taking the module cache lock.
+
+The varying cache mutex protects only lookup, in-flight claims and publication: seed rereads, SPIR-V
+passes, `vkCreateShaderModule` and logging run outside it. A genuine build joins only an in-flight
+matching VS/interface through a condition wait that releases the mutex. Distinct interfaces can build
+concurrently. Cache-only synchronous pipeline probes use trylock and immediately defer a busy cache
+or absent/in-flight module as `VK_PIPELINE_COMPILE_REQUIRED`; they never join module creation.
+Thus varying-module creation contributes **zero blocking waits** to statistics/probes. This is not a
+wall-clock scheduling or Vulkan-driver latency guarantee: cache lookup/allocation and the subsequent
+Vulkan pipeline-cache probe can still take CPU/driver time. Mandatory synchronous captures, worker-disabled
+builds and pending-pipeline joins may wait for required storage/driver work with **no proved time bound**.
+Already-ready pipelines bypass this helper. The held-driver fixture exercises the real reporting entry,
+busy/missing/in-flight probe deferral, same-interface reuse and unrelated-interface creation before release.
 
 Independent `TOTK_VK_NAN_MINMAX=1` is a **default-off experiment**. It changes GLSL.std.450
 FMin/FMax/FClamp to NMin/NMax/NClamp, with identical operands/word counts, in targeted VS/FS/CS
@@ -3094,6 +3109,11 @@ modules, integer folding in the production replacement path, disabled byte ident
 mask/type reuse, fallback counts, completed-marker isolation and concurrent reader/reset TSan coverage.
 Malformed-module guards cover short/zero/overrunning instructions, entry-function framing, output-size
 overflow (including 32-bit `size_t`) and entry-point word-count overflow; they are not a semantic validator.
+The runtime fixture fabricates FS interface metadata to stress 64 pair/type combinations; it does not
+prove fragment-input classification or cross-stage linking. Individual-module validation is not a linker
+or Maxwell arithmetic oracle. Arrays/blocks, wider types and Component-decorated interfaces are outside
+this fixture's coverage; do not generalize the restricted classifier without dedicated stage-pair evidence.
+Unknown classification returns early, so zero fallback alone does not establish complete interface coverage.
 Only devices can establish corrected wind/grass, absence of ordinary-scene regressions, prewarm duration,
 GPU/native instruction cost and restart O/B/B/O frame-time results.
 

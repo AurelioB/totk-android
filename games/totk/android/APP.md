@@ -5040,7 +5040,14 @@ with both new policies off; the older position/integer-fold switches must match 
 Pair rewrites share the ordinary module postprocessing chain, including integer folding. Workers reread
 owned seed payloads using thread-safe seed IO and atomic accounting; seed warming does not permanently
 retain consumed words. Additional retained SPIR-V source budget is **0 bytes**. Patched driver modules
-and small per-pair cache records live for the session; GPU/driver allocations are not bounded here.
+and encounter-bounded per-pair records live for the session (64-byte records on the 64-bit target,
+excluding allocator overhead); there is no record eviction, fixed RSS cap or driver-memory bound.
+Statistics read independent atomic totals and never join module creation. A new cache-only pipeline
+probe uses a nonblocking lookup and defers missing/in-flight replacement modules to the ordinary
+compile-required path: it does no seed IO, SPIR-V rewriting or shader-module driver call.
+Actual capture/worker-disabled synchronous builds can still build or join the exact interface and
+wait for its storage/driver work, with no proved wall-time bound. Different interface creation does
+not hold the short lookup/publication lock, and ready-pipeline draws never enter this helper.
 At most 40 pair-detail lines report cumulative `session shader_pairs patched=N fallback=M`; changed
 totals are also reported at the existing IO-stat cadence and normal exit. Fallback retains old behavior,
 not a successful repair. Device acceptance needs nonzero patches and an explanation for any fallback,
@@ -5656,7 +5663,8 @@ context envelope, stay unchanged; stale/imported/temp files and graphics-key/res
 `sh install_app.sh cache-import FILE...` stages one or more such files in the standard external game folder,
 under each file's **unchanged basename**, including on a release APK. The runtime consumes only its exact selected
 namespace, validates context, and renames a successfully merged file to `<selected path>.imported`.
-An opposite rewrite arm is left unconsumed with a startup diagnostic; it is never promoted into the selected arm.
+An opposite rewrite arm is left unconsumed and never promoted into the selected arm. Startup warnings discover
+only some opposite integer-fold filenames; they are advisory, not an exhaustive inventory of other policy arms.
 The script does not infer the phone's configuration from host variables or execute `totk.env`. It accepts only the
 standard basename grammar, including seed/position/integer-fold/varying/NaN suffixes. Timestamp-renamed old exports
 have lost that filename provenance and are refused; never relabel another arm's cache, even for the same driver.
