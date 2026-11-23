@@ -85,6 +85,9 @@ static inline void totk_ft_count(enum totk_ft_counter counter, uint64_t n) {
 void totk_ft_work_begin(uint64_t frame);
 void totk_ft_work_end(void);
 void totk_ft_count_frame(uint64_t frame, enum totk_ft_counter counter, uint64_t n);
+/* Joined recorder-worker totals: one publication per assembled slot, or TLS
+ * accumulation when that slot is assembled inside its originating walk. */
+void totk_ft_recorded(uint64_t frame, uint64_t draws, uint64_t descriptors);
 void runtime_frame_timeline_walking(void);
 /* Called after state formation; frame is captured before releasing inputLock.
  * Per-sender TLS groups are consumed at main->walking WaitForAddress wake.
@@ -131,6 +134,7 @@ static inline uint64_t totk_ft_work_frame(void) { return 0; }
 #define totk_ft_work_begin(...) ((void)0)
 #define totk_ft_work_end(...) ((void)0)
 #define totk_ft_count_frame(...) ((void)0)
+#define totk_ft_recorded(...) ((void)0)
 #define totk_ft_acquire_wait(...) ((void)0)
 #define totk_ft_input_read(...) ((void)0)
 #define totk_ft_input_take(...) ((void)0)

@@ -1040,9 +1040,10 @@ means; the preceding anchor frame is not counted. Empty groups print `n=0 ... mi
   sequential/parallelizable/other split, explicitly enable `TOTK_VK_REC_PROFILE=1`; its configured
   sampling rate and additional overhead remain, and such runs are diagnostic-only.
 
-Per-event walking counters use thread-local additions and are published once per walk. Secondary descriptor/draw
-counts publish per job, rather than taking the timeline ring lock for every draw/allocation. Rare asynchronous
-pipeline creation and slot-level guard registration publish against captured frame IDs. Disabled timeline accounting
+Per-event walking counters use thread-local additions and are published once per walk. Recorder workers
+accumulate actual draws/descriptors in atomic slot totals; the existing all-jobs-done assembly boundary
+publishes both in one update per slot (or merges them into walking TLS). Rare asynchronous pipeline creation
+and slot-level guard registration publish against captured frame IDs. Disabled timeline accounting
 does not enable recorder profiling, create another reporter, alter pacing, or change rendering defaults.
 
 Acquire diagnostics now retain the original total span and add `acquire_pacing` and `acquire_texture` (milliseconds)
@@ -1063,7 +1064,7 @@ Use the existing frame-timeline environment, with `TOTK_FRAME_TIMELINE=1` and **
 for per-walk elapsed accounting. Retain the entire `[frame-tl work]` pair, loss counters and late rows; compare
 counter growth with measured walk/off-CPU times. Per-slot seal/queue/GPU anchors are retained because the
 report needs their ordering and maximum latency. Draw/pass/lag counts remain TLS additions, merged once
-per walk (worker draws/descriptors once per job); no per-draw/pass ring setters were added.
+per walk (worker draws/descriptors once per assembled slot); no per-draw/pass ring setters were added.
 This change does not change main-thread handoff or frame buffering. Host checks and the realistic
 150-pass/4,400-draw/31,251-command `vkdrawtest --timeline-bench` do not establish Android observer cost.
 

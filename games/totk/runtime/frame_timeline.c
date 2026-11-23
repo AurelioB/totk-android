@@ -96,6 +96,18 @@ void totk_ft_count_frame(uint64_t frame, enum totk_ft_counter counter, uint64_t 
     ft_entry *e = entry(frame); if (!e) return;
     e->data.work.value[counter] += n; unlock_entry(e);
 }
+void totk_ft_recorded(uint64_t frame, uint64_t draws, uint64_t descriptors) {
+    if (!frame || (!draws && !descriptors)) return;
+    if (frame == totk_ft_active_frame) {
+        totk_ft_count(FT_COUNT_DRAWS, draws);
+        totk_ft_count(FT_COUNT_DESC_CREATES, descriptors);
+        return;
+    }
+    ft_entry *e = entry(frame); if (!e) return;
+    e->data.work.value[FT_COUNT_DRAWS] += draws;
+    e->data.work.value[FT_COUNT_DESC_CREATES] += descriptors;
+    unlock_entry(e);
+}
 void totk_ft_acquire_wait(uint64_t frame, uint64_t pacing_ns, uint64_t texture_ns) {
     ft_entry *e = entry(frame); if (!e) return;
     e->data.acquire_pacing_ns += pacing_ns; e->data.acquire_texture_ns += texture_ns;

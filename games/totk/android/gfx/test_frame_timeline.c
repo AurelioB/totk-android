@@ -396,6 +396,12 @@ int main(int argc, char **argv) {
     assert(strstr(text, "[frame-tl late] frame=6 ")); free(text);
     input_cases(base);
     reserve_cases(base);
+    totk_ft_recorded(702, 40, 7);
+    assert(totk_ft_snapshot(702, &r) && r.work.value[FT_COUNT_DRAWS] == 40 &&
+           r.work.value[FT_COUNT_DESC_CREATES] == 7);
+    totk_ft_work_begin(703); totk_ft_recorded(703, 80, 14); totk_ft_work_end();
+    assert(totk_ft_snapshot(703, &r) && r.work.value[FT_COUNT_DRAWS] == 80 &&
+           r.work.value[FT_COUNT_DESC_CREATES] == 14);
     /* Exact no-contention content fixture. Lossy simultaneous ownership is
      * exercised separately by contention_cases, including a stalled reader. */
     for (unsigned i = 0; i < 4; i++) slot_writer((void *)(uintptr_t)i);
