@@ -29,8 +29,8 @@ static void take(thr_t *t) {
 static void put(thr_t *t) {
     pthread_mutex_lock(&G); core_put(t); pthread_mutex_unlock(&G); pthread_setspecific(g_keythr, NULL);
 }
-static void poll(uint64_t start) { if (now_ns() - start > 10000000000ull) runtime_fail("fixture deadline"); sched_yield(); }
-static void await(_Atomic int *p) { uint64_t start = now_ns(); while (!atomic_load(p)) poll(start); }
+static void poll_deadline(uint64_t start) { if (now_ns() - start > 10000000000ull) runtime_fail("fixture deadline"); sched_yield(); }
+static void await(_Atomic int *p) { uint64_t start = now_ns(); while (!atomic_load(p)) poll_deadline(start); }
 static uint8_t *pages(size_t n) {
     void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) runtime_fail("guest mapping"); return p;
@@ -47,7 +47,7 @@ static void *finalize_run(void *arg) {
     put(&f->t); atomic_store(&f->done, 1); return NULL;
 }
 static void await_ticket(finalizer *f, uint64_t ticket) {
-    uint64_t start = now_ns(); while (atomic_load(&f->ticket) != ticket) poll(start);
+    uint64_t start = now_ns(); while (atomic_load(&f->ticket) != ticket) poll_deadline(start);
 }
 static uint64_t copy_gate(uint8_t *src, VkBuffer dst, uint64_t dst_offset, VkEvent *event) {
     VkBuffer buffer; uint64_t offset;
@@ -61,7 +61,20 @@ static uint64_t copy_gate(uint8_t *src, VkBuffer dst, uint64_t dst_offset, VkEve
 }
 static void inflight(int shutdown) {
     size_t n = 131072, pg = (size_t)getpagesize(); uint8_t *src = pages(n), *alias = pages(n);
-    memset(src, 0x4d, n); register_pool(src, n); mtl_pool_add(src + pg, pg);
+    int alias_fd = -1;
+    const char *alias_setting = getenv("TOTK_WB_ALIAS");
+    if (alias_setting && !strcmp(alias_setting, "1")) {
+        alias_fd = memfd_create("finalize-private-alias", MFD_CLOEXEC);
+        need(alias_fd >= 0 && !ftruncate(alias_fd, n), "private alias fixture backing");
+        need(mmap(src, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, alias_fd, 0) == src,
+            "real shared owner backing before host import");
+    }
+    memset(src, 0x4d, n); register_pool(src, n);
+    if (alias_fd >= 0) {
+        need(vk_wb_test_alias_attach(src, n, alias_fd, 0), "private writer attached during genuine finalize/completion race");
+        close(alias_fd);
+    }
+    mtl_pool_add(src + pg, pg);
     if (mremap(src, 0, n, MREMAP_MAYMOVE | MREMAP_FIXED, alias) != alias) runtime_fail("shared alias");
     vk_record_test_alias(alias, (uint64_t)(uintptr_t)src, n);
     nvn_dirty_protect(src, n);
@@ -82,7 +95,7 @@ static void inflight(int shutdown) {
     if (shutdown) { puts("PASS pool-finalize shutdown during genuine GPU wait"); fflush(stdout); _exit(0); }
     if (g_vcore_release) {
         uint64_t start = now_ns();
-        for (;;) { pthread_mutex_lock(&G); int released = f.t.host_resume && f.t.cur_core < 0; pthread_mutex_unlock(&G); if (released) break; poll(start); }
+        for (;;) { pthread_mutex_lock(&G); int released = f.t.host_resume && f.t.cur_core < 0; pthread_mutex_unlock(&G); if (released) break; poll_deadline(start); }
         finalizer concurrent[3] = {0}; pthread_t concurrent_threads[3];
         for (unsigned i = 0; i < 3; i++) {
             concurrent[i].p = pages(n); register_pool(concurrent[i].p, n);
@@ -93,7 +106,7 @@ static void inflight(int shutdown) {
                 pthread_mutex_lock(&G);
                 int released = concurrent[i].t.host_resume && concurrent[i].t.cur_core < 0;
                 pthread_mutex_unlock(&G);
-                if (released) break; poll(began);
+                if (released) break; poll_deadline(began);
             }
         }
         thr_t borrower; init(&borrower); take(&borrower);

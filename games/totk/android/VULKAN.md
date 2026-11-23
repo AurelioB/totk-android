@@ -8,8 +8,11 @@ on Metal. This file is its Vulkan counterpart, built in stages. Each stage runs 
 disables it, while release builds (`--release` / `DEV_BUILD=0`) retain the off default. SGSR (`TOTK_POST_SCALE=sgsr`),
 automatic 60/30 control (`TOTK_FPS_AUTO=1`, with `TOTK_FPS60=1`) and camera/depth frame generation
 (`TOTK_FRAMEGEN=1`, fixed real 30 only) are opt-in; automatic control and frame generation are mutually exclusive.
-Postprocessing precedes the final overlay on copy and AHB paths. Protected `TOTK_FRAME_LAG` defaults
-off on every platform and in every FPS mode; only explicit `TOTK_FRAME_LAG=1` enables it.
+Postprocessing precedes the final overlay on copy and AHB paths. Protected `TOTK_FRAME_LAG` remains off
+when unset at runtime. The Android menu generates `TOTK_FRAME_LAG=1` only for Snapdragon 8 Elite-class
+(`CQ8725S` / `SM8750`, Odin3) native60 fps without frame generation, including first-run and saved settings;
+developer `totk.env` `=0` wins. All other chips/modes retain their prior policy. Resolved lag keeps the automatic
+600-draw chunk threshold when native VMA pressure is absent (otherwise75); explicit chunk overrides still win.
 Android shipping-30 mode (`TOTK_FPS60` unset/`0`) defaults `TOTK_GPU_TIME` to hardware; FPS60=1
 and other platforms/BOTW retain latency. Explicit hardware/latency overrides remain effective;
 unknown values log and retain latency. The latest Thor evidence supersedes the round 10.1 lag-on policy.
@@ -665,8 +668,9 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   at Lookout (minimum 29.6, no windows below 29.5, 1.4% long frames), compared with lag on plus latency
   at 27.71 fps (minimum 22.6, 10 low windows, 13.2% long). Latency reports overstated GPU time by
   roughly 9–12 ms; hardware's roughly 23 ms agrees with KGSL's roughly 22.7 ms. The older lag
-  measurements below used latency reports and do not justify default-on lag. Lag is now explicit opt-in;
-  its protection and the 600/75 chunk rule are unchanged. See `docs/translation-research.md`.
+  measurements below used latency reports and do not justify default-on lag on Thor. The Android menu's
+  Odin native60-only lag default uses newer capped cross-device evidence (APP.md); runtime unset stays off.
+  Its protection and the600/75 chunk rule are unchanged. See `docs/translation-research.md`.
 - **One frame late: `TOTK_FRAME_LAG=1`.** The frame end waits two syncs for the frame just submitted (the
   frame-end sync, then one of a pair at main+0x2db998); with the switch both wait for the previous frame's fence, so the
   next submission records while the GPU finishes the last one (at most two frames in flight). The game's own no-wait
@@ -741,6 +745,10 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   sleep behind that ownership handoff while queue submission is waiting for its worker to join.
   Hot selection and private copies remain walking-thread operations. The software-GPU path retains late writable
   exclusion and merging; software shader-written host VAs are not armed by recorder workers.
+  Repeated GPU-writer deduplication keys both the selected canonical donor VA and alias-graph generation,
+  not only raw VA/extent/submission. A same-serial remap must index the new donor, and an alias join must
+  refresh frozen guard projection even with an unchanged donor. Keeping the donor separately also covers
+  a remap completing between canonicalization and the generation sample; no guard is armed earlier.
 
   Lag ticket and unit-gate waits exceeding 500 ms emit one `[dirty-lag-wait]` record per wait episode, including
   waiting TID and scoped runtime role plus OS thread name, unit VA/extent, captured ticket, GPU completion and latest
@@ -1436,6 +1444,22 @@ measurements, the ownership contract is:
   and secondary [WriteTimestamp2](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdWriteTimestamp2.html).
   The saved Thor probe and current device extension setup do not enumerate/enable maintenance7 or nested-command-buffer
   support; their availability is not inferred and the recorder does not depend on either extension.
+  `TOTK_VK_REC_ONE_PRIMARY=1` (exact `1`, read once, default off) instead retains ordered rendering sections
+  and walker sections, then assembles one main primary per original chunk without pass-end joins.
+  `pre` and adopted frame-generation primaries keep their original order (at most three submitted primaries).
+  Occlusion diagnostics and inline/FG profiler statistics fall back before recording any chunk; other inline passes work.
+  Compare the recorder line's main/aux primaries, section kinds, walker secondaries and fallbacks with identical settings.
+  Recorder workers use raw secondary commands; shared dynamic state resolves a walking token only on its first
+  emitted command. Enabled recorder-overhead lines additionally report section-secondary begin/end and section-assembly ms/frame.
+  Immediate PipelineBarrier2 (including deep-copied memory/buffer/image arrays without extension chains),
+  CopyBuffer, UpdateBuffer (including data), FillBuffer, ResetQueryPool and WriteTimestamp2 commands are
+  retained in a per-slot byte arena and replayed directly into the main primary. Other immediate commands
+  materialize a secondary: its deferred prefix is replayed first and every later command stays in that
+  secondary, preserving issue order. Rendering and worker sections are unchanged. Arena offsets survive
+  growth; bytes are reused only when the existing slot-retirement rules permit reset.
+  Enabled-only 300-frame diagnostics report `deferred records/frame`, `deferred-only sections/frame`,
+  `secondary sections/frame`, and nonzero `recorder immediate commands/frame: <Vulkan command suffix>`
+  counts, including commands recorded after materialization. `External` denotes opaque emitter routing.
 - **Diagnostics:** occlusion queries, pass dumps, `TOTK_VK_PASS_PROFILE`, `TOTK_VK_PASS_MERGE=1`
   and pass probes force the original single-thread path with a diagnostic log. `TOTK_VK_GPU_PROFILE`
   (default off) retains recorder workers and asynchronous assembly. Full mode
@@ -1464,12 +1488,13 @@ measurements, the ownership contract is:
   close keeps its original one-argument ordinary entry; the enabled token copy has a separate
   profiled entry selected by the draw-side guard, not a token-preserving wrapper around ordinary work.
   Cached `vk_gpuprof_on` guards remain predictable branches, not a claim of zero instructions.
-  One opt-in startup preparation creates sixteen query-slot leases on the dedicated `totk-gpuprof`
+  One opt-in startup preparation creates 32 query-slot leases on the dedicated `totk-gpuprof`
   worker; startup may wait for readiness once. Thereafter the walker takes a prepared lease with
   a short private O(1) mutex operation, without query resets, result reads, formatting or I/O.
   Existing fence completion only detaches/enqueues the fenced lease and releases the game ring slot.
-  The profiler worker alone reads results without WAIT or polling, aggregates, formats, writes/logs,
-  resets queries and returns prepared leases. The bounded sixteen-lease FIFO never blocks the game
+  The profiler worker reads results without WAIT or polling, aggregates, formats, resets queries
+  and returns prepared leases. Compact file writes/flushes run on the separate `totk-prof-io` sink.
+  The bounded 32-lease FIFO never blocks the game
   for output: no available lease means dropped profiler coverage, recorded by cumulative
   `background_dropped_slots` and missing frame coverage. Its mutex is not the recorder-worker mutex.
   CPU frame closure has its own bounded 256-entry FIFO under the same private background mutex:
@@ -1520,9 +1545,9 @@ measurements, the ownership contract is:
   absolute area, scene reference and scene role remains available, including passes with zero samples.
   Only selected passes get timestamp/statistics queries. Rotation is not random sampling: periodic key
   churn or a short route can under-cover a key, so inspect coverage rather than assuming representativeness.
-  Each frame emits actual profiler-owned `vkCmdWriteTimestamp2` command `timestamp_count`, including
-  deferred ends after assembly, not the game's independent timestamp reports. It is at least the two
-  whole-main-frame endpoints and at most **`2k+2`**. There are no additional pre/slot timestamp pairs.
+  Each frame emits pass-profiler-owned `vkCmdWriteTimestamp2` command `timestamp_count`, including
+  deferred ends after assembly, not the game's independent timestamp reports or the optional pipeline pool.
+  It is at least the two whole-main-frame endpoints and at most **`2k+2`**. There are no additional pre/slot pairs.
   The whole pair uses completion-accurate `ALL_COMMANDS`, spanning main submissions through present.
   When CPU present finds no open command buffer, SAMPLE must issue **one small marker-only main
   submission** for the real end timestamp (the start was written earlier). This is an explicit extra
@@ -1542,6 +1567,216 @@ measurements, the ownership contract is:
   stutter-tail estimate; histogram precision does not establish statistical confidence.
   Overlapping family frame populations expose bounds rather than fabricated exact unions. A missing key
   observation in a censored capture is not a zero-cost pass.
+- **Pipeline/shader group profiler:** `TOTK_VK_GPU_PROFILE_PIPELINES=0` (unset/invalid/out-of-range also off)
+  preserves pass profiling. With `GPU_PROFILE=1/2/3`, budget `1`–`16` enables an independent bounded sampler;
+  initial capture: `GPU_PROFILE=1 SAMPLE=2 PIPELINES=4 STATS=0` (full `TOTK_VK_` names). Startup logs
+  `[gpu-profile] pipeline-budget=...`; requesting only PIPELINES while the parent profiler is off stays off.
+  A group is consecutive draws with the same actual `VkPipeline` and exact selected VS/FS variants, within
+  one pass part. Changes, inline clears and pass ends close it; returning to an earlier pipeline creates a
+  new group. Compute dispatches are separate groups with CS identity and dispatch counts, never graphics
+  draws or zero-primitives. The legacy pass `shader` is ONLY its first draw's signature: neither it nor
+  the whole-pass draw count is a pipeline/shader work proxy.
+  Graphics brackets start before pipeline bind/state setup; ends precede the next pipeline bind or clear/
+  EndRendering. Direct rendering writes on its original command buffer. Deferred rendering copies exact
+  pool/index/stage timestamp events into the ordered secondary job stream. A group may span several
+  chunks, and an end-only chunk is retained before the original pass flush. Workers/assembly never consult
+  the walker's current group/pass; pool leases, coordinates and copied variant names survive until the
+  existing fence and profiler-worker read/reset. No waits, forced-inline workers or per-group submissions.
+  Every frame uses one global ordinal sequence across all passes/groups (not a per-pass prefix).
+  `getrandom` supplies uniform 32-bit launch bits once. Population `N` starts at **2048** and grows to
+  the next power of two after observing a larger frame (never shrinks, max `2^31` groups/frame).
+  Frame `f` selects `k` consecutive positions starting at `(launch_bits + (f-1)*k) mod N`.
+  Keeping ALL launch bits preserves uniform phase after growth: no random syscall is needed per frame.
+  A growing frame's new tail is explicitly uncovered for that frame, then becomes eligible; stable layouts
+  including >2048 groups cover EVERY ordinal within `ceil(N/k)` frames. Failure to obtain uniform launch
+  bits disables this sampler rather than inventing authority. Selection is correlated systematic sampling,
+  not IID; periodic scenes may alias. Each in-domain group has marginal probability `k/N`, independent
+  of draw count/pass length. The Horvitz-Thompson sum is **measured group ms × N/k**, never equal draw
+  work or observed/sample scaling. This is conditional on domain coverage and workload independent of
+  instrumentation, NOT proof of unperturbed cost or confidence. Headers retain the initial population and
+  full launch bits (`pipeline_phase`); compact exposure strata retain actual population and selection weights.
+  Actual GPU timing includes timestamp cost and intervening GPU state/setup; ALL_COMMANDS can serialize
+  work/change tiled scheduling. A group is not an isolated shader invocation or marginal cost.
+  Bounds: at most **2k extra timestamp writes/frame**, `1024 + 64k` metadata records/lease and
+  `64k` query pairs/lease for configured pipeline budget k (maximum 16); 32 prepared leases bound
+  backlog. Space for ALL selected groups is reserved; optional unselected detail uses at most
+  1024 records/lease, with additional omitted detail explicitly counted as `unretained_groups`,
+  not a selected timing drop. Thus a long pass cannot crowd tail samples out. Pipeline arrays/query
+  pools exist only with PIPELINES enabled. Parent timestamp pools similarly pack the configured
+  SAMPLE budget (386 query slots at SAMPLE=2, rather than the full-mode 4226); statistics scratch
+  arrays exist only with STATS enabled. Headers report all actual capacities and CPU lease bytes.
+  The walker compares/borrows three immutable shader-name pointers, never copies names, scans bindings
+  or allocates group storage. Published shader objects never move or die (`vk_shader.c`); names are
+  initialized before publication. Leases therefore keep valid references after GPU fence retirement.
+  The worker copies canonical full names only when interning a new identity. Exact names still merge
+  aliases from different source objects; stable source tuples avoid repeating string comparisons.
+  Pass `timestamp_count` remains unchanged; sum compact coverage `timestamp_count` for the extra pool.
+  With pass sample budget `s`, the combined normal-frame write bound is **2s + 2 + 2k**.
+  Default pipeline output is compact: schema-3 header `pipeline_output:"compact"`,
+  `pipeline_compact_version:1` and `pipeline_window_columns` publish the numeric column order.
+  `pipeline_key` interns actual launch-local Vulkan handle + kind + full VS/FS/CS tuple, never pass key
+  or ordinal. Only keys selected within a 300-frame window emit `pipeline_window` numeric arrays.
+  Sums, sum-squares, actual-denominator weighted sums and eligible-domain counterparts remain separate;
+  moments are descriptive, not IID standard errors. `pipeline_window_coverage` retains completed-frame
+  counts, domain exclusions, selected/valid/missing samples, timestamps, optional omissions and true loss.
+  `population_exposure` entries are `[N,k,N,frames,eligible_frames,observed_groups,selected_groups]`,
+  so population growth within a window never borrows the latest denominator for earlier samples.
+  Eligibility is committed only at completed-frame closure, after every split lease/nested scope.
+  Missing/invalid selected samples, dropped slots/closures and explicit key/frame/aggregate overflows
+  withhold unsupported estimates; unknown remains unknown. Suppressed unselected-only key observations
+  also count as `unretained_groups`, making count subtotals honestly incomplete.
+  `TOTK_VK_GPU_PROFILE_PIPELINES_RAW=1` restores the old per-group/per-lease-frame and global frame
+  rows. Default compact suppresses all three, retaining parent pass/window rows (and explicit mode-3
+  long-frame diagnostics). Parent profiling with PIPELINES off is unchanged. Startup logs
+  `[gpu-profile] pipeline-output=compact/raw`. Raw `pipeline` rows name frame/global group, pass
+  key/ordinal, handle, full variants, emitted draw/dispatch counts, primitive knownness, selected/status,
+  nullable `gpu_ms`, timestamp count and probability numerator/denominator.
+  Primitive counts include instances and generated quad triangles, not clipped/rasterized primitives.
+  Indexed restart strips are unknown without index reads (`primitives:null`, known subtotal and unknown
+  draw count); compute is `null`/`not-graphics`. This backend lowers guest draws to concrete direct draws:
+  it does not synthesize zero primitive counts for unavailable GPU-indirect argument buffers.
+  Raw mode emits per-lease/frame `pipeline_coverage`: observed/dropped/selected/unretained/out-of-range
+  groups, timestamp count, lease/submission IDs, population/phase and discard state. Unselected or
+  unavailable/invalid/incomplete/discarded timings have `gpu_ms:null`, never fake zero durations. Setup
+  attempts rejected before drawing are explicit `no-work`, a missing selected sample rather than zero cost.
+  A frame larger than its domain censors the WHOLE-capture `estimated_gpu_ms`. The analyzer separately
+  ranks `eligible_estimated_gpu_ms` over its explicitly named domain-covered frames, with exclusions
+  retained as `domain_excluded_frames`; it never pretends that subtotal includes the growing frame's tail.
+  True metadata/query loss or missing authority still withholds estimates. Omitting only unselected
+  detail does not change inclusion probabilities, but draw/primitive sums become retained subtotals
+  (`counts_complete:false`), not whole-workload counts. Zero samples mean unknown cost. Pipeline handles
+  remain launch-local; only full shader variants are merged across launches.
+  Join seed manifest/module hashes externally before treating name parity as exact device seed parity.
+  Calibration: first run all profiling off versus `GPU_PROFILE=1 SAMPLE=2 PIPELINES=4 STATS=0` on the
+  same signed APK, driver/seed, warmed save/route, FPS cap, render size and thermal state in **A/B/B/A**
+  order; collect equal stationary and moving intervals and report CPU frame p50/p95, GPU span, fps,
+  query counts and drops. Then hold pass sampling fixed and ABBA PIPELINES=0/4 to isolate incremental
+  cost. Repeat fresh launches (independent phases), extend beyond several rotations and require adequate
+  per-pair samples before ranking. No device calibration was performed as part of the implementation.
+  Supported pipeline-capture qualification is limited to **≤30 fps** (Duo or capped Thor).
+  The 600-second 30-fps model has zero drops; the shared-host 45-fps models do not qualify.
+  Uncapped Thor remains experimental pending its own O/P/P/O check. No automatic cap or larger pool
+  hides this limit: retain the footer/drop counters and fail closed on any loss or missing authority.
+  Compact active state is fixed: 8192 exact keys, a 16384-cell open-addressed index, 8192 frame-touched IDs and
+  64 exposure strata: **4,427,008 bytes** on the supported 64-bit ABI. Compact mode also allocates exactly
+  one enabled-only frozen report snapshot of that same size, plus a `gp_json` diagnostics snapshot
+  (8192 data bytes and bookkeeping). Header/footer aggregation memory is
+  `2 * sizeof(gp_compact) + sizeof(compact_report_diagnostics)`; this is separate from the leases and sink.
+  Pipeline lease storage is separately bounded by 32 leases and the configured budget (including
+  pipeline metadata, parent records and readback arrays; excluding Vulkan driver/query-pool storage).
+  SAMPLE=2/PIPELINES=4/STATS=0 uses **31,075,072 bytes** on the host 64-bit ABI, down from compact2's
+  **51,980,288 bytes** (−40.2%); header `lease_memory_bytes` publishes the actual build's size.
+  At SAMPLE=2/PIPELINES=4/STATS=0, each lease has 1280 pipeline records, 386 parent and 512 pipeline
+  timestamp query slots; across 32 leases that is **28,736 query slots**, versus compact2's
+  **200,768** (32 × (4226 + 2048)). Actual driver bytes are not inferred from query counts.
+  This is not RSS. A subsequent compact2 Duo pan exhausted all 32 leases (74 drops in frames
+  4801–5100), despite aggregation averaging only about 160 ms per 300-frame gameplay window.
+  Its worker peak was 32 **already-fenced queued/active leases**; the renderer has only eight slots,
+  so GPU latency alone cannot explain that exhaustion. The old two-leases/frame host model missed
+  the device's approximately 18 submissions/frame and unmeasured writer/scheduling stalls.
+  The consumer requests nice +5; the independent blocking sink requests nice +10. Both retain
+  inherited affinity, without extra pinning. Effective consumer nice/error/mask are in the header.
+  Compact serialized bytes use a **1 MiB fixed FIFO**, with a **256 KiB sink-thread stack** plus
+  fixed mutex/cursor state (`output_sink_memory_bytes` reports its actual size). A full FIFO never
+  blocks the consumer: it increments `output_sink_overflows` and `output_failures`; the analyzer
+  withholds estimates. Bounded rotation markers keep rotation IO on the sink as well; only terminal/
+  test close waits for prior writes, and close joins the sink after writing the footer.
+  Raw pipeline output and non-pipeline modes retain synchronous IO for their diagnostic fixtures.
+  Worker service CPU/wall, readback/reset/report wall totals, maximum service and queue-wait wall
+  time are cumulative window/footer counters. The footer retains at most 64 drop-frame summaries:
+  `[frame, count, peak_queued, peak_consuming, peak_inflight, phase_bitmask]`; additional attempts
+  are counted in `background_drop_frame_overflow`. These are per-frame maxima, not additive
+  instantaneous occupancy. Phase names are in the header. No per-event logging or syscalls occur
+  on draws; enqueue/service clocks are per submission.
+  Bucket selection mixes the pipeline handle; full shader strings and compute kind still determine
+  exact identity, including reused handles. Shader bytes are neither hashed per observation nor copied by the walker.
+  Each pipeline lease record is 104 bytes rather than 320: hot counters and borrowed source pointers,
+  not a 240-byte shader tuple copied per group. The dictionary owns the capture text; pointer equality
+  is only a cache over already-proven immutable source objects, never a weaker exported shader identity.
+  Borrowed names point into each published `vk_shader`'s inline `key[80]`, copied before cache publication.
+  Published shader objects have process lifetime: variant-list refresh, program release, seed-IO shutdown
+  and pipeline failure cleanup do not reclaim them. Native presentation/post/framegen helper modules
+  are raw Vulkan objects, not temporary `vk_shader` name owners passed to the group profiler.
+  Any future shader reclamation must retain names through reporter shutdown, including frozen reports;
+  a completed GPU fence alone is insufficient. The GPU-free `test_vk_shader_lifetime.py` pins this contract.
+  Optional count columns stay exact integers in the hot loop, with the same 2^53−1
+  representability guard; only selected keys enter the per-frame floating-point moment-reduction list.
+  A frame-ordered cursor walks each immutable lease once across frame segments. At each completed frame,
+  pending numeric/text encoding visits at most **64 key indices**; all 8192 indices drain within **128 frames**
+  of the next 300-frame window. A window edge freezes one bounded snapshot and resets active state instead
+  of encoding the full report in a burst. Dictionary strings are encoded only when needed for the retained
+  file; ordinary JSON string runs use bounded copies, not per-character printf calls. Numeric window columns
+  use one fixed-schema encoding call. No new thread or report queue is introduced; the existing 1 MiB sink
+  remains unchanged.
+  Parent table occupancy is a 2 KiB bitmap; reports visit/clear only live groups instead of scanning/clearing
+  a multi-MiB cold table. JSON initialization resets cursors, not whole 8192-byte scratch arrays.
+  The compact index is rebuilt only after actual eviction leaves tombstones, not on insert-only
+  windows; clean dictionary bucket positions remain valid across reset.
+  Report-edge CPU therefore pays a bounded snapshot copy and reset, not full numeric/text encoding;
+  the subsequent encoding is amortized rather than hidden with more leases.
+  The compact aggregator makes no per-group/window allocations; existing parent pass buffering/histograms
+  remain separately bounded. Inactive previous-window dictionary entries are
+  evicted under lifetime churn; IDs are never reused. Current-window entries cannot be evicted: saturation
+  is an explicit overflow, not a silently weakened estimate. A referenced key is announced before its
+  summary in each file; reserve only that key/summary pair on rotation, never replay an entire dictionary.
+  Losing earlier rotated files still loses coverage and cannot silently regain full-capture authority.
+  Terminal close and sparse window jumps synchronously drain outstanding frozen reports. Close flushes a
+  remaining partial window once; unfinished frames are explicitly excluded/overflowed, and in-flight GPU
+  retirement remains unknown.
+  Coverage reports `CLOCK_THREAD_CPUTIME_ID` aggregation and key-encoding/flush CPU milliseconds,
+  serialized bytes before the coverage row (including parent rows and repeated rotation headers),
+  peak queued+active leases and the fixed aggregation bound. The footer reports cumulative serialized
+  bytes, backlog and close-flush thread CPU. File retention size is not cumulative emitted bytes.
+
+  Host-only fixture, with outputs kept in a fresh scratch directory:
+  build `make -C games/totk/android TARGET=linux CC=cc OUT=<absolute-scratch-build> vkgpuprofcompacttest`,
+  then `<absolute-scratch-build>/vkgpuproftest --compact-contract` (no GPU), and
+  `vkgpuproftest --compact-fixture --seconds 600 --fps 0 --pace 0 --loss 0`.
+  `--fps 0` cycles 20/30/40/50/60 logical fps every 20 seconds; `--fps 60` is the size upper-rate arm.
+  4096 groups/frame span two leases, each retaining 1024 optional unselected records plus selected groups.
+  Recurrent keys appear/disappear between windows and a fresh-variant tail forces bounded lifetime churn.
+  `--frames 302` exercises partial close; `--loss 1` injects unavailable/invalid/incomplete queries, true
+  group loss and one dropped-slot counter. RAW=1 replays identical deterministic identities/timestamps/
+  phase for analyzer comparisons. Tiny MAX_BYTES exercises dictionary reannouncement/retention eviction.
+  The fixture prints cumulative bytes/average window, worker thread CPU/average/peak window, backlog,
+  aggregation/lease and parent-aggregation memory bounds, zero compact allocation count, write-call count,
+  producer wait and close CPU/wall time. `--pace 0` is accelerated throughput,
+  not 600 wall seconds. `--pace 1` uses monotonic absolute wall pacing. Without `--nonblocking 1`,
+  both wait for a free synthetic lease to keep datasets identical; producer wait and wall time MUST
+  be reported. Production-rate runs use nonblocking admission. Backlog is queued+active host leases,
+  not GPU latency. This excludes real query calls/GPU/driver/device scheduling and proves no Duo result.
+  `--worker-scale 2700` charges 2.7x measured lease service to `CLOCK_THREAD_CPUTIME_ID`, using
+  test-only CPU work rather than per-lease nanosleeps. Host descheduling is never multiplied;
+  explicit coupled/sink stalls independently model IO. Reported model worker CPU includes this
+  synthetic work and must not be presented as production aggregation overhead.
+  Paced producers default to `--catch-up 0`: a missed whole-frame deadline rebases future pacing
+  without skipping any logical frame or submission. `--catch-up 1` explicitly restores the old
+  absolute-deadline burst stress. Output counts late producer frames/slots, worst lateness and
+  rebased seconds; report those plus actual wall time, not just the nominal fps.
+  For a 600-second Duo/Thor model use `--seconds 600 --fps 30` or `--fps 45`, plus
+  `--pace 1 --parts 18 --gpu-held 8 --nonblocking 1 --sample-budget 2 --spread-percent 60
+  --writer-stall-ms 200 --worker-scale 2700 --catch-up 0`: 540/810 nominal submissions/second.
+  Eighteen submissions/frame is measured for Duo but assumed for Thor. Keep failed legacy/burst
+  captures; a corrected host model is not equivalent to that stress or a real GPU/device gate.
+  Check stable low backlog, producer waits, queued/processed equality and the writer-end footer;
+  a larger pool with growing backlog is not success. `--record-fixture` measures production pipeline
+  hooks and lease handoffs at 4096 groups/8192 draws per frame. Its counted timestamp sink excludes
+  driver command encoding: report this CPU lower bound separately from real Vulkan/device recording.
+  To exercise the observed mechanism, run `--compact-fixture --frames 330 --fps 30 --pace 1
+  --parts 18 --gpu-held 8 --nonblocking 1 --sample-budget 2 --spread-percent 60 --writer-stall-ms 200`.
+  Submissions span 60% of each frame (~20 ms at device 30 fps, ~10 ms at 60 fps stress), matching the
+  measured recording interval rather than an instantaneous 18-lease burst. It uses the exact production
+  no-free-lease path and retains up to eight synthetic GPU-held leases. `--coupled-stall 1` is a
+  test-only control that stalls the lease consumer at the same output point; it must reproduce
+  pool exhaustion. The default stalls only the independent sink and must drain without lease
+  drops, output overflow or missing writer-end. `--sink-contract` checks FIFO overflow, nonblocking
+  rejection, byte identity across ring wrap and final drain.
+  Leases already cover an entire actual queue submission, including its pre/main primaries and
+  every pass, not individual draws/secondary command buffers. Sharing across independent fences
+  or frames is not a safe local rate reduction: cancellation, multiple frame markers per submission,
+  immutable publication and query reset all rely on that ownership boundary.
+  Host commands run with `taskset -c 0-3 nice -n 10`; matrices also hold the shared hosttest flock.
+
 - **Profiler capture lifecycle:** the default is 128 MiB per JSONL file × four files; compact windows
   target a 6–8-minute pan without rotation, not a guaranteed duration for arbitrary pass counts/raw modes.
   Each rotation repeats a schema-3 header with launch ID, APK `assets/build.txt` commit, package/versionCode
@@ -1563,9 +1798,10 @@ measurements, the ownership contract is:
   describe activated queries/leases in abandoned, never-submitted recordings, not submitted work.
   Historical footers without `query_retirement` retain nullable `all_queries_retired: null` as unknown.
   Force-stop/crash/kill normally has no footer; the analyzer reports missing closure, not a fabricated
-  end marker or GPU failure. The footer also retains `pending_frame_closures`; zero pending CPU closures
+  end marker or GPU failure. Missing closure censors both raw and compact pipeline estimates
+  (`streams_without_end`), even when retained complete windows are internally consistent. The footer also retains `pending_frame_closures`; zero pending CPU closures
   alone does not establish query retirement. The additive header `background_closures: 256` records the
-  closure FIFO capacity, independently of the sixteen query leases.
+  closure FIFO capacity, independently of the 32 query leases.
   Enabled GPU draining has one two-second budget. On expiry, `query_drain_timed_out: true` accompanies
   the retirement accounting; uncompleted leases and unread queries remain outstanding rather than
   being fabricated as retired. The additive timeout field is boolean when present; old footers without
@@ -2787,6 +3023,29 @@ The second adds `NoContraction` only to core float arithmetic feeding Position t
 Each opt-in arm isolates shader/pipeline/prewarm cache identity. Compare identical fresh-process camera sweeps for flicker, GPU ms and compile/warm-up cost; no speedup is claimed.
 Host checks: `python3 -m unittest discover -s tests -p test_vk_position.py -v`; with `spirv-val`, set `TOTK_TEST_POSITION_SEED` to a loose seed directory or `seed.vkpack` for real vertex samples in all four arms.
 
+**Integer address proofs:** `TOTK_VK_INT_FOLD` is startup-only, default **1**; only exact `=0` disables it.
+The requested and effective policy is logged once. It folds only proven scalar integer bits, preserving
+byte-offset wraparound, FP/NaN guards, bounds and stage outputs. Same-block non-aliased Function locals
+carry alignment proofs into UBO component selection; unknown control-flow facts are discarded.
+Direct/group `RelaxedPrecision` values and decorated locals supply no exact-bit facts; any decorated result
+keeps its original opcode, including `NoSignedWrap` / `NoUnsignedWrap`. This avoids changing permitted reduced
+precision or leaving opcode-specific decorations on `OpCopyObject`. Per-block generation stamps and a
+constant lookup index replace bound-sized clears/searches; the lowest already-seen same-type constant ID
+is still selected. No index or proof allocation occurs in the off arm.
+The pass runs on each loaded module immediately before `vkCreateShaderModule`, after the existing runtime
+patches; it does not change translator outputs, shared variant hashes, reflection, or packed seed bytes.
+Keep seeds unfurled for both arms. Existing seeds and fresh-install packs remain usable without regeneration.
+The enabled arm adds `.intfold-v1` to pipeline/prewarm/import/compute/learned-IO cache paths (including
+alternate seeds and explicit paths); `=0` retains the old unfurled namespace. The first default launch after
+updating recompiles driver pipelines as needed, with possible one-time loading/route stutter, not a full
+shader import. Newly learned histories warm later launches; elapsed rebuild time is device/route dependent.
+Earlier standalone a740 estimates reduced total instructions by 6.58% (not an FPS prediction), with seven
+occupancy regressions. Prior Thor quartets were throughput-neutral with no observed visual defects;
+capped busy-weighted-clock work proxies fell 2.26% on Duo Hateno and 4.1–5.4% on Odin (Odin's strict
+equal-FPS gate did not pass). Battery savings remain unconfirmed. Odin's uncapped standing sample rose
+61.93→63.81 fps; pan remained SAME. Measure fresh-process `=0`/default O/B/B/O GPU time, clocks and tails,
+with geometry/skinning/vegetation picture checks on each device; these are not general speedup guarantees.
+
 ### Original NVN early fragment tests (guest semantics)
 
 Original shader **declared** early depth/stencil tests are honored **by default**. `TOTK_VK_EARLYZ=0` is an explicit,
@@ -3061,6 +3320,7 @@ eligible consumers below50ms without weakening an unfinished producer's completi
 | `TOTK_VK_SETTLED_WB_DETAIL=1` | At most 64 `[settledwb]` lines per 300-frame window: shape/format/levels, serial/storage/pool, guest/image bytes, storage landing count, old/next quiet interval, idle/invalidate cause. |
 | `TOTK_VK_WB_SERVICE_STATS=1` | Default OFF. Every300presents: recording-lock hold max/peak and owner-service delay p50/p99 upper bounds/max (100µs histogram bins, overflow uses max); no idle opcode clocks/locks. |
 | `TOTK_VK_WRITEBACK=1` | Select full legacy invalidate flush/authority behavior, default off; not required for fresh default explicit consumers. `TOTK_VK_OFF=writeback` disables only this legacy path. |
+| `TOTK_WB_ALIAS=1` | Experimental, launch-only, default OFF; only exact `1` enables it. Retain one backend-private RW mapping per dma-buf-backed owner and land supported dirty-tracked extents through it without temporarily making protected guest pages writable. Unset/other values preserve the original path and logs. |
 | `TOTK_VK_OFF=settledbackoff` | Disable learned history; use the base quiet interval for every rendering. |
 | `TOTK_VK_OFF=settledinval` | Disable default explicit-consumer landing at all ages; keep ordinary automatic settled copies. |
 | `TOTK_VK_OFF=settleddrain` | Diagnostic only: omit frontend drain for a matched default consumer; may weaken queued-command ordering. |
@@ -3100,9 +3360,10 @@ the later eight-run qualification includes the resumable1MiB/~2ms landing budget
 or its hybrid/native-interpolation interaction. See `DEBUGGING.md`; host coverage alone does not qualify that combination.
 Run `vkdrawtest --settled-wb-race` for the concurrent landing boundary test: 128 trials each before ownership,
 faulted under still-RO BUSY ownership, temporary RW before/after freshness, and after RO restoration; every writer
-stores 256 rounds into texture bytes and both adjacent same-page guards. The three protected/stamped cases must
-preserve CPU bytes; the two temporary-RW cases intentionally demonstrate residual overwrite without dirty publication.
-All adjacent guards must stay intact. Test-only handoffs do not exist in shipping code.
+stores 256 rounds into texture bytes and both adjacent same-page guards. With aliases off or unsupported backing,
+the three protected/stamped cases must preserve CPU bytes; the two temporary-RW cases intentionally demonstrate
+residual overwrite without dirty publication. All adjacent guards must stay intact. Test-only handoffs do not
+exist in shipping code. The opt-in alias path below removes that temporary-RW window only for protected guest pages.
 
 Run `vkdrawtest --settled-wb-learning` for 64 prompt RG8 tiles, 40 intermittent refreshes/new serials without recurring
 automatic copies, default invalidate before learned deadlines/reuse of staged data, CPU overwrite, fresh rendering,
@@ -3125,6 +3386,106 @@ one unbounded draw-free jump stream, proving no draw/return/submit is needed. Ru
 `TOTK_VK_TEST_OWNER_PENDING=1` adds real no-op owner requests and reports their completed count.
 Run `--settled-wb-budget` for partial >10MiB landings, byte/yield accounting, complete invalidate and CPU/GPU/pool
 cancellation between chunks, plus a point-address swizzle oracle covering2D/array/3D/linear layouts and padding.
+
+### Private write-back aliases (`TOTK_WB_ALIAS=1`, experimental)
+
+Launch-only and **default off**; only the exact value `1` enables it.
+This does not enable write-back or frame lag; their existing policies remain in force. It retains the original
+temporary `MAP_SHARED`, `PROT_READ | PROT_WRITE` mapping made when each `K_OWN` dma-buf is populated, instead of
+unmapping it. Guest and private mappings use the same fd, offsets and exporter-selected memory attributes.
+`K_VIEW` and mapped `K_VIRT` ranges resolve to that owner plus the real backing offset. The pool registry lock
+pins backing through the last store and dirty-token end; deletion/remapping cannot recycle an alias mid-landing.
+Cross-owner landings split at every backing transition. The span encoder receives pointers inside each real
+mapping, handles arbitrary byte-clipped splits and leaves padding untouched, without another staging allocation.
+Enabled production MapVirtual replacements (including anonymous unmap and mremap fallback) retire old
+destination authority under the same registry lock as the actual mapping syscall. Only a proved successful
+fd mapping installs a private-writer translation; anonymous/unproved pages use the current guest destination.
+Failed potentially partial replacements never revive stale donor metadata. Host-owned final release uses the
+same serialized retirement; deleting only a VIEW registration does not invalidate its unchanged owner mapping.
+
+For a texture landing extent, **all** bytes must have supported backing and dirty tracking, and the record must
+have its existing tracked-watch/ownership eligibility before selecting aliases. Watch-slot exhaustion and other
+no-token synchronous records retain the legacy guest destination; range registration alone grants no ownership.
+Mixed, untracked, host-import or CPU-only extents likewise retain the whole extent's original protocol. Report, event and
+uniform publications attempt the same backing pin with a nonblocking registry trylock, then use per-owner spans
+and the old store path for unsupported segments. On registry contention they immediately use the exact original
+whole-operation store without borrowing an alias pointer; that fallback may still change guest protections.
+This avoids a pool-deletion/completion lock cycle without changing the original lifetime/order protocol.
+An event's 32-bit assignment/addition is not split between owners; this adds no atomicity to the original operation.
+
+Alias ownership retains the existing reader tickets/unit gates, `PG_BUSY`, watch and generation checks, including
+freshness **after** ownership. A protected guest page stays RO throughout: a fresh direct CPU store faults and
+waits, then publishes the normal CPU dirty generation after alias ownership ends, preserving that CPU write.
+Alias stores themselves publish no CPU dirty generation; end restores `PG_PROT` state without `mprotect`.
+Alias gate acquisition also avoids the lag-only VMA-pressure drain that could otherwise open a guest RW window.
+This closes the documented temporary-RW race for those protected guest pages, **not** every already-writable page
+or unwatched writable alias of the same backing. Unsupported/contended fallback retains its old residual window.
+Runtime commit/decommit, zero-on-recommit and ordinary CPU-write/fault behavior are unchanged; the private pointer
+is not guest commitment authority and is never registered as a guest dirty range.
+
+Cost: one additional live VMA and owner-sized virtual-address extent per retained mapping, plus mapping/page-table
+overhead, not another pool-sized physical/RSS backing allocation. Procfs RSS accounting may count the same resident
+pages through multiple mappings; the reported alias byte count is mapped VA, not extra physical memory.
+This avoids these write-back permission flips, not all dirty-tracker/runtime `mprotect` calls, existing fragments
+or every source of VMA growth. It is not a replacement for mapping-pressure safeguards.
+Retention does not add an alias-creation recovery path: the original mandatory population/fixed mmap failures
+remain fatal. Extra live VA/VMA pressure therefore needs explicit device headroom/failure qualification.
+
+**Cache/coherency:** on arm64, two CPU mappings of the same physical pages with identical memory type, cacheability
+and shareability need no additional CPU-alias cache maintenance. RO versus RW access permission is independent.
+Cached versus write-combined attributes must match; same-fd shared mappings preserve the exporter's selection.
+[AOSP system heap](https://android.googlesource.com/kernel/common/+/refs/heads/android14-6.1/drivers/dma-buf/heaps/system_heap.c)
+uses `pgprot_writecombine` only for its `uncached` buffers; published
+[QCOM mapping](https://github.com/OnePlusOSS/android_kernel_oneplus_sm8550/blob/c462ef8ffab7a58e035ee04705b16cdfced494b1/drivers/dma-buf/heaps/qcom_sg_ops.c)
+does likewise. Both inspected implementations select cached `system` heaps separately from their uncached heaps.
+The bundled Turnip KGSL shared-allocation path uses the system-heap fd, not its separate native-KGSL cachemode flags.
+These are source facts, **not proof of the actual Odin vendor exporter/kernel identity**.
+[Arm's alias-attribute requirements](https://documentation-service.arm.com/static/63a43e333f28e5456434e18b)
+do not eliminate CPU/GPU coherency, fences, barriers or cache synchronization: all existing device synchronization
+remains required and unchanged. See `.scratch/perf/map-limit/wb-alias/design.md` for the source-selection analysis.
+
+Enabled startup adds `[nvn-vk] write-back alias: enabled (TOTK_WB_ALIAS=1); backend-private RW dma-buf mapping per owned pool; host-import/CPU ranges use existing path`.
+The existing memory report additionally emits `[nvn-vk] memory write-back aliases: mappings N, bytes B (backend-private RW dma-buf; not guest pools)`,
+where N/B are current live retained mappings/page-rounded owner bytes. These are not guest-pool counts.
+Off adds neither line and leaves existing logs unchanged. The earlier eight-run settled-write-back qualification
+above predates this switch; it is not alias-path device evidence or a frame-rate/VMA-reduction guarantee.
+
+**First alias-enabled device evidence (AYN Thor):** fix `7129293`, attribution integration `8945e9f`,
+same APK with attribution enabled in both arms, alias first then legacy. Across five common completed loads,
+texture GPU-unprotect new boundaries were **0 versus 17,214** and mean whole-process row growth was
+**+1,025 versus +4,535/load** (legacy +4,534.8 before rounding). Enabled completed a sixth load; legacy
+stopped input during load six at the planned mapping-pressure safety threshold, then closed normally.
+Sampled pictures showed no switch-attributable corruption; this is not exhaustive rendering/cache-coherency proof.
+All pooled metrics for thirteen admitted standing window pairs, including frame tails, were SAME. Some
+individual Hateno phases had tool-WORSE tails, and no pan pairs were admitted: the ordered pair is not a
+causal speed proof or grounds to enable by default. Odin and Duo have **not** been tested with this switch.
+Other watch/fault/host and non-pool mapping growth remains. Full controls, limitations and picture evidence:
+`.scratch/perf/map-limit/wb-alias/thor/report.md`. Earlier settled-write-back evidence above remains distinct.
+
+With the switch enabled, one additional cumulative path-coverage line is emitted at the existing periodic
+memory-report cadence, on each effective Android pause edge, and at normal `atexit`:
+```
+[nvn-vk] memory write-back alias paths: phase=PHASE cumulative=1 landing=alias:O/B,registry:O/B,ownership:O/B,mixed:O/B,non-dmabuf:O/B,retired:O/B,other:O/B store=alias:O/B,registry:O/B,ownership:O/B,mixed:O/B,non-dmabuf:O/B,retired:O/B,other:O/B publication=alias:O/B,registry:O/B,ownership:O/B,mixed:O/B,non-dmabuf:O/B,retired:O/B,other:O/B
+```
+`PHASE` is `periodic`, `pause` or `exit`; each decimal `O/B` is operation incidences / requested bytes.
+`landing` covers dispatched texture encoders (including padding in their logical span), `store` covers report/event
+stores, and `publication` covers uniform-buffer publications. Freshness-rejected/deferred work without a writer
+dispatch is not counted. Multiple supported owners count once per logical operation, not once per owner.
+A split store can contribute one `alias` incidence plus one `mixed` fallback incidence, with bytes partitioned
+between those paths; therefore summing incidences is not a unique-call count. Bytes describe attempted spans,
+not the number of texels changed or completed writes.
+
+Reasons are `registry` (nonblocking pin contention), `ownership` (landing lacks its existing tracked-watch/token
+eligibility or dirty containment), `mixed` (unsupported/mixed backing classes, or an unsplittable event word
+crossing owners), `non-dmabuf` (known HOST/CPU backing without a retained private mapping), `retired`
+(known virtual hole or invalidated guest-translation proof), and `other` (unregistered/invalid extent or no
+more specific proof). Classification uses current registry authority, not a kernel/exporter query. Entirely
+unregistered retired ranges are consequently `other`; landing's blocking lifetime pin never reports `registry`.
+Counters are lock-free relaxed atomics; snapshots are nontransactional and never reset. Reporting runs only
+in ordinary thread context, not the fault handler. Off adds no counters or new log lines. Abrupt `_exit`,
+abort, fatal signals and process kills do not promise an exit snapshot.
+An independent relaxed atomic reporting latch permits an early UI pause during Vulkan startup without reading
+the game-thread-only switch flag or waiting for/initializing Vulkan; reporting needs no other published state.
 
 ## Finding rendering errors: the frame dump
 

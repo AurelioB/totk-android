@@ -7,6 +7,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.AttachedSurfaceControl;
+import android.view.Display;
 import android.view.View;
 import com.aure.totk.companion.AssetStore;
 import com.aure.totk.companion.CompanionNative;
@@ -84,6 +85,27 @@ public final class TotkActivity extends NativeActivity {
     public void rumble(int left, int right) {
         GameFeedback f = feedback;
         if (f != null) f.rumble(left, right);
+    }
+
+    /** Native UI thread, on each window/display lifecycle update. This is an app-local content-rate request,
+     * not a preferred mode or Android setting. -1 selects the highest advertised rate, including fractional Hz.
+     * Integer requests retain the 0.01 Hz matching tolerance; 0 means no validated override. */
+    public float selectFrameRateHint(int hz) {
+        Display display = getWindow().getDecorView().getDisplay();
+        float highest = 0;
+        if ((hz > 0 || hz == -1) && display != null) {
+            for (Display.Mode mode : display.getSupportedModes()) {
+                float rate = mode.getRefreshRate();
+                if (!Float.isFinite(rate) || rate <= 0) continue;
+                if (hz == -1) highest = Math.max(highest, rate);
+                else if (Math.abs((double)rate - hz) <= 0.01) return hz;
+            }
+        }
+        if (highest > 0) return highest;
+        Log.w("TotkPerf", "TOTK_FRAME_RATE_HINT_HZ=" + (hz == -1 ? "max" : hz) + " refused: "
+                + (display == null ? "window has no display" : "not advertised by window display " + display.getDisplayId())
+                + "; retaining existing policy");
+        return 0;
     }
 
     /** Native UI thread only, after its explicit parent transaction succeeded.

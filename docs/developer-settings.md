@@ -53,10 +53,10 @@ both processes without a SharedPreferences cache. They contain no URL; changing 
 | Menu option | Value | `settings.env` lines |
 |---|---|---|
 | Game data location | SD card or chosen folder | `TOTK_DATA_DIR=<path>` (first line; absent for internal storage) |
-| Frame rate | 30 fps / 60 fps | `TOTK_FPS60=0` / `TOTK_FPS60=1` plus `TOTK_GPU_TIME=hardware` |
+| Frame rate | 30 fps / 40 fps / 60 fps | 30: `TOTK_FPS60=0`; 60: `TOTK_FPS60=1` plus `TOTK_GPU_TIME=hardware`. 40: `TOTK_FPS60=1`, `TOTK_UNCAPPED=1`, `TOTK_UNCAPPED_HZ=40`, `TOTK_UNCAPPED_INTERVAL=1`, `TOTK_REALTIME=1`, `TOTK_FRAME_LAG=0`, `TOTK_FPS_AUTO=0`, `TOTK_PACE=0`, `TOTK_PRESENT_SLOTS=auto`, `TOTK_ACQUIRE_SLACK=0`, `TOTK_ACQUIRE_CLOCK=0`, `TOTK_FRAME_RATE_HINT=1`, `TOTK_FRAME_RATE_HINT_HZ=120` ([pacing and qualification](../games/totk/android/APP.md#frame-rate)) |
 | Frame generation | Interpolation | the locked timing block instead of the frame-rate and latency lines: `TOTK_FPS60=0`, `TOTK_FRAMEGEN=locked`, `TOTK_REALTIME=1`, `TOTK_FRAME_LAG=0`, `TOTK_FPS_AUTO=0`, `DM_PRESENT_HZ=60`, `DM_PRESENT_INTERVAL=game`, `TOTK_PRESENT_SLOTS=1`, `TOTK_VK_PRESENT=ahb`, `TOTK_ACQUIRE_SLACK=0`, `TOTK_ACQUIRE_CLOCK=0`, `TOTK_PACE=0`, `TOTK_ASYNC_REPLAY=0` |
 | Render resolution | 1280 × 720, 1152 × 648, 960 × 540 | `TOTK_RENDER_RES=1280x720` (etc.; absent for *Game default*) |
-| Latency | Responsive / Balanced / Smoothest | `TOTK_ACQUIRE_SLACK=0` / `1` / `2` (not written with frame generation) |
+| Latency | Responsive / Balanced / Smoothest | `TOTK_ACQUIRE_SLACK=0` / `1` / `2` (fixed to `0` at 40 fps; part of the locked block with frame generation) |
 | Upscaler | Off / FSR 1 / Snapdragon GSR | `TOTK_POST_SCALE=off` / `fsr` / `sgsr` |
 | Sharpness (FSR 1) | 0–100 | `TOTK_POST_SHARPNESS=<value / 100>` (20 → `0.2`) |
 | Sharpness (Snapdragon GSR) | 0–100 | `TOTK_POST_SGSR_SHARPNESS=<value × 4 / 100>` (50 → `2.0`) |
@@ -85,6 +85,7 @@ Everything not in the menu is a developer switch. A selection:
 | `TOTK_VK_DRIVER=system` | Use the device's own Vulkan driver instead of Turnip. No current Qualcomm system driver passes the game's startup check; for testing only. Pick a custom Turnip AdrenoTools `.zip` or 64-bit ARM `.so` in *Game data → Graphics driver* (or copy the library as `driver.so` in the game folder). |
 | `TOTK_ASPECT=21:9` (or `4:3`, …) | Shows the game's view at that ratio with black bars instead of stretching it; the HUD and menus keep their proportions. |
 | `TOTK_AUTOLOAD=1` | Loads the newest save again at start. |
+| `TOTK_BENCH_TIME=02:00` | Benchmark-only, launch-time 1.4.3 effective clock override; strict `HH:MM` (`00:00`–`23:59`). Absent/`off` keeps native code/data unchanged, without a veneer; any other value logs one rejection and stays off. |
 | `TOTK_COMPANION=0` | Disables the second-screen companion at runtime (no controller, display listener or poller is started). |
 | `TOTK_COMPANION_LOG=1` | Logs each companion status change and the first full snapshot to `totk.log`. |
 | `TOTK_INPUT_LOG=1` | Logs each **−** / **R** overlay-chord decision as `[chord] …`. |
@@ -99,3 +100,13 @@ The complete, current list of switches with their status and evidence is in
 [games/totk/android/APP.md](../games/totk/android/APP.md) (the *Integration opt-in qualification index* under
 [Device profiles](../games/totk/android/APP.md#device-profiles), and the sections on the picture, frame rate and
 presentation) and the diagnostic switches in [games/totk/android/DEBUGGING.md](../games/totk/android/DEBUGGING.md).
+
+## Benchmark clock (restored saves only)
+
+`TOTK_BENCH_TIME=HH:MM` takes the engine's fixed-time path ahead of natural time and timeline requests;
+use the **same value in both benchmark arms**, then restart. One `[totk-bench-time]` line records the effective
+time and seconds. It overrides cutscene/sleep time changes, time-dependent schedules, day rollover and
+blood-moon progression: **benchmark use on restored saves only, never normal play**. Restore the save for
+each arm; unchanged save behavior has not been device-qualified.
+This does **not** fix weather, wind, clouds or randomness, and is not whole-scene determinism or a speedup.
+

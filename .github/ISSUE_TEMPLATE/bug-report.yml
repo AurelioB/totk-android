@@ -1,0 +1,229 @@
+name: Bug report
+description: Something in the game or the app doesn't work (crash, graphics, performance, setup, saves, controls).
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! A few rules keep reports useful:
+
+        - **One problem per issue.** Several problems in one report get split up or lost; open one issue for each.
+        - **Use a specific title**, e.g. "White artifacts instead of wind effects at Gatakis Shrine", not "bugs" or "crash".
+        - **Never attach game files, keys (`prod.keys`, `title.keys`) or dumps.** Issues that do are closed.
+        - Setup or how-to questions: check the [FAQ and troubleshooting](https://github.com/AurelioB/totk-android#faq-and-troubleshooting) and [known limitations](https://github.com/AurelioB/totk-android#known-limitations) first.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched the [open and closed issues](https://github.com/AurelioB/totk-android/issues?q=is%3Aissue) and this problem is not reported yet. If it is, I'll add my details there instead.
+          required: true
+        - label: This report is about one problem only.
+          required: true
+        - label: I'm using the latest [release](https://github.com/AurelioB/totk-android/releases).
+          required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Type of problem
+      options:
+        - The game crashes or closes
+        - Graphics glitch (something draws wrong)
+        - Performance (low frame rate, stutter, frame drops)
+        - Setup or game data import
+        - Save import or export
+        - Controls, rumble or audio
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: Describe the problem. Screenshots or a short video help a lot; for performance problems, include a screenshot with the performance overlay set to Full.
+      placeholder: |
+        Updrafts from burning grass show bright white rectangles that blow outward instead of the wind effect.
+        [drag screenshots or video here]
+    validations:
+      required: true
+
+  - type: textarea
+    id: where
+    attributes:
+      label: Where and how to make it happen
+      description: Where in the game, what you did, and how often it happens, so someone else can repeat it.
+      placeholder: |
+        1. Go to Gatakis Shrine.
+        2. Stand next to the fan.
+        Happens every time.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should happen
+      description: Optional if it's obvious (for example, "it shouldn't crash").
+
+  - type: dropdown
+    id: ending
+    attributes:
+      label: If the game stopped, how did it end?
+      options:
+        - It didn't stop
+        - The menu showed "The game stopped"
+        - It went back to the home screen with no message
+        - It froze and I had to close it
+        - Setup stopped ("Setup stopped" screen)
+
+  - type: markdown
+    attributes:
+      value: "## Your device"
+
+  - type: input
+    id: device
+    attributes:
+      label: Device model
+      placeholder: AYN Thor / Samsung Galaxy S23 Ultra (SM-S918B)
+    validations:
+      required: true
+
+  - type: input
+    id: chip
+    attributes:
+      label: Chip (SoC / GPU)
+      placeholder: Snapdragon 8 Gen 2 / Adreno 740
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ram
+    attributes:
+      label: RAM
+      options:
+        - 6 GB or less
+        - 8 GB
+        - 12 GB
+        - 16 GB
+        - 24 GB or more
+    validations:
+      required: true
+
+  - type: input
+    id: android
+    attributes:
+      label: Android version
+      placeholder: 15 (One UI 7)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: refresh
+    attributes:
+      label: Screen refresh rate setting
+      description: In Android's display settings (for example Samsung's "Motion smoothness", or a 60/120 Hz choice).
+      options:
+        - 60 Hz
+        - 90 Hz
+        - 120 Hz or higher
+        - Adaptive / automatic
+        - I don't know
+    validations:
+      required: true
+
+  - type: dropdown
+    id: controls
+    attributes:
+      label: How you play
+      description: Select all that apply.
+      multiple: true
+      options:
+        - Built-in controls (handheld)
+        - Bluetooth controller
+        - Wired or clip-on controller (USB)
+        - Connected to an external display or TV
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: "## App and settings"
+
+  - type: input
+    id: app
+    attributes:
+      label: App version
+      description: Menu › About › Version.
+      placeholder: 1.0.1
+    validations:
+      required: true
+
+  - type: input
+    id: driver
+    attributes:
+      label: Graphics driver
+      description: As shown under Graphics driver. For a custom driver, give its name and version.
+      placeholder: Bundled / Turnip v25.3.0 R11
+    validations:
+      required: true
+
+  - type: dropdown
+    id: preset
+    attributes:
+      label: Preset
+      options:
+        - Light
+        - Balanced
+        - Smooth
+        - 60 fps
+        - Custom
+    validations:
+      required: true
+
+  - type: dropdown
+    id: console
+    attributes:
+      label: Console mode
+      options:
+        - Handheld
+        - Docked
+    validations:
+      required: true
+
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings you changed
+      description: Anything you changed from the preset. If the game folder has a `totk.env` file, paste its contents too.
+      placeholder: |
+        Frame rate: Unlimited
+        Shadows: Low
+
+  - type: dropdown
+    id: defaults
+    attributes:
+      label: Does it also happen with the default settings?
+      description: Pick the preset the app chose for your device, undo your changes, and try again.
+      options:
+        - "Yes"
+        - "No"
+        - I didn't try
+
+  - type: markdown
+    attributes:
+      value: "## Logs"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        - **Setup stopped:** tap **Share details** *before* Resume and paste the text here.
+        - **Game problems:** if your game data is in a folder you chose (All files access), attach `totk.log` from that folder. On the default internal storage the file can't be reached without root; just say so.
+        - **Went back to the home screen with no message:** if you can use adb, run `adb logcat -d | grep -i lmkd` right after it happens and paste the line that mentions `com.aure.totk`.
+
+        Logs are public once posted. They can include folder names from your device; remove anything you don't want to share.
+      placeholder: "[drag totk.log here or paste the Share details text]"
