@@ -6,6 +6,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Make optional frame-timeline and fence-evidence ring producers single-attempt/nonblocking, with counted
+  dropped updates and skipped snapshots. Reuse per-walk elapsed clocks instead of enabling recorder
+  opcode/category probes. Retain slot/walk/input/presentation evidence and ordinary default-off behavior.
+  The old diagnostic inflated Thor walk CPU by about 4.7 ms/frame (+30%) and implicated rare ≥60 ms walks;
+  pre-fix timeline-on tails are suspect. Keep it off for performance/tail acceptance pending device overhead measurement.
 - Add enabled-only `TOTK_WB_ALIAS=1` path coverage: cumulative operations/bytes by landing, report/event store
   and publication, separated into alias and fallback reasons at periodic memory reports, Android pause and normal exit.
   Publish pause-report enablement atomically so early Android lifecycle callbacks can race Vulkan initialization safely.

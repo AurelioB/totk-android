@@ -17,6 +17,23 @@ cluster: a `su -c` per command costs the device a su session and, with Magisk, a
 Common options: `-s <serial>` (adb serial), `--device <label>` (a short name used in file names, e.g. `thor`),
 `--package` (default `com.aure.totk`), `--game-dir` (default `/data/user/0/<package>/files/game`).
 
+**Frame-timeline observer warning:** keep `TOTK_FRAME_TIMELINE=0` for tail/performance acceptance
+until the nonblocking implementation's overhead has been measured on a device. On AYN Thor the old
+implementation added about **4.7 ms/frame of command-walk CPU** (15.9 → 20.6 ms, about +30%) and
+equal 40-minute standing exposures contained **13 walks ≥60 ms on versus zero off**. Pre-fix
+timeline-on worst-frame results are suspect and walk CPU is inflated; do not compare them with
+ordinary default-off player runs as if instrumentation were free.
+
+The replacement tries ring ownership once (including fence metadata), counts dropped producer
+updates and skipped/busy snapshots in the periodic summary, and never waits on the diagnostic ring.
+Timeline-only recorder elapsed accounting is now `rec_wall_ns` once per walk, reusing existing
+clocks; S/P/O estimates require explicit `TOTK_VK_REC_PROFILE=1` and its separate overhead.
+Retain loss/coverage lines with every diagnostic report. See `games/totk/android/DEBUGGING.md`,
+“Frame critical-path timeline”, for field semantics. To qualify observer cost, use matched
+restart arms timeline-off / old-on / new-on with the same standing scene and independent walk
+measurements, not the timeline's own counters alone; host microbenchmarks cannot clear device tails.
+
+
 | Script | Use |
 |---|---|
 | `bench_input.sh -s <serial> [--event /dev/input/eventN] [--display <id>] <action>` | `press <A\|B\|X\|Y\|L\|R\|PLUS\|MINUS\|UP\|DOWN\|LEFT\|RIGHT> [ms]`, `rstick <x> [y]` (`rstick 0` releases), `shot <file>`, `log`, `detect`, `freqs` (the frequency limits as one line: `cpuN=<cpus>:<scaling_min>:<scaling_max>:<cpuinfo_max>` kHz per cpufreq policy, `gpu_maxclk`, `gpu_freqs`, `gpu_devfreq_max`, GPU power levels). Auto-detects the controller node (`getevent -p`: ABS_Z/ABS_RZ + BTN_SOUTH) and the first display (`dumpsys SurfaceFlinger --display-id`). |

@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <time.h>
 
 static void synthetic(uint64_t frame, uint64_t begin, uint64_t walk_ns, uint64_t present) {
     totk_ft_wake(frame, begin, begin - 100000, 0x123400, 0x1001, NULL);
@@ -254,6 +256,70 @@ static void reserve_cases(uint64_t base) {
     assert(strstr(text, "missing=1 incomplete-lookahead=0"));
     free(text);
 }
+enum { CONTEND_THREADS = 16, CONTEND_UPDATES = 10000 };
+static const uint64_t contend_frame = 10000;
+static pthread_mutex_t reporter_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t reporter_cv = PTHREAD_COND_INITIALIZER;
+static int reporter_held, reporter_release;
+static void *stalled_reporter(void *unused) {
+    (void)unused;
+    totk_ft_test_hold(contend_frame);
+    pthread_mutex_lock(&reporter_mu);
+    reporter_held = 1; pthread_cond_broadcast(&reporter_cv);
+    while (!reporter_release) pthread_cond_wait(&reporter_cv, &reporter_mu);
+    pthread_mutex_unlock(&reporter_mu);
+    totk_ft_test_release(contend_frame);
+    return NULL;
+}
+static void *contended_producer(void *arg) {
+    uint64_t writer = (uintptr_t)arg + 1;
+    for (unsigned i = 0; i < CONTEND_UPDATES; i++) {
+        uint64_t value = writer * CONTEND_UPDATES + i;
+        totk_ft_compositor(contend_frame, value, value);
+    }
+    return NULL;
+}
+static void bounded_join(pthread_t thread) {
+    struct timespec deadline;
+    assert(!clock_gettime(CLOCK_REALTIME, &deadline));
+    deadline.tv_sec += 5;
+    assert(!pthread_timedjoin_np(thread, NULL, &deadline));
+}
+static void contention_cases(void) {
+    pthread_t reporter, producers[CONTEND_THREADS];
+    totk_ft_record r;
+    totk_ft_compositor(contend_frame, 123, 123);
+    uint64_t losses = totk_ft_test_dropped();
+    assert(!pthread_create(&reporter, NULL, stalled_reporter, NULL));
+    pthread_mutex_lock(&reporter_mu);
+    while (!reporter_held) pthread_cond_wait(&reporter_cv, &reporter_mu);
+    pthread_mutex_unlock(&reporter_mu);
+    for (unsigned i = 0; i < CONTEND_THREADS; i++)
+        assert(!pthread_create(&producers[i], NULL, contended_producer, (void *)(uintptr_t)i));
+    /* Join BEFORE releasing the reporter: waiting/spinning producers fail the
+     * five-second bound instead of being rescued by the reporter's release. */
+    for (unsigned i = 0; i < CONTEND_THREADS; i++) bounded_join(producers[i]);
+    assert(totk_ft_test_dropped() - losses == CONTEND_THREADS * CONTEND_UPDATES);
+    memset(&r, 0xff, sizeof r);
+    assert(!totk_ft_snapshot(contend_frame, &r) && !r.frame && !r.apply);
+    totk_ft_present(contend_frame, 33333333, 456);
+    assert(totk_ft_current() == contend_frame + 1); /* loss cannot freeze IDs */
+    char *text = report_text(contend_frame, contend_frame);
+    assert(strstr(text, "dropped_events=") && !strstr(text, "inconsistent_samples=0 "));
+    free(text);
+    pthread_mutex_lock(&reporter_mu);
+    reporter_release = 1; pthread_cond_broadcast(&reporter_cv);
+    pthread_mutex_unlock(&reporter_mu);
+    bounded_join(reporter);
+    assert(totk_ft_snapshot(contend_frame, &r) && r.apply == 123 && r.display == 123);
+    for (unsigned i = 0; i < CONTEND_THREADS; i++)
+        assert(!pthread_create(&producers[i], NULL, contended_producer, (void *)(uintptr_t)i));
+    for (unsigned i = 0; i < CONTEND_UPDATES; i++)
+        if (totk_ft_snapshot(contend_frame, &r)) assert(r.apply == r.display);
+    for (unsigned i = 0; i < CONTEND_THREADS; i++) bounded_join(producers[i]);
+    assert(totk_ft_snapshot(contend_frame, &r) && r.apply == r.display);
+    puts("frame timeline: stalled reporter, bounded producers, counted losses and coherent snapshots passed");
+}
 int main(int argc, char **argv) {
     int disabled = argc > 1 && !strcmp(argv[1], "off");
     assert(atomic_load(&totk_ft_enabled) == -1);
@@ -282,6 +348,10 @@ int main(int argc, char **argv) {
     synthetic(1, base, 20000000, base + 25000000);
     synthetic(2, base + period, 30000000, base + period + 35000000);
     synthetic(3, base + period * 2, 20000000, base + period * 2 + 25000000);
+    if (argc > 1 && !strcmp(argv[1], "report")) {
+        totk_ft_test_report(stdout, 1, 3);
+        return 0;
+    }
     assert(totk_ft_current() == 4);
     assert(totk_ft_snapshot(2, &r));
     assert(r.wake == base + period && r.ready == r.wake - 100000);
@@ -326,17 +396,9 @@ int main(int argc, char **argv) {
     assert(strstr(text, "[frame-tl late] frame=6 ")); free(text);
     input_cases(base);
     reserve_cases(base);
-    pthread_t threads[4];
-    for (unsigned i = 0; i < 4; i++) assert(!pthread_create(&threads[i], NULL, slot_writer, (void *)(uintptr_t)i));
-    for (unsigned i = 0; i < 1000; i++) {
-        if (totk_ft_snapshot(700, &r)) {
-            assert(r.slots <= FT_SLOTS);
-            assert(r.input_window.reads <= FT_SLOTS);
-            if (r.input_window.reads) assert(r.input_window.first && r.input_window.last >= r.input_window.first);
-            for (unsigned s = 0; s < r.slots; s++) if (r.slot[s].gpu_done) assert(r.slot[s].gpu_done >= r.slot[s].queue_end);
-        }
-    }
-    for (unsigned i = 0; i < 4; i++) assert(!pthread_join(threads[i], NULL));
+    /* Exact no-contention content fixture. Lossy simultaneous ownership is
+     * exercised separately by contention_cases, including a stalled reader. */
+    for (unsigned i = 0; i < 4; i++) slot_writer((void *)(uintptr_t)i);
     assert(totk_ft_snapshot(700, &r) && r.slots == FT_SLOTS && !r.lost_slots);
     assert(r.input_window.reads == FT_SLOTS && r.input_window.mixed_threads);
     assert(r.input_window.first == 101000 && r.input_window.last == 164000);
@@ -393,6 +455,7 @@ int main(int argc, char **argv) {
     assert(strstr(text, "association=main-wake-snapshot metric=last-read-to-compositor-submit n=300 p50=149.500 p95=284.500"));
     assert(strstr(text, "association=main-wake-snapshot metric=first-read-to-AHB-present-fence n=300 p50=155.000 p95=290.000"));
     assert(strstr(text, "association=global-window-observation metric=last-read-to-AHB-present-fence n=300 p50=154.500 p95=289.500")); free(text);
+    contention_cases();
     puts("frame timeline: frame IDs, intervals, input read groups, main-wake ownership/no-read and reader migration, latency percentiles/missing/invalid evidence, concurrent owners, capacity and wraparound passed");
     return 0;
 }

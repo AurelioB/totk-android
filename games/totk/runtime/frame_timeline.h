@@ -19,7 +19,7 @@ enum { FT_RING = 1024, FT_WALKS = 32, FT_SLOTS = 64 };
     X(GUARD_REGS, guard_regs) X(PIPE_CREATES, pipe_creates) X(DESC_CREATES, desc_creates) \
     X(TEX_UPLOADS, tex_uploads) X(TEX_REALIZATIONS, tex_realizations) \
     X(CPU_STEPS, cpu_steps) X(REC_S_NS, rec_s_ns) X(REC_P_NS, rec_p_ns) \
-    X(REC_O_NS, rec_o_ns) X(REC_SAMPLES, rec_samples)
+    X(REC_O_NS, rec_o_ns) X(REC_SAMPLES, rec_samples) X(REC_WALL_NS, rec_wall_ns)
 #define FT_COUNTER_ENUM(symbol, label) FT_COUNT_##symbol,
 enum totk_ft_counter { FT_COUNTERS(FT_COUNTER_ENUM) FT_COUNT_N };
 #undef FT_COUNTER_ENUM
@@ -117,6 +117,9 @@ void totk_ft_present(uint64_t frame, uint64_t target, uint64_t now);
 int totk_ft_snapshot(uint64_t frame, totk_ft_record *out);
 #include <stdio.h>
 void totk_ft_test_report(FILE *out, uint64_t first, uint64_t last);
+void totk_ft_test_hold(uint64_t frame);
+void totk_ft_test_release(uint64_t frame);
+uint64_t totk_ft_test_dropped(void);
 #endif
 #else
 static inline int totk_ft_on(void) { return 0; }

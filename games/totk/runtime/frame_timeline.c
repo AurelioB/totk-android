@@ -11,13 +11,14 @@
 #include <semaphore.h>
 #endif
 
-/* Locks cover only a bounded memory update/copy, never I/O or another lock.
- * An expired async writer is rejected, rather than corrupting a reused entry. */
+/* One try only, for producers AND snapshots. A preempted owner must never
+ * stall a game thread. Copies remain lock-protected (no racy seqlock payload).
+ * Contention loses evidence, not game progress; report cumulative losses. */
 typedef struct { atomic_flag lock; totk_ft_record data; } ft_entry;
 static ft_entry ring[FT_RING];
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 _Atomic int totk_ft_enabled = -1;
-static _Atomic uint64_t current = 1, expired;
+static _Atomic uint64_t current = 1, expired, dropped_events, snapshot_busy;
 _Thread_local uint64_t totk_ft_active_frame;
 _Thread_local totk_ft_work_counts totk_ft_active_work;
 /* Written and consumed only by the sender's host thread. A wake copies this
@@ -49,13 +50,17 @@ static void initialize(void) {
 }
 int totk_ft_init(void) { pthread_once(&once, initialize); return atomic_load(&totk_ft_enabled); }
 uint64_t totk_ft_current(void) { return atomic_load_explicit(&current, memory_order_relaxed); }
-static void lock_entry(ft_entry *e) {
-    while (atomic_flag_test_and_set_explicit(&e->lock, memory_order_acquire)) {}
+static int try_entry(ft_entry *e) {
+    return !atomic_flag_test_and_set_explicit(&e->lock, memory_order_acquire);
 }
 static void unlock_entry(ft_entry *e) { atomic_flag_clear_explicit(&e->lock, memory_order_release); }
 static ft_entry *entry(uint64_t frame) {
     if (!frame || !totk_ft_on()) return NULL;
-    ft_entry *e = &ring[frame % FT_RING]; lock_entry(e);
+    ft_entry *e = &ring[frame % FT_RING];
+    if (!try_entry(e)) {
+        atomic_fetch_add_explicit(&dropped_events, 1, memory_order_relaxed);
+        return NULL;
+    }
     if (e->data.frame > frame) {
         atomic_fetch_add_explicit(&expired, 1, memory_order_relaxed); unlock_entry(e); return NULL;
     }
@@ -63,9 +68,15 @@ static ft_entry *entry(uint64_t frame) {
     return e;
 }
 static int snapshot(uint64_t frame, totk_ft_record *out) {
-    ft_entry *e = &ring[frame % FT_RING]; lock_entry(e);
+    memset(out, 0, sizeof *out);
+    if (!frame) return 0;
+    ft_entry *e = &ring[frame % FT_RING];
+    if (!try_entry(e)) {
+        atomic_fetch_add_explicit(&snapshot_busy, 1, memory_order_relaxed);
+        return 0;
+    }
     int found = frame && e->data.frame == frame;
-    if (found) *out = e->data; else memset(out, 0, sizeof *out);
+    if (found) *out = e->data;
     unlock_entry(e); return found;
 }
 void totk_ft_work_begin(uint64_t frame) {
@@ -474,8 +485,9 @@ static void report(FILE *out, uint64_t first, uint64_t last) {
                 r.acquire_pacing_ns / 1e6, r.acquire_texture_ns / 1e6, r.lost_walks, r.lost_slots); funlockfile(out);
         prev = r;
     }
-    fprintf(out, "[frame-tl summary] frames=%llu..%llu late=%u dominant(wake/walk/submit/gpu/acquire/present/unknown)=%u/%u/%u/%u/%u/%u/%u missing=%u overflow_frames=%u expired_events=%llu attribution=largest-positive-growth-vs-previous-frame-not-causality\n",
-            (unsigned long long)first, (unsigned long long)last, late, dominant[0], dominant[1], dominant[2], dominant[3], dominant[4], dominant[5], dominant[6], missing, overflow, (unsigned long long)atomic_load(&expired));
+    fprintf(out, "[frame-tl summary] frames=%llu..%llu late=%u dominant(wake/walk/submit/gpu/acquire/present/unknown)=%u/%u/%u/%u/%u/%u/%u missing=%u overflow_frames=%u expired_events=%llu dropped_events=%llu inconsistent_samples=%llu attribution=largest-positive-growth-vs-previous-frame-not-causality\n",
+            (unsigned long long)first, (unsigned long long)last, late, dominant[0], dominant[1], dominant[2], dominant[3], dominant[4], dominant[5], dominant[6], missing, overflow, (unsigned long long)atomic_load(&expired),
+            (unsigned long long)atomic_load(&dropped_events), (unsigned long long)atomic_load(&snapshot_busy));
     for (unsigned group = 0; group < 2; group++) {
         flockfile(out);
         fprintf(out, "[frame-tl work] frames=%llu..%llu class=%s n=%u means_per_frame",
@@ -505,8 +517,9 @@ static void *report_worker(void *unused) {
 }
 #endif
 void totk_ft_present(uint64_t f, uint64_t target, uint64_t now) {
-    ft_entry *e = entry(f); if (!e) return;
-    e->data.present = now; e->data.target = target; unlock_entry(e);
+    if (!f || !totk_ft_on()) return;
+    ft_entry *e = entry(f);
+    if (e) { e->data.present = now; e->data.target = target; unlock_entry(e); }
     totk_ff_present(f, now);
     atomic_store_explicit(&current, f + 1, memory_order_relaxed);
 #ifndef TOTK_FRAME_TIMELINE_TEST
@@ -519,5 +532,11 @@ void totk_ft_present(uint64_t f, uint64_t target, uint64_t now) {
 #ifdef TOTK_FRAME_TIMELINE_TEST
 int totk_ft_snapshot(uint64_t f, totk_ft_record *out) { return snapshot(f, out); }
 void totk_ft_test_report(FILE *out, uint64_t first, uint64_t last) { report(out, first, last); }
+void totk_ft_test_hold(uint64_t f) {
+    /* Called by the synthetic reporter only, before starting producers. */
+    if (!try_entry(&ring[f % FT_RING])) abort();
+}
+void totk_ft_test_release(uint64_t f) { unlock_entry(&ring[f % FT_RING]); }
+uint64_t totk_ft_test_dropped(void) { return atomic_load(&dropped_events); }
 #endif
 #endif

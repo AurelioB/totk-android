@@ -3037,6 +3037,44 @@ int main(int argc, char **argv) {
     p_viewports vp; memset(&vp, 0, sizeof vp); vp.n = 1; vp.v[0][2] = 64; vp.v[0][3] = 64; vp.v[0][5] = 1; op(OP_VIEWPORTS, &vp, sizeof vp);
     p_draw dw = {4, 0, 3, 0, 0}; op(OP_DRAW, &dw, sizeof dw);
     p_copy_b2t cp; memset(&cp, 0, sizeof cp); cp.src = (uint64_t)(uintptr_t)readback; cp.tex = &rt; cp.r = (NVNcopyRegion){0, 0, 0, 64, 64, 1}; op(OP_COPY_T2B, &cp, sizeof cp);
+    if (argc == 2 && !strcmp(argv[1], "--timeline-bench")) {
+        CHECK(mtl_wait(run(), 5000000000ull), "timeline benchmark initial scene completes");
+        enum { passes = 150, draws = 4400, warmup = 30, frames = 200 };
+        rn = 0;
+        for (unsigned pass = 0; pass < passes; pass++) {
+            op(OP_SET_RT, &srt, sizeof srt); op(OP_CLEAR_COLOR, &cc, sizeof cc);
+            for (unsigned draw = pass * draws / passes; draw < (pass + 1) * draws / passes; draw++) {
+                p_scissor pixel = {(int)(draw % 64), (int)(draw / 64 % 64), 1, 1};
+                op(OP_BIND_PROGRAM, &bp, sizeof bp);
+                op(OP_BIND_VBUF, &vb, offsetof(p_bind_vbuf, r) + sizeof vb.r[0]);
+                op(OP_BIND_UBO, &u0, sizeof u0); op(OP_BIND_UBO, &u1, sizeof u1);
+                op(OP_BIND_TEX, &th, offsetof(p_bind_handles, h) + sizeof th.h[0]);
+                op(OP_SCISSOR, &pixel, sizeof pixel); op(OP_DRAW, &dw, sizeof dw);
+            }
+            /* Real copy closes each pass; no fake driver calls or CPU work. */
+            op(OP_COPY_T2B, &cp, sizeof cp);
+        }
+        op(OP_END, NULL, 0);
+        uint64_t cpu = 0, wall = 0, count_draws = 0, count_passes = 0;
+        for (unsigned frame = 0; frame < warmup + frames; frame++) {
+            vk_record_test_counts before, after; vk_record_test_counts_get(&before);
+            uint64_t c0 = walk_clock(CLOCK_THREAD_CPUTIME_ID), t0 = host_now_ns();
+            mtl_sub_begin(); mtl_exec(rec); uint64_t fence = mtl_sub_commit();
+            uint64_t elapsed = host_now_ns() - t0, used = walk_clock(CLOCK_THREAD_CPUTIME_ID) - c0;
+            if (totk_ft_on()) totk_ft_walk(totk_ft_current(), t0, t0 + elapsed, used);
+            if (frame >= warmup) { cpu += used; wall += elapsed; }
+            CHECK(mtl_wait(fence, 5000000000ull), "timeline benchmark frame %u completes", frame);
+            vk_record_test_counts_get(&after);
+            CHECK(after.draws - before.draws == draws && after.passes - before.passes == passes,
+                  "timeline benchmark retains 4400 draws and 150 actual passes");
+            count_draws += after.draws - before.draws; count_passes += after.passes - before.passes;
+            if (totk_ft_on()) totk_ft_present(totk_ft_current(), 33333333, host_now_ns());
+        }
+        printf("timeline-bench enabled=%d measured=%u warmup=%u commands=31251 draws=%u passes=%u cpu_ns_per_frame=%.3f wall_ns_per_frame=%.3f checked_draws=%llu checked_passes=%llu\n",
+               totk_ft_on(), frames, warmup, draws, passes, cpu / (double)frames, wall / (double)frames,
+               (unsigned long long)count_draws, (unsigned long long)count_passes);
+        return fails != 0;
+    }
     if (argc >= 2 && !strcmp(argv[1],"--alpha-test")) {
         CHECK(mtl_wait(run(),5000000000ull),"alpha fixture initial draw completes");
         const float full[]={-1,-1,3,-1,-1,3}; memcpy(vtx,full,sizeof full);
@@ -4366,9 +4404,17 @@ int main(int argc, char **argv) {
                 CHECK(totk_ft_snapshot(totk_ft_current(), &record), "timeline retains identity walk frame");
                 CHECK(record.work.value[FT_COUNT_DRAWS] - ft_before.work.value[FT_COUNT_DRAWS] == 2068,
                       "timeline actual worker/inline draws match independently checked stream count");
-                CHECK(record.work.value[FT_COUNT_REC_SAMPLES] > ft_before.work.value[FT_COUNT_REC_SAMPLES] &&
-                      record.work.value[FT_COUNT_REC_P_NS] > ft_before.work.value[FT_COUNT_REC_P_NS],
-                      "timeline opcode sampling captures parallelizable work without requiring full profiler");
+                if (getenv("TOTK_VK_REC_PROFILE") && !strcmp(getenv("TOTK_VK_REC_PROFILE"), "1")) {
+                    CHECK(record.work.value[FT_COUNT_REC_SAMPLES] > ft_before.work.value[FT_COUNT_REC_SAMPLES] &&
+                          record.work.value[FT_COUNT_REC_P_NS] > ft_before.work.value[FT_COUNT_REC_P_NS],
+                          "explicit recorder profiling retains sampled parallelizable work");
+                } else {
+                    CHECK(!record.work.value[FT_COUNT_REC_SAMPLES] &&
+                          !record.work.value[FT_COUNT_REC_S_NS] && !record.work.value[FT_COUNT_REC_P_NS] &&
+                          !record.work.value[FT_COUNT_REC_O_NS] &&
+                          record.work.value[FT_COUNT_REC_WALL_NS] > ft_before.work.value[FT_COUNT_REC_WALL_NS],
+                          "timeline uses existing walk clocks, never opcode/category probes");
+                }
                 printf("frame-tl identity: frame=%llu samples=%llu S/P/O_ns=%llu/%llu/%llu draws=%llu cpu_steps=%llu\n",
                     (unsigned long long)record.frame, (unsigned long long)record.work.value[FT_COUNT_REC_SAMPLES],
                     (unsigned long long)record.work.value[FT_COUNT_REC_S_NS], (unsigned long long)record.work.value[FT_COUNT_REC_P_NS],

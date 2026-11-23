@@ -425,13 +425,6 @@ void vk_rec_profile_end(void) {
     if (vk_rec_profile_on) g_rec.coarse_ns += T_rec.last - T_rec.coarse_start;
     T_rec.active = T_rec.weight = T_rec.timeline = 0;
 }
-/* Timeline-only mode reuses the exclusive scopes without enabling the full profiler, calibration or logs.
-   Opcode S/P/O intervals are sampled at 1/64 and weighted 64x. Outside mtl_exec the lifecycle is exact,
-   at weight one; unselected opcode scopes take no clock reads, including O. */
-static void rec_timeline_begin(void) {
-    T_rec.active = T_rec.weight = T_rec.timeline = 1;
-    T_rec.rate = 64; T_rec.category = VK_REC_S_STREAM; T_rec.last = rec_now();
-}
 #ifdef TOTK_VK_TESTS
 void vk_record_test_profile_ns(uint64_t *out, size_t count) {
     if (count > VK_REC_N) count = VK_REC_N;
@@ -674,7 +667,9 @@ static void vk_init_once(void) {
     { const char *e = getenv("TOTK_VK_LOOKUP_STATS"); g_lookup_stats = e && atoi(e); }
     wb_alias_init();
     { const char *e = getenv("TOTK_VK_REC_PROFILE"); vk_rec_profile_on = e && !strcmp(e, "1"); }
-    vk_rec_timing_on = vk_rec_profile_on || totk_ft_on();
+    /* Timeline-only recording uses the existing walk-wall span. Never turn on
+     * per-opcode/category clock probes just to collect per-frame evidence. */
+    vk_rec_timing_on = vk_rec_profile_on;
     const char *gpl_env = getenv("TOTK_VK_PIPELINE_LIBRARY");
     int gpl_requested = gpl_env && !strcmp(gpl_env, "1");
     V.has_pipeline_library = 0;
@@ -3857,7 +3852,6 @@ void mtl_sub_begin(void) {
     T_ft_walk_frame = totk_ft_on() ? totk_ft_current() : 0;
     totk_ft_work_begin(T_ft_walk_frame);
     if (__builtin_expect(vk_rec_profile_on, 0)) vk_rec_profile_begin(VK_REC_S_STREAM);
-    else if (T_ft_walk_frame) rec_timeline_begin();
     if (g_lookup_stats) atomic_store_explicit(&g_lookup_thread, (uintptr_t)pthread_self(), memory_order_relaxed);
     g_ncarry = 0; snap_reset(); g_perf_t0 = host_now_ns(); g_perf_cpu_t0 = walker_cpu_now();
     g_perf_sub0 = g_perf_wait_ns; g_in_sub = 1;
@@ -6428,6 +6422,7 @@ uint64_t mtl_sub_commit(void) {
         uint64_t cpu = walker_cpu_now() - g_perf_cpu_t0, dt = host_now_ns() - g_perf_t0;
         uint64_t w = g_perf_wait_ns - g_perf_sub0, r = dt > w ? dt - w : 0;
         g_perf_cpu_ns += cpu; g_perf_elapsed_ns += dt;
+        totk_ft_count(FT_COUNT_REC_WALL_NS, dt); /* existing clocks, once per walk */
         g_perf_replay_ns += r; g_cum[0] += r; g_perf_t0 = 0; g_perf_subs++; vk_record_walk_time(r);
         HK_ADD(subs, 1); HK_ADD(replay_ns, r); HK_ADD(wait_ns, w);
     }

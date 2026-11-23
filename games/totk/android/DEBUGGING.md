@@ -892,6 +892,24 @@ FILE classification path. Android syntax passed the final dirty tracker. Evidenc
 
 ## Frame critical-path timeline (opt-in, 2026-10-23)
 
+**Performance warning (2026-11-23): keep `TOTK_FRAME_TIMELINE=0` for tail and performance
+acceptance until this implementation's overhead is measured on a device.** The old implementation
+added about **4.7 ms of render-thread command-walk CPU per frame on AYN Thor** (15.9 → 20.6 ms,
+about +30%). Equal 40-minute standing exposures had **13 walks ≥60 ms with it on, zero with it
+off**; sampled long-walk PCs included the timeline's unbounded ring-lock spin. Pre-fix timeline-on
+results have inflated walk CPU and suspect worst-frame figures. This implicates the diagnostic as
+a whole, not a proven lock holder or every player hitch.
+
+Producers now try a ring entry exactly once and drop contended evidence rather than spin or wait.
+The reporter also tries once and skips busy snapshots; payload copies remain lock-protected, so
+no torn record is accepted. `[frame-tl summary]` adds cumulative `dropped_events` (producer updates)
+and `inconsistent_samples` (busy snapshot attempts skipped, not copies accepted with torn fields).
+Nonzero losses make the affected reports incomplete; missing values are not evidence of zero cost.
+Frame IDs and reporting watermarks still advance when a present update is dropped. The separate
+fence-evidence rings likewise use one try, retaining their existing cumulative `busy` coverage.
+No locks are held across formatting/I/O.
+
+
 Operator observation, **not rerun here**: Thor, 60-Hz panel, shipping 30-fps controller, protected lag,
 `CHUNK_DRAWS=600` and two recorder threads averages 29.6–29.8 fps, but each 300-frame window contains 22–59
 40–60-ms frames followed by short frames. There are no in-game pipeline compiles; display pacing did not fix
@@ -925,7 +943,7 @@ Instrumentation and ownership:
   only after `nvnQueuePresentTexture` returns through its host implementation. Every host anchor uses
   `CLOCK_MONOTONIC`; GPU query durations are converted with the existing timestamp period, not mixed into the
   CPU time domain. There is no hot-path allocation, file write or per-frame logging. Disabled hooks do not read
-  clocks. Short atomic-flag critical sections protect record updates/snapshots, with no I/O under those flags.
+  clocks. Single-attempt atomic-flag ownership protects updates/copies; contention is counted, never waited on.
 - `runtime/threads.c` marks the guest thread actually calling `QueueSubmitCommands` as a walker. For its
   blocking SVC `0x34` address waits, the existing wake machinery records the signalling guest's handle and
   ready time. After the wait and virtual-core reacquisition, the first successful wake by TOTK main thread
@@ -985,9 +1003,10 @@ completion evidence at the report deadline stays missing; the diagnostic does no
   span or presenter delay, or excess wake-to-wake interval above target. Summary counts those candidates
   across late frames. Compare raw anchors to follow propagated delay before blaming a stage. Missing GPU
   completions cannot win the GPU category; unchanged/unknown growth reports `unknown`.
-- Capacity is 32 walks / 64 slots per frame. `lost_walks`, `lost_slots`, `overflow_frames`, `missing` and
-  `expired_events` expose truncation or a reporter falling behind the ring. An expired async writer cannot
-  corrupt a reused frame entry. Walking totals remain cumulative after walk-detail capacity is reached.
+- Capacity is 32 walks / 64 slots per frame. `lost_walks`, `lost_slots`, `overflow_frames`, `missing`,
+  `expired_events`, `dropped_events` and `inconsistent_samples` expose truncation/contention or a reporter
+  falling behind the ring. An expired async writer cannot corrupt a reused frame entry. Walking totals
+  remain cumulative after walk-detail capacity is reached; contended updates may be absent.
 
 ### Walk-variance counters
 
@@ -1013,13 +1032,13 @@ means; the preceding anchor frame is not counted. Empty groups print `n=0 ... mi
   counts new texture images, including format upgrades/dummy images, not views or shared-image reuse.
 - `cpu_steps` counts actual replay CPU-step boundaries. Creation/worker counters retain their originating walk's
   frame ID even when the work finishes later; no worker attributes work to whichever frame happens to be current.
-- `rec_s_ns/rec_p_ns/rec_o_ns` are the recorder's exclusive sequential/parallelizable/other split. Without
-  `TOTK_VK_REC_PROFILE`, opcode scopes are sampled at **1/64**, weighted by 64; `rec_samples` reports actual selected
-  scopes. Lifecycle outside opcode replay is measured directly. These are noisy per-frame time estimates, not exact
-  CPU-time counters or an overhead subtraction. If the full recorder profiler is explicitly enabled, its configured
-  sampling rate is retained instead; compare runs with the same settings.
-  They exclude asynchronous worker CPU time and are not a complete partition of walk wall time; the existing timing
-  scope ends before post-unlock resource sweeping.
+- `rec_wall_ns` reuses the recorder's existing wall-clock begin/commit measurements, summed once per
+  walk, with no extra timer reads. It includes recorder waits, is not thread CPU, and starts after
+  setup/lag-pressure work; the outer `walk` scope also includes NVN/deferred-bind work.
+  Timeline-only mode no longer enables opcode/category elapsed-time probes: `rec_s_ns/rec_p_ns/rec_o_ns`
+  and `rec_samples` are zero/unmeasured in that mode, **not zero execution time**. For the old exclusive
+  sequential/parallelizable/other split, explicitly enable `TOTK_VK_REC_PROFILE=1`; its configured
+  sampling rate and additional overhead remain, and such runs are diagnostic-only.
 
 Per-event walking counters use thread-local additions and are published once per walk. Secondary descriptor/draw
 counts publish per job, rather than taking the timeline ring lock for every draw/allocation. Rare asynchronous
@@ -1040,10 +1059,13 @@ sampled parallelizable timing. All identity outputs are byte-identical across th
 `cc1.sh` checks passed for all nine changed C translation units without diagnostics. Evidence is under
 `.scratch/integ3/walk-variance/`; no device run or performance improvement is claimed.
 
-Use the existing frame-timeline environment, with `TOTK_FRAME_TIMELINE=1` and **`TOTK_VK_REC_PROFILE` unset** for
-the cheap fixed-1/64 path. Keep recorder count, lag and pacing settings identical to the baseline. Retain the entire
-`[frame-tl work]` pair and late rows; compare counter growth together with measured walk/off-CPU times, not sampled
-S/P/O alone. This change diagnoses variance; it does not change main-thread handoff or frame buffering.
+Use the existing frame-timeline environment, with `TOTK_FRAME_TIMELINE=1` and **`TOTK_VK_REC_PROFILE` unset**
+for per-walk elapsed accounting. Retain the entire `[frame-tl work]` pair, loss counters and late rows; compare
+counter growth with measured walk/off-CPU times. Per-slot seal/queue/GPU anchors are retained because the
+report needs their ordering and maximum latency. Draw/pass/lag counts remain TLS additions, merged once
+per walk (worker draws/descriptors once per job); no per-draw/pass ring setters were added.
+This change does not change main-thread handoff or frame buffering. Host checks and the realistic
+150-pass/4,400-draw/31,251-command `vkdrawtest --timeline-bench` do not establish Android observer cost.
 
 Host acceptance exercised for this change: `.scratch/cc1.sh` passed for `frame_timeline.c`, `threads.c`,
 `hle_nvn.c`, `nvn_vk.c` and `vk_draw.c`; the deterministic bookkeeping test passed enabled and disabled.
