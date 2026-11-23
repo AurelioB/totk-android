@@ -1,4 +1,4 @@
-"""Keep the abandoned A/B lifetime scenarios unchanged against main 8bbbce5.
+"""Keep the abandoned A/B lifetime scenarios unchanged against main bad3012.
 
 Adapted from the prior branch's test_main_defects/test_pool_lifetime scenarios.
 Both source versions run the same production-slice fixture and real shared-page
@@ -16,7 +16,7 @@ import unittest
 
 import test_main_defects as fixture
 
-BASE = '8bbbce573ff9f68d73c248667889e9379ffc81f5'
+BASE = 'bad30123ed8f797118211367ed3d0533b633ec5b'
 GFX_PATH = 'games/totk/android/gfx/'
 VPOOL_PATH = 'games/totk/third_party/d2r_gfx/gfx/nvn/totk_vpool.c'
 
