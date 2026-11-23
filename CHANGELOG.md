@@ -37,9 +37,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   ([#4](https://github.com/AurelioB/totk-android/issues/4)). Thanks to @Dorkington
   ([#43](https://github.com/AurelioB/totk-android/pull/43)); keep the credited MIT adaptation.
   The varying correction is on by default (`TOTK_VK_VARYING_FIX=0` opts out); integer folding and all
-  other module postprocessing still apply. Separate cache/prewarm namespaces rebuild driver pipelines
-  once, without rebuilding shader packs. Worker seed-IO accounting is thread-safe and session logs count
-  patched/fallback shader pairs. The contributor's independent NaN min/max/clamp rewrite is retained as
+  other module postprocessing still apply. New cache namespaces seed unchanged driver entries from a
+  context-matched predecessor without reusing its prewarm completion bits or changing shader packs.
+  Startup cache-only probes publish hits before play; only misses queue for compilation. Rollback files
+  remain untouched. Worker seed-IO accounting is thread-safe and session logs count patched/fallback
+  shader pairs. The contributor's independent NaN min/max/clamp rewrite is retained as
   **default-off** `TOTK_VK_NAN_MINMAX=1`, pending separate device qualification. Host checks cannot establish
   the wind picture, ordinary-scene regressions, prewarm time or frame-time effects on devices.
   Keep presentation-time varying statistics independent of module creation. Cache-only probes now defer

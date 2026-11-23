@@ -29,6 +29,15 @@ int main(int argc, char **argv) {
     assert(vk_shader_cache_path("custom-import", imported, sizeof imported));
     assert(!vk_shader_cache_path("0", path, sizeof path));
     assert(!vk_shader_cache_path("oversize", path, 4));
+    char predecessors[7][1100];
+    for (unsigned i = 0; i < 7; i++) {
+        assert(vk_shader_cache_predecessor("state/vk-pipeline-cache.bin", i, predecessors[i], sizeof predecessors[i]));
+        assert(strcmp(cache, predecessors[i]));
+        for (unsigned j = 0; j < i; j++) assert(strcmp(predecessors[i], predecessors[j]));
+    }
+    assert(!vk_shader_cache_predecessor("state/vk-pipeline-cache.bin", 7, path, sizeof path));
+    assert(!vk_shader_cache_predecessor("0", 0, path, sizeof path));
+    assert(!vk_shader_cache_predecessor("oversize", 0, path, 4));
     puts(seed_dir()); puts(cache); puts(prewarm); puts(imported);
     uint32_t w[] = {0x07230203, 0x00010300, 0, 1, 0, 2u << 16 | 17, 55, 2u << 16 | 17, 56};
     assert(spirv_image_features_ok(w, 9, 1, 1));

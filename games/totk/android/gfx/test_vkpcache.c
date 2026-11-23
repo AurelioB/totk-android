@@ -2,6 +2,7 @@
 #include "vk_int.h"
 #include "vk_pcache_store.h"
 #include "vk_pcache_identity.h"
+#include "vk_pso_keys.h"
 #include <sys/wait.h>
 #include <time.h>
 static int checks, failures;
@@ -305,7 +306,79 @@ static int real_context_case(unsigned mode) {
     printf("pcache context %s variant=%u: %d checks, %d failed\n", importing ? "import" : "primary", variant, checks, failures);
     return failures != 0;
 }
+static int upgrade_case(const char *source, unsigned variant) {
+    /* A real Vulkan cache payload, but policy siblings are fixtures, never a user's cache. */
+    int fd = open(source, O_RDONLY); struct stat st; pcache_identity header;
+    int valid = fd >= 0 && !fstat(fd, &st) && pcache_read_exact(fd, &header, sizeof header, 0);
+    CHECK(valid, "upgrade source envelope"); if (!valid) { if (fd >= 0) close(fd); return 1; }
+    size_t offset = pcache_identity_size(&header), size = (size_t)st.st_size - offset;
+    void *blob = malloc(size);
+    valid = blob && pcache_read_exact(fd, blob, size, (off_t)offset);
+    CHECK(valid, "upgrade source payload");
+    close(fd);
+    if (!valid) { free(blob); return 1; }
+    char base[128], import[128], target[1100], predecessor[1100], marker[1200];
+    snprintf(base, sizeof base, "state/upgrade-%u.bin", variant);
+    snprintf(import, sizeof import, "state/upgrade-import-%u.bin", variant);
+    vk_shader_cache_path(base, target, sizeof target);
+    const char *seed_base = variant == 8 ? import : base;
+    vk_shader_cache_predecessor(seed_base, 0, predecessor, sizeof predecessor);
+    uint8_t driver[32] = {0}; if (variant == 3) driver[0] = 1;
+    pcache_identity *id = pcache_identity_create(variant == 5 ? "sysmem" : "", driver, 0);
+    if (variant == 4) ((uint32_t *)blob)[4] ^= 1; /* Vulkan UUID, not opaque instructions */
+    if (variant != 1) context_fixture(predecessor, variant == 6 ? NULL : id, blob, size);
+    if (variant == 2 || variant == 7) CHECK(!truncate(predecessor, 7), "corrupt predecessor fixture");
+    char fallback[1100] = {0};
+    if (variant == 7) {
+        for (unsigned i = 0; i < 7; i++) {
+            char candidate[1100]; vk_shader_cache_predecessor(base, i, candidate, sizeof candidate);
+            if (!*fallback || strlen(candidate) < strlen(fallback)) strcpy(fallback, candidate);
+        }
+        context_fixture(fallback, id, blob, size);
+    }
+    if (variant == 9) context_fixture(target, id, blob, size);
+    char temporary[1200]; snprintf(temporary, sizeof temporary, "%s.tmp", target);
+    if (variant == 10) {
+        FILE *abandoned = fopen(temporary, "wb"); CHECK(abandoned != NULL, "interrupted target fixture");
+        if (abandoned) { fputs("TOTKPC", abandoned); fclose(abandoned); }
+    }
+    free(id); free(blob);
+    snprintf(marker, sizeof marker, "%s.pso-state", predecessor);
+    FILE *f = fopen(marker, "wb"); CHECK(f != NULL, "old completion fixture");
+    uint8_t completion[8+32+32+PSO_BITMAP_BYTES+32] = {0};
+    memcpy(completion, "TOTKPM01", 8); memset(completion+8, 0x51, 32);
+    pcache_driver_hash(predecessor, completion+40); completion[72]=0xff; completion[73]=1;
+    pso_hash(completion, sizeof completion-32, completion+sizeof completion-32);
+    if (f) { CHECK(fwrite(completion, 1, sizeof completion, f)==sizeof completion, "valid completed-state envelope"); fclose(f); }
+    uint8_t old_sha[32], after_sha[32], state_sha[32], state_after[32];
+    int existed = pcache_driver_hash(predecessor, old_sha);
+    CHECK(pcache_driver_hash(marker, state_sha), "old completion digest");
+    setenv("TOTK_VK_PIPELINE_CACHE", base, 1);
+    setenv("TOTK_VK_PIPELINE_CACHE_IMPORT", import, 1);
+    setenv("TOTK_VK_PREWARM", "0", 1); unsetenv("TU_DEBUG");
+    mtl_init();
+    int wanted = variant == 0 || variant == 7 || variant == 8 || variant == 10;
+    CHECK(vk_pcache_seeded() == wanted, "only fully context-matched predecessor seeds absent primary");
+    CHECK((vk_pcache_loaded_path() != NULL) == (variant == 9), "a seed is not primary/resume authority");
+    CHECK(existed == pcache_driver_hash(predecessor, after_sha) && (!existed || !memcmp(old_sha, after_sha, 32)),
+          "downgrade predecessor cache untouched, including rejected contexts/corruption");
+    CHECK(pcache_driver_hash(marker, state_after) && !memcmp(state_sha, state_after, 32), "downgrade completion untouched");
+    char path[1200]; snprintf(path, sizeof path, "%s.pso-state", target);
+    CHECK(access(path, F_OK) != 0, "old marker never copied to target");
+    snprintf(path, sizeof path, "%s.stale", predecessor); CHECK(access(path, F_OK) != 0, "rejected predecessor not quarantined");
+    snprintf(path, sizeof path, "%s.imported", predecessor); CHECK(access(path, F_OK) != 0, "predecessor import remains read-only");
+    vk_pcache_flush();
+    if (wanted) CHECK(!access(target, F_OK), "merged driver data saved durably under new namespace");
+    if (variant == 10) CHECK(access(temporary, F_OK) != 0, "successful atomic save replaces/removes abandoned temporary");
+    vk_pcache_shutdown();
+    CHECK(existed == pcache_driver_hash(predecessor, after_sha) && (!existed || !memcmp(old_sha, after_sha, 32)),
+          "new cache persistence leaves rollback cache intact");
+    unlink(target); unlink(predecessor); unlink(marker); if (*fallback) unlink(fallback);
+    printf("pcache upgrade variant=%u: %d checks, %d failed\n", variant, checks, failures);
+    return failures != 0;
+}
 int main(int argc, char **argv) {
+    if (argc == 4 && !strcmp(argv[1], "--upgrade")) return upgrade_case(argv[2], (unsigned)atoi(argv[3]));
     if (argc > 2 && !strcmp(argv[1], "--context")) return real_context_case((unsigned)atoi(argv[2]));
     int reload = argc > 1 && !strcmp(argv[1], "--reload");
     if (!reload) { policies(); stores(); contexts(); }

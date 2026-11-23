@@ -730,6 +730,7 @@ int vk_unwritten_mask_on(void);                 /* TOTK_VK_UNWRITTEN_MASK: pipel
 int vk_shaders_ready(void);
 void vk_shader_seed_startup(const char *game_dir); /* freeze game-relative selection and diagnose seed before replay */
 const char *vk_shader_cache_path(const char *base, char *out, size_t size); /* folder/content-isolated disk state */
+const char *vk_shader_cache_predecessor(const char *base, unsigned index, char *out, size_t size); /* seven same-seed/position arms */
 vk_shader *vk_shader_seed(const char *variant, int stage, int early_tests); /* startup/replay exact seed, no guest state */
 vk_shader *vk_shader_alpha(vk_shader *base, unsigned func);
 void vk_pipeline_prewarm(void);   /* device/cache ready, before replay: load keys and queue the compile workers */

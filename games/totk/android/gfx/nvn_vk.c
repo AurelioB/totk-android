@@ -965,29 +965,9 @@ static void vk_init_once(void) {
     VkPipelineCacheCreateInfo pcc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = pc_size, .pInitialData = pc_data};
     VKCHECK(vkCreatePipelineCache(V.dev, &pcc, NULL, &V.pcache));
     free(pc_data);
-    { const char *base = getenv("TOTK_VK_PIPELINE_CACHE_IMPORT"); if (!base || !*base) base = "vk-pipeline-cache.bin";
-      char import_path[1100]; const char *ip = vk_shader_cache_path(base, import_path, sizeof import_path);
-      /* Imports retain their arm's filename; never relabel the opposite arm's
-       * blob into this namespace, even when the selected import is absent. */
-      if (ip) {
-          const char fold[] = ".intfold-v1"; size_t len = strlen(ip), suffix = sizeof fold - 1;
-          char other[1100]; int n;
-          if (len >= suffix && !strcmp(ip + len - suffix, fold))
-              n = snprintf(other, sizeof other, "%.*s", (int)(len - suffix), ip);
-          else n = snprintf(other, sizeof other, "%s%s", ip, fold);
-          if (n >= 0 && (size_t)n < sizeof other && !access(other, F_OK))
-              LOGV("[pipeline-cache] import skipped: %s does not match effective namespace %s", other, ip);
-      }
-      size_t isz = 0; void *idata = vk_pcache_load(ip, &isz, 0); VkPipelineCache ic;
-      VkPipelineCacheCreateInfo icc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = isz, .pInitialData = idata};
-      if (idata && !vkCreatePipelineCache(V.dev, &icc, NULL, &ic)) {
-          VkResult r = vkMergePipelineCaches(V.dev, V.pcache, 1, &ic); vkDestroyPipelineCache(V.dev, ic, NULL);
-          if (!r) vk_pcache_changed();
-          char done[1100]; snprintf(done, sizeof done, "%s.imported", ip);
-          if (!r && !rename(ip, done)) LOGV("pipeline cache: merged %zu KiB from %s (now %s)", isz >> 10, ip, done);
-          else RED(4, "pipeline cache: importing %s: merge %d, rename %s", ip, r, strerror(errno));
-      }
-      free(idata); }
+    { const char *base = getenv("TOTK_VK_PIPELINE_CACHE"), *import = getenv("TOTK_VK_PIPELINE_CACHE_IMPORT");
+      vk_pcache_imports(base && *base ? base : "state/vk-pipeline-cache.bin",
+                       import && *import ? import : "vk-pipeline-cache.bin"); }
     vk_pcache_start(pcache_path(), pc_size);
     vk_fmt_set_depth(depth_choice(VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D32_SFLOAT), depth_choice(VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT));
     vk_post_init();   /* optional internal pipelines are ready before game recording starts */

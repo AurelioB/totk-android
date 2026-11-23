@@ -103,17 +103,34 @@ static void seed_init(void) {
 static const char *seed_dir(void) { pthread_once(&g_seed_once, seed_init); return g_seed_dir; }
 /* Every rewrite policy namespaces default and explicit cache/import paths.
    All policies off retains legacy paths. Caller owns out. */
-const char *vk_shader_cache_path(const char *base, char *out, size_t size) {
+static const char *cache_policy_path(const char *base, char *out, size_t size, unsigned policy) {
     pthread_once(&g_seed_once, seed_init);
     pthread_once(&g_position_once, position_init);
     pthread_once(&g_int_fold_once, int_fold_init);
     if (!base || !strcmp(base, "0")) return NULL;
     const char *suffix = vk_position_cache_suffix(g_position_policy);
-    const char *fold = g_int_fold ? ".intfold-v1" : "";
-    const char *vary = g_varying_fix ? ".vary-v1" : "", *nan = g_nan_minmax ? ".nan-v1" : "";
+    const char *fold = policy & 4 ? ".intfold-v1" : "";
+    const char *vary = policy & 2 ? ".vary-v1" : "", *nan = policy & 1 ? ".nan-v1" : "";
     int n = g_seed_default ? snprintf(out, size, "%s%s%s%s%s", base, suffix, fold, vary, nan) :
         snprintf(out, size, "%s.%s%s%s%s%s", base, g_seed_tag, suffix, fold, vary, nan);
     return n >= 0 && (size_t)n < size ? out : NULL;
+}
+const char *vk_shader_cache_path(const char *base, char *out, size_t size) {
+    pthread_once(&g_position_once, position_init);
+    pthread_once(&g_int_fold_once, int_fold_init);
+    return cache_policy_path(base, out, size, (g_int_fold ? 4u : 0) | (g_varying_fix ? 2u : 0) | (g_nan_minmax ? 1u : 0));
+}
+/* Prefer predecessors with a subset of the current rewrites, then other switch arms.
+ * Never cross seed/content or position identity. No directory scan or guessed filename stripping. */
+const char *vk_shader_cache_predecessor(const char *base, unsigned index, char *out, size_t size) {
+    pthread_once(&g_position_once, position_init);
+    pthread_once(&g_int_fold_once, int_fold_init);
+    unsigned current = (g_int_fold ? 4u : 0) | (g_varying_fix ? 2u : 0) | (g_nan_minmax ? 1u : 0);
+    for (unsigned siblings = 0; siblings < 2; siblings++) for (int policy = 7; policy >= 0; policy--) {
+        if ((unsigned)policy == current || !!((unsigned)policy & ~current) != siblings) continue;
+        if (!index--) return cache_policy_path(base, out, size, (unsigned)policy);
+    }
+    return NULL;
 }
 static void seed_io_start(void) {
     char path[1100];

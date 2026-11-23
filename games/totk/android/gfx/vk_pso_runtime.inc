@@ -180,10 +180,21 @@ static void pso_complete(pipe_ent *e, VkResult result, uint64_t dt) {
     g_pw_ns += dt;
     if (!result && !(g_pw_done[i/8] >> (i%8) & 1)) { g_pw_done[i/8] |= 1u << (i%8); g_pw_completed++; }
     if (result) g_pw_failed++;
-    if (!(g_pw_completed % 64) || !g_pw_head)
+    if (!(g_pw_completed % 64) || (!g_pw_head && atomic_load_explicit(&g_pso_ready, memory_order_relaxed)))
         LOGV("[pso-prewarm] progress %u/%u missing=%u failed=%u build_ms=%.1f wall_ms=%.1f", g_pw_completed, g_pw_total, g_pw_missing, g_pw_failed, g_pw_ns/1e6, (host_now_ns()-g_pw_started)/1e6);
 }
 #ifdef TOTK_VK_TESTS
+static unsigned g_key_probe_calls, g_key_build_calls;
+static VKAPI_ATTR VkResult VKAPI_CALL key_probe(VkDevice dev, VkPipelineCache cache, uint32_t count,
+        const VkGraphicsPipelineCreateInfo *info, const VkAllocationCallbacks *alloc, VkPipeline *out) {
+    (void)dev; (void)cache; (void)alloc;
+    int probe = count == 1 && (info->flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
+    if (probe) g_key_probe_calls++; else g_key_build_calls++;
+    /* Synthetic driver cache contains the old module's content identity only. */
+    VkResult result = probe && info->pStages[0].module != (VkShaderModule)(uintptr_t)1 ? VK_PIPELINE_COMPILE_REQUIRED : VK_SUCCESS;
+    *out = result ? VK_NULL_HANDLE : (VkPipeline)(uintptr_t)0x123;
+    return result;
+}
 int vk_pipeline_test_keys(void) {
     unsigned checks = 0, failed = 0;
 #define KTEST(c) do { checks++; if (!(c)) { failed++; printf("FAIL keylist line %d: %s\n", __LINE__, #c); } } while (0)
@@ -248,6 +259,10 @@ int vk_pipeline_test_keys(void) {
     pso_restore_from("pso-cache.bin");
     KTEST(g_pw_completed==3 && g_pw_done[0]==5 && g_pw_done[1]==1);
     KTEST(!vk_pipeline_keys_dirty());
+    g_pw_done[0]=255; g_pw_done[1]=1;
+    vk_pipeline_keys_saved("pso-cache.bin",vk_pipeline_keys_snapshot());
+    memset(g_pw_done,0,sizeof g_pw_done); g_pw_completed=0;
+    pso_restore_from("pso-cache.bin"); KTEST(g_pw_completed==g_pw_total);
     /* An old completed marker and identical cache/list digests must not make a
        newly selected rewrite arm complete. Each arm saves/resumes its own file. */
     const char *rewrite[] = {".vary-v1", ".nan-v1", ".vary-v1.nan-v1"};
@@ -261,6 +276,26 @@ int vk_pipeline_test_keys(void) {
         pso_restore_from("pso-cache.bin"); KTEST(g_pw_completed==3);
         unlink(g_pw_path);
     }
+    /* A completed predecessor is not authority. Only a successful cache-only creation
+     * makes a migration key ready; a changed-module miss remains queued and incomplete. */
+    PFN_vkCreateGraphicsPipelines saved_graphics = vkCreateGraphicsPipelines;
+    vkCreateGraphicsPipelines = key_probe;
+    uint64_t old_sync = atomic_load(&g_hk.pipes_sync), old_async = atomic_load(&g_win_async);
+    memset(g_pw_done, 0, sizeof g_pw_done); g_pw_completed = 0; g_pw_total = 2;
+    pipe_ent hit = {.k=k, .list_index=1}, miss = {.k=k, .list_index=2};
+    vs.mod = (VkShaderModule)(uintptr_t)1; fs.mod = (VkShaderModule)(uintptr_t)2;
+    KTEST(pipe_prewarm_cached(&hit) && atomic_load(&hit.state)==PE_READY && hit.p &&
+        g_pw_completed==1 && g_pw_done[0]==1);
+    vk_shader changed_vs = vs; changed_vs.mod = (VkShaderModule)(uintptr_t)3; miss.k.vs = &changed_vs;
+    KTEST(!pipe_prewarm_cached(&miss) && atomic_load(&miss.state)==PE_QUEUED && !miss.p &&
+        g_pw_completed==1 && g_pw_done[0]==1);
+    KTEST(g_key_probe_calls==2 && old_sync==atomic_load(&g_hk.pipes_sync) && old_async==atomic_load(&g_win_async));
+    VkPipeline built;
+    KTEST(!pipe_create(&miss.k, miss.layout, 0, &built, 0, 0));
+    pipe_publish(&miss, VK_SUCCESS, built, 17);
+    KTEST(g_pw_completed==2 && g_pw_done[0]==3 && atomic_load(&miss.state)==PE_READY && g_key_build_calls==1);
+    vkCreateGraphicsPipelines = saved_graphics;
+    g_pw_total=9; g_pw_completed=0; memset(g_pw_done,0,sizeof g_pw_done);
     strcpy(g_pw_path,"pso-marker.bin");
     memset(g_pw_done,0,sizeof g_pw_done); g_pw_completed=0; g_pw_digest[0]^=1;
     pso_restore_from("pso-cache.bin"); KTEST(g_pw_completed==0); /* changed list */

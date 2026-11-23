@@ -3098,10 +3098,40 @@ modules. The intended Maxwell special-value semantics and driver code cost are n
 the wind result must be tested with this experiment **off**, then NaN behavior separately.
 
 Enabled policies append `.vary-v1` / `.nan-v1` after existing seed/position/integer-fold suffixes,
-including explicit import paths and the cache-derived prewarm `.pso-state` path. Old completion markers
-cannot mark the new namespace complete. This deliberately recompiles all driver pipelines once in a
-new arm, even when a particular module is byte-identical; it does not change shader-list identifiers,
-reflection or packed seeds, and needs no full shader rebuild.
+including explicit import paths and the cache-derived prewarm `.pso-state` path. A missing primary
+is seeded **before workers start** using `vkCreatePipelineCache` + `vkMergePipelineCaches` on the
+first matching sibling: subset policies first (so `.intfold-v1.vary-v1` prefers `.intfold-v1`,
+then eventually legacy unsuffixed), then other switch arms. Seed/content and position identities
+never change. Explicit cache bases and import bases use the same bounded filename generation.
+Automatic seeds require the full driver SHA/source, exact TU_DEBUG and Vulkan vendor/device/UUID
+context; missing/corrupt/mismatching sources stay untouched. Header-only legacy blobs cannot prove
+that context and are not automatic seeds; exact explicit imports retain their existing legacy rule.
+No predecessor is renamed, quarantined, relabelled or deleted. Exact imports still become `.imported`.
+
+Only opaque driver entries migrate, **never completion bits**. Portable PSO keys carry exact variant
+identifiers, FS modes and fixed state, not interface masks, NaN-op presence or rewritten module hashes.
+Those facts require reading/classifying SPIR-V; the reflection/index cannot identify affected pairs
+without loading their shaders. Therefore prewarm checks all outstanding keys against the seeded cache.
+Cache-only hits are published ready at startup (reported separately as `cache_hits`, not `resumed`),
+so their first draws neither queue, join nor count synchronous builds. Misses, including absent
+pair-specific replacement modules, use the ordinary worker/demand path. A changed key is complete only
+after its own successful creation, and progress remains bound to the successfully saved cache digest.
+Drivers without cache-control support retain their existing synchronous path; no zero-wait claim.
+
+Our calls pass the selected replacement VS module, FS module, entry points, specialization, layout
+and pipeline state to Vulkan, not a portable PSO ID as a driver lookup key. Turnip hashes module
+content and compilation inputs: changed bytes miss while unchanged modules retain valid entries.
+This does not promise every driver retains every cache entry. No shader-list identifier, reflection
+or packed seed changes and no full shader rebuild are needed.
+
+Retention is deliberately conservative: the previous build's namespace/cache/state remain intact
+for rollback, costing approximately one extra cache (Thor observed 29,581 KiB, about 29 MiB) plus
+small metadata. Migration creates no on-disk staging copy. Existing main already retains older arms;
+automatic deletion cannot safely distinguish users' explicit files/rollback choices. After confirming
+the new cache was saved and available-key prewarm finished without failures, manually remove only
+known cache/metadata files **older than the immediate predecessor**, in that cache directory; retain
+the immediate predecessor until rollback is no longer needed. Do not delete unrelated explicit paths.
+No automatic broad cleanup or new permanent backup copy is introduced.
 
 Host coverage: `test_vk_position.py`, `test_vk_varyings.py`, `test_vk_shader_seed.py`,
 `test_android_cache_transfer.py`, and `vkpipetest --pso-keylist`. It includes `spirv-val` of rewritten

@@ -5032,10 +5032,15 @@ Both policies change only runtime module bytes. Shader-list identifiers, variant
 bytes stay unchanged: **no full shader rebuild**. Cache names append `.vary-v1` when the varying fix is
 on, then `.nan-v1` only for the NaN experiment. Explicit cache/import paths and `.pso-state` completion
 files use the same namespace. Existing completed prewarm state does not skip the new arm's modules.
-The first default launch after this update has a cold driver cache for **all graphics and compute
-pipelines**, including those whose shader bytes are unaffected. Expect one-time background/on-demand
-compilation and route stutter; later launches resume this arm's warmed cache. Old files remain available
-with both new policies off; the older position/integer-fold switches must match too.
+On first use, a context-matched predecessor's driver cache is merged before compilation workers start,
+without modifying that predecessor. Prewarm rechecks keys: unchanged cache hits become ready before
+play and are logged as `cache_hits`; only misses (including changed modules) need compilation.
+No old completion bits are copied. Missing/corrupt caches or a driver/device/context change fall back
+to cold warming, not stale entries. NaN and integer-fold switch chains follow the same rule.
+Old namespaces remain available for downgrade. The immediate predecessor costs about one extra
+29 MiB cache on the observed Thor case. After successful new cache save/prewarm, manually remove
+only known older-than-predecessor cache/metadata in its directory; retain the predecessor for rollback.
+No automatic deletion of ambiguous older/explicit files occurs. See VULKAN.md for admission/retention.
 
 Pair rewrites share the ordinary module postprocessing chain, including integer folding. Workers reread
 owned seed payloads using thread-safe seed IO and atomic accounting; seed warming does not permanently
@@ -5064,11 +5069,11 @@ Shared guest/bind-state variant hashes, `.vk` reflection, `.vv` indexes, `seed-i
 do not change; existing packs and newly prepared seeds work in both arms. Do not pre-fold the seed.
 No full shader rebuild/import is required for this update, and the APK does not bundle game-derived packs.
 The enabled arm uses `.intfold-v1` driver-pipeline, prewarm/import, compute-history and learned-IO
-namespaces; explicit paths and alternate seeds are isolated too. The first default launch after updating
-therefore has cold driver pipelines: expect possible one-time loading/first-visit stutter while they compile
-and learn, rather than the full shader-setup wait. Exact seconds/minutes depend on the device/route and are
-not yet measured for this update. Later starts reuse the newly warmed namespace. Reusing an old unfurled
-cache also requires disabling the new varying/NaN policies; old files are not deleted.
+namespaces; explicit paths and alternate seeds are isolated too. An absent namespace can now seed
+driver entries from same-seed/position policy siblings with a fully matching context. Prewarm completion
+is still isolated; startup cache-only hits avoid re-compilation/first-demand takeovers for unchanged
+pipelines. Unavailable/context-mismatched sources stay cold. Old files are not modified or deleted;
+the retention/manual-cleanup rule above applies.
 
 
 Android now defaults to indexed seed IO (`TOTK_VK_SEED_IO=0` retains legacy loose IO for diagnosis).
