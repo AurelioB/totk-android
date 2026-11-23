@@ -158,7 +158,7 @@ static void *report_during_create(void *arg) {
     uint64_t began = host_now_ns(), n, ns, max;
     vk_shader_io_take(&n, &ns, &max); /* the actual 300-present statistics entry */
     assert(vk_vs_module_for(vary_vs, pending, 0) == VK_NULL_HANDLE);
-    vk_shader cold = {.io_known=1, .fin_mask=1u << 30};
+    static vk_shader cold = {.io_known=1, .fin_mask=1u << 30};
     assert(vk_vs_module_for(vary_vs, &cold, 0) == VK_NULL_HANDLE);
     /* Probe lock contention is another deferral, never a wait for publication. */
     pthread_mutex_lock(&g_vfix_mu);
@@ -174,7 +174,7 @@ static void *report_during_create(void *arg) {
 }
 static void check_nonblocking_report(void) {
     if (!g_varying_fix) return;
-    vk_shader pending = {.io_known=1, .fin_mask=1u << 29};
+    static vk_shader pending = {.io_known=1, .fin_mask=1u << 29};
     assert(vk_vs_module_for(vary_vs, &pending, 0) == VK_NULL_HANDLE);
     uint64_t reads = atomic_load(&g_io_n);
     unsigned count = atomic_load(&modules);
@@ -249,7 +249,7 @@ static int varying_test(void) {
     assert(g_vfix_patched == (g_varying_fix ? 64u : 0u) && !g_vfix_fallback);
     assert(atomic_load(&io_walks) == (unsigned)g_varying_fix); /* helper does not reclassify */
     if (g_varying_fix) {
-        vk_shader failure = {.io_known=1, .fin_mask=1u << 31};
+        static vk_shader failure = {.io_known=1, .fin_mask=1u << 31};
         fail_module = 1; assert(vk_vs_module_for(vary_vs, &failure, 1) == vary_vs->mod);
         fail_module = 0; assert(vk_vs_module_for(vary_vs, &failure, 1) == vary_vs->mod);
         assert(g_vfix_patched == 64 && g_vfix_fallback == 1);
