@@ -76,7 +76,7 @@ class QueueExecutor {
 }
 class CacheProbe {
     final LruCache<String,Bitmap> images, tiles, overviews, decorImages;
-    final int tileFloor, tileCeiling;
+    final int tileFloor, tileMarginLimit;
     final Set<String> pending = new HashSet<>(), missing = new HashSet<>();
     final QueueExecutor decoder = new QueueExecutor();
     final Map<String,Integer> decodes = new HashMap<>();
@@ -112,31 +112,39 @@ class Canvas {
 }
 class MapProbe {
     final CacheProbe assets;
-    final RectF bounds = new RectF(1280, 960), tile = new RectF(0, 0);
+    final RectF bounds, tile = new RectF(0, 0);
     final Canvas canvas = new Canvas();
     final Object paint = new Object();
     final JSONObject map = new JSONObject();
-    double minX = -6000, maxX = 6000, minZ = -5000, maxZ = 5000, centerX, centerZ;
-    float cx = 640, cy = 480, pixelsPerWorld;
+    double minX = -6000, maxX = 6000, minZ = -5000, maxZ = 5000, centerX, centerZ, anchorX = Double.NaN, anchorZ;
+    float cx, cy, pixelsPerWorld;
     String layer = "Ground";
-    MapProbe(CacheProbe assets) { this.assets = assets; }
+    MapProbe(CacheProbe assets) { this(assets, 1280, 960); }
+    MapProbe(CacheProbe assets, float width, float height) {
+        this.assets = assets; bounds = new RectF(width, height); cx = width / 2; cy = height / 2;
+    }
+    /** Pin the viewport's top-left world point so it straddles tile boundaries at any zoom. */
+    MapProbe at(double left, double top) { anchorX = left; anchorZ = top; return this; }
     float x(double v) { return cx + (float)(v - centerX) * pixelsPerWorld; }
     float y(double v) { return cy + (float)(v - centerZ) * pixelsPerWorld; }
     void draw(float pixels) {
         pixelsPerWorld = pixels / 1000;
+        if (!Double.isNaN(anchorX)) { centerX = anchorX + cx / pixelsPerWorld; centerZ = anchorZ + cy / pixelsPerWorld; }
         canvas.drawn.clear();
         assets.bitmap("map/" + layer + "/overview.webp", true);
 '''
 
 MAP_TESTS = r'''
     }
-    void settle(float pixels) {
+    void settle(float pixels) { settle(pixels, 8); }
+    void settle(float pixels, int tiles) {
         for (int n = 0; n < 4; n++) { draw(pixels); assets.decoder.drain(); }
         int decoded = assets.decoded(), evicted = assets.evicted();
         for (int n = 0; n < 20; n++) { draw(pixels); assets.decoder.drain(); }
         CompanionMapProbe.require(assets.decoded() == decoded && assets.evicted() == evicted,
                 "stationary viewport kept decoding/evicting at " + pixels + " on " + layer);
-        CompanionMapProbe.require(canvas.drawn.size() == 8, "full stationary viewport did not converge");
+        CompanionMapProbe.require(canvas.drawn.size() == tiles,
+                "stationary viewport drew " + canvas.drawn.size() + " of " + tiles + " tiles");
         for (String name : canvas.drawn)
             CompanionMapProbe.require(assets.cachedTile(name) != null, "visible tile not retained: " + name);
     }
@@ -149,7 +157,7 @@ public class CompanionMapProbe {
 TEST_MAIN = r'''
     public static void main(String[] args) throws Exception {
         CompanionMapProbe probe = new CompanionMapProbe();
-        String[] expected = {"1234, 1234, 0000", "-1234, -1234, 0000", "0001, 0001, -0106", "8000, 8000, 7894"};
+        String[] expected = {"1234, 1234, 0000", "-1234, -1234, 0000", "0001, 0001, -0107", "8000, 8000, 7894"};
         List<String> lines = Files.readAllLines(Path.of(args[0]));
         require(lines.size() == expected.length, "native roundtrip fixtures missing");
         for (int n = 0; n < expected.length; n++) {
@@ -161,7 +169,7 @@ TEST_MAIN = r'''
             CacheProbe assets = new CacheProbe(memory);
             // Both the UI budget and decoder's oversized growth must hold the very same lock at check and resize.
             assets.tiles.resizeLock = assets.pending;
-            require(assets.tileCeiling == Math.min(64, Math.max(32, memory / 8)) * 1024 * 1024, "class ceiling");
+            require(assets.tileMarginLimit == Math.min(64, Math.max(32, memory / 8)) * 1024 * 1024, "class margin limit");
             MapProbe map = new MapProbe(assets);
             map.draw(501); require(assets.decoded() == 0, "draw decoded synchronously");
             require(!assets.pending.isEmpty(), "cold miss did not queue");
@@ -181,12 +189,21 @@ TEST_MAIN = r'''
                 assets.bitmap(name, name.startsWith("map/")); assets.decoder.drain();
                 require(assets.bitmap(name, name.startsWith("map/")) != null, "oversized image immediately evicted");
             }
-            int grown = assets.tileMax(); assets.tileBudget(32L * 1024 * 1024);
+            int grown = assets.tileMax(); assets.tileBudget(12L * 840 * 840 * 4, 840L * 840 * 4);
             require(assets.tileMax() == grown && grown == 81 * 1024 * 1024, "budget shrank oversized exception");
             assets.close();
             require(assets.images.size == 0 && assets.tiles.size == 0 && assets.overviews.size == 0 && assets.decorImages.size == 0,
                     "close did not clear every cache");
             new MapProbe(new CacheProbe(memory)).settle(501);
+            // Panels whose map area straddles 4 x 3 (1167 x 757 map area of a 1240 x 1080 panel) and 5 x 3
+            // (1920-wide) LOD-1 tiles just above the 500 px switch: 12 or 15 tiles exceed a 32 MiB class limit.
+            for (float pixels : new float[]{500.1f, 501}) {
+                CacheProbe four = new CacheProbe(memory), five = new CacheProbe(memory);
+                new MapProbe(four, 1167, 757).at(-1200, -400).settle(pixels, 12);
+                new MapProbe(five, 1920, 800).at(-1200, -400).settle(pixels, 15);
+                require(four.tileMax() >= 13 * 840 * 840 * 4 && five.tileMax() >= 16 * 840 * 840 * 4,
+                        "visible tiles plus one were capped by memory class " + memory);
+            }
         }
         System.out.println("pass: companion map native JSON roundtrip and cache policy");
     }

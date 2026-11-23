@@ -40,7 +40,7 @@ public final class AssetStore {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService decoder = Executors.newSingleThreadExecutor();
     private final LruCache<String, Bitmap> images, tiles, overviews, decorImages;
-    private final int tileFloor, tileCeiling;
+    private final int tileFloor, tileMarginLimit;
     private final Set<String> pending = new HashSet<>(), missing = new HashSet<>();
     private final Runnable changed;
     public volatile JSONObject index = new JSONObject(), text = new JSONObject();
@@ -109,8 +109,9 @@ public final class AssetStore {
         int budget = Math.min(32, Math.max(8, memory / 12)) * 1024 * 1024;
         images = cache(budget);
         tileFloor = Math.max(24 * 1024 * 1024, budget);
-        // Use Android's existing per-app heap class, not guessed physical RAM or a device-name table.
-        tileCeiling = Math.min(64, Math.max(32, memory / 8)) * 1024 * 1024;
+        // Android's existing per-app heap class (not guessed physical RAM) limits only the margin above what is on
+        // screen; capping the visible working set would bring back the stationary decode/evict loop.
+        tileMarginLimit = Math.min(64, Math.max(32, memory / 8)) * 1024 * 1024;
         tiles = cache(tileFloor);
         // A 19,200,000-byte overview used to leave room for only two 840 px tiles in a 24 MiB cache,
         // causing a stationary viewport to decode and evict its visible tiles repeatedly.
@@ -346,10 +347,11 @@ public final class AssetStore {
     }
     /** A map tile only if it is already decoded; never starts a load. */
     public Bitmap cachedTile(String path) { return closed ? null : tiles.get(path); }
-    /** Retain the visible working set plus a margin, bounded by the memory-class ceiling.
-        Oversized decoded images can raise this ceiling; budget updates must never shrink that exception. */
-    public void tileBudget(long bytes) {
-        int size = (int)Math.max(tileFloor, Math.min((long)tileCeiling, bytes));
+    /** Retain every visible tile plus one more, whatever the memory class; the memory-class limit caps only the extra
+        16 MiB margin above that. Oversized decoded images can raise capacity further; budget updates never shrink it. */
+    public void tileBudget(long visibleBytes, long tileBytes) {
+        long working = visibleBytes + tileBytes, margin = Math.min((long)tileMarginLimit, visibleBytes + 16L * 1024 * 1024);
+        int size = (int)Math.min(Integer.MAX_VALUE, Math.max(tileFloor, Math.max(working, margin)));
         synchronized (pending) {
             if (size > tiles.maxSize()) tiles.resize(size);
         }

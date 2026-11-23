@@ -32,8 +32,9 @@ Coordinates read **x, north (−z), height above 105.5 m**, truncated toward zer
 sign. Native JSON preserves the position float before the Java display conversion.
 
 Map overviews have a separate cache, so they do not evict detailed tiles. While a requested detail level loads, an
-already-decoded tile at the other level can fill the same area; otherwise the overview shows through. A stationary
-viewport fitting its cache should settle, but cold loads and fast layer/zoom changes can still show loading.
+already-decoded tile at the other level can fill the same area; otherwise the overview shows through. The detail
+cache always holds every visible tile plus one, so a stationary viewport settles; cold loads and fast layer/zoom
+changes can still show loading.
 
 ### Bitmap memory limits
 
@@ -42,22 +43,33 @@ front or process RSS. `M` is Android's existing `ActivityManager.getMemoryClass(
 (128 if unavailable). For every memory class:
 
 - ordinary images: `B = min(32, max(8, floor(M / 12)))`;
-- detail tiles: start at `max(24, B)`, grow to at most `T = min(64, max(32, floor(M / 8)))`;
+- detail tiles: start at `max(24, B)`. With `n` visible tiles of `t` decoded bytes (840 px: 2,822,400 B;
+  300 px: 360,000 B), they grow to `max(max(24, B), (n + 1)·t, min(T, n·t + 16))` with margin limit
+  `T = min(64, max(32, floor(M / 8)))`. The memory class limits only the 16 MiB margin, **never the visible tiles
+  plus one**;
 - overviews: 24; menu decorations: 48;
-- total initial capacity: `B + max(24, B) + 72`; total nominal ceiling: `B + T + 72`.
+- total initial capacity: `B + max(24, B) + 72`; total ceiling: `B + tile ceiling + 72`.
 
-| Android memory class M | Images | Tiles start → ceiling | Overviews | Decor | Total start → ceiling | Previous total |
-|---:|---:|---:|---:|---:|---:|---:|
-| 96 | 8 | 24 → 32 | 24 | 48 | 104 → 112 | 80 |
-| 128 (also unavailable) | 10 | 24 → 32 | 24 | 48 | 106 → 114 | 82 |
-| 192 | 16 | 24 → 32 | 24 | 48 | 112 → 120 | 88 |
-| 256 | 21 | 24 → 32 | 24 | 48 | 117 → 125 | 93 |
-| 384 | 32 | 32 → 48 | 24 | 48 | 136 → 152 | 112 |
-| 512 or more | 32 | 32 → 64 | 24 | 48 | 136 → 168 | 112 |
+`n` is set by the map area's size. Just above the 500 px detail switch, a W×H px map area shows at most
+`(floor(W / 500) + 2) × (floor(H / 500) + 2)` 840 px tiles: 12 (4×3) for a 1240×1080 panel's map area or 1280×960,
+15 (5×3) for a 1920-wide strip, at most 20 (5×4) for a full 1920×1080 area. 300 px tiles never exceed T there
+(at most 77 × 360,000 B + one tile = 28,080,000 B).
 
-Previously there was no separate overview cache; detail tiles and overviews shared `max(24, B)` MiB. The tile
-working-set request is visible tile count × decoded bytes at that LOD + 16 MiB, capped at T and never shrinking.
-This gives smaller heap classes less of the increase; an 8 GB device is not assumed to have any particular M.
+| Android memory class M | Images | Tiles start | T | Tile ceiling 12 / 15 / 20 tiles | Overviews | Decor | Total start → ceiling (20 tiles) | Previous total |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 96 | 8 | 24 | 32 | 34.99 / 43.07 / 56.52 | 24 | 48 | 104 → 136.52 | 80 |
+| 128 (also unavailable) | 10 | 24 | 32 | 34.99 / 43.07 / 56.52 | 24 | 48 | 106 → 138.52 | 82 |
+| 192 | 16 | 24 | 32 | 34.99 / 43.07 / 56.52 | 24 | 48 | 112 → 144.52 | 88 |
+| 256 | 21 | 24 | 32 | 34.99 / 43.07 / 56.52 | 24 | 48 | 117 → 149.52 | 93 |
+| 384 | 32 | 32 | 48 | 48 / 48 / 56.52 | 24 | 48 | 136 → 160.52 | 112 |
+| 512 or more | 32 | 32 | 64 | 48.30 / 56.375 / 64 | 24 | 48 | 136 → 168 | 112 |
+
+In bytes, the 12 / 15 / 20-tile ceilings are 36,691,200 / 45,158,400 / 59,270,400 for M = 96–256 (T = 32 MiB),
+50,331,648 / 50,331,648 / 59,270,400 for M = 384 and 50,646,016 / 59,113,216 / 67,108,864 for M ≥ 512; classes in
+between scale T linearly by `floor(M / 8)`. Views of up to 10 840-px tiles stay at or below T.
+Previously there was no separate overview cache; detail tiles and overviews shared `max(24, B)` MiB. The budget only
+grows. Smaller heap classes get less margin, but never less than the screen; an 8 GB device is not assumed to have any
+particular M (the AYN Thor's recorded heap growth limit is 256 MiB).
 
 **Oversized-image exception:** if a decoded image exceeds its selected cache's current capacity, that cache grows
 to the image's allocation byte count **plus 1 MiB**, even above the nominal ceilings above. Later tile budget calls

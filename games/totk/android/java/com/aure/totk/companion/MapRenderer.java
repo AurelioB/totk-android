@@ -79,10 +79,10 @@ final class MapRenderer {
             int lastCol = Math.min(cols - 1, (int)Math.floor((centerX + (bounds.right - cx) / pixelsPerWorld - minX) / tw));
             int firstRow = Math.max(0, (int)Math.floor((centerZ + (bounds.top - cy) / pixelsPerWorld - minZ) / th));
             int lastRow = Math.min(rows - 1, (int)Math.floor((centerZ + (bounds.bottom - cy) / pixelsPerWorld - minZ) / th));
-            // Room for every tile on screen at this detail level and the other one (the screen switches between them
-            // while zooming); a full LRU would evict visible tiles and reload them in turn.
+            // Room for every tile on screen at this detail level plus one; the memory-class limit trims only the extra
+            // margin. A cache smaller than the screen would evict visible tiles and reload them in turn.
             long visible = (long)(lastCol - firstCol + 1) * (lastRow - firstRow + 1);
-            assets.tileBudget(visible * TILE_BYTES[lod] + 16L * 1024 * 1024);
+            assets.tileBudget(visible * TILE_BYTES[lod], TILE_BYTES[lod]);
             for (int r = firstRow; r <= lastRow; r++) for (int c = firstCol; c <= lastCol; c++) {
                 String name = c + "_" + r + ".webp";
                 Bitmap image = assets.bitmap("map/" + layer + "/" + lod + "/" + name, true);

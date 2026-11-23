@@ -309,7 +309,7 @@ int main(void) {
     static const float POSITIONS[][3] = {
         {1234.9996337890625f, 106.49996185302734f, -1234.9996337890625f},
         {-1234.9996337890625f, 104.50003814697266f, 1234.9996337890625f},
-        {1, -0.500003814697265625f, -1}, /* float height subtraction rounds to -106, unlike double */
+        {1, -1.4999980926513672f, -1}, /* y - 105.5f rounds to -107 in float; double subtraction would give -106 */
         {8000, 8000, -8000}};
     for (unsigned k = 0; k < sizeof POSITIONS / sizeof *POSITIONS; k++) {
         memcpy(actor + 0x2b4, POSITIONS[k], sizeof POSITIONS[k]);
@@ -344,7 +344,7 @@ int main(void) {
         /* Each invalid/inherited sample must use the old flag, not a made-up computed layer. */
         static const float BAD_DEPTH[][2] = {
             {2000, 0}, {-2000, -1}, {NAN, 400}, {INFINITY, 400}, {-INFINITY, 400},
-            {-100, NAN}, {-100, INFINITY}, {-100, -INFINITY}};
+            {-100, NAN}, {-100, INFINITY}, {-100, -INFINITY}, {3e38f, 1e-38f}};   /* last: finite inputs, overflowing ratio */
         putf(actor + 0x2b8, 1600);
         for (unsigned k = 0; k < sizeof BAD_DEPTH / sizeof *BAD_DEPTH; k++) {
             putf(s + 0x104, BAD_DEPTH[k][0]); putf(s + 0x108, BAD_DEPTH[k][1]);

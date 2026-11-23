@@ -345,6 +345,7 @@ static const char *map_layer(Ctx *c, const float pos[3], float *sky_line) {
         !rd(c, s + 0x104, depth, sizeof depth) || !isfinite(depth[0]) || !isfinite(depth[1]) || depth[1] <= 0) return NULL;
     uint64_t grids = rd64(c, env + ENV_GRIDS);
     float ratio = (depth[0] - pos[1]) / depth[1];
+    if (!isfinite(ratio)) return NULL;   /* finite inputs can still overflow (huge numerator, subnormal denominator) */
     const char *layer = ratio > 0.5f ? "UnderGround" : "Ground";
     GridSample a_sample = {0}, b_sample = {0};
     int sampled = 0;
