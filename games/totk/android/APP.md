@@ -444,16 +444,24 @@ frame identity or optical quality. API admission remains limited to the internal
 
 
 **Docked (`TOTK_OPERATION_MODE=docked`):** unset/empty `TOTK_APP_WIDTH` becomes process-only effective `guest`
-whether `TOTK_NATIVE_UI` is unset, `0`, or `1`. Both front-buffer dimensions follow the current guest canvas/crop,
+whether `TOTK_NATIVE_UI` is unset, `0`, or `1`. The render-buffer fit follows the current guest canvas/crop,
 aspect-fit without upsampling and capped by the live render-window extent; ordinary docked play no longer
-downscales a shipping 1920×1080 canvas through the handheld 1280×720 default.
+downscales a shipping 1920×1080 canvas through the handheld 1280×720 default. The displayed rectangle is separate:
+if neither fitted dimension reaches the window, it is enlarged to aspect-fit the window. For a 1920×1080 canvas
+on a 2400×1504 panel, the buffer fit stays 1920×1080 while the picture becomes 2400×1350 at `(0,77)`.
+A fit already touching either window edge is unchanged, including 1920×1080, 1920×1200, 1280×800 and 2560×1080
+windows with that canvas. This is relative to the effective canvas/crop: a deliberately smaller canvas is enlarged too.
 If `TOTK_NATIVE_UI=1` was requested, startup also logs `requested=1 effective=0`: the shipping docked canvas
 already has native UI and must not require a handheld promoted sibling. Only in that requested-native-UI path,
 unset/empty/`auto` `TOTK_OUTPUT_RES` becomes effective `0` (shipping canvas, no larger output heap);
 explicit `0` or dimensions remain authoritative. A smaller/non-16:9 panel is fitted and
-letterboxed; no fixed Odin/Thor width is assumed. AHB uses the fitted buffer and centered destination; copy
-fallback paints its bars into a full window-sized buffer. A missing/zero window defers work; subsequent
-resize/recreation uses an event-refreshed extent, not a fixed startup size or per-frame native-window polling.
+letterboxed; no fixed Odin/Thor width is assumed. AHB uses the fitted buffer and the separate centered display
+destination; copy fallback paints its bars into an already full-window-sized buffer and uses a linear blit by default.
+Optional copy-path `TOTK_POST_SCALE=fsr|sgsr` instead runs at the enlarged picture size; see `VULKAN.md`,
+"Zero-copy presentation", for its pixel/memory cost. We do not select the AHB compositor's scaling filter;
+SurfaceControl enlargement is not an FSR-quality or HWC-admission guarantee.
+A missing/zero window defers work; subsequent resize/recreation uses an event-refreshed extent,
+not a fixed startup size or per-frame native-window polling.
 Create/recreate, resize/redraw, content/configuration and focus/resume notifications refresh the atomic width/height
 cache. Guest canvas/crop changes refresh the cached aspect-fit geometry; steady real/generated frames reuse it.
 Attachment epochs reject stale callbacks, and a changed guest-window extent advances the queued-frame generation

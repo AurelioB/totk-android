@@ -893,6 +893,21 @@ Android defaults to `ahb`; `TOTK_VK_PRESENT=copy` selects the existing `ANativeW
 Missing extensions, explicit-layout import or SurfaceControl support automatically retain that copy fallback.
 By default both keep `TOTK_APP_WIDTH` and the window's aspect ratio fixed across crop changes, with black bars.
 Host spatial scaling and the explicit native-UI profile instead select window-sized buffers as documented in `APP.md`.
+
+With `TOTK_APP_WIDTH=guest` (the ordinary docked default), allocation fit and display fit are separate.
+The render buffer keeps the guest canvas/crop's no-upsample fit. If neither fitted dimension reaches the window,
+the displayed rectangle is enlarged to aspect-fit it; otherwise the previous rectangle is returned unchanged.
+For a 1920×1080 canvas in a 2400×1504 window, the fit remains 1920×1080, but the picture is 2400×1350 at `(0,77)`.
+The same canvas keeps its old geometry on 1920×1080, 1920×1200, 1280×800 and 2560×1080 windows.
+This rule follows the effective shown aspect and crop, so a deliberately smaller canvas can enlarge on a 1080p panel too.
+AHB retains the fitted allocation and requests the larger SurfaceControl destination; we do not choose the
+Android compositor/HWC scaling filter or guarantee DEVICE composition or FSR-quality reconstruction.
+Copy retains its already window-sized image/readback backing and uses `VK_FILTER_LINEAR` without post-scaling.
+Optional copy-path `TOTK_POST_SCALE=fsr|sgsr` runs at the enlarged picture size: 2400×1350 versus 1920×1080
+is 1.5625× the output pixels. Each RGBA8 scale-stage image grows by 4,665,600 bytes per used slot
+(two stages for FSR, one for SGSR, excluding allocation alignment). AHB post-scaling still targets the fitted buffer;
+SMAA-only intermediates stay source-sized. No guest scene resolution or output heap is changed.
+
 The AHB UNORM image has an sRGB attachment view where required; sampling and attachment conversion preserve the
 old blit's sRGB decode/encode, with opaque alpha.
 The AHB's native dma-buf is imported with an explicit LINEAR DRM modifier and gralloc's byte stride; the AHB memory
