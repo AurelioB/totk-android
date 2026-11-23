@@ -5354,6 +5354,27 @@ int main(int argc, char **argv) {
         }
         CHECK(vk_dpool_count() == after_first, "descriptor pools reused across submissions: %d after 16 rounds, %d after 40", after_first, vk_dpool_count());
     }
+    /* Compute always takes the direct descriptor path, even with two recorders.
+       Both array families consume element 2; singleton-only tests miss the ABI. */
+    {
+        uint8_t control[0x880],code[0x230];uint32_t length;
+        shader_binary(5,47,control,code,&length);
+        memcpy(cpu_pool+0x103000,code,length);
+        prog_t compute={.nstage=1,.serial=947};
+        compute.sd[0].data=(NVNbufferAddress)(uintptr_t)(cpu_pool+0x103000);compute.sd[0].control=control;
+        p_bind_program program={&compute,1u<<5};
+        uint32_t *result=(uint32_t *)(cpu_pool+0x500000);memset(result,0,256);
+        uint32_t *uniform=(uint32_t *)(cpu_pool+0x501000);uniform[0]=0x1234;
+        p_bind_buf output={5,0,(uint64_t)(uintptr_t)result,256};
+        p_bind_buf input={5,1,(uint64_t)(uintptr_t)uniform,16};
+        p_dispatch dispatch={1,1,1};p_set_rt none={0};
+        op(OP_SET_RT,&none,sizeof none);op(OP_BIND_PROGRAM,&program,sizeof program);
+        op(OP_BIND_UBO,&input,sizeof input);op(OP_BIND_UBO,&output,sizeof output);
+        op(OP_DISPATCH,&dispatch,sizeof dispatch);
+        CHECK(mtl_wait(run(),5000000000ull),"three-element compute descriptor arrays finish");
+        int correct=1;for(unsigned i=0;i<64;i++) if(result[i]!=(i^(3u*0x1234))) correct=0;
+        CHECK(correct,"direct compute consumes contiguous UBO and storage-buffer array element 2");
+    }
     /* GPU profiler acceptance: real passes in 301 frames, recycling all fence slots. The first
        pass loads, then fully clears before its first draw; a later copy consumes its store.
        The second clear-only pass has no later read. Keep ordinary test runs unchanged. */

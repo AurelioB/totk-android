@@ -248,45 +248,38 @@ def descriptor_probe():
 #include <stdio.h>
 #include <string.h>
 #include "vk_int.h"
+#define MINV(a,b) ((a)<(b)?(a):(b))
 '''
     code += section(draw, 'typedef struct { VkDescriptorBufferInfo b;', 'static int ubo_desc(')
+    # All three consumers must use the same packed constructor.
+    for call in ('dinfo_write(set,b,in,first,', 'dinfo_write(replay_set,b,in,element,',
+                 'dinfo_write(VK_NULL_HANDLE,b,in,element,'):
+        assert call in draw
     code += r'''
-static int check(const VkWriteDescriptorSet *w,dinfo *expected) {
-    int bad=0;
-    for(unsigned e=0;e<w->descriptorCount;e++) {
-        if(w->descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
-            bad+=memcmp(&w->pBufferInfo[e],&expected[e].b,sizeof expected[e].b)!=0;
-        else if(w->descriptorType==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
-            bad+=memcmp(&w->pImageInfo[e],&expected[e].i,sizeof expected[e].i)!=0;
-        else bad+=w->pTexelBufferView[e]!=expected[e].t;
-    }
-    return bad;
-}
 int main(void) {
-    dinfo info[3]={0};VkDescriptorSet set=(VkDescriptorSet)(uintptr_t)1,replay_set=set;
-    VkDescriptorType types[]={VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-        VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER};
-    int mismatches[3]={0};
-    for(unsigned e=0;e<3;e++) {
+    dinfo info[65]={0};
+    for(unsigned e=0;e<65;e++) {
         info[e].b=(VkDescriptorBufferInfo){(VkBuffer)(uintptr_t)(10+e),20+e,30+e};
         info[e].i=(VkDescriptorImageInfo){(VkSampler)(uintptr_t)(40+e),
             (VkImageView)(uintptr_t)(50+e),VK_IMAGE_LAYOUT_GENERAL};
         info[e].t=(VkBufferView)(uintptr_t)(60+e);
     }
-    for(unsigned type=0;type<3;type++) for(unsigned count=1;count<=3;count+=2) {
-        vk_bind binding={.binding=0,.count=count,.dtype=types[type]};const vk_bind *b=&binding;
-        dinfo *in=info;VkWriteDescriptorSet w[1];int i=0;
-'''
-    code += section(draw, '            w[i] = (VkWriteDescriptorSet){', '\n        }\n        vkUpdateDescriptorSets')
-    code += '\nint first=check(&w[0],in);if(count==1) assert(!first);else mismatches[0]+=first;\n{\n'
-    code += section(draw, '                VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,', '\n                vkUpdateDescriptorSets(V.dev,1,&write')
-    code += '\nint bad=check(&write,in);if(count==1) assert(!bad);else mismatches[1]+=bad;\n}\n{\n'
-    code += section(draw, '                VkWriteDescriptorSet write={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,', '\n                if (!vk_fg_terminal_owned_binding')
-    code += r'''
-        int bad=check(&write,in);if(count==1) assert(!bad);else mismatches[2]+=bad;
-    }}
-    printf("{\"immediate\":%d,\"replay\":%d,\"terminal\":%d}\n",
-        mismatches[0],mismatches[1],mismatches[2]);
+    unsigned counts[]={1,2,3,32,33,65};
+    for(unsigned type=0;type<=7;type++) for(unsigned c=0;c<6;c++) {
+        vk_bind binding={.binding=7,.count=counts[c],.dtype=type};
+        for(unsigned first=0;first<binding.count;first+=DINFO_BATCH) {
+            dinfo_scratch scratch;
+            VkWriteDescriptorSet w=dinfo_write((VkDescriptorSet)(uintptr_t)1,&binding,info,first,&scratch);
+            assert(w.dstBinding==7 && w.dstArrayElement==first);
+            assert(w.descriptorCount==MINV(binding.count-first,DINFO_BATCH));
+            for(unsigned e=0;e<w.descriptorCount;e++) {
+                if(type==6 || type==7) assert(!memcmp(&w.pBufferInfo[e],&info[first+e].b,sizeof info[0].b));
+                else if(type==4 || type==5) assert(w.pTexelBufferView[e]==info[first+e].t);
+                else assert(!memcmp(&w.pImageInfo[e],&info[first+e].i,sizeof info[0].i));
+            }
+        }
+    }
+    puts("{\"immediate\":0,\"replay\":0,\"terminal\":0}");
     return 0;
 }
 '''
@@ -433,7 +426,6 @@ class MainDefectReproductions(unittest.TestCase):
         self.assertEqual(self.observed['storage-unpinned'],
                          {'same_image': 0, 'allocations': 2, 'retired': 1})
 
-    @unittest.expectedFailure
     def test_c_array_writes_use_contiguous_vulkan_elements(self):
         self.assertEqual(self.observed['descriptors'], {'immediate': 0, 'replay': 0, 'terminal': 0})
 
