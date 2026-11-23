@@ -3051,7 +3051,7 @@ The pass runs on each loaded module immediately before `vkCreateShaderModule`, a
 patches; it does not change translator outputs, shared variant hashes, reflection, or packed seed bytes.
 Keep seeds unfurled for both arms. Existing seeds and fresh-install packs remain usable without regeneration.
 The enabled arm adds `.intfold-v1` to pipeline/prewarm/import/compute/learned-IO cache paths (including
-alternate seeds and explicit paths); `=0` retains the old unfurled namespace. The first default launch after
+alternate seeds and explicit paths); `=0` omits that suffix, independently of the varying/NaN policies below. The first default launch after
 updating recompiles driver pipelines as needed, with possible one-time loading/route stutter, not a full
 shader import. Newly learned histories warm later launches; elapsed rebuild time is device/route dependent.
 Earlier standalone a740 estimates reduced total instructions by 6.58% (not an FPS prediction), with seven
@@ -3060,6 +3060,42 @@ capped busy-weighted-clock work proxies fell 2.26% on Duo Hateno and 4.1–5.4% 
 equal-FPS gate did not pass). Battery savings remain unconfirmed. Odin's uncapped standing sample rose
 61.93→63.81 fps; pan remained SAME. Measure fresh-process `=0`/default O/B/B/O GPU time, clocks and tails,
 with geometry/skinning/vegetation picture checks on each device; these are not general speedup guarantees.
+
+### Pair-specific missing vertex outputs
+
+`TOTK_VK_VARYING_FIX` is startup-only and default **on** (`=0` opts out), contributed by Dorkington
+in PR #43 for wind/air-flow white boxes (#4). A VS/FS interface mismatch gets a cached vertex module
+writing absent locations as `(0,0,0,1)`, with the fragment input's 32-bit numeric kind; integer `.w`
+uses the bits `0x3f800000`. The original attribution to totk-pc-recomp and its MIT notice are retained.
+The replacement runs through the **same** position/NaN/subgroup/integer-fold chain as ordinary modules.
+The off arm does not classify interfaces, allocate classification tables, reread or create replacements.
+
+Worker rereads use the seed reader's lock and atomic I/O interval counters; their maxima use CAS and
+recorder resets use exchange. Counters are independent interval samples, not a transactional snapshot.
+No extra SPIR-V source is retained (source RAM budget **0 bytes**); a seed payload may require real IO
+again after consumption. Replacement modules/per-pair records remain session-owned. Per-pair detail is
+capped at 40 lines; cumulative `[varyings] session shader_pairs patched=... fallback=...` totals update
+at IO reporting and normal exit. Reused interface modules still count each distinct VS/FS pair once.
+
+Independent `TOTK_VK_NAN_MINMAX=1` is a **default-off experiment**. It changes GLSL.std.450
+FMin/FMax/FClamp to NMin/NMax/NClamp, with identical operands/word counts, in targeted VS/FS/CS
+modules. The intended Maxwell special-value semantics and driver code cost are not device-qualified;
+the wind result must be tested with this experiment **off**, then NaN behavior separately.
+
+Enabled policies append `.vary-v1` / `.nan-v1` after existing seed/position/integer-fold suffixes,
+including explicit import paths and the cache-derived prewarm `.pso-state` path. Old completion markers
+cannot mark the new namespace complete. This deliberately recompiles all driver pipelines once in a
+new arm, even when a particular module is byte-identical; it does not change shader-list identifiers,
+reflection or packed seeds, and needs no full shader rebuild.
+
+Host coverage: `test_vk_position.py`, `test_vk_varyings.py`, `test_vk_shader_seed.py`,
+`test_android_cache_transfer.py`, and `vkpipetest --pso-keylist`. It includes `spirv-val` of rewritten
+modules, integer folding in the production replacement path, disabled byte identity/no classification,
+mask/type reuse, fallback counts, completed-marker isolation and concurrent reader/reset TSan coverage.
+Malformed-module guards cover short/zero/overrunning instructions, entry-function framing, output-size
+overflow (including 32-bit `size_t`) and entry-point word-count overflow; they are not a semantic validator.
+Only devices can establish corrected wind/grass, absence of ordinary-scene regressions, prewarm duration,
+GPU/native instruction cost and restart O/B/B/O frame-time results.
 
 ### Original NVN early fragment tests (guest semantics)
 

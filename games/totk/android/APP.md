@@ -5019,6 +5019,34 @@ pass-start clears, and `TOTK_VK_STORE_CLEAR=1` also skips stores proven dead bef
 first option). Neither has device measurements yet; extra pass boundaries can cost more than they save. See
 [VULKAN.md](VULKAN.md#opt-in-attachment-work-reductions-device-measurement-pending) for the counters and A/B procedure.
 
+### Missing vertex outputs and experimental NaN min/max
+
+PR #43 supplies `(0,0,0,1)` for fragment input locations absent from their paired vertex shader,
+targeting wind/air-flow white boxes (issue #4). `TOTK_VK_VARYING_FIX` is startup-only, default **on**;
+exact `=0` keeps the old modules and avoids the IO-classification walk and its allocations.
+`TOTK_VK_NAN_MINMAX=1` separately opts into **default-off experimental** NMin/NMax/NClamp replacement
+in every loaded VS/FS/CS containing a targeted GLSL instruction. It is not necessary to enable the varying
+fix. Guest special-value equivalence and Adreno driver cost need separate qualification.
+
+Both policies change only runtime module bytes. Shader-list identifiers, variants, reflection and pack
+bytes stay unchanged: **no full shader rebuild**. Cache names append `.vary-v1` when the varying fix is
+on, then `.nan-v1` only for the NaN experiment. Explicit cache/import paths and `.pso-state` completion
+files use the same namespace. Existing completed prewarm state does not skip the new arm's modules.
+The first default launch after this update has a cold driver cache for **all graphics and compute
+pipelines**, including those whose shader bytes are unaffected. Expect one-time background/on-demand
+compilation and route stutter; later launches resume this arm's warmed cache. Old files remain available
+with both new policies off; the older position/integer-fold switches must match too.
+
+Pair rewrites share the ordinary module postprocessing chain, including integer folding. Workers reread
+owned seed payloads using thread-safe seed IO and atomic accounting; seed warming does not permanently
+retain consumed words. Additional retained SPIR-V source budget is **0 bytes**. Patched driver modules
+and small per-pair cache records live for the session; GPU/driver allocations are not bounded here.
+At most 40 pair-detail lines report cumulative `session shader_pairs patched=N fallback=M`; changed
+totals are also reported at the existing IO-stat cadence and normal exit. Fallback retains old behavior,
+not a successful repair. Device acceptance needs nonzero patches and an explanation for any fallback,
+wind/burning-grass pictures, ordinary water/particle/menu checks, first-launch prewarm timing and a
+matched restart O/B/B/O frame-time quartet. No such device evidence is claimed by host tests.
+
 ### Packed shader IO and learned demand warming
 
 Exact integer shader-address folding is now on by default. For an unfurled A/B control, put
@@ -5032,8 +5060,8 @@ The enabled arm uses `.intfold-v1` driver-pipeline, prewarm/import, compute-hist
 namespaces; explicit paths and alternate seeds are isolated too. The first default launch after updating
 therefore has cold driver pipelines: expect possible one-time loading/first-visit stutter while they compile
 and learn, rather than the full shader-setup wait. Exact seconds/minutes depend on the device/route and are
-not yet measured for this update. Later starts reuse the newly warmed namespace. The opt-out can still
-reuse its old unfurled caches; old files are not deleted.
+not yet measured for this update. Later starts reuse the newly warmed namespace. Reusing an old unfurled
+cache also requires disabling the new varying/NaN policies; old files are not deleted.
 
 
 Android now defaults to indexed seed IO (`TOTK_VK_SEED_IO=0` retains legacy loose IO for diagnosis).
@@ -5618,19 +5646,20 @@ lifetime oracle: verify persistent Gerudo lighting and actual target traces befo
 a capture-sync label to a real cached probe.
 
 At the standard base, the cache grows in private app storage as `state/vk-pipeline-cache.bin<namespace>`.
-Default-on integer folding appends `.intfold-v1`; only exact `TOTK_VK_INT_FOLD=0` keeps the unsuffixed off-arm name.
-An alternate seed's folder/content hash and any `.pos-v1-10`, `.pos-v1-01` or `.pos-v1-11` precision suffix come
-before `.intfold-v1`. `sh install_app.sh cache-export` copies **all existing recognized cache names** from private
+Default-on integer folding appends `.intfold-v1`, default-on varying correction appends `.vary-v1`,
+and opt-in NaN min/max appends `.nan-v1`, in that order; each disabled policy omits its suffix.
+An alternate seed's folder/content hash and any `.pos-v1-10`, `.pos-v1-01` or `.pos-v1-11` precision suffix
+come first. `sh install_app.sh cache-export` copies **all existing recognized cache names** from private
 `files/state` into a new `cache-export-<date>-<pid>/` folder on the computer. Basenames and bytes, including the
 context envelope, stay unchanged; stale/imported/temp files and graphics-key/resume sidecars are not exported.
 
 `sh install_app.sh cache-import FILE...` stages one or more such files in the standard external game folder,
 under each file's **unchanged basename**, including on a release APK. The runtime consumes only its exact selected
 namespace, validates context, and renames a successfully merged file to `<selected path>.imported`.
-An opposite integer-fold arm is left unconsumed with a startup diagnostic; it is never promoted into the selected arm.
+An opposite rewrite arm is left unconsumed with a startup diagnostic; it is never promoted into the selected arm.
 The script does not infer the phone's configuration from host variables or execute `totk.env`. It accepts only the
-standard basename grammar, including the existing seed/position suffixes. Timestamp-renamed old exports have lost
-that filename provenance and are refused; never relabel an off-arm cache as `.intfold-v1`, even for the same driver.
+standard basename grammar, including seed/position/integer-fold/varying/NaN suffixes. Timestamp-renamed old exports
+have lost that filename provenance and are refused; never relabel another arm's cache, even for the same driver.
 
 These convenience handlers cover the standard private cache and external import bases. Custom
 `TOTK_VK_PIPELINE_CACHE` / `TOTK_VK_PIPELINE_CACHE_IMPORT` bases or another selected game-data folder still require

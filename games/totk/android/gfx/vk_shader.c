@@ -38,14 +38,14 @@ int totk_depth_near_minus_w(void) __attribute__((weak));
 
 static pthread_once_t g_position_once = PTHREAD_ONCE_INIT;
 static unsigned g_position_policy;
-static int g_nan_minmax;       /* TOTK_VK_NAN_MINMAX (startup-only, default on; 0 = off): min / max / saturate with the Switch's NaN rules */
+static int g_nan_minmax;       /* TOTK_VK_NAN_MINMAX (startup-only, experimental, default off; exact 1 opts in) */
 static int g_varying_fix;      /* TOTK_VK_VARYING_FIX (startup-only, default on; 0 = off): vk_vs_module_for adds missing varyings */
 static void varying_report(void);
 static void position_init(void) {
     g_position_policy = vk_position_policy(getenv("TOTK_VK_POS_INVARIANT"), getenv("TOTK_VK_POS_NOCONTRACT"));
-    const char *nm = getenv("TOTK_VK_NAN_MINMAX"); g_nan_minmax = !(nm && !strcmp(nm, "0"));
+    const char *nm = getenv("TOTK_VK_NAN_MINMAX"); g_nan_minmax = nm && !strcmp(nm, "1");
     const char *vf = getenv("TOTK_VK_VARYING_FIX"); g_varying_fix = !(vf && !strcmp(vf, "0"));
-    LOGV("[nvn-vk] TOTK_VK_NAN_MINMAX=%d (startup-only): FMin/FMax/FClamp %s", g_nan_minmax, g_nan_minmax ? "-> NMin/NMax/NClamp (Maxwell NaN rules)" : "as translated");
+    LOGV("[nvn-vk] TOTK_VK_NAN_MINMAX=%d (startup-only, experimental): FMin/FMax/FClamp %s", g_nan_minmax, g_nan_minmax ? "-> NMin/NMax/NClamp" : "as translated");
     LOGV("[nvn-vk] TOTK_VK_VARYING_FIX=%d (startup-only): fragment inputs a vertex shader does not write %s", g_varying_fix, g_varying_fix ? "read (0, 0, 0, 1) as on Maxwell" : "left undefined");
     LOGV("[nvn-vk] TOTK_VK_POS_INVARIANT=%u (startup-only): vertex Position Invariant", g_position_policy & 1);
     LOGV("[nvn-vk] TOTK_VK_POS_NOCONTRACT=%u (startup-only): position-feeding float arithmetic NoContraction", g_position_policy >> 1);
@@ -411,23 +411,24 @@ static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c
 /* The only module postprocessing chain. Pair-specific vertex replacements pass
    through here too, so integer folding and future passes cannot be bypassed. */
 static int shader_postprocess(vk_shader *sh, char **data, size_t *length) {
+#define SHADER_RED(n, ...) do { static _Atomic unsigned said_; if (atomic_fetch_add(&said_, 1) < (n)) LOGV("【红】" __VA_ARGS__); } while (0)
     char *spv = *data; size_t spv_len = *length;
     const char *variant = sh->key;
     int result = -1;
     if (sh->stage == 0 && g_position_policy) {
         size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
         if (vk_spirv_position(&words, &nw, g_position_policy) < 0) {
-            RED(16, "shader %s: cannot preserve requested vertex position precision; refused", variant);
+            SHADER_RED(16, "shader %s: cannot preserve requested vertex position precision; refused", variant);
             goto done;
         }
         spv = (char *)words; spv_len = nw * 4;
     }
     if (g_nan_minmax && vk_spirv_nan_minmax((uint32_t *)spv, spv_len / 4) < 0)
-        RED(16, "shader %s: TOTK_VK_NAN_MINMAX: malformed module", variant);
+        SHADER_RED(16, "shader %s: TOTK_VK_NAN_MINMAX: malformed module", variant);
     if (sh->stage == 1) {
         size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
         if (vk_spirv_early_tests(&words, &nw, sh->early_tests && earlyz_on() && !sh->alpha_func) < 0) {
-            RED(16, "shader %s: invalid fragment execution modes", variant); goto done;
+            SHADER_RED(16, "shader %s: invalid fragment execution modes", variant); goto done;
         }
         spv = (char *)words; spv_len = nw * 4;
         size_t nnw; uint32_t *pw = spirv_depth_nudge((const uint32_t *)spv, spv_len / 4, &nnw);
@@ -438,7 +439,7 @@ static int shader_postprocess(vk_shader *sh, char **data, size_t *length) {
             for (int i=0;i<sh->nb;i++) if (sh->b[i].binding>=binding) binding=sh->b[i].binding+1;
             pw=vk_spirv_alpha_test((const uint32_t *)spv,spv_len/4,sh->alpha_func,binding,&nnw);
             if (!pw || binding>UINT16_MAX) {
-                RED(16,"shader %s: cannot build alpha-test comparison %u",variant,sh->alpha_func);
+                SHADER_RED(16,"shader %s: cannot build alpha-test comparison %u",variant,sh->alpha_func);
                 free(pw); goto done;
             }
             free(spv); spv=(char *)pw; spv_len=nnw*4;
@@ -463,15 +464,16 @@ static int shader_postprocess(vk_shader *sh, char **data, size_t *length) {
                 sh->required_subgroup_size ? " (pinned)" : " (fixed default)");
         }
         if (fixed < 0) {
-            RED(32, "subgroup shader %s: cannot preserve 32-lane semantics on this device/module; refused", variant);
+            SHADER_RED(32, "subgroup shader %s: cannot preserve 32-lane semantics on this device/module; refused", variant);
             goto done;
         }
     }
     if (g_int_fold && vk_spirv_int_fold((uint32_t *)spv, spv_len / 4) < 0)
-        RED(16, "shader %s: integer proof unavailable; retaining original module", variant);
+        SHADER_RED(16, "shader %s: integer proof unavailable; retaining original module", variant);
     result = 0;
 done:
     *data = spv; *length = spv_len; return result;
+#undef SHADER_RED
 }
 static vk_shader *shader_load(const char *variant, int early_tests) {
     pthread_once(&g_position_once, position_init);

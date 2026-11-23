@@ -216,6 +216,14 @@ int main(int argc, char **argv) {
         assert(!vk_spirv_add_outputs(bad.words, bad.count, missing, kinds, &n)); free(bad.words);
         bad = clone(m.words, m.count); bad.words[5] = 0;
         assert(!vk_spirv_add_outputs(bad.words, bad.count, missing, kinds, &n)); free(bad.words);
+        size_t ep_at = 5;
+        while ((m.words[ep_at] & 0xffff) != 15) ep_at += m.words[ep_at] >> 16;
+        size_t ep_words = m.words[ep_at] >> 16, padding = UINT16_MAX - ep_words;
+        module huge = {calloc(m.count + padding, 4), m.count + padding}; assert(huge.words);
+        memcpy(huge.words, m.words, (ep_at + ep_words) * 4);
+        huge.words[ep_at] = OP(UINT16_MAX,15);
+        memcpy(huge.words + ep_at + UINT16_MAX, m.words + ep_at + ep_words, (m.count - ep_at - ep_words) * 4);
+        assert(!vk_spirv_add_outputs(huge.words, huge.count, missing, kinds, &n)); free(huge.words);
         assert(!vk_spirv_add_outputs(m.words, m.count, 0, kinds, &n));   /* nothing missing: nothing to do */
         free(o); free(m.words);
     }

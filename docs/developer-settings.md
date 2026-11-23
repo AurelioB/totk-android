@@ -94,6 +94,8 @@ Everything not in the menu is a developer switch. A selection:
 | `TOTK_FRAMEGEN=locked` / `hybrid` / `adaptive` / `interp` | Frame-generation modes; *locked* is the menu's *Interpolation*. The others are opt-in qualification modes with their own required timing settings ([frame-interpolation.md](frame-interpolation.md), APP.md *Device profiles*). |
 | `TOTK_FRAMEGEN_ENGINE=lsfg` (+ `TOTK_LSFG_PERF`, `TOTK_LSFG_FLOW`) | Experimental LSFG frame generation with your own, privately owned DLL; only with the locked timing block. |
 | `TOTK_PSO_PREWARM=0` | Turns off the startup pipeline prewarm from the packaged key list. |
+| `TOTK_VK_VARYING_FIX=0` | Startup-only opt-out of the default-on, pair-specific missing vertex-output correction for wind/air-flow white boxes (#4). Off performs no varying classification/rewrite work. Changes the driver-cache and prewarm-resume namespace; restart after editing. |
+| `TOTK_VK_NAN_MINMAX=1` | Startup-only, **default-off experiment**: replace GLSL FMin/FMax/FClamp with NMin/NMax/NClamp in loaded VS/FS/CS modules. Has its own `.nan-v1` cache namespace; special-value semantics and driver cost await separate device qualification. Not required to enable the varying fix. |
 | `TU_DEBUG=…` | Turnip debug flags (e.g. `noslabcs`); on Adreno 722 an absent `TU_DEBUG` defaults to `sysmem`. |
 
 The complete, current list of switches with their status and evidence is in
