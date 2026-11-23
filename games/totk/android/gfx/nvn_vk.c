@@ -1191,6 +1191,13 @@ static void unback_pool(pool_ent *e) {
 #ifdef TOTK_VK_TESTS
     if (e->test_backing) return;
 #endif
+    /* Guest pages and private aliases are restored under g_pool_mu before
+       allowing another registration to back the same range. Only the detached
+       Vulkan buffer remains: resource -> pool resolution forbids holding the
+       pool mutex while retiring its views. No guest mapping changes follow. */
+    pthread_mutex_unlock(&g_pool_mu);
+    vk_res_buffer_released(e->buf);
+    pthread_mutex_lock(&g_pool_mu);
     vkDestroyBuffer(g_dev, e->buf, NULL); vk_memory_release(e->mem, VK_MEMORY_POOL);
 #endif
 }
@@ -1259,15 +1266,6 @@ static pool_ent *pool_remove_locked(const void *mem, int wait_gpu) {
 #ifndef TOTK_VK_ALIAS_FIXTURE
         if (wait_gpu) vk_gpu_idle();
         HK_ADD(idle_pool, 1);
-#endif
-#ifndef TOTK_VK_ALIAS_FIXTURE
-        /* Match arena chunk_release after the existing GPU-use wait: active
-           and deferred views of this exact buffer must go before unback.
-           Resolution takes resource -> pool; do not invert those locks. The
-           removed entry stays private until synchronous unback completes. */
-        pthread_mutex_unlock(&g_pool_mu);
-        vk_res_buffer_released(e->buf);
-        pthread_mutex_lock(&g_pool_mu);
 #endif
         unback_pool(e);
         g_pool_bytes -= e->end - e->base;

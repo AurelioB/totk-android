@@ -287,9 +287,21 @@ class PoolLifetimeParity(unittest.TestCase):
         for name in ('vk_tex_pool_gone', 'stor_key_of', 'tex_drop_locked', 'wb_unref',
                      'tex_mark_gpu_written_inner', 'vk_wb_range_gone'):
             self.assertEqual(fixture.function(main_res, name), fixture.function(acd_res, name), name)
-        for name in ('add_range', 'back_pool', 'unback_pool', 'pool_retired', 'mtl_vpool_del',
+        for name in ('add_range', 'back_pool', 'pool_remove_locked', 'pool_retired', 'mtl_vpool_del',
                      'mtl_vpool_add', 'mtl_vpool_release', 'mtl_pool_finalize'):
             self.assertEqual(fixture.function(main_pool, name), fixture.function(acd_pool, name), name)
+        # The sole unback exception is view retirement AFTER guest-page restoration.
+        retirement = """    /* Guest pages and private aliases are restored under g_pool_mu before
+       allowing another registration to back the same range. Only the detached
+       Vulkan buffer remains: resource -> pool resolution forbids holding the
+       pool mutex while retiring its views. No guest mapping changes follow. */
+    pthread_mutex_unlock(&g_pool_mu);
+    vk_res_buffer_released(e->buf);
+    pthread_mutex_lock(&g_pool_mu);
+"""
+        main_unback = fixture.function(main_pool, 'unback_pool')
+        self.assertEqual(fixture.function(acd_pool, 'unback_pool'),
+                         main_unback.replace('    vkDestroyBuffer', retirement + '    vkDestroyBuffer', 1))
         self.assertEqual(main_vpool, acd_vpool)
 
 

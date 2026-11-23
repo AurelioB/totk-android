@@ -62,6 +62,7 @@ static int dirty_written, upload_calls, last_uploaded_byte, destroyed_buffers;
 static VkBuffer view_buffers[4096];
 static int live_views, destroy_with_view, resolve_calls;
 static VkBuffer resolved_buffer;
+static void (*retire_view_hook)(void);
 static vk_treg registration;
 static unsigned next_view=100;
 uint64_t vk_submit_serial(void) { return submission; }
@@ -129,6 +130,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL create_view(VkDevice d,const VkBufferViewC
     view_buffers[next_view]=ci->buffer;return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL destroy_view(VkDevice d,VkBufferView v,const VkAllocationCallbacks *a) {
+    if(retire_view_hook) retire_view_hook();
     (void)d;(void)a;assert(view_buffers[(uintptr_t)v]);view_buffers[(uintptr_t)v]=VK_NULL_HANDLE;live_views--;
 }
 static VKAPI_ATTR void VKAPI_CALL destroy_buffer(VkDevice d,VkBuffer b,const VkAllocationCallbacks *a) {
@@ -182,7 +184,9 @@ static uint64_t g_host_align=4096;
 void mtl_init(void) {}
 static uintptr_t page_sz(void) { return 4096; }
 static int backing_failure;
+static int (*backing_hook)(pool_ent *);
 static int back_pool(pool_ent *e) {
+    if(backing_hook) return backing_hook(e);
     if(backing_failure) return 0;
     e->buf=(VkBuffer)(uintptr_t)++next_view;e->fd=-1;return 1;
 }

@@ -49,6 +49,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Mandatory synchronous builds can still wait for required driver work; no device latency bound is claimed.
 - Retire cached and deferred texel-buffer views of an owning pool's exact Vulkan buffer before unbacking destroys it,
   using the existing arena-buffer release mechanism and existing GPU-use wait. Image/storage invalidation is unchanged.
+  Restore guest pages/private aliases under the pool lock before view retirement, so concurrent same-range
+  registration cannot have its new backing overwritten by the old pool's restoration.
 - Pack multi-element direct and frame-generation descriptor writes into fixed Vulkan-typed scratch arrays.
   Singleton direct writes retain the existing batched path; descriptor hashing and immutable ownership are unchanged.
 - Retry transient image creation/allocation OOM failures after 1–64 submissions, with at most four retry attempts
