@@ -28,6 +28,10 @@ The replacement tries ring ownership once (including fence metadata), counts dro
 updates and skipped/busy snapshots in the periodic summary, and never waits on the diagnostic ring.
 Timeline-only recorder elapsed accounting is now `rec_wall_ns` once per walk, reusing existing
 clocks; S/P/O estimates require explicit `TOTK_VK_REC_PROFILE=1` and its separate overhead.
+The new coarse walk and assembled-slot accounting bodies are enabled-only; with timeline off, each
+site does at most one cached flag check and no new timer/counter work. Existing native timing remains.
+Losses can bias individual stages and interval grouping; `missing=0` is not complete coverage, and
+cumulative dropped/busy attempts are not window-local lost-frame counts.
 Retain loss/coverage lines with every diagnostic report. See `games/totk/android/DEBUGGING.md`,
 “Frame critical-path timeline”, for field semantics. To qualify observer cost, use matched
 restart arms timeline-off / old-on / new-on with the same standing scene and independent walk

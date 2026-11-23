@@ -10,6 +10,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   dropped updates and skipped snapshots. Reuse per-walk elapsed clocks instead of enabling recorder
   opcode/category probes, and batch recorder-worker draws/descriptors at slot assembly instead of each job.
   Retain slot/walk/input/presentation evidence and ordinary default-off behavior.
+  Gate the new per-walk/per-assembly accounting bodies before all counter/slot work when disabled;
+  test both probe regions stay unentered with timeline off, including with explicit recorder profiling on.
   The old diagnostic inflated Thor walk CPU by about 4.7 ms/frame (+30%) and implicated rare ≥60 ms walks;
   pre-fix timeline-on tails are suspect. Keep it off for performance/tail acceptance pending device overhead measurement.
 - Add enabled-only `TOTK_WB_ALIAS=1` path coverage: cumulative operations/bytes by landing, report/event store

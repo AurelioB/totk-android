@@ -6422,7 +6422,12 @@ uint64_t mtl_sub_commit(void) {
         uint64_t cpu = walker_cpu_now() - g_perf_cpu_t0, dt = host_now_ns() - g_perf_t0;
         uint64_t w = g_perf_wait_ns - g_perf_sub0, r = dt > w ? dt - w : 0;
         g_perf_cpu_ns += cpu; g_perf_elapsed_ns += dt;
-        totk_ft_count(FT_COUNT_REC_WALL_NS, dt); /* existing clocks, once per walk */
+        if (__builtin_expect(T_ft_walk_frame != 0, 0)) {
+#ifdef TOTK_FRAME_TIMELINE_TEST
+            totk_ft_test_probe_hit(FT_TEST_WALK_WALL);
+#endif
+            totk_ft_count(FT_COUNT_REC_WALL_NS, dt); /* reuse main's clocks, no off-path counter call */
+        }
         g_perf_replay_ns += r; g_cum[0] += r; g_perf_t0 = 0; g_perf_subs++; vk_record_walk_time(r);
         HK_ADD(subs, 1); HK_ADD(replay_ns, r); HK_ADD(wait_ns, w);
     }

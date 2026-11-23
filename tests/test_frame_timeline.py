@@ -60,3 +60,31 @@ class FrameTimeline(unittest.TestCase):
         report = re.sub(rb' rec_wall_ns=[0-9.]+', b'', report)
         self.assertEqual(hashlib.sha256(report).hexdigest(),
                          'dfbac65547cd15fa0f97267090e4d40c39230188a350729261d8ac0c3d0ee307')
+
+    def test_actual_walk_and_assembly_probes_stay_off(self):
+        binary = os.environ.get('TOTK_VK_TIMELINE_TEST')
+        seed = os.environ.get('TOTK_SHADER_SEED_DIR')
+        if not binary or not seed:
+            self.skipTest('Set TOTK_VK_TIMELINE_TEST and TOTK_SHADER_SEED_DIR for production Vulkan probe gates')
+        binary = Path(binary).resolve()
+        seed = Path(seed).resolve()
+        self.assertTrue(binary.is_file() and os.access(binary, os.X_OK), str(binary))
+        self.assertTrue((seed / '.done').is_file(), 'complete owned shader seed required')
+        env = {key: value for key, value in os.environ.items() if not key.startswith(('TOTK_', 'DM_'))}
+        env.update(TOTK_SHADER_SEED_DIR=str(seed), TOTK_VK_REC_THREADS='2',
+                   TOTK_FRAME_LAG='1', TOTK_VK_WRITEBACK='1', TOTK_VK_CHUNK_DRAWS='600',
+                   TOTK_VK_COMPILE_THREADS='0')
+        outputs = []
+        for timeline in ('0', '1'):
+            for profile in ('0', '1'):
+                with self.subTest(timeline=timeline, profile=profile):
+                    output = Path(self.temp.name) / f'identity-{timeline}-{profile}.bin'
+                    run = subprocess.run([str(binary), '--rec-identity', str(output)],
+                                         cwd=self.temp.name, capture_output=True, text=True, timeout=180,
+                                         env=dict(env, TOTK_FRAME_TIMELINE=timeline, TOTK_VK_REC_PROFILE=profile))
+                    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                    self.assertIn(f'frame-tl probe-check: enabled={timeline} ', run.stdout)
+                    if timeline == '0':
+                        self.assertIn('enabled=0 walk=0 assembly=0', run.stdout)
+                    outputs.append(output.read_bytes())
+        self.assertTrue(all(data == outputs[0] for data in outputs), 'off/on profiler/timeline pixels and data differ')

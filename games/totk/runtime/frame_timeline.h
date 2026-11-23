@@ -65,6 +65,11 @@ static inline int totk_ft_on(void) {
     int on = atomic_load_explicit(&totk_ft_enabled, memory_order_acquire);
     return on < 0 ? totk_ft_init() : on;
 }
+/* Steady-state admission only: never initialize the diagnostic or touch TLS.
+ * Use once to guard a new optional region, not once per field in that region. */
+static inline int totk_ft_cached_on(void) {
+    return atomic_load_explicit(&totk_ft_enabled, memory_order_relaxed) > 0;
+}
 static inline uint64_t totk_ft_now(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
@@ -123,9 +128,13 @@ void totk_ft_test_report(FILE *out, uint64_t first, uint64_t last);
 void totk_ft_test_hold(uint64_t frame);
 void totk_ft_test_release(uint64_t frame);
 uint64_t totk_ft_test_dropped(void);
+enum totk_ft_test_probe { FT_TEST_WALK_WALL, FT_TEST_ASSEMBLY_WORK, FT_TEST_PROBES };
+void totk_ft_test_probe_hit(enum totk_ft_test_probe probe);
+uint64_t totk_ft_test_probe_hits(enum totk_ft_test_probe probe);
 #endif
 #else
 static inline int totk_ft_on(void) { return 0; }
+static inline int totk_ft_cached_on(void) { return 0; }
 static inline uint64_t totk_ft_now(void) { return 0; }
 static inline uint64_t totk_ft_current(void) { return 0; }
 static inline void runtime_frame_timeline_walking(void) {}

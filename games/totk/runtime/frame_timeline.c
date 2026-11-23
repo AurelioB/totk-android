@@ -542,6 +542,13 @@ void totk_ft_present(uint64_t f, uint64_t target, uint64_t now) {
 #endif
 }
 #ifdef TOTK_FRAME_TIMELINE_TEST
+static _Atomic uint64_t test_probe_hits[FT_TEST_PROBES];
+void totk_ft_test_probe_hit(enum totk_ft_test_probe probe) {
+    atomic_fetch_add_explicit(&test_probe_hits[probe], 1, memory_order_relaxed);
+}
+uint64_t totk_ft_test_probe_hits(enum totk_ft_test_probe probe) {
+    return atomic_load_explicit(&test_probe_hits[probe], memory_order_relaxed);
+}
 int totk_ft_snapshot(uint64_t f, totk_ft_record *out) { return snapshot(f, out); }
 void totk_ft_test_report(FILE *out, uint64_t first, uint64_t last) { report(out, first, last); }
 void totk_ft_test_hold(uint64_t f) {

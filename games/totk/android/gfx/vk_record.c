@@ -1550,12 +1550,17 @@ static void record_assemble_inner(unsigned slot, int background) {
             if (!vk_one_primary_on) VKCHECK(vkEndCommandBuffer(p->primary)));
         execute += host_now_ns() - t0;
     }
-    if (slots[slot].frame) {
-        /* All jobs above are done (acquire): each slot's captured frame remains
-         * authoritative even when its assembler runs after the walker ends. */
-        uint64_t recorded = atomic_exchange_explicit(&timeline_work[slot].draws, 0, memory_order_relaxed);
-        uint64_t descriptors = atomic_exchange_explicit(&timeline_work[slot].descriptors, 0, memory_order_relaxed);
-        totk_ft_recorded(slots[slot].frame, recorded, descriptors);
+    if (__builtin_expect(totk_ft_cached_on(), 0)) {
+#ifdef TOTK_FRAME_TIMELINE_TEST
+        totk_ft_test_probe_hit(FT_TEST_ASSEMBLY_WORK);
+#endif
+        if (slots[slot].frame) {
+            /* All jobs above are done (acquire): each slot's captured frame remains
+             * authoritative even when its assembler runs after the walker ends. */
+            uint64_t recorded = atomic_exchange_explicit(&timeline_work[slot].draws, 0, memory_order_relaxed);
+            uint64_t descriptors = atomic_exchange_explicit(&timeline_work[slot].descriptors, 0, memory_order_relaxed);
+            totk_ft_recorded(slots[slot].frame, recorded, descriptors);
+        }
     }
     if (vk_one_primary_on) vk_sections_until(slot, NULL);
     slots[slot].pending = NULL;

@@ -323,12 +323,14 @@ static void contention_cases(void) {
 int main(int argc, char **argv) {
     int disabled = argc > 1 && !strcmp(argv[1], "off");
     assert(atomic_load(&totk_ft_enabled) == -1);
+    assert(!totk_ft_cached_on()); /* no initialization or TLS while uninitialized */
     assert(!totk_ft_work_frame());
     totk_ft_count(FT_COUNT_DRAWS, 1);
     assert(atomic_load(&totk_ft_enabled) == -1); /* hot counters never initialize the diagnostic */
     assert(!totk_ft_active_work.value[FT_COUNT_DRAWS]);
     setenv("TOTK_FRAME_TIMELINE", disabled ? "0" : "1", 1);
     assert(totk_ft_on() == !disabled);
+    assert(totk_ft_cached_on() == !disabled);
     totk_ft_record r;
     if (disabled) {
         totk_ft_walk(1, 10, 20, 5); totk_ft_present(1, 30, 100);

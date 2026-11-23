@@ -63,11 +63,11 @@ static inline void *vk_heap_zero(size_t count, size_t size, const char *function
 /* a red line the first few times (the Mac's RED_ONCE) */
 #define RED(n, ...) do { static int said_; if (said_++ < (n)) LOGV("【红】" __VA_ARGS__); } while (0)
 
-/* CPU recording split (TOTK_VK_REC_PROFILE=1 or frame-timeline sampled walk timing).
-   With both disabled each probe is one predictable branch: no clock, TLS lookup, allocation or update.
-   Scopes are exclusive, including nested S/O work. Only mtl_sub_begin/commit and explicit full-profile
-   present activate the calling thread, under vk_rec_lock. Timeline-only timing samples opcode scopes
-   at 1/64 with 64x weighted ns; setup/commit outside the opcode stream are exact, unweighted scopes. */
+/* Exclusive CPU recording split, enabled only by TOTK_VK_REC_PROFILE=1.
+   Disabled probes are one predictable branch: no clock, TLS lookup, allocation or update.
+   Scopes include nested S/O work; mtl_sub_begin/commit and explicit full-profile present
+   activate the calling thread under vk_rec_lock. Frame timeline alone does not activate
+   these opcode/category probes; it reuses the existing per-walk wall elapsed reading. */
 enum {
     VK_REC_S, VK_REC_RESOLVE, VK_REC_BIND, VK_REC_PROG, VK_REC_PIPE, VK_REC_VERTEX, VK_REC_CMD, VK_REC_O,
     VK_REC_S_STREAM, VK_REC_S_STATE, VK_REC_S_UNIFORM, VK_REC_S_COUNTER, VK_REC_S_PASS, VK_REC_S_SNAPSHOT,
@@ -76,7 +76,7 @@ enum {
     VK_REC_O_WORKER_WAIT, VK_REC_O_EXECUTE, VK_REC_O_ASSEMBLE,
     VK_REC_O_DISPATCH, VK_REC_O_TRANSFER, VK_REC_O_UPLOAD, VK_REC_O_PRESENT, VK_REC_N
 };
-extern int vk_rec_profile_on, vk_rec_timing_on; /* initialized once; timing includes either opt-in mode */
+extern int vk_rec_profile_on, vk_rec_timing_on; /* initialized once; timing is explicit full-profile only */
 int vk_rec_profile_push(int category);
 void vk_rec_profile_pop(int previous);
 void vk_rec_profile_begin(int category);

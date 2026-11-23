@@ -908,6 +908,10 @@ Nonzero losses make the affected reports incomplete; missing values are not evid
 Frame IDs and reporting watermarks still advance when a present update is dropped. The separate
 fence-evidence rings likewise use one try, retaining their existing cumulative `busy` coverage.
 No locks are held across formatting/I/O.
+Losses can systematically understate a particular stage or remove intervals/change late-frame grouping;
+they are not random missingness. `missing=0` does not prove complete stage coverage. Counters are
+cumulative attempts, not lost-frame counts or window-local rates; current work can increment them
+while an older window is printed.
 
 
 Operator observation, **not rerun here**: Thor, 60-Hz panel, shipping 30-fps controller, protected lag,
@@ -1045,6 +1049,13 @@ accumulate actual draws/descriptors in atomic slot totals; the existing all-jobs
 publishes both in one update per slot (or merges them into walking TLS). Rare asynchronous pipeline creation
 and slot-level guard registration publish against captured frame IDs. Disabled timeline accounting
 does not enable recorder profiling, create another reporter, alter pacing, or change rendering defaults.
+New optional accounting has two disabled-path gates: commit checks the walk's already-captured
+`T_ft_walk_frame` once before the coarse counter call; assembly checks the cached enabled flag once
+before reading the slot frame/exchanging worker totals. Off executes neither probe body, counter
+helper, worker-total exchange nor new clock. The ordinary recorder wall/thread-CPU readings used
+for native CPU reports already exist with timeline off in main and are unchanged/reused, not new probes.
+Test builds count entries into both new regions and require zero with timeline off, including when
+the separate recorder profiler is on.
 
 Acquire diagnostics now retain the original total span and add `acquire_pacing` and `acquire_texture` (milliseconds)
 to late rows, plus their per-group means. The former measures the display-link/synthetic/deterministic pacing block;

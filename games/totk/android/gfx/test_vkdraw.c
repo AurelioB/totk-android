@@ -4445,6 +4445,20 @@ int main(int argc, char **argv) {
         const uint64_t footer[] = {0x5245434944454e33ull, 12};
         CHECK(fwrite(footer, sizeof footer, 1, out) == 1, "write identity footer");
         CHECK(!fclose(out), "close identity output");
+#ifdef TOTK_FRAME_TIMELINE_TEST
+        uint64_t wall_probes = totk_ft_test_probe_hits(FT_TEST_WALK_WALL);
+        uint64_t assembly_probes = totk_ft_test_probe_hits(FT_TEST_ASSEMBLY_WORK);
+        if (totk_ft_on()) {
+            CHECK(wall_probes > 0, "enabled timeline executes coarse per-walk accounting");
+            CHECK(!vk_record_enabled() || assembly_probes > 0,
+                  "enabled recorder executes assembled-slot accounting");
+        } else {
+            CHECK(!wall_probes && !assembly_probes,
+                  "disabled timeline executes no new walk or assembly probe, including with the full profiler on");
+        }
+        printf("frame-tl probe-check: enabled=%d walk=%llu assembly=%llu\n", totk_ft_on(),
+               (unsigned long long)wall_probes, (unsigned long long)assembly_probes);
+#endif
         printf("recorder identity timing ms/NVN-submit: walk wall %.3f body %.3f final %.3f summed worker busy %.3f background assembly wait %.3f walking wait %.3f body wait %.3f slots %.2f\n",
             walk_wall / 12e6, body_wall / 12e6, final_wall / 12e6, worker_busy / 12e6, assembly_wait / 12e6,
             walking_wait / 12e6, body_wait / 12e6, slot_sum / 12.0);
