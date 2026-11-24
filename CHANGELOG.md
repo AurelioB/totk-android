@@ -58,6 +58,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Add experimental, default-off `TOTK_MAP_WARN=1`: count process maps on the existing low-priority
+  sampler about every five seconds, independently of frame lag. Log at 80%; show `MAP LIMIT NEAR` /
+  `SAVE AND RESTART GAME SOON` at 88%, even with the performance overlay off; clear below 84%.
+  Hidden kernel limits use 65,530; unreadable counts clear the notice and log once. Startup-only
+  percentage overrides support safe low-threshold testing. This warns only: it does not fix map growth
+  or change mapping/protection/admission policy, and no Android device verification is claimed.
 - Correct fragment inputs that their vertex shader never writes, targeting wind/air-flow white boxes
   ([#4](https://github.com/AurelioB/totk-android/issues/4)). Thanks to @Dorkington
   ([#43](https://github.com/AurelioB/totk-android/pull/43)); keep the credited MIT adaptation.

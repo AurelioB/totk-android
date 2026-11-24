@@ -7,6 +7,7 @@
 // (measured: the game writes streamed assets into texture storage that is still being sampled, without re-registering).
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
 #include "nvn_dirty.h"
+#include "nvn_map_warn.h"
 #include "../../host/dm.h"
 #include <stdatomic.h>
 #include <pthread.h>
@@ -289,6 +290,62 @@ static _Atomic unsigned g_vma_requests;
 static _Atomic uint64_t g_vma_epoch = UINT64_MAX;
 enum { VMA_EPOCH = 1, VMA_CLASSES = 2 };
 static void vma_start(void);
+/* Startup-only configuration; immutable before the shared worker is created. The notice is
+   the only publication consumed by presentation. Warning-only scans take no tracker locks. */
+static pthread_once_t g_map_warn_once = PTHREAD_ONCE_INIT;
+static int g_map_warn_enabled;
+static nvn_map_warn_thresholds g_map_warn_thresholds = {80, 88, 84};
+static nvn_map_warn_state g_map_warn_state;
+static _Atomic int g_map_warn_notice;
+enum { MAP_WARN_PERIOD_MS = 5000 };
+static unsigned map_warn_percent(const char *name, unsigned fallback) {
+    const char *value = getenv(name);
+    if (!value) return fallback;
+    char *end; errno = 0; unsigned long parsed = strtoul(value, &end, 10);
+    if (!*value || *end || errno || parsed < 1 || parsed > 100) {
+        LOG("[map-warn] invalid %s; using %u percent", name, fallback);
+        return fallback;
+    }
+    return (unsigned)parsed;
+}
+static void map_warn_configure(void) {
+    const char *value = getenv("TOTK_MAP_WARN");
+    g_map_warn_enabled = value && !strcmp(value, "1");
+    if (!g_map_warn_enabled) return;
+    nvn_map_warn_thresholds t = {
+        map_warn_percent("TOTK_MAP_WARN_LOG_PERCENT", 80),
+        map_warn_percent("TOTK_MAP_WARN_NOTICE_PERCENT", 88),
+        map_warn_percent("TOTK_MAP_WARN_CLEAR_PERCENT", 84)
+    };
+    if (t.log_percent > t.clear_percent || t.clear_percent >= t.notice_percent) {
+        LOG("[map-warn] thresholds require log <= clear < notice; using 80/84/88 percent");
+        return;
+    }
+    g_map_warn_thresholds = t;
+}
+int nvn_dirty_map_warn_init(void) {
+    pthread_once(&g_map_warn_once, map_warn_configure);
+    if (g_map_warn_enabled) pthread_once(&g_vma_once, vma_start);
+    return g_map_warn_enabled;
+}
+int nvn_dirty_map_warn_notice(void) {
+    return atomic_load_explicit(&g_map_warn_notice, memory_order_relaxed);
+}
+static void map_warn_sample(uint64_t count, uint64_t maximum) {
+    /* Called only by totk-vmascan, never by vma_sample's synchronous lag callers. */
+    if (!maximum) maximum = 65530;
+    nvn_map_warn_result result = nvn_map_warn_step(g_map_warn_state, count, maximum, g_map_warn_thresholds);
+    g_map_warn_state = result.state;
+    atomic_store_explicit(&g_map_warn_notice, result.state.notice, memory_order_relaxed);
+    if (result.logs & NVN_MAP_WARN_LOG_UNKNOWN)
+        LOG("[map-warn] maps count unavailable; no notice until a valid sample");
+    if (result.logs & NVN_MAP_WARN_LOG_EARLY)
+        LOG("[map-warn] maps %llu/%llu >= %u percent; map limit is approaching",
+            (unsigned long long)count, (unsigned long long)maximum, g_map_warn_thresholds.log_percent);
+    if (result.logs & NVN_MAP_WARN_LOG_NOTICE)
+        LOG("[map-warn] maps %llu/%llu >= %u percent; SAVE AND RESTART GAME SOON",
+            (unsigned long long)count, (unsigned long long)maximum, g_map_warn_thresholds.notice_percent);
+}
 static uint64_t vma_read(const char *path, int lines) {
 #ifdef TOTK_VK_TESTS
     g_vma_test_reads++;
@@ -480,20 +537,43 @@ static void *vma_worker(void *unused) {
     /* Linux nice is per-thread. Failure to lower priority is harmless; never renice the game thread. */
     nice(10);
 #endif
+    uint64_t scan_period = (uint64_t)g_vma_period_ms * 1000000;
+    uint64_t warn_period = (uint64_t)MAP_WARN_PERIOD_MS * 1000000;
+    uint64_t next_scan = vma_clock_ns() + scan_period, next_warn = vma_clock_ns() + warn_period;
     for (;;) {
-        /* End-to-start spacing also covers the first worker scan after the synchronous startup sample.
-           Only this thread sleeps: requests cannot shorten the period or accumulate extra scans. */
-        struct timespec delay = {g_vma_period_ms / 1000, (g_vma_period_ms % 1000) * 1000000L};
+        /* Independent deadlines preserve lag's configured cadence. Requests never advance either.
+           No game/render/present thread scans for this feature, including its startup sample. */
+        uint64_t now = vma_clock_ns(), due = next_scan;
+        if (g_map_warn_enabled && next_warn < due) due = next_warn;
+        uint64_t wait = due > now ? due - now : 0;
+        struct timespec delay = {wait / 1000000000, wait % 1000000000};
         while (nanosleep(&delay, &delay)) if (errno != EINTR) die("VMA sampler sleep: %d", errno);
-        unsigned requests = atomic_exchange_explicit(&g_vma_requests, 0, memory_order_acquire);
-        if (!g_lag_enabled && !requests) continue; /* lag-off diagnostic worker has no periodic scans */
-        uint64_t start = vma_clock_ns();
-        /* Exactly one maps traversal per scheduled scan, even when classification was requested. */
+        now = vma_clock_ns();
+        int scan_due = now >= next_scan, warn_due = g_map_warn_enabled && now >= next_warn;
+        unsigned requests = scan_due ? atomic_exchange_explicit(&g_vma_requests, 0, memory_order_acquire) : 0;
+        int lag_scan = scan_due && (g_lag_enabled || requests);
+        if (scan_due) next_scan = now + scan_period;
+        if (!lag_scan && !warn_due) continue;
+        uint64_t start = vma_clock_ns(), maps = 0, maximum = 0;
+        if (lag_scan) {
+            /* Reuse the existing traversal, including classification when explicitly requested. */
 #ifdef __linux__
-        if (requests & VMA_CLASSES) nvn_dirty_lag_vma_report();
-        else
+            if (requests & VMA_CLASSES) nvn_dirty_lag_vma_report();
+            else
 #endif
-            nvn_dirty_lag_vma_refresh();
+                nvn_dirty_lag_vma_refresh();
+            maps = atomic_load(&g_vma_missing_maps) ? 0 : atomic_load(&g_vma_count);
+            maximum = atomic_load(&g_vma_max);
+        } else {
+            /* No g_vma_mu, g_slot_mu, pool or runtime locks in warning-only sampling. */
+            maps = vma_read("/proc/self/maps", 1);
+            maximum = vma_read("/proc/sys/vm/max_map_count", 0);
+        }
+        if (warn_due) {
+            map_warn_sample(maps, maximum);
+            next_warn = vma_clock_ns() + warn_period;
+        }
+        if (scan_due) next_scan = vma_clock_ns() + scan_period;
         uint64_t elapsed = vma_clock_ns() - start;
         pthread_mutex_lock(&g_vma_scan_mu);
         g_vma_scan_stats[0]++;
@@ -519,6 +599,7 @@ static unsigned vma_scan_period(const char *period) {
 static void vma_start(void) {
     /* pthread_once makes a clamping diagnostic a startup-only message, never one per scan/request. */
     g_vma_period_ms = vma_scan_period(getenv("TOTK_VMA_SCAN_MS"));
+    pthread_once(&g_map_warn_once, map_warn_configure);
     pthread_attr_t attr;
     if (pthread_attr_init(&attr)) die("VMA sampler thread attributes");
     if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED)) die("VMA sampler detach");

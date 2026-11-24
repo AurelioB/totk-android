@@ -231,6 +231,7 @@ VKTEST_SRC := $(TOTK)/android/gfx/nvn_vk.c $(TOTK)/android/gfx/vk_load.c $(TOTK)
   $(TOTK)/runtime/fps_hybrid_runtime.c $(TOTK)/runtime/fps_adaptive_runtime.c
 VKTEST_SRC += $(TOTK)/android/gfx/vk_framegen_qcom.c $(TOTK)/android/gfx/vk_framegen_lsfg.c
 VKTEST_SRC += $(TOTK)/android/gfx/vk_sections.h $(TOTK)/android/gfx/vk_sections.inc
+VKTEST_SRC += $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_map_warn.h
 VKTEST_FLAGS := -O1 -g $(WARN) -Wno-unused-parameter -D_GNU_SOURCE -DGPU_VK -DTOTK_VK_TESTS -I$(TOTK)/runtime -I$(TOTK)/third_party/d2r_gfx/gfx/nvn \
   -I$(TOTK)/third_party/d2r_gfx/gfx/nvn/include $(COMPAT) -fPIE -pie
 VKTEST_LIBS := -ldl -lm $(if $(filter linux,$(TARGET)),-lpthread)

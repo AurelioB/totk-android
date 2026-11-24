@@ -37,6 +37,10 @@ enum {
 };
 void nvn_dirty_lag_enable(void);
 int nvn_dirty_lag_enabled(void);   /* set once by nvn_dirty_lag_enable before pool registration */
+/* Startup-only opt-in: starts the existing low-priority sampler only when TOTK_MAP_WARN=1.
+   The notice getter is one cached atomic load; neither API scans procfs. */
+int nvn_dirty_map_warn_init(void);
+int nvn_dirty_map_warn_notice(void);
 /* Linux VMA guard budget. Explicit refresh/report and drain are normal-thread-only, off the recurring
    frame/recording paths. Request is non-blocking with respect to scans; pressure is an acquire-load.
    Pressure is latched until restart: no new additional lag/private-copy watches; baseline texture
