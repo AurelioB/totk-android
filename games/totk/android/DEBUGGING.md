@@ -892,9 +892,9 @@ FILE classification path. Android syntax passed the final dirty tracker. Evidenc
 
 ## Frame critical-path timeline (opt-in, 2026-10-23)
 
-**Performance warning (2026-11-23): keep `TOTK_FRAME_TIMELINE=0` for tail and performance
-acceptance.** The replacement is suitable for coarse per-frame attribution, not cleared for tail
-acceptance. Six matched **AYN Thor, 30-fps standing, 20-minute launches** measured:
+**Performance warning (2026-11-23): prefer `TOTK_FRAME_TIMELINE=0` for final tail and performance
+acceptance unless its presence is identical in both arms.** The replacement remains a diagnostic:
+it adds per-frame work when on. Six matched **AYN Thor, 30-fps standing, 20-minute launches** measured:
 
 | Diagnostic | Walk CPU per frame | Observed game-present intervals ≥60 / ≥80 ms per 20 minutes |
 |---|---|---|
@@ -908,17 +908,24 @@ fraction; loss can hide intervals. CPU values are medians of ordinary 300-frame 
 not per-frame medians. The ≥60/≥80 counts are observed optional game-present intervals, not
 individual walks or optical frames.
 
-**The run's pre-set gate on the ordinary counter of frames >50 ms failed.** New-on rates were
-**37 and 63 per 20 minutes**, against **19–37 across three off launches** (old-on: **68**).
-These ordinary-counter rates use complete-report exposure estimates, unlike the exact 20-minute
-window for the observed timeline intervals. It is **not established that the new diagnostic adds
-no 50–60 ms frames**. The near-zero walk-CPU overhead does not clear that limitation.
-Results taken with the **old implementation on have suspect worst-frame figures and about 30%
-inflated walk CPU**; they are intrusive diagnostic controls, not player-performance baselines.
+The first run's pre-set ordinary >50 ms counter gate failed (new-on **37 and 63 per 20 minutes**,
+off **19–37**, old-on **68**). An eight-launch paired follow-up **CLEARED** the rewritten diagnostic
+for no material added >50 ms frames on this **AYN Thor, one Hateno scene, standing only, 30-fps cap**:
+ON rates **31.43, 10.10, 22.44, 30.30** (mean **23.57**) versus OFF **21.32, 39.27, 33.67, 35.92**
+(mean **32.55**) per 20 minutes; adjacent ON-minus-OFF differences **+10.10, −29.17, −11.23, −5.62**.
+The frozen clearance rule required ON mean minus OFF mean ≤10 frames/20 minutes, ON mean ≤1.30×OFF
+mean, not all four pair differences positive, and at most one ON value above the OFF maximum.
+All passed; walk-CPU overhead was **+0.19%** by equal-launch means of block medians.
+The first run's single high launch is consistent with launch-to-launch variation, not a demonstrated
+diagnostic effect. Fixed order and small samples do not establish causality or general tail safety.
+Ordinary-counter rates use complete-report exposure estimates from rounded FPS, unlike exact
+20-minute windows for observed timeline intervals. Results with the **old implementation on have
+suspect worst-frame figures and about 30% inflated walk CPU**; they are intrusive diagnostic controls,
+not player-performance baselines.
 
-Measurement source: `.scratch/perf/frame-timeline-fix/thor/report.md`, old/main `8bbbce5`
-versus new `8dc331f`, before replay onto current main. These are not fresh device measurements
-of the rebased head.
+Sources: `.scratch/perf/frame-timeline-fix/thor/report.md` and `thor-pairs/report.md` in that directory,
+old/main `8bbbce5` versus rewritten `8dc331f`, before replay onto current main. These measurements
+do not qualify the integrated head or other devices, scenes, movement, or frame caps.
 
 Producers now try a ring entry exactly once and drop contended evidence rather than spin or wait.
 The reporter also tries once and skips busy snapshots; payload copies remain lock-protected, so

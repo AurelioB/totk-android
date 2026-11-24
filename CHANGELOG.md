@@ -16,14 +16,21 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   20.4 ms old-on (+29.6%), and 15.5 / 15.7 ms new-on (−1.3% / +0.3%, within noise).
   New-off was −0.4% / −0.8% versus the measured main baseline, within noise; sample loss ≤0.07%
   of producer-update attempts. Observed intervals ≥60 / ≥80 ms per 20 minutes fell from 20 / 11
-  old-on to 1 / 0 and 4 / 0 new-on. However, ordinary >50 ms counter rates were 37 and 63 per
-  20 minutes new-on versus 19–37 across three off launches (old-on: 68); the run's pre-set gate
-  on that counter failed. It is not established that the new diagnostic adds no 50–60 ms frames:
-  keep it OFF for tail/performance acceptance; use it for coarse per-frame attribution.
-  Old-on worst-frame figures are suspect and walk CPU is about 30% inflated.
-  CPU is the median of ordinary block means; >50 ms rates use complete-report exposure estimates,
-  unlike the observed timeline intervals' exact 20-minute windows. Measurements compare old/main
-  8bbbce5 with new 8dc331f, not the rebased head; see DEBUGGING.md for the source and limitations.
+  old-on to 1 / 0 and 4 / 0 new-on. The first run's ordinary >50 ms gate failed (new-on 37 / 63,
+  off 19–37 per 20 minutes), but an eight-launch paired follow-up CLEARED the rewritten diagnostic
+  on this AYN Thor, one Hateno scene, standing only, 30-fps cap: ON 31.43 / 10.10 / 22.44 / 30.30
+  (mean 23.57) versus OFF 21.32 / 39.27 / 33.67 / 35.92 (mean 32.55) per 20 minutes;
+  paired ON-minus-OFF +10.10 / −29.17 / −11.23 / −5.62 and walk-CPU overhead +0.19%.
+  Frozen rule: mean difference ≤10, ON mean ≤1.30×OFF mean, not all pair differences positive,
+  at most one ON value above OFF maximum; all passed. The first run's single high launch is
+  consistent with launch-to-launch variation, not a demonstrated diagnostic effect.
+  It still adds per-frame work when on and remains a diagnostic: prefer OFF for final tail/performance
+  acceptance unless present identically in both arms. Old-on worst-frame figures are suspect and
+  walk CPU about 30% inflated. CPU uses medians of ordinary block means; >50 ms rates use
+  complete-report exposure estimates, unlike exact 20-minute timeline windows. Fixed-order,
+  single-device/scene standing evidence does not establish general tail safety. Measurements are
+  old/main 8bbbce5 versus rewritten 8dc331f, not the integrated head; see DEBUGGING.md and
+  `.scratch/perf/frame-timeline-fix/thor-pairs/report.md` for the follow-up source and limitations.
 - Add enabled-only `TOTK_WB_ALIAS=1` path coverage: cumulative operations/bytes by landing, report/event store
   and publication, separated into alias and fallback reasons at periodic memory reports, Android pause and normal exit.
   Publish pause-report enablement atomically so early Android lifecycle callbacks can race Vulkan initialization safely.
