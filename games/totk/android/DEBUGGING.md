@@ -893,12 +893,32 @@ FILE classification path. Android syntax passed the final dirty tracker. Evidenc
 ## Frame critical-path timeline (opt-in, 2026-10-23)
 
 **Performance warning (2026-11-23): keep `TOTK_FRAME_TIMELINE=0` for tail and performance
-acceptance until this implementation's overhead is measured on a device.** The old implementation
-added about **4.7 ms of render-thread command-walk CPU per frame on AYN Thor** (15.9 → 20.6 ms,
-about +30%). Equal 40-minute standing exposures had **13 walks ≥60 ms with it on, zero with it
-off**; sampled long-walk PCs included the timeline's unbounded ring-lock spin. Pre-fix timeline-on
-results have inflated walk CPU and suspect worst-frame figures. This implicates the diagnostic as
-a whole, not a proven lock holder or every player hitch.
+acceptance.** The replacement is suitable for coarse per-frame attribution, not cleared for tail
+acceptance. Six matched **AYN Thor, 30-fps standing, 20-minute launches** measured:
+
+| Diagnostic | Walk CPU per frame | Observed game-present intervals ≥60 / ≥80 ms per 20 minutes |
+|---|---|---|
+| Off (three launches) | About 15.7 ms | Not measured with the optional timeline off |
+| Old implementation on | 20.4 ms (+29.6%) | 20 / 11 |
+| New implementation on (two launches) | 15.5 / 15.7 ms (−1.3% / +0.3%, within noise) | 1 / 0 and 4 / 0 |
+
+New-off walk CPU was −0.4% / −0.8% versus the measured main baseline, also within noise.
+The conservative sample-loss bound was **≤0.07% of producer-update attempts**, not a lost-frame
+fraction; loss can hide intervals. CPU values are medians of ordinary 300-frame block means,
+not per-frame medians. The ≥60/≥80 counts are observed optional game-present intervals, not
+individual walks or optical frames.
+
+**The run's pre-set gate on the ordinary counter of frames >50 ms failed.** New-on rates were
+**37 and 63 per 20 minutes**, against **19–37 across three off launches** (old-on: **68**).
+These ordinary-counter rates use complete-report exposure estimates, unlike the exact 20-minute
+window for the observed timeline intervals. It is **not established that the new diagnostic adds
+no 50–60 ms frames**. The near-zero walk-CPU overhead does not clear that limitation.
+Results taken with the **old implementation on have suspect worst-frame figures and about 30%
+inflated walk CPU**; they are intrusive diagnostic controls, not player-performance baselines.
+
+Measurement source: `.scratch/perf/frame-timeline-fix/thor/report.md`, old/main `8bbbce5`
+versus new `8dc331f`, before replay onto current main. These are not fresh device measurements
+of the rebased head.
 
 Producers now try a ring entry exactly once and drop contended evidence rather than spin or wait.
 The reporter also tries once and skips busy snapshots; payload copies remain lock-protected, so

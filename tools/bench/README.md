@@ -17,12 +17,24 @@ cluster: a `su -c` per command costs the device a su session and, with Magisk, a
 Common options: `-s <serial>` (adb serial), `--device <label>` (a short name used in file names, e.g. `thor`),
 `--package` (default `com.aure.totk`), `--game-dir` (default `/data/user/0/<package>/files/game`).
 
-**Frame-timeline observer warning:** keep `TOTK_FRAME_TIMELINE=0` for tail/performance acceptance
-until the nonblocking implementation's overhead has been measured on a device. On AYN Thor the old
-implementation added about **4.7 ms/frame of command-walk CPU** (15.9 → 20.6 ms, about +30%) and
-equal 40-minute standing exposures contained **13 walks ≥60 ms on versus zero off**. Pre-fix
-timeline-on worst-frame results are suspect and walk CPU is inflated; do not compare them with
-ordinary default-off player runs as if instrumentation were free.
+**Frame-timeline observer warning:** keep `TOTK_FRAME_TIMELINE=0` for tail/performance acceptance;
+the replacement is suitable for coarse per-frame attribution, not cleared for tail acceptance.
+Measured **AYN Thor, 30-fps standing, 20-minute launches**: ordinary walk CPU was about
+**15.7 ms/frame off**, **20.4 ms old-on (+29.6%)**, and **15.5 / 15.7 ms new-on
+(−1.3% / +0.3%, within noise)**. New-off was **−0.4% / −0.8% versus the measured main
+baseline**, also within noise. Observed game-present intervals **≥60 / ≥80 ms** per 20 minutes
+were **20 / 11 old-on**, versus **1 / 0 and 4 / 0 new-on**. Conservative sample loss was
+**≤0.07% of producer-update attempts**, not a lost-frame fraction; missing evidence can hide intervals.
+Walk CPU uses medians of ordinary 300-frame block means, not per-frame medians.
+
+**The run's pre-set gate on the ordinary counter of frames >50 ms failed:** new-on was
+**37 and 63 per 20 minutes**, versus **19–37 across three off launches** (old-on: **68**).
+Those rates use complete-report exposure estimates; the observed timeline intervals use exact
+20-minute windows and are a different measure. It is **not established that the new diagnostic
+adds no 50–60 ms frames**. Old-on results have **suspect worst-frame figures and about 30%
+inflated walk CPU**; do not treat them as ordinary default-off player-performance baselines.
+Source: `.scratch/perf/frame-timeline-fix/thor/report.md`, measured old/main `8bbbce5` versus
+new `8dc331f`, before replay onto current main; the rebased head has not been measured on device.
 
 The replacement tries ring ownership once (including fence metadata), counts dropped producer
 updates and skipped/busy snapshots in the periodic summary, and never waits on the diagnostic ring.
@@ -33,8 +45,8 @@ site does at most one cached flag check and no new timer/counter work. Existing 
 Losses can bias individual stages and interval grouping; `missing=0` is not complete coverage, and
 cumulative dropped/busy attempts are not window-local lost-frame counts.
 Retain loss/coverage lines with every diagnostic report. See `games/totk/android/DEBUGGING.md`,
-“Frame critical-path timeline”, for field semantics. To qualify observer cost, use matched
-restart arms timeline-off / old-on / new-on with the same standing scene and independent walk
+“Frame critical-path timeline”, for field semantics. For future observer-cost checks, use matched
+restart arms old-off / new-off / old-on / new-on with the same standing scene and independent walk
 measurements, not the timeline's own counters alone; host microbenchmarks cannot clear device tails.
 
 

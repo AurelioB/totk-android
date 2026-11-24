@@ -12,8 +12,18 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Retain slot/walk/input/presentation evidence and ordinary default-off behavior.
   Gate the new per-walk/per-assembly accounting bodies before all counter/slot work when disabled;
   test both probe regions stay unentered with timeline off, including with explicit recorder profiling on.
-  The old diagnostic inflated Thor walk CPU by about 4.7 ms/frame (+30%) and implicated rare ≥60 ms walks;
-  pre-fix timeline-on tails are suspect. Keep it off for performance/tail acceptance pending device overhead measurement.
+  Measured AYN Thor, 30-fps standing, 20-minute launches: walk CPU about 15.7 ms/frame off,
+  20.4 ms old-on (+29.6%), and 15.5 / 15.7 ms new-on (−1.3% / +0.3%, within noise).
+  New-off was −0.4% / −0.8% versus the measured main baseline, within noise; sample loss ≤0.07%
+  of producer-update attempts. Observed intervals ≥60 / ≥80 ms per 20 minutes fell from 20 / 11
+  old-on to 1 / 0 and 4 / 0 new-on. However, ordinary >50 ms counter rates were 37 and 63 per
+  20 minutes new-on versus 19–37 across three off launches (old-on: 68); the run's pre-set gate
+  on that counter failed. It is not established that the new diagnostic adds no 50–60 ms frames:
+  keep it OFF for tail/performance acceptance; use it for coarse per-frame attribution.
+  Old-on worst-frame figures are suspect and walk CPU is about 30% inflated.
+  CPU is the median of ordinary block means; >50 ms rates use complete-report exposure estimates,
+  unlike the observed timeline intervals' exact 20-minute windows. Measurements compare old/main
+  8bbbce5 with new 8dc331f, not the rebased head; see DEBUGGING.md for the source and limitations.
 - Add enabled-only `TOTK_WB_ALIAS=1` path coverage: cumulative operations/bytes by landing, report/event store
   and publication, separated into alias and fallback reasons at periodic memory reports, Android pause and normal exit.
   Publish pause-report enablement atomically so early Android lifecycle callbacks can race Vulkan initialization safely.
