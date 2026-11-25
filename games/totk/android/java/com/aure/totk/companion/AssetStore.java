@@ -39,7 +39,8 @@ public final class AssetStore {
     private final File root;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService decoder = Executors.newSingleThreadExecutor();
-    private final LruCache<String, Bitmap> images, tiles, decorImages;
+    private final LruCache<String, Bitmap> images, tiles, overviews, decorImages;
+    private final int tileFloor, tileMarginLimit;
     private final Set<String> pending = new HashSet<>(), missing = new HashSet<>();
     private final Runnable changed;
     public volatile JSONObject index = new JSONObject(), text = new JSONObject();
@@ -107,7 +108,14 @@ public final class AssetStore {
         int memory = manager == null ? 128 : manager.getMemoryClass();
         int budget = Math.min(32, Math.max(8, memory / 12)) * 1024 * 1024;
         images = cache(budget);
-        tiles = cache(Math.max(24 * 1024 * 1024, budget));
+        tileFloor = Math.max(24 * 1024 * 1024, budget);
+        // Android's existing per-app heap class (not guessed physical RAM) limits only the margin above what is on
+        // screen; capping the visible working set would bring back the stationary decode/evict loop.
+        tileMarginLimit = Math.min(64, Math.max(32, memory / 8)) * 1024 * 1024;
+        tiles = cache(tileFloor);
+        // A 19,200,000-byte overview used to leave room for only two 840 px tiles in a 24 MiB cache,
+        // causing a stationary viewport to decode and evict its visible tiles repeatedly.
+        overviews = cache(24 * 1024 * 1024);
         // Full-screen frames must not evict one another or every redraw re-decodes the menu.
         decorImages = cache(48 * 1024 * 1024);
         decoder.execute(() -> {
@@ -335,7 +343,18 @@ public final class AssetStore {
         return true;
     }
     public Bitmap bitmap(String path, boolean tile) {
-        return bitmap(path, tile ? tiles : path.startsWith("decor/") ? decorImages : images);
+        return bitmap(path, path.endsWith("/overview.webp") ? overviews : tile ? tiles : path.startsWith("decor/") ? decorImages : images);
+    }
+    /** A map tile only if it is already decoded; never starts a load. */
+    public Bitmap cachedTile(String path) { return closed ? null : tiles.get(path); }
+    /** Retain every visible tile plus one more, whatever the memory class; the memory-class limit caps only the extra
+        16 MiB margin above that. Oversized decoded images can raise capacity further; budget updates never shrink it. */
+    public void tileBudget(long visibleBytes, long tileBytes) {
+        long working = visibleBytes + tileBytes, margin = Math.min((long)tileMarginLimit, visibleBytes + 16L * 1024 * 1024);
+        int size = (int)Math.min(Integer.MAX_VALUE, Math.max(tileFloor, Math.max(working, margin)));
+        synchronized (pending) {
+            if (size > tiles.maxSize()) tiles.resize(size);
+        }
     }
     private Bitmap bitmap(String path, LruCache<String, Bitmap> cache) {
         if (closed) return null;
@@ -351,7 +370,11 @@ public final class AssetStore {
             synchronized (pending) {
                 pending.remove(path);
                 if (result == null) missing.add(path);
-                else if (!closed) cache.put(path, result);
+                else if (!closed) {
+                    // An image larger than its whole cache would be evicted at once and decoded again on every redraw.
+                    if (result.getAllocationByteCount() > cache.maxSize()) cache.resize(result.getAllocationByteCount() + 1024 * 1024);
+                    cache.put(path, result);
+                }
             }
             if (result != null) notifyChanged();
         });
@@ -361,7 +384,7 @@ public final class AssetStore {
     public void close() {
         closed = true;
         decoder.shutdownNow();
-        images.evictAll(); tiles.evictAll(); decorImages.evictAll();
+        images.evictAll(); tiles.evictAll(); overviews.evictAll(); decorImages.evictAll();
         decorations = java.util.Collections.emptyMap();
         softPart = null; softImage = null; softShader = null;
     }

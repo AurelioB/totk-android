@@ -20,11 +20,14 @@ static void *alloc(size_t n) {
 }
 /* A hook that runs after every read: the tests use it to change game memory while a snapshot is being taken. */
 static void (*after_read)(uint64_t a);
+static uint64_t parameter_flags_at;
+static unsigned parameter_flag_reads;
 static int fake_read(uint64_t a, void *out, size_t n) {
     for (unsigned i = 0; i < nregions; i++) {
         uint64_t b = (uintptr_t)regions[i].p;
         if (a >= b && a - b <= regions[i].n && n <= regions[i].n - (a - b)) {
             memcpy(out, (void *)(uintptr_t)a, n);
+            if (parameter_flags_at && a < parameter_flags_at + 3 && a + n > parameter_flags_at) parameter_flag_reads++;
             if (after_read) after_read(a);
             return 1;
         }
@@ -112,12 +115,18 @@ static void swap_hook(uint64_t a) {
     }
     else if (reads == swap_after) put64(swap_at, swap_to[0]);
 }
+/* Replace a selected link immediately after it was sampled, without changing the snapshot's outer actor/GDM. */
+static uint64_t replace_trigger;
+static void replace_hook(uint64_t a) {
+    if (a == replace_trigger) { put64(swap_at, swap_to[0]); after_read = NULL; }
+}
 
 /* ---------- fake game functions for the item actions (companion_actions.c) ---------- */
 void companion_actions_test_verify(int key, unsigned mask);
 void companion_actions_test_sha256(const void *m, size_t n, char out[65]);
 void companion_actions_test_expect_prologues(uintptr_t main_base);
 void companion_snapshot_test_expect_guard(const void *words, size_t n);
+void companion_snapshot_test_player(uintptr_t main_base, uint64_t g, companion_read_fn read, CompanionBuf *out);
 /* the functions the actions call or check, by main offset; the test fills each with its own stand-in bytes */
 static const uint32_t FN_OFF[] = {0x20a1128, 0x20a9a28, 0x20ac5c4, 0x20ac080, 0x20af148, 0x20afab4, 0x20affa8, 0x20aff18,
     0x63307c, 0x711000, 0x20af2b4, 0x20af1b8, 0x20b356c, 0x20a837c, 0x20a871c, 0x20a8ad0, 0x20a7680, 0x20a6af8,
@@ -299,6 +308,121 @@ int main(void) {
     expect(b.data, "\"layer\":\"UnderGround\"");   /* deep below the surface, whatever the map flag says */
     reject(b.data, "\"pouch\"");
     printf("live: %s\n", b.data);
+    /* The Java regression consumes these real native JSON snapshots, not handwritten decimal fixtures. */
+    static const float POSITIONS[][3] = {
+        {1234.9996337890625f, 106.49996185302734f, -1234.9996337890625f},
+        {-1234.9996337890625f, 104.50003814697266f, 1234.9996337890625f},
+        {1, -1.4999980926513672f, -1}, /* y - 105.5f rounds to -107 in float; double subtraction would give -106 */
+        {8000, 8000, -8000}};
+    for (unsigned k = 0; k < sizeof POSITIONS / sizeof *POSITIONS; k++) {
+        memcpy(actor + 0x2b4, POSITIONS[k], sizeof POSITIONS[k]);
+        companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b);
+        printf("coordinate-roundtrip: %s\n", b.data);
+    }
+    putf(actor + 0x2b4, -254.5f); putf(actor + 0x2b8, -900); putf(actor + 0x2bc, 1100);
+
+    /* the map layer as the game's map works it out: environment E = *(*(main+0x3a83968)+0xb8), parameters
+       S = *(*(E+0x28)+0x150), height grids at *(E+0x218); MapData.CurrentLayer still says Ground */
+    {
+        enum { ENV_SLOT = 0x3a83968 };
+        uint8_t *mgr = alloc(0xc0), *env = alloc(0x220), *vt = alloc(0x298), *owner = alloc(0x158), *s = alloc(0x130),
+                *grids = alloc(0x370), *ha = alloc(4), *hb = alloc(4);
+        uint16_t *ga = alloc(8), *gb = alloc(8);
+        put64(main_ + ENV_SLOT, (uintptr_t)mgr); put64(mgr + 0xb8, (uintptr_t)env); put64(env, (uintptr_t)vt);
+        put64(vt + 0x290, (uintptr_t)main_ + 0x22acf4); put64(vt + 0x270, (uintptr_t)main_ + 0x402180);
+        put64(env + 0x28, (uintptr_t)owner); put64(owner + 0x150, (uintptr_t)s); put64(env + 0x218, (uintptr_t)grids);
+        putf(s + 0xec, 150); putf(s + 0x104, -100); putf(s + 0x108, 400);   /* Depths from y < -300 */
+        s[0x126] = s[0x127] = 1; s[0x128] = 0;   /* observed Thor surface flags; plain-value computation still applies */
+        parameter_flags_at = (uintptr_t)s + 0x126; parameter_flag_reads = 0;
+        ha[2] = ha[3] = hb[2] = hb[3] = 2;   /* 2 x 2 cells each */
+        put64(grids + 0x340, (uintptr_t)ha); put64(grids + 0x348, (uintptr_t)ga);
+        put64(grids + 0x360, (uintptr_t)hb); put64(grids + 0x368, (uintptr_t)gb);
+        for (int k = 0; k < 4; k++) { ga[k] = 1500; gb[k] = 400; }   /* sky floor 1500, ground top 400: sky from y 1410 */
+        static const struct { float y; const char *layer; } CASES[] = {
+            {-900, "UnderGround"}, {-250, "Ground"}, {500, "Ground"}, {1400, "Ground"}, {1420, "Sky"}, {1600, "Sky"}};
+        for (unsigned k = 0; k < sizeof CASES / sizeof *CASES; k++) {
+            putf(actor + 0x2b8, CASES[k].y);
+            companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b);
+            char want[48]; snprintf(want, sizeof want, "\"layer\":\"%s\"", CASES[k].layer); expect(b.data, want);
+        }
+        /* Invalid values still use the old flag, regardless of the unread parameter flag bytes. */
+        static const float BAD_DEPTH[][2] = {
+            {2000, 0}, {-2000, -1}, {NAN, 400}, {INFINITY, 400}, {-INFINITY, 400},
+            {-100, NAN}, {-100, INFINITY}, {-100, -INFINITY}, {3e38f, 1e-38f}};   /* last: finite inputs, overflowing ratio */
+        putf(actor + 0x2b8, 1600);
+        for (unsigned k = 0; k < sizeof BAD_DEPTH / sizeof *BAD_DEPTH; k++) {
+            putf(s + 0x104, BAD_DEPTH[k][0]); putf(s + 0x108, BAD_DEPTH[k][1]);
+            companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b);
+            expect(b.data, "\"layer\":\"Ground\"");
+        }
+        putf(s + 0x104, -100); putf(s + 0x108, 400);
+        static const uint8_t FLAGS[][3] = {{1, 1, 0}, {0, 0, 0}, {0, 1, 1}, {1, 0, 1}, {2, 2, 2}};
+        for (unsigned k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++) {
+            memcpy(s + 0x126, FLAGS[k], 3);
+            putf(actor + 0x2b8, 1600);
+            companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b);
+            expect(b.data, "\"layer\":\"Sky\"");   /* fallback flag says Ground: plain values must actually compute */
+            putf(actor + 0x2b8, -350);
+            companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b);
+            expect(b.data, "\"layer\":\"UnderGround\"");   /* above -400: old height heuristic would say Ground */
+        }
+        putf(actor + 0x2b8, 1600);
+        static const float BAD_BAND[] = {0, -150, NAN, INFINITY};
+        for (unsigned k = 0; k < sizeof BAD_BAND / sizeof *BAD_BAND; k++) {
+            putf(s + 0xec, BAD_BAND[k]);
+            companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b);
+            expect(b.data, "\"layer\":\"Ground\"");
+        }
+        putf(s + 0xec, 150);
+        check(parameter_flag_reads == 0, "layer reader does not read parameter flags");
+        parameter_flags_at = 0;
+        /* Every traversed pointer can be replaced after sampling; none may publish the old Sky answer. */
+        uint8_t *slots[] = {main_ + ENV_SLOT, mgr + 0xb8, env, env + 0x28, owner + 0x150,
+                           env + 0x218, grids + 0x340, grids + 0x348, grids + 0x360, grids + 0x368};
+        for (unsigned k = 0; k < sizeof slots / sizeof *slots; k++) {
+            uint64_t saved; memcpy(&saved, slots[k], 8);
+            swap_at = slots[k]; swap_to[0] = 0;
+            replace_trigger = (uintptr_t)gb + 6; after_read = replace_hook;
+            companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b);
+            check(after_read == NULL, "environment replacement hook ran");
+            expect(b.data, "\"layer\":\"Ground\"");
+            after_read = NULL; put64(slots[k], saved);
+        }
+        /* Exercise the actual World_PlayerPos fallback without an actor, including unsafe finite extremes. */
+        uint64_t vec_entries; memcpy(&vec_entries, g + VEC3.base + 0x10, 8);
+        float *world = (float *)(uintptr_t)(vec_entries + 0x24);
+        const float EXTREMES[] = {0x1.fffffep127f, -0x1.fffffep127f, NAN, INFINITY, 8001, -8001};
+        for (unsigned k = 0; k < sizeof EXTREMES / sizeof *EXTREMES; k++) {
+            world[0] = EXTREMES[k]; world[1] = 1600; world[2] = 0;
+            companion_snapshot_test_player((uintptr_t)main_, (uintptr_t)g, fake_read, &b);
+            reject(b.data, "\"pos\""); expect(b.data, "\"layer\":\"Ground\"");
+        }
+        world[0] = 8000; world[1] = 1600; world[2] = -8000;
+        companion_snapshot_test_player((uintptr_t)main_, (uintptr_t)g, fake_read, &b);
+        expect(b.data, "\"pos\":[8000,1600,-8000]"); expect(b.data, "\"layer\":\"Sky\"");
+        world[0] = 1; world[1] = 2; world[2] = 3;
+        /* ground top + F above the sky floor: the sky starts from there (1400 + 150 - 90) */
+        for (int k = 0; k < 4; k++) gb[k] = 1400;
+        putf(actor + 0x2b8, 1450); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Ground\"");
+        putf(actor + 0x2b8, 1470); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Sky\"");
+        /* the cell and its nearer neighbour: the sky floor blends only towards a lower neighbour. x = -254.5 is 9.491
+           cells of 500 m: cell 9, nearer neighbour 8 at weight 1 - 2 * 0.491, so 1500 - 500 * 0.018 = 1491 and the sky
+           starts at 1401 (1410 unblended) */
+        for (int k = 0; k < 4; k++) gb[k] = 0;
+        ha[2] = ha[3] = 20; uint16_t *wide = alloc(2 * 20 * 20);
+        for (int k = 0; k < 400; k++) wide[k] = 1500;
+        for (int z = 0; z < 20; z++) wide[z * 20 + 8] = 1000;   /* x cell 8, the nearer neighbour of 9.49 */
+        put64(grids + 0x348, (uintptr_t)wide);
+        putf(actor + 0x2b8, 1405); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Sky\"");
+        putf(actor + 0x2b8, 1398); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Ground\"");
+        /* a higher neighbour is not blended in */
+        for (int z = 0; z < 20; z++) wide[z * 20 + 8] = 2000;
+        putf(actor + 0x2b8, 1405); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Ground\"");
+        /* an environment the game would not take the plain path for: back to MapData.CurrentLayer */
+        put64(vt + 0x270, 0);
+        putf(actor + 0x2b8, 1600); companion_snapshot((uintptr_t)main_, COMPANION_LIVE, fake_read, &b); expect(b.data, "\"layer\":\"Ground\"");
+        put64(main_ + ENV_SLOT, 0); putf(actor + 0x2b8, -900);
+    }
 
     companion_snapshot((uintptr_t)main_, COMPANION_FULL, fake_read, &b);
     printf("full: %s\n", b.data);
