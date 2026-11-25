@@ -33,6 +33,16 @@ layout(local_size_x=64) in;
 layout(std430, set=0, binding=0) buffer cp_s0_t { uint values[]; } cp_s0;
 void main() { uint i = gl_GlobalInvocationID.x; cp_s0.values[i] = i ^ 0x12345678u; }
 '''
+CS_ARRAY = '''#version 450
+layout(local_size_x=64) in;
+layout(std430,set=0,binding=0) buffer cp_s0_t { uint values[]; } cp_s0[3];
+layout(std140,set=0,binding=1) uniform cp_c4_t { uvec4 value; } cp_c4[3];
+void main() {
+    uint i=gl_GlobalInvocationID.x;
+    uint sum=cp_c4[0].value.x+cp_c4[1].value.x+cp_c4[2].value.x;
+    cp_s0[2].values[i]=i^sum;
+}
+'''
 FS_STORAGE = FS.replace('layout(location=0)', '''layout(std430, set=0, binding=3) buffer fp_s0_t { uint values[]; } fp_s0;
 layout(location=0)''').replace(
     'void main() {', 'void main() { fp_s0.values[uint(gl_FragCoord.y) * 64u + uint(gl_FragCoord.x)] = 0x89abcde1u;')
@@ -194,7 +204,8 @@ def main(out):
                    (1, FS_ATLAS_UV, 43, 'frag', []),
                    (0, VS_TERMINAL_OWNED, 44, 'vert', []),
                    (1, FS_TERMINAL_OWNED, 45, 'frag', []),
-                   (1, FS_ARRAY_OUT, 46, 'frag', []))
+                   (1, FS_ARRAY_OUT, 46, 'frag', []),
+                   (5, CS_ARRAY, 47, 'comp', [{'binding':0,'cb_slot':0,'cb_offset':0x210//4,'flags':1}]))
         for stage, src, salt, ext, sbufs in shaders:
             control, code = shader_binary(stage, salt)
             key = key_of(control, code)

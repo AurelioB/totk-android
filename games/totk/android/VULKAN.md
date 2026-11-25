@@ -2912,12 +2912,26 @@ recovery and long-session matched-configuration map deltas still require the aut
 | Packet/descriptor slabs and size-class lists | Walking-only allocator per slot. Growth copies only the unpublished job; workers read immutable blocks after queue publication. Old construction pointers do not survive commit/abort. After GPU/submit-owner retirement, pressure pruning clears only cold job references and recycles blocks; slab live counts prevent unmapping referenced arrays, and free-list links are removed before an empty slab is released. ASan poison tracks returned payloads; physical-capacity counters are atomic. |
 | Secondary lease returns and cold-tail maintenance | The final backend busy/submit_busy pin publishes stable completed-slot chain endpoints under rec_mu, once per slot and with no Vulkan calls. Only the recording owner splices these chains into its free list, mutates handle links, resets cold excess or frees/trims the pool. Pending flags protect chains against repeat retirement; a new generation consumes returns before reusing its context. No owner accesses command-pool metadata owned by another recording thread. Counters/timings publish atomically without inspecting owner metadata. |
 | Retired primary/arena BOs and cached texel views | Walking-only metadata; reset requires the slot's busy and submit-owner pins to retire, or the snapshot arena's whole-submission release fence. View invalidation holds the recursive resource mutex, including deferred views with the same source buffer. No old packet, Vulkan descriptor or GPU command can reference a compacted buffer. |
+| Owned pool buffer destruction | After the existing finalization/legacy-delete GPU wait, `unback_pool` restores guest pages and releases the old private alias under `g_pool_mu`, then drops/reacquires it around the arena path's exact-buffer `vk_res_buffer_released` before destroying the detached VkBuffer. This preserves resource -> pool ordering without a removal-to-page-restoration lock gap: a same-range registration during view retirement backs already-restored pages, which old destruction can no longer replace. Active and already-deferred views are cleared; unrelated buffers are untouched. No added notification on non-owning removal, pool add/backing failure or changed virtual ranges. |
+| Direct descriptor arrays | Ordinary, frame-generation replay and terminal-owned writes use native-type contiguous arrays in fixed 32-element stack batches; `dstArrayElement` carries larger bindings across batches. Singleton direct writes stay batched without copying. Resource hashes still cover the original resolved `dinfo` records. Recorder templates remain per-element. |
+| Failed image realization | OOM classes alone schedule retries after 1, 2, 4, 8, 16, 32 then 64 submissions. Under the existing resource mutex, at most four cached-image retries run per submission across all callers. Successful retries reuse the serial and invalidate cache stamps; unsupported format/memory type failures stay failed. Only the first 16 attempts log individually; periodic texture stats include cumulative attempts/recoveries. No global retry walk or extra lock. |
 | Pressure cutover | One walking owner under the recording lock drains every old queue/GPU/post owner before release-publishing the atomic capture-disabled flag. Original GPU-cursor selection stays immutable, so completion cannot skip its slot-lifetime pin. Future work reads the disabled flag with acquire semantics and never arms old capture state. |
 | Backend memory-purpose counters | Successful allocation/free sites update relaxed atomic live counts; logging snapshots them without inspecting mutable allocation structures. They are diagnostics, not lifetime authority or an exact count of driver VMAs. |
 | Sealed slots and queue owner | Walking closes/finalizes slot inputs and publishes via `g_mu`; the FIFO owner alone finishes parked primaries, arms native guards and calls QueueSubmit. It never reads live walking state. Completion visibility follows actual queue success; final guest-return/CPU boundaries join owner publication. GPU completion and the submit-owner pin both precede slot/fence/pool reuse. |
 | Chunk queues and completion | Mutex/condition-variable packet publication; release/acquire completion permits lock-free reads of finished commands. The worker captures its next job before publishing and never accesses the finished job again. Assembly locks only for unfinished jobs. Ring reuse follows complete primary consumption and its fence. |
 | Statistics | Walking totals stay walking-only. Worker/assembly/guard aggregates publish under the recorder mutex and logging reads/resets there. Cross-owner guard/QueueSubmit totals use coarse atomics, with no new per-draw clocks. No worker updates global draw/descriptor statistics. |
 | VMA admission and baseline watch flags | Each dirty unit gate owns its page watch bits and reserved/final run credit; global budget/pressure/retained-capacity counters are atomic. Proc sampling/epoch bookkeeping uses a normal-thread mutex, never a fault-path lock. The ordered failed-slot owner drains under the range-lifetime mutex and unit gates only after its queued GPU fence. A sealed native batch is sorted/rehash-complete before worker publication and immutable until every shard joins. |
+
+The A/C/D split intentionally leaves finalized image-storage discoverability (B) unchanged from main:
+a surviving texture/write-back reference can retain an address/layout lookup identity. The normal
+quiet finalize path has not been shown to retain a write-back-only pin, and no game occurrence of
+a surviving texture reference has been established. Four review rounds of the abandoned broader
+fix found image invalidation regressions (nested/live children, MapVirtual, host re-backing and
+failed backing). See `.scratch/perf/main-defects/fix/review-r1.md`, `review-r2.md`,
+`review-2nd.md`, `review-r3.md` and `.scratch/perf/main-defects/acd/report.md`.
+The B reproductions and the undecided default-120-Hz pacing case E remain expected failures.
+`test_pool_lifetime.py` runs identical scenario probes against main `8bbbce5` and the split,
+asserting image/storage/upload/write-back-routing parity, not claiming main is correct in every case.
 
 ### Host identity and race checks
 
@@ -3051,7 +3065,7 @@ The pass runs on each loaded module immediately before `vkCreateShaderModule`, a
 patches; it does not change translator outputs, shared variant hashes, reflection, or packed seed bytes.
 Keep seeds unfurled for both arms. Existing seeds and fresh-install packs remain usable without regeneration.
 The enabled arm adds `.intfold-v1` to pipeline/prewarm/import/compute/learned-IO cache paths (including
-alternate seeds and explicit paths); `=0` retains the old unfurled namespace. The first default launch after
+alternate seeds and explicit paths); `=0` omits that suffix, independently of the varying/NaN policies below. The first default launch after
 updating recompiles driver pipelines as needed, with possible one-time loading/route stutter, not a full
 shader import. Newly learned histories warm later launches; elapsed rebuild time is device/route dependent.
 Earlier standalone a740 estimates reduced total instructions by 6.58% (not an FPS prediction), with seven
@@ -3060,6 +3074,92 @@ capped busy-weighted-clock work proxies fell 2.26% on Duo Hateno and 4.1–5.4% 
 equal-FPS gate did not pass). Battery savings remain unconfirmed. Odin's uncapped standing sample rose
 61.93→63.81 fps; pan remained SAME. Measure fresh-process `=0`/default O/B/B/O GPU time, clocks and tails,
 with geometry/skinning/vegetation picture checks on each device; these are not general speedup guarantees.
+
+### Pair-specific missing vertex outputs
+
+`TOTK_VK_VARYING_FIX` is startup-only and default **on** (`=0` opts out), contributed by Dorkington
+in PR #43 for wind/air-flow white boxes (#4). A VS/FS interface mismatch gets a cached vertex module
+writing absent locations as `(0,0,0,1)`, with the fragment input's 32-bit numeric kind; integer `.w`
+uses the bits `0x3f800000`. The original attribution to totk-pc-recomp and its MIT notice are retained.
+The replacement runs through the **same** position/NaN/subgroup/integer-fold chain as ordinary modules.
+The off arm does not classify interfaces, allocate classification tables, reread or create replacements.
+
+Worker rereads use the seed reader's lock and atomic I/O interval counters; their maxima use CAS and
+recorder resets use exchange. Counters are independent interval samples, not a transactional snapshot.
+No extra SPIR-V source is retained (source RAM budget **0 bytes**); a seed payload may require real IO
+again after consumption. Replacement modules/per-pair records remain session-owned: one 64-byte record
+per encountered missing-output VS/FS object pair on the 64-bit target, excluding allocator overhead.
+Module reuse is by VS/missing-mask/numeric-kind set. There is no eviction or fixed record/RSS/driver-memory cap;
+early-test/alpha FS objects can add records even with matching interfaces. Repeated ready draws do not grow it.
+Per-pair detail is capped at 40 lines; atomic cumulative `[varyings] session shader_pairs patched=... fallback=...`
+totals update at IO reporting and normal exit without taking the module cache lock.
+
+The varying cache mutex protects only lookup, in-flight claims and publication: seed rereads, SPIR-V
+passes, `vkCreateShaderModule` and logging run outside it. A genuine build joins only an in-flight
+matching VS/interface through a condition wait that releases the mutex. Distinct interfaces can build
+concurrently. Cache-only synchronous pipeline probes use trylock and immediately defer a busy cache
+or absent/in-flight module as `VK_PIPELINE_COMPILE_REQUIRED`; they never join module creation.
+Thus varying-module creation contributes **zero blocking waits** to statistics/probes. This is not a
+wall-clock scheduling or Vulkan-driver latency guarantee: cache lookup/allocation and the subsequent
+Vulkan pipeline-cache probe can still take CPU/driver time. Mandatory synchronous captures, worker-disabled
+builds and pending-pipeline joins may wait for required storage/driver work with **no proved time bound**.
+Already-ready pipelines bypass this helper. The held-driver fixture exercises the real reporting entry,
+busy/missing/in-flight probe deferral, same-interface reuse and unrelated-interface creation before release.
+
+Independent `TOTK_VK_NAN_MINMAX=1` is a **default-off experiment**. It changes GLSL.std.450
+FMin/FMax/FClamp to NMin/NMax/NClamp, with identical operands/word counts, in targeted VS/FS/CS
+modules. The intended Maxwell special-value semantics and driver code cost are not device-qualified;
+the wind result must be tested with this experiment **off**, then NaN behavior separately.
+
+Enabled policies append `.vary-v1` / `.nan-v1` after existing seed/position/integer-fold suffixes,
+including explicit import paths and the cache-derived prewarm `.pso-state` path. A missing primary
+is seeded **before workers start** using `vkCreatePipelineCache` + `vkMergePipelineCaches` on the
+first matching sibling: subset policies first (so `.intfold-v1.vary-v1` prefers `.intfold-v1`,
+then eventually legacy unsuffixed), then other switch arms. Seed/content and position identities
+never change. Explicit cache bases and import bases use the same bounded filename generation.
+Automatic seeds require the full driver SHA/source, exact TU_DEBUG and Vulkan vendor/device/UUID
+context; missing/corrupt/mismatching sources stay untouched. Header-only legacy blobs cannot prove
+that context and are not automatic seeds; exact explicit imports retain their existing legacy rule.
+No predecessor is renamed, quarantined, relabelled or deleted. Exact imports still become `.imported`.
+
+Only opaque driver entries migrate, **never completion bits**. Portable PSO keys carry exact variant
+identifiers, FS modes and fixed state, not interface masks, NaN-op presence or rewritten module hashes.
+Those facts require reading/classifying SPIR-V; the reflection/index cannot identify affected pairs
+without loading their shaders. Therefore prewarm checks all outstanding keys against the seeded cache.
+Cache-only hits are published ready at startup (reported separately as `cache_hits`, not `resumed`),
+so their first draws neither queue, join nor count synchronous builds. Misses, including absent
+pair-specific replacement modules, use the ordinary worker/demand path. A changed key is complete only
+after its own successful creation, and progress remains bound to the successfully saved cache digest.
+Drivers without cache-control support retain their existing synchronous path; no zero-wait claim.
+
+Our calls pass the selected replacement VS module, FS module, entry points, specialization, layout
+and pipeline state to Vulkan, not a portable PSO ID as a driver lookup key. Turnip hashes module
+content and compilation inputs: changed bytes miss while unchanged modules retain valid entries.
+This does not promise every driver retains every cache entry. No shader-list identifier, reflection
+or packed seed changes and no full shader rebuild are needed.
+
+Retention is deliberately conservative: the previous build's namespace/cache/state remain intact
+for rollback, costing approximately one extra cache (Thor observed 29,581 KiB, about 29 MiB) plus
+small metadata. Migration creates no on-disk staging copy. Existing main already retains older arms;
+automatic deletion cannot safely distinguish users' explicit files/rollback choices. After confirming
+the new cache was saved and available-key prewarm finished without failures, manually remove only
+known cache/metadata files **older than the immediate predecessor**, in that cache directory; retain
+the immediate predecessor until rollback is no longer needed. Do not delete unrelated explicit paths.
+No automatic broad cleanup or new permanent backup copy is introduced.
+
+Host coverage: `test_vk_position.py`, `test_vk_varyings.py`, `test_vk_shader_seed.py`,
+`test_android_cache_transfer.py`, and `vkpipetest --pso-keylist`. It includes `spirv-val` of rewritten
+modules, integer folding in the production replacement path, disabled byte identity/no classification,
+mask/type reuse, fallback counts, completed-marker isolation and concurrent reader/reset TSan coverage.
+Malformed-module guards cover short/zero/overrunning instructions, entry-function framing, output-size
+overflow (including 32-bit `size_t`) and entry-point word-count overflow; they are not a semantic validator.
+The runtime fixture fabricates FS interface metadata to stress 64 pair/type combinations; it does not
+prove fragment-input classification or cross-stage linking. Individual-module validation is not a linker
+or Maxwell arithmetic oracle. Arrays/blocks, wider types and Component-decorated interfaces are outside
+this fixture's coverage; do not generalize the restricted classifier without dedicated stage-pair evidence.
+Unknown classification returns early, so zero fallback alone does not establish complete interface coverage.
+Only devices can establish corrected wind/grass, absence of ordinary-scene regressions, prewarm duration,
+GPU/native instruction cost and restart O/B/B/O frame-time results.
 
 ### Original NVN early fragment tests (guest semantics)
 

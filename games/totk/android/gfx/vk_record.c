@@ -119,6 +119,10 @@ static struct {
     rec_storage draw_storage, info_storage;
     unsigned prune_uses;
 } slots[REC_RING];
+/* Worker-only totals are joined at the existing slot assembly boundary, not
+ * published to the shared frame ring for every pass/job. Walking inline work
+ * still accumulates in its existing TLS scope. No worker waits on telemetry. */
+static struct { _Atomic uint64_t draws, descriptors; } timeline_work[REC_RING];
 static pthread_mutex_t rec_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t rec_work = PTHREAD_COND_INITIALIZER, rec_done = PTHREAD_COND_INITIALIZER;
 /* Sleepers on rec_work / rec_done, counted under rec_mu: signal only when someone actually waits. Bionic's
@@ -1149,15 +1153,14 @@ static void record_job(rec_job *j, unsigned worker) {
     }
     VKCHECK(vkEndCommandBuffer(j->cb));
     project_guards(j);   /* freeze every owner/view/alias VA while this recording job still owns its inputs */
-    /* Publish once per completed chunk, never a ring lock for each draw or descriptor update. */
     uint64_t desc_creates = c->descriptor_sets; /* this job's driver allocations: published and cleared below */
     if (j->frame) {
         if (j->frame == totk_ft_work_frame()) {
             totk_ft_count(FT_COUNT_DRAWS, draws);
             totk_ft_count(FT_COUNT_DESC_CREATES, desc_creates);
         } else {
-            if (draws) totk_ft_count_frame(j->frame, FT_COUNT_DRAWS, draws);
-            if (desc_creates) totk_ft_count_frame(j->frame, FT_COUNT_DESC_CREATES, desc_creates);
+            atomic_fetch_add_explicit(&timeline_work[j->slot].draws, draws, memory_order_relaxed);
+            atomic_fetch_add_explicit(&timeline_work[j->slot].descriptors, desc_creates, memory_order_relaxed);
         }
     }
     if (!worker) commands_publish(0);
@@ -1546,6 +1549,18 @@ static void record_assemble_inner(unsigned slot, int background) {
             if (__builtin_expect(vk_gpuprof_on, 0)) vk_gpuprof_end_emit(p->primary, &((const rec_profile_pass *)p)->end);
             if (!vk_one_primary_on) VKCHECK(vkEndCommandBuffer(p->primary)));
         execute += host_now_ns() - t0;
+    }
+    if (__builtin_expect(totk_ft_cached_on(), 0)) {
+#ifdef TOTK_FRAME_TIMELINE_TEST
+        totk_ft_test_probe_hit(FT_TEST_ASSEMBLY_WORK);
+#endif
+        if (slots[slot].frame) {
+            /* All jobs above are done (acquire): each slot's captured frame remains
+             * authoritative even when its assembler runs after the walker ends. */
+            uint64_t recorded = atomic_exchange_explicit(&timeline_work[slot].draws, 0, memory_order_relaxed);
+            uint64_t descriptors = atomic_exchange_explicit(&timeline_work[slot].descriptors, 0, memory_order_relaxed);
+            totk_ft_recorded(slots[slot].frame, recorded, descriptors);
+        }
     }
     if (vk_one_primary_on) vk_sections_until(slot, NULL);
     slots[slot].pending = NULL;

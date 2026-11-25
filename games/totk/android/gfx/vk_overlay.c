@@ -1,6 +1,7 @@
 /* 5x7 glyphs derive from d2r_gfx/gfx/nvn/fps_overlay.c (same MIT project lineage). */
 #include "vk_int.h"
 #include "vk_overlay.h"
+#include "nvn_dirty.h"
 #include "vk_present_policy.h"
 #include <stddef.h>
 #include "build_kind.h"
@@ -321,8 +322,9 @@ int vk_overlay_configure(vk_overlay_panel *p, uint32_t w, uint32_t h, int frameg
     framegen = framegen != 0; power = power != 0;
     int compact = p->compact != 0;
     int system = p->system != 0;
-    if (l->generation && l->output_w == w && l->output_h == h && l->framegen == framegen && l->power == power && l->position == corner && l->handheld == (p->handheld != 0) && l->compact == compact && l->system == system) return 0;
+    if (l->generation && l->output_w == w && l->output_h == h && l->framegen == framegen && l->power == power && l->position == corner && l->handheld == (p->handheld != 0) && l->compact == compact && l->system == system && l->map_notice == p->map_notice && l->notice_only == p->notice_only) return 0;
     l->output_w = w; l->output_h = h; l->framegen = framegen; l->power = power; l->position = corner; l->handheld = p->handheld != 0; l->compact = compact; l->system = system;
+    l->map_notice = p->map_notice; l->notice_only = p->notice_only;
     if (compact) {
         /* One rate row, no graph (graph_w 0 skips every graph raster/copy); glyph height plus padding. */
         l->width = (framegen ? VK_OVERLAY_COMPACT_FG_COLS : VK_OVERLAY_COMPACT_COLS) * VK_OVERLAY_CELL_W + 2 * VK_OVERLAY_PAD;
@@ -337,6 +339,16 @@ int vk_overlay_configure(vk_overlay_panel *p, uint32_t w, uint32_t h, int frameg
         l->rows += system ? 2 : 0;
         l->graph_x = VK_OVERLAY_PAD; l->graph_y = VK_OVERLAY_PAD + l->rows * VK_OVERLAY_ROW_H;
         l->graph_w = l->width - 2 * VK_OVERLAY_PAD; l->height = l->graph_y + VK_OVERLAY_GRAPH_H + VK_OVERLAY_PAD;
+    }
+    l->notice_row = UINT_MAX;
+    if (p->map_notice) {
+        l->notice_row = p->notice_only ? 0 : l->rows;
+        l->rows = l->notice_row + 2;
+        unsigned notice_width = (sizeof("SAVE AND RESTART GAME SOON") - 1) * VK_OVERLAY_CELL_W + 2 * VK_OVERLAY_PAD;
+        if (p->notice_only || l->width < notice_width) l->width = notice_width;
+        if (p->notice_only) l->graph_w = 0;
+        l->graph_y = VK_OVERLAY_PAD + l->rows * VK_OVERLAY_ROW_H;
+        l->height = l->graph_y + (l->graph_w ? VK_OVERLAY_GRAPH_H : 0) + VK_OVERLAY_PAD;
     }
     uint32_t s = (uint32_t)(((uint64_t)h * 3 + 550) / 1100);
     if (s < 1) s = 1; if (s > VK_OVERLAY_MAX_SCALE) s = VK_OVERLAY_MAX_SCALE;
@@ -357,6 +369,10 @@ int vk_overlay_configure(vk_overlay_panel *p, uint32_t w, uint32_t h, int frameg
     return 1;
 }
 static const char *row_text(const vk_overlay_panel *p, unsigned row) {
+    if (p->layout.map_notice) {
+        if (row == p->layout.notice_row) return "MAP LIMIT NEAR";
+        if (row == p->layout.notice_row + 1) return "SAVE AND RESTART GAME SOON";
+    }
     if (row == 0) return p->text;
     if (row == 1) return p->resolution_text;
     if (row == p->layout.compile_row) return p->compile_text;
@@ -438,7 +454,7 @@ vk_overlay_counters vk_overlay_get_counters(const vk_overlay_panel *panel) {
 }
 /* available: fixed at init (see vk_overlay_available). live_mode: the shown mode, changed by
    vk_overlay_cycle from the input thread and read by the recorder at every present. */
-static int available, power_enabled, system_enabled;
+static int available, power_enabled, system_enabled, map_warn_enabled;
 static _Atomic int live_mode, power_started;
 static const char *position;
 void vk_overlay_set_resolution(uint32_t rw, uint32_t rh, uint32_t cw, uint32_t ch) {
@@ -662,6 +678,8 @@ static void init(void) {
 #else
     available = mode != 0;
 #endif
+    map_warn_enabled = nvn_dirty_map_warn_init();
+    if (map_warn_enabled) available = 1; /* warnings remain visible with TOTK_OVERLAY=off */
     position = getenv("TOTK_OVERLAY_POS");
     e = getenv("TOTK_FPS60"); history.target_ms = e && !strcmp(e, "1") ? 1000.0 / 60 : 1000.0 / 30;
     history.handheld = runtime_handheld_mode();
@@ -809,10 +827,16 @@ static void copy_region(VkBufferImageCopy copies[6], unsigned *count, const vk_o
 }
 int vk_overlay_record(VkCommandBuffer cb, VkImage image, VkImageLayout layout, uint32_t w, uint32_t h, unsigned slot, unsigned rotation) {
     int mode = vk_overlay_mode();
-    if (!mode || slot >= VK_OVERLAY_SLOTS || !w || !h) return 0;
+    int notice = map_warn_enabled && nvn_dirty_map_warn_notice();
+    if ((!mode && !notice) || slot >= VK_OVERLAY_SLOTS || !w || !h) return 0;
     static unsigned consumed;
     static int shown_mode;
     vk_overlay_panel *p = &history;
+    if (p->map_notice != notice || p->notice_only != !mode) {
+        p->map_notice = notice; p->notice_only = !mode;
+        /* Force changed cells even when the normal telemetry labels did not change. */
+        p->text_generation++;
+    }
     if (mode != shown_mode) {
         /* A live toggle: relabel at once (not at the next 1 Hz tick) and re-lay out below. */
         shown_mode = mode; p->compact = mode == 1; p->text_ns = 0; p->display_key_valid = 0;
@@ -822,7 +846,8 @@ int vk_overlay_record(VkCommandBuffer cb, VkImage image, VkImageLayout layout, u
     if (refresh) sample_labels(p, now, atomic_load_explicit(&framegen_sample, memory_order_relaxed));
     /* Configuration identity, not text length or telemetry values, owns geometry. */
     if (!p->layout.generation || p->layout.output_w != w || p->layout.output_h != h || p->layout.framegen != (p->engine != VK_OVERLAY_FG_OFF) ||
-        p->layout.handheld != (p->handheld != 0) || p->layout.compact != p->compact)
+        p->layout.handheld != (p->handheld != 0) || p->layout.compact != p->compact ||
+        p->layout.map_notice != p->map_notice || p->layout.notice_only != p->notice_only)
         vk_overlay_configure(p, w, h, p->engine != VK_OVERLAY_FG_OFF, power_enabled, position);
     unsigned produced = atomic_load_explicit(&handoff_count, memory_order_relaxed);
     if (produced - consumed > 256) consumed = produced - 256;

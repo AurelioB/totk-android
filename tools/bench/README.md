@@ -17,6 +17,47 @@ cluster: a `su -c` per command costs the device a su session and, with Magisk, a
 Common options: `-s <serial>` (adb serial), `--device <label>` (a short name used in file names, e.g. `thor`),
 `--package` (default `com.aure.totk`), `--game-dir` (default `/data/user/0/<package>/files/game`).
 
+**Frame-timeline observer warning:** prefer `TOTK_FRAME_TIMELINE=0` for final tail/performance
+acceptance unless its presence is identical in both arms. It adds per-frame work when on and remains
+a coarse per-frame attribution diagnostic, not a general tail-safety guarantee.
+Measured **AYN Thor, 30-fps standing, 20-minute launches**: ordinary walk CPU was about
+**15.7 ms/frame off**, **20.4 ms old-on (+29.6%)**, and **15.5 / 15.7 ms new-on
+(−1.3% / +0.3%, within noise)**. New-off was **−0.4% / −0.8% versus the measured main
+baseline**, also within noise. Observed game-present intervals **≥60 / ≥80 ms** per 20 minutes
+were **20 / 11 old-on**, versus **1 / 0 and 4 / 0 new-on**. Conservative sample loss was
+**≤0.07% of producer-update attempts**, not a lost-frame fraction; missing evidence can hide intervals.
+Walk CPU uses medians of ordinary 300-frame block means, not per-frame medians.
+
+The first run's pre-set ordinary >50 ms counter gate failed (new-on **37 and 63 per 20 minutes**,
+off **19–37**, old-on **68**). The eight-launch paired follow-up **CLEARED** the rewritten diagnostic
+for no material added >50 ms frames on this **AYN Thor, one Hateno scene, standing only, 30-fps cap**:
+ON **31.43, 10.10, 22.44, 30.30** (mean **23.57**) versus OFF **21.32, 39.27, 33.67, 35.92**
+(mean **32.55**) per 20 minutes; adjacent ON-minus-OFF **+10.10, −29.17, −11.23, −5.62**.
+The frozen rule required ON-minus-OFF mean ≤10 frames/20 minutes, ON mean ≤1.30×OFF mean,
+not all four pair differences positive, and at most one ON value above the OFF maximum; all passed.
+Equal-launch walk-CPU overhead was **+0.19%**. The first run's single high launch is consistent with
+launch-to-launch variation, not a demonstrated diagnostic effect; fixed order and small samples do
+not establish causality or generalize beyond this device/scene/standing/cap.
+Ordinary-counter rates use complete-report exposure estimates from rounded FPS; timeline intervals
+use exact 20-minute windows, a different measure. Old-on results have **suspect worst-frame figures
+and about 30% inflated walk CPU**; do not use them as default-off player-performance baselines.
+Sources: `.scratch/perf/frame-timeline-fix/thor/report.md` and `thor-pairs/report.md` in that directory,
+old/main `8bbbce5` versus rewritten `8dc331f`, before replay onto current main, not integrated-head evidence.
+
+The replacement tries ring ownership once (including fence metadata), counts dropped producer
+updates and skipped/busy snapshots in the periodic summary, and never waits on the diagnostic ring.
+Timeline-only recorder elapsed accounting is now `rec_wall_ns` once per walk, reusing existing
+clocks; S/P/O estimates require explicit `TOTK_VK_REC_PROFILE=1` and its separate overhead.
+The new coarse walk and assembled-slot accounting bodies are enabled-only; with timeline off, each
+site does at most one cached flag check and no new timer/counter work. Existing native timing remains.
+Losses can bias individual stages and interval grouping; `missing=0` is not complete coverage, and
+cumulative dropped/busy attempts are not window-local lost-frame counts.
+Retain loss/coverage lines with every diagnostic report. See `games/totk/android/DEBUGGING.md`,
+“Frame critical-path timeline”, for field semantics. For future observer-cost checks, use matched
+restart arms old-off / new-off / old-on / new-on with the same standing scene and independent walk
+measurements, not the timeline's own counters alone; host microbenchmarks cannot clear device tails.
+
+
 | Script | Use |
 |---|---|
 | `bench_input.sh -s <serial> [--event /dev/input/eventN] [--display <id>] <action>` | `press <A\|B\|X\|Y\|L\|R\|PLUS\|MINUS\|UP\|DOWN\|LEFT\|RIGHT> [ms]`, `rstick <x> [y]` (`rstick 0` releases), `shot <file>`, `log`, `detect`, `freqs` (the frequency limits as one line: `cpuN=<cpus>:<scaling_min>:<scaling_max>:<cpuinfo_max>` kHz per cpufreq policy, `gpu_maxclk`, `gpu_freqs`, `gpu_devfreq_max`, GPU power levels). Auto-detects the controller node (`getevent -p`: ABS_Z/ABS_RZ + BTN_SOUTH) and the first display (`dumpsys SurfaceFlinger --display-id`). |

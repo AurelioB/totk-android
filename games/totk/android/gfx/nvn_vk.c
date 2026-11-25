@@ -425,13 +425,6 @@ void vk_rec_profile_end(void) {
     if (vk_rec_profile_on) g_rec.coarse_ns += T_rec.last - T_rec.coarse_start;
     T_rec.active = T_rec.weight = T_rec.timeline = 0;
 }
-/* Timeline-only mode reuses the exclusive scopes without enabling the full profiler, calibration or logs.
-   Opcode S/P/O intervals are sampled at 1/64 and weighted 64x. Outside mtl_exec the lifecycle is exact,
-   at weight one; unselected opcode scopes take no clock reads, including O. */
-static void rec_timeline_begin(void) {
-    T_rec.active = T_rec.weight = T_rec.timeline = 1;
-    T_rec.rate = 64; T_rec.category = VK_REC_S_STREAM; T_rec.last = rec_now();
-}
 #ifdef TOTK_VK_TESTS
 void vk_record_test_profile_ns(uint64_t *out, size_t count) {
     if (count > VK_REC_N) count = VK_REC_N;
@@ -674,7 +667,9 @@ static void vk_init_once(void) {
     { const char *e = getenv("TOTK_VK_LOOKUP_STATS"); g_lookup_stats = e && atoi(e); }
     wb_alias_init();
     { const char *e = getenv("TOTK_VK_REC_PROFILE"); vk_rec_profile_on = e && !strcmp(e, "1"); }
-    vk_rec_timing_on = vk_rec_profile_on || totk_ft_on();
+    /* Timeline-only recording uses the existing walk-wall span. Never turn on
+     * per-opcode/category clock probes just to collect per-frame evidence. */
+    vk_rec_timing_on = vk_rec_profile_on;
     const char *gpl_env = getenv("TOTK_VK_PIPELINE_LIBRARY");
     int gpl_requested = gpl_env && !strcmp(gpl_env, "1");
     V.has_pipeline_library = 0;
@@ -965,29 +960,9 @@ static void vk_init_once(void) {
     VkPipelineCacheCreateInfo pcc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = pc_size, .pInitialData = pc_data};
     VKCHECK(vkCreatePipelineCache(V.dev, &pcc, NULL, &V.pcache));
     free(pc_data);
-    { const char *base = getenv("TOTK_VK_PIPELINE_CACHE_IMPORT"); if (!base || !*base) base = "vk-pipeline-cache.bin";
-      char import_path[1100]; const char *ip = vk_shader_cache_path(base, import_path, sizeof import_path);
-      /* Imports retain their arm's filename; never relabel the opposite arm's
-       * blob into this namespace, even when the selected import is absent. */
-      if (ip) {
-          const char fold[] = ".intfold-v1"; size_t len = strlen(ip), suffix = sizeof fold - 1;
-          char other[1100]; int n;
-          if (len >= suffix && !strcmp(ip + len - suffix, fold))
-              n = snprintf(other, sizeof other, "%.*s", (int)(len - suffix), ip);
-          else n = snprintf(other, sizeof other, "%s%s", ip, fold);
-          if (n >= 0 && (size_t)n < sizeof other && !access(other, F_OK))
-              LOGV("[pipeline-cache] import skipped: %s does not match effective namespace %s", other, ip);
-      }
-      size_t isz = 0; void *idata = vk_pcache_load(ip, &isz, 0); VkPipelineCache ic;
-      VkPipelineCacheCreateInfo icc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = isz, .pInitialData = idata};
-      if (idata && !vkCreatePipelineCache(V.dev, &icc, NULL, &ic)) {
-          VkResult r = vkMergePipelineCaches(V.dev, V.pcache, 1, &ic); vkDestroyPipelineCache(V.dev, ic, NULL);
-          if (!r) vk_pcache_changed();
-          char done[1100]; snprintf(done, sizeof done, "%s.imported", ip);
-          if (!r && !rename(ip, done)) LOGV("pipeline cache: merged %zu KiB from %s (now %s)", isz >> 10, ip, done);
-          else RED(4, "pipeline cache: importing %s: merge %d, rename %s", ip, r, strerror(errno));
-      }
-      free(idata); }
+    { const char *base = getenv("TOTK_VK_PIPELINE_CACHE"), *import = getenv("TOTK_VK_PIPELINE_CACHE_IMPORT");
+      vk_pcache_imports(base && *base ? base : "state/vk-pipeline-cache.bin",
+                       import && *import ? import : "vk-pipeline-cache.bin"); }
     vk_pcache_start(pcache_path(), pc_size);
     vk_fmt_set_depth(depth_choice(VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D32_SFLOAT), depth_choice(VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT));
     vk_post_init();   /* optional internal pipelines are ready before game recording starts */
@@ -1211,6 +1186,13 @@ static void unback_pool(pool_ent *e) {
 #ifdef TOTK_VK_TESTS
     if (e->test_backing) return;
 #endif
+    /* Guest pages and private aliases are restored under g_pool_mu before
+       allowing another registration to back the same range. Only the detached
+       Vulkan buffer remains: resource -> pool resolution forbids holding the
+       pool mutex while retiring its views. No guest mapping changes follow. */
+    pthread_mutex_unlock(&g_pool_mu);
+    vk_res_buffer_released(e->buf);
+    pthread_mutex_lock(&g_pool_mu);
     vkDestroyBuffer(g_dev, e->buf, NULL); vk_memory_release(e->mem, VK_MEMORY_POOL);
 #endif
 }
@@ -3870,7 +3852,6 @@ void mtl_sub_begin(void) {
     T_ft_walk_frame = totk_ft_on() ? totk_ft_current() : 0;
     totk_ft_work_begin(T_ft_walk_frame);
     if (__builtin_expect(vk_rec_profile_on, 0)) vk_rec_profile_begin(VK_REC_S_STREAM);
-    else if (T_ft_walk_frame) rec_timeline_begin();
     if (g_lookup_stats) atomic_store_explicit(&g_lookup_thread, (uintptr_t)pthread_self(), memory_order_relaxed);
     g_ncarry = 0; snap_reset(); g_perf_t0 = host_now_ns(); g_perf_cpu_t0 = walker_cpu_now();
     g_perf_sub0 = g_perf_wait_ns; g_in_sub = 1;
@@ -6441,6 +6422,12 @@ uint64_t mtl_sub_commit(void) {
         uint64_t cpu = walker_cpu_now() - g_perf_cpu_t0, dt = host_now_ns() - g_perf_t0;
         uint64_t w = g_perf_wait_ns - g_perf_sub0, r = dt > w ? dt - w : 0;
         g_perf_cpu_ns += cpu; g_perf_elapsed_ns += dt;
+        if (__builtin_expect(T_ft_walk_frame != 0, 0)) {
+#ifdef TOTK_FRAME_TIMELINE_TEST
+            totk_ft_test_probe_hit(FT_TEST_WALK_WALL);
+#endif
+            totk_ft_count(FT_COUNT_REC_WALL_NS, dt); /* reuse main's clocks, no off-path counter call */
+        }
         g_perf_replay_ns += r; g_cum[0] += r; g_perf_t0 = 0; g_perf_subs++; vk_record_walk_time(r);
         HK_ADD(subs, 1); HK_ADD(replay_ns, r); HK_ADD(wait_ns, w);
     }

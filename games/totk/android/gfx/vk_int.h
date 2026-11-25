@@ -63,11 +63,11 @@ static inline void *vk_heap_zero(size_t count, size_t size, const char *function
 /* a red line the first few times (the Mac's RED_ONCE) */
 #define RED(n, ...) do { static int said_; if (said_++ < (n)) LOGV("【红】" __VA_ARGS__); } while (0)
 
-/* CPU recording split (TOTK_VK_REC_PROFILE=1 or frame-timeline sampled walk timing).
-   With both disabled each probe is one predictable branch: no clock, TLS lookup, allocation or update.
-   Scopes are exclusive, including nested S/O work. Only mtl_sub_begin/commit and explicit full-profile
-   present activate the calling thread, under vk_rec_lock. Timeline-only timing samples opcode scopes
-   at 1/64 with 64x weighted ns; setup/commit outside the opcode stream are exact, unweighted scopes. */
+/* Exclusive CPU recording split, enabled only by TOTK_VK_REC_PROFILE=1.
+   Disabled probes are one predictable branch: no clock, TLS lookup, allocation or update.
+   Scopes include nested S/O work; mtl_sub_begin/commit and explicit full-profile present
+   activate the calling thread under vk_rec_lock. Frame timeline alone does not activate
+   these opcode/category probes; it reuses the existing per-walk wall elapsed reading. */
 enum {
     VK_REC_S, VK_REC_RESOLVE, VK_REC_BIND, VK_REC_PROG, VK_REC_PIPE, VK_REC_VERTEX, VK_REC_CMD, VK_REC_O,
     VK_REC_S_STREAM, VK_REC_S_STATE, VK_REC_S_UNIFORM, VK_REC_S_COUNTER, VK_REC_S_PASS, VK_REC_S_SNAPSHOT,
@@ -76,7 +76,7 @@ enum {
     VK_REC_O_WORKER_WAIT, VK_REC_O_EXECUTE, VK_REC_O_ASSEMBLE,
     VK_REC_O_DISPATCH, VK_REC_O_TRANSFER, VK_REC_O_UPLOAD, VK_REC_O_PRESENT, VK_REC_N
 };
-extern int vk_rec_profile_on, vk_rec_timing_on; /* initialized once; timing includes either opt-in mode */
+extern int vk_rec_profile_on, vk_rec_timing_on; /* initialized once; timing is explicit full-profile only */
 int vk_rec_profile_push(int category);
 void vk_rec_profile_pop(int previous);
 void vk_rec_profile_begin(int category);
@@ -647,6 +647,11 @@ typedef struct vk_shader {
     uint8_t framegen_plane; /* audited VS view-position or FS plane-depth convention, not unconditional admission */
     uint8_t framegen_uncertified_plane; /* exact experimental VS candidate; no authority unless opt-in and runtime checks */
     uint64_t xlate_miss_ns; /* recorder clears after its first emitted draw/dispatch; not a GPU-completion timestamp */
+    /* user varyings (vk_varyings.h): a vertex shader's Output Locations, a fragment shader's Input Locations and their
+       numeric kinds; io_known when the module could be read. vfix: vertex modules with the varyings a fragment shader
+       reads that this vertex shader does not write added as (0, 0, 0, 1) (vk_vs_module_for). */
+    uint32_t vout_mask, fin_mask; uint8_t fin_kind[32]; uint8_t io_known;
+    struct vk_vfix *vfix;
 } vk_shader;
 
 /* ---------- opt-in per-slot GPU pass profiler (vk_gpuprof.c) ---------- */
@@ -703,6 +708,8 @@ typedef struct vk_prog vk_prog;
 int vk_prog_resolve(const prog_t *p, vk_shader *out[6]);
 void vk_stage_sig_invalidate(unsigned stages);   /* recording-thread state writes: one bit per NVN stage */
 void vk_prog_prepare(const prog_t *p); /* bind-time compute compilation, no variant selection or graphics seed IO */
+/* create=0: cache-only, NULL means defer; create=1: build/join the exact interface. */
+VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs, int create);
 VkPipelineLayout vk_layout_of(vk_shader *vs, vk_shader *fs);
 VkPipeline vk_compute_pipeline(vk_shader *cs, VkPipelineLayout *layout);
 void vk_compute_start(void);
@@ -723,6 +730,7 @@ int vk_unwritten_mask_on(void);                 /* TOTK_VK_UNWRITTEN_MASK: pipel
 int vk_shaders_ready(void);
 void vk_shader_seed_startup(const char *game_dir); /* freeze game-relative selection and diagnose seed before replay */
 const char *vk_shader_cache_path(const char *base, char *out, size_t size); /* folder/content-isolated disk state */
+const char *vk_shader_cache_predecessor(const char *base, unsigned index, char *out, size_t size); /* seven same-seed/position arms */
 vk_shader *vk_shader_seed(const char *variant, int stage, int early_tests); /* startup/replay exact seed, no guest state */
 vk_shader *vk_shader_alpha(vk_shader *base, unsigned func);
 void vk_pipeline_prewarm(void);   /* device/cache ready, before replay: load keys and queue the compile workers */

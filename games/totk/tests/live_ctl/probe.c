@@ -6,7 +6,8 @@
  *   switches <dir>            every live switch toggled many times by batches applied on a frame thread, while
  *                             registered render threads (TOTK_PRIO_RENDER by tid, through the nice hook; a walker
  *                             pinned by TOTK_PRIO_WALK), game threads applying TOTK_TIMER_SLACK_NS before their timed
- *                             waits, and readers of every other switch run
+ *                             waits, and readers of every other switch run; every game thread validates the final
+ *                             published slack before exiting. TOTK_TEST_DROP_SLACK_APPLY makes that assertion fail.
  *   missing <dir>             one CPU-pinned control worker: unrelated creates/deletes and moves while totk.ctl
  *                             is absent, interrupted reads, then late creation and repeated deletion/recreation;
  *                             thread CPU and syscall/watch counts catch spins invisible to rd.wakeups
@@ -46,6 +47,12 @@ static int observed_rm_watch(int fd, int watch);
 #define close(...) observed_close(__VA_ARGS__)
 #define inotify_add_watch(...) observed_add_watch(__VA_ARGS__)
 #define inotify_rm_watch(...) observed_rm_watch(__VA_ARGS__)
+#ifdef TOTK_TEST_DROP_SLACK_APPLY
+/* Negative control: acknowledge live generations but lose their kernel applications on game threads. */
+static _Thread_local int drop_slack_apply;
+#define prctl(option, ...) \
+    ((option) == PR_SET_TIMERSLACK && drop_slack_apply ? 0 : prctl(option, __VA_ARGS__))
+#endif
 #include "thread_place.h"   /* includes live_ctl.h */
 #undef open
 #undef read
@@ -55,6 +62,9 @@ static int observed_rm_watch(int fd, int watch);
 #undef close
 #undef inotify_add_watch
 #undef inotify_rm_watch
+#ifdef TOTK_TEST_DROP_SLACK_APPLY
+#undef prctl
+#endif
 
 enum { CTL_OPEN, CTL_READ, CTL_PREAD, CTL_STAT, CTL_FSTAT, CTL_CLOSE, CTL_ADD, CTL_REMOVE, CTL_CALLS };
 static _Thread_local int observe_control;
@@ -430,29 +440,43 @@ static void *render_thread(void *arg) {
     while (!atomic_load(&stop_all)) usleep(500);
     return NULL;
 }
+typedef struct { int bad, final_checked; long final_slack, final_want; } slack_result;
+/* Caller holds the staging mutex: desired state and its generation are fully published.
+ * Equal generation reads alone cannot exclude a publisher paused between those stores. */
+static int slack_mismatch(long base, long *slack, long *want) {
+    totk_live_slack_tick();
+    *slack = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+    int live = totk_live_int("TOTK_TIMER_SLACK_NS", 0);
+    *want = live ? live : base;
+    return *slack != *want;
+}
 static void *slack_thread(void *arg) {
-    int *bad = arg; char name[16]; snprintf(name, sizeof name, "g-%d", (int)(intptr_t)bad % 97);
+    slack_result *result = arg; char name[16]; snprintf(name, sizeof name, "g-%d", (int)((intptr_t)result % 97));
     /* Capture inheritance before startup can apply a live value. Do not publish
      * any toggles until every worker has recorded that same pre-toggle baseline. */
     long base = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+#ifdef TOTK_TEST_DROP_SLACK_APPLY
+    drop_slack_apply = 1;
+#endif
     totk_thread_start(name, NULL);
     atomic_fetch_add(&slack_started, 1);
     while (!atomic_load(&stop_all)) {
-        /* A value is stored just before its slack generation is published: a mismatch counts only if it outlives a
-           few further ticks with the generation unchanged. */
-        int mismatch = 0;
-        for (int attempt = 0; attempt < 3; attempt++) {
-            uint32_t before = atomic_load(&totk_live_slack_gen);
-            totk_live_slack_tick();   /* as before a timed wait */
-            long slack = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
-            int want = totk_live_int("TOTK_TIMER_SLACK_NS", 0);
-            mismatch = atomic_load(&totk_live_slack_gen) == before && slack != (want ? want : base);
-            if (!mismatch) break;
-            usleep(1000);
+        totk_live_slack_tick();   /* normal, unconstrained safe point before a timed wait */
+        /* Busy means deferred, not validated: a publisher may have stored a newer desired
+         * value without publishing its generation yet. Do not serialize the normal tick. */
+        if (!pthread_mutex_trylock(&totk_live_stage.mu)) {
+            long slack, want;
+            result->bad += slack_mismatch(base, &slack, &want);
+            pthread_mutex_unlock(&totk_live_stage.mu);
         }
-        *bad += mismatch;
         struct timespec ts = {0, 20000}; nanosleep(&ts, NULL);
     }
+    /* stop_all follows the last completed publication. This blocking check is mandatory
+     * even if every concurrent check was deferred, and catches a genuinely lost update. */
+    pthread_mutex_lock(&totk_live_stage.mu);
+    slack_mismatch(base, &result->final_slack, &result->final_want);
+    result->final_checked = 1;
+    pthread_mutex_unlock(&totk_live_stage.mu);
     return NULL;
 }
 static void *switch_reader(void *arg) {
@@ -479,11 +503,17 @@ static void switches(void) {
     setenv("TOTK_PRIO_WALK", "5", 1); unsetenv("TOTK_PRIO_RENDER"); unsetenv("TOTK_TIMER_SLACK_NS");
     for (int i = 0; i <= RENDER; i++) atomic_store(&render_nice[i], -100);
     errno = 0; int inherited = getpriority(PRIO_PROCESS, 0);   /* render threads inherit it; unset returns them to it */
+    long inherited_slack = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+    CHECK(inherited_slack >= 0, "read inherited timer slack");
+    int final_slack = inherited_slack == 1000 ? 2000 : 1000;
+#ifdef TOTK_TEST_DROP_SLACK_APPLY
+    printf("negative control: dropping game-thread timer-slack applications\n");
+#endif
     pthread_t render[RENDER + 1], slackers[SLACKERS], readers[2], frames;
-    int slack_bad[SLACKERS] = {0}, read_bad[2] = {0};
+    slack_result slack_results[SLACKERS] = {0}; int read_bad[2] = {0};
     for (int i = 0; i <= RENDER; i++) pthread_create(&render[i], NULL, render_thread, (void *)(intptr_t)i);
     while (atomic_load(&render_started) < RENDER + 1) usleep(1000);   /* registered, the walker pinned */
-    for (int i = 0; i < SLACKERS; i++) pthread_create(&slackers[i], NULL, slack_thread, &slack_bad[i]);
+    for (int i = 0; i < SLACKERS; i++) pthread_create(&slackers[i], NULL, slack_thread, &slack_results[i]);
     while (atomic_load(&slack_started) < SLACKERS) usleep(1000);
     for (int i = 0; i < 2; i++) pthread_create(&readers[i], NULL, switch_reader, &read_bad[i]);
     pthread_create(&frames, NULL, frame_thread, NULL);
@@ -493,7 +523,11 @@ static void switches(void) {
         for (unsigned i = 0; i < n; i++) {
             const totk_live_switch *w = &totk_live_switches[i];
             s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-            if (s % 3 == 0) k += snprintf(batch + k, sizeof batch - k, "unset %s\n", w->key);
+            /* End at a known value different from inheritance, so losing applications
+             * cannot accidentally pass the mandatory final check (including the negative control). */
+            if (t == TOGGLES - 1 && !strcmp(w->key, "TOTK_TIMER_SLACK_NS"))
+                k += snprintf(batch + k, sizeof batch - k, "set %s=%d\n", w->key, final_slack);
+            else if (s % 3 == 0) k += snprintf(batch + k, sizeof batch - k, "unset %s\n", w->key);
             else k += snprintf(batch + k, sizeof batch - k, "set %s=%d\n", w->key, w->lo + (int)(s % (uint32_t)(w->hi - w->lo + 1)));
         }
         snprintf(batch + k, sizeof batch - k, "mark toggle %d\n", t);
@@ -508,7 +542,18 @@ static void switches(void) {
     }
     atomic_store(&stop_all, 1);
     for (int i = 0; i <= RENDER; i++) pthread_join(render[i], NULL);
-    for (int i = 0; i < SLACKERS; i++) { pthread_join(slackers[i], NULL); CHECK(!slack_bad[i], "game thread %d: slack differed from the live value %d times", i, slack_bad[i]); }
+    unsigned final_good = 0;
+    for (int i = 0; i < SLACKERS; i++) {
+        pthread_join(slackers[i], NULL);
+        slack_result *r = &slack_results[i];
+        CHECK(!r->bad, "game thread %d: slack differed from the live value %d times", i, r->bad);
+        CHECK(r->final_checked, "game thread %d: missing final slack validation", i);
+        CHECK(r->final_slack == r->final_want, "game thread %d: final slack differed from the live value (got %ld, want %ld)",
+              i, r->final_slack, r->final_want);
+        final_good += r->final_checked && r->final_slack == r->final_want;
+    }
+    if (final_good == SLACKERS)
+        printf("ok: %u game threads validated final timer slack after publication quiesced\n", final_good);
     for (int i = 0; i < 2; i++) { pthread_join(readers[i], NULL); CHECK(!read_bad[i], "reader %d: %d values out of range", i, read_bad[i]); }
     pthread_join(frames, NULL);
     CHECK(!prio_bad, "render threads: nice differed from TOTK_PRIO_RENDER (or their inherited nice when unset) %u times", prio_bad);

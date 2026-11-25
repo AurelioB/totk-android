@@ -48,6 +48,12 @@ build uses only those found in the selected game files.
 The build exports the warm rows to `build/pso_title.tsv` (rows marked `t`) and `build/pso_manifest.tsv` (rows marked
 `m`), which the runtime reads. Edit the list, never those files.
 
+Android runtime SPIR-V policies (integer folding, missing vertex outputs, and experimental NaN min/max)
+do not change these identifiers, variant names, reflection or packed seed bytes. They change driver modules,
+so pipeline caches and prewarm completion use separate policy namespaces. PR #43 needs no list refresh or
+full shader rebuild. A new namespace seeds context-matched predecessor driver entries, then rechecks
+prewarm without copying completion bits: unchanged cache hits are ready before play; changed keys build.
+
 ## Warm-up scope
 
 The prepared seed also carries `shader-keys.json`: every shader key found in the selected game files, including shaders

@@ -3037,6 +3037,44 @@ int main(int argc, char **argv) {
     p_viewports vp; memset(&vp, 0, sizeof vp); vp.n = 1; vp.v[0][2] = 64; vp.v[0][3] = 64; vp.v[0][5] = 1; op(OP_VIEWPORTS, &vp, sizeof vp);
     p_draw dw = {4, 0, 3, 0, 0}; op(OP_DRAW, &dw, sizeof dw);
     p_copy_b2t cp; memset(&cp, 0, sizeof cp); cp.src = (uint64_t)(uintptr_t)readback; cp.tex = &rt; cp.r = (NVNcopyRegion){0, 0, 0, 64, 64, 1}; op(OP_COPY_T2B, &cp, sizeof cp);
+    if (argc == 2 && !strcmp(argv[1], "--timeline-bench")) {
+        CHECK(mtl_wait(run(), 5000000000ull), "timeline benchmark initial scene completes");
+        enum { passes = 150, draws = 4400, warmup = 30, frames = 200 };
+        rn = 0;
+        for (unsigned pass = 0; pass < passes; pass++) {
+            op(OP_SET_RT, &srt, sizeof srt); op(OP_CLEAR_COLOR, &cc, sizeof cc);
+            for (unsigned draw = pass * draws / passes; draw < (pass + 1) * draws / passes; draw++) {
+                p_scissor pixel = {(int)(draw % 64), (int)(draw / 64 % 64), 1, 1};
+                op(OP_BIND_PROGRAM, &bp, sizeof bp);
+                op(OP_BIND_VBUF, &vb, offsetof(p_bind_vbuf, r) + sizeof vb.r[0]);
+                op(OP_BIND_UBO, &u0, sizeof u0); op(OP_BIND_UBO, &u1, sizeof u1);
+                op(OP_BIND_TEX, &th, offsetof(p_bind_handles, h) + sizeof th.h[0]);
+                op(OP_SCISSOR, &pixel, sizeof pixel); op(OP_DRAW, &dw, sizeof dw);
+            }
+            /* Real copy closes each pass; no fake driver calls or CPU work. */
+            op(OP_COPY_T2B, &cp, sizeof cp);
+        }
+        op(OP_END, NULL, 0);
+        uint64_t cpu = 0, wall = 0, count_draws = 0, count_passes = 0;
+        for (unsigned frame = 0; frame < warmup + frames; frame++) {
+            vk_record_test_counts before, after; vk_record_test_counts_get(&before);
+            uint64_t c0 = walk_clock(CLOCK_THREAD_CPUTIME_ID), t0 = host_now_ns();
+            mtl_sub_begin(); mtl_exec(rec); uint64_t fence = mtl_sub_commit();
+            uint64_t elapsed = host_now_ns() - t0, used = walk_clock(CLOCK_THREAD_CPUTIME_ID) - c0;
+            if (totk_ft_on()) totk_ft_walk(totk_ft_current(), t0, t0 + elapsed, used);
+            if (frame >= warmup) { cpu += used; wall += elapsed; }
+            CHECK(mtl_wait(fence, 5000000000ull), "timeline benchmark frame %u completes", frame);
+            vk_record_test_counts_get(&after);
+            CHECK(after.draws - before.draws == draws && after.passes - before.passes == passes,
+                  "timeline benchmark retains 4400 draws and 150 actual passes");
+            count_draws += after.draws - before.draws; count_passes += after.passes - before.passes;
+            if (totk_ft_on()) totk_ft_present(totk_ft_current(), 33333333, host_now_ns());
+        }
+        printf("timeline-bench enabled=%d measured=%u warmup=%u commands=31251 draws=%u passes=%u cpu_ns_per_frame=%.3f wall_ns_per_frame=%.3f checked_draws=%llu checked_passes=%llu\n",
+               totk_ft_on(), frames, warmup, draws, passes, cpu / (double)frames, wall / (double)frames,
+               (unsigned long long)count_draws, (unsigned long long)count_passes);
+        return fails != 0;
+    }
     if (argc >= 2 && !strcmp(argv[1],"--alpha-test")) {
         CHECK(mtl_wait(run(),5000000000ull),"alpha fixture initial draw completes");
         const float full[]={-1,-1,3,-1,-1,3}; memcpy(vtx,full,sizeof full);
@@ -4366,9 +4404,17 @@ int main(int argc, char **argv) {
                 CHECK(totk_ft_snapshot(totk_ft_current(), &record), "timeline retains identity walk frame");
                 CHECK(record.work.value[FT_COUNT_DRAWS] - ft_before.work.value[FT_COUNT_DRAWS] == 2068,
                       "timeline actual worker/inline draws match independently checked stream count");
-                CHECK(record.work.value[FT_COUNT_REC_SAMPLES] > ft_before.work.value[FT_COUNT_REC_SAMPLES] &&
-                      record.work.value[FT_COUNT_REC_P_NS] > ft_before.work.value[FT_COUNT_REC_P_NS],
-                      "timeline opcode sampling captures parallelizable work without requiring full profiler");
+                if (getenv("TOTK_VK_REC_PROFILE") && !strcmp(getenv("TOTK_VK_REC_PROFILE"), "1")) {
+                    CHECK(record.work.value[FT_COUNT_REC_SAMPLES] > ft_before.work.value[FT_COUNT_REC_SAMPLES] &&
+                          record.work.value[FT_COUNT_REC_P_NS] > ft_before.work.value[FT_COUNT_REC_P_NS],
+                          "explicit recorder profiling retains sampled parallelizable work");
+                } else {
+                    CHECK(!record.work.value[FT_COUNT_REC_SAMPLES] &&
+                          !record.work.value[FT_COUNT_REC_S_NS] && !record.work.value[FT_COUNT_REC_P_NS] &&
+                          !record.work.value[FT_COUNT_REC_O_NS] &&
+                          record.work.value[FT_COUNT_REC_WALL_NS] > ft_before.work.value[FT_COUNT_REC_WALL_NS],
+                          "timeline uses existing walk clocks, never opcode/category probes");
+                }
                 printf("frame-tl identity: frame=%llu samples=%llu S/P/O_ns=%llu/%llu/%llu draws=%llu cpu_steps=%llu\n",
                     (unsigned long long)record.frame, (unsigned long long)record.work.value[FT_COUNT_REC_SAMPLES],
                     (unsigned long long)record.work.value[FT_COUNT_REC_S_NS], (unsigned long long)record.work.value[FT_COUNT_REC_P_NS],
@@ -4399,6 +4445,20 @@ int main(int argc, char **argv) {
         const uint64_t footer[] = {0x5245434944454e33ull, 12};
         CHECK(fwrite(footer, sizeof footer, 1, out) == 1, "write identity footer");
         CHECK(!fclose(out), "close identity output");
+#ifdef TOTK_FRAME_TIMELINE_TEST
+        uint64_t wall_probes = totk_ft_test_probe_hits(FT_TEST_WALK_WALL);
+        uint64_t assembly_probes = totk_ft_test_probe_hits(FT_TEST_ASSEMBLY_WORK);
+        if (totk_ft_on()) {
+            CHECK(wall_probes > 0, "enabled timeline executes coarse per-walk accounting");
+            CHECK(!vk_record_enabled() || assembly_probes > 0,
+                  "enabled recorder executes assembled-slot accounting");
+        } else {
+            CHECK(!wall_probes && !assembly_probes,
+                  "disabled timeline executes no new walk or assembly probe, including with the full profiler on");
+        }
+        printf("frame-tl probe-check: enabled=%d walk=%llu assembly=%llu\n", totk_ft_on(),
+               (unsigned long long)wall_probes, (unsigned long long)assembly_probes);
+#endif
         printf("recorder identity timing ms/NVN-submit: walk wall %.3f body %.3f final %.3f summed worker busy %.3f background assembly wait %.3f walking wait %.3f body wait %.3f slots %.2f\n",
             walk_wall / 12e6, body_wall / 12e6, final_wall / 12e6, worker_busy / 12e6, assembly_wait / 12e6,
             walking_wait / 12e6, body_wait / 12e6, slot_sum / 12.0);
@@ -5353,6 +5413,27 @@ int main(int argc, char **argv) {
             if (round == 15) after_first = vk_dpool_count();
         }
         CHECK(vk_dpool_count() == after_first, "descriptor pools reused across submissions: %d after 16 rounds, %d after 40", after_first, vk_dpool_count());
+    }
+    /* Compute always takes the direct descriptor path, even with two recorders.
+       Both array families consume element 2; singleton-only tests miss the ABI. */
+    {
+        uint8_t control[0x880],code[0x230];uint32_t length;
+        shader_binary(5,47,control,code,&length);
+        memcpy(cpu_pool+0x103000,code,length);
+        prog_t compute={.nstage=1,.serial=947};
+        compute.sd[0].data=(NVNbufferAddress)(uintptr_t)(cpu_pool+0x103000);compute.sd[0].control=control;
+        p_bind_program program={&compute,1u<<5};
+        uint32_t *result=(uint32_t *)(cpu_pool+0x500000);memset(result,0,256);
+        uint32_t *uniform=(uint32_t *)(cpu_pool+0x501000);uniform[0]=0x1234;
+        p_bind_buf output={5,0,(uint64_t)(uintptr_t)result,256};
+        p_bind_buf input={5,1,(uint64_t)(uintptr_t)uniform,16};
+        p_dispatch dispatch={1,1,1};p_set_rt none={0};
+        op(OP_SET_RT,&none,sizeof none);op(OP_BIND_PROGRAM,&program,sizeof program);
+        op(OP_BIND_UBO,&input,sizeof input);op(OP_BIND_UBO,&output,sizeof output);
+        op(OP_DISPATCH,&dispatch,sizeof dispatch);
+        CHECK(mtl_wait(run(),5000000000ull),"three-element compute descriptor arrays finish");
+        int correct=1;for(unsigned i=0;i<64;i++) if(result[i]!=(i^(3u*0x1234))) correct=0;
+        CHECK(correct,"direct compute consumes contiguous UBO and storage-buffer array element 2");
     }
     /* GPU profiler acceptance: real passes in 301 frames, recycling all fence slots. The first
        pass loads, then fully clears before its first draw; a later copy consumes its store.

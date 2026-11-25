@@ -3741,6 +3741,9 @@ static uint32_t pipe_write_mask(const pipe_key *k) {   /* the key's channel mask
     for (unsigned i = 0; i < 8; i++) if (!(outputs >> i & 1)) mask &= ~(0xfu << (4 * i));
     return mask;
 }
+static int pipe_prewarm_cached(pipe_ent *e);
+static VkResult pipe_create(const pipe_key *k, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipeline *out, uint64_t frame, int synchronous);
+static vk_lend pipe_publish(pipe_ent *e, VkResult r, VkPipeline p, uint64_t dt);
 #include "vk_pso_runtime.inc"
 static void pipe_enqueue(pipe_ent *e) {
     pthread_mutex_lock(&g_pq_mu);
@@ -3787,8 +3790,10 @@ static void pipe_key_fill(pipe_key *k, const vk_state *state, vk_shader *vs, vk_
 /* the pipeline of a key; flags VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT asks the pipeline cache alone */
 static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipeline *out, uint64_t frame, int synchronous, int part) {
     vk_shader *vs = k->vs, *fs = k->fs; VkPipeline p = VK_NULL_HANDLE;
+    VkShaderModule vertex = vk_vs_module_for(vs, fs, !(flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT));
+    if (!vertex) { *out = VK_NULL_HANDLE; return VK_PIPELINE_COMPILE_REQUIRED; }
     VkPipelineShaderStageCreateInfo st[2] = {
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs->mod, .pName = "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vertex, .pName = "main"},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs ? fs->mod : VK_NULL_HANDLE, .pName = "main"}};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = vs->required_subgroup_size},
@@ -4042,6 +4047,16 @@ static vk_lend pipe_publish(pipe_ent *e, VkResult r, VkPipeline p, uint64_t dt) 
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     return lend;
+}
+/* Migration has a warm driver cache but deliberately no trusted completion bits. Resolve hits
+ * before replay starts, rather than putting ready work in a queue that demand must join/take over.
+ * This is cache-only: changed/missing modules and any probe failure stay on the ordinary workers. */
+static int pipe_prewarm_cached(pipe_ent *e) {
+    VkPipeline p;
+    if (pipe_create(&e->k, e->layout, VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, &p, 0, 0))
+        return 0;
+    pipe_publish(e, VK_SUCCESS, p, 0);
+    return 1;
 }
 static int pipe_pending(int state) { return state == PE_QUEUED || state == PE_BUILDING; }
 /* Remove a queued entry to build it on the walk. An in-flight build is joined, never duplicated or overwritten. */
@@ -4305,6 +4320,7 @@ void vk_pipeline_prewarm(void) {
     const char *cache = vk_pcache_current_path();
     if (cache) snprintf(g_pw_path, sizeof g_pw_path, "%s.pso-state", cache);
     g_pw_started = host_now_ns();
+    unsigned cache_hits = 0;
     pso_restore();
     pipe_ent *head = NULL, *tail = NULL;
     if (records && g_pw_total > g_pw_completed && compile_threads()) {
@@ -4321,11 +4337,13 @@ void vk_pipeline_prewarm(void) {
             e->k = k; e->layout = vk_layout_of(k.vs, k.fs); e->list_index = i+1;
             e->capture = r->capture; e->predicted = 1; /* first demand must build/join, never skip a formerly cached draw */
             nvn_hm_put(&g_pipes, &k, e);
+            if (V.has_cache_control && (vk_pcache_seeded() || vk_pcache_loaded_path()) &&
+                pipe_prewarm_cached(e)) { cache_hits++; continue; }
             if (tail) tail->next = e; else head = e; tail = e;
         }
     }
     free(records);
-    if (path) LOGV("[pso-prewarm] list=%s resumed=%u/%u missing=%u startup_ms=%.1f; background_worker_limit=1, demand first", path, g_pw_completed, g_pw_total, g_pw_missing, (host_now_ns()-g_pw_started)/1e6);
+    if (path) LOGV("[pso-prewarm] list=%s resumed=%u/%u missing=%u startup_ms=%.1f; cache_hits=%u background_worker_limit=1, demand first", path, g_pw_completed-cache_hits, g_pw_total, g_pw_missing, (host_now_ns()-g_pw_started)/1e6, cache_hits);
     pthread_mutex_lock(&g_pq_mu);
     g_pw_head = head; g_pw_tail = tail;
     atomic_store_explicit(&g_pso_warming, head != NULL, memory_order_relaxed);
@@ -4495,6 +4513,33 @@ static void support_fill(uint8_t *d, uint32_t w, uint32_t h) {   /* Ryujinx Supp
     for (int i = 0; i < 73; i++) { float one = 1; memcpy(d + 192 + 16 * i, &one, 4); }
 }
 typedef struct { VkDescriptorBufferInfo b; VkDescriptorImageInfo i; VkBufferView t; } dinfo;
+/* Vulkan steps descriptor elements by their native type, never dinfo's stride.
+   Array writes use bounded stack scratch; singleton writes keep their pointers. */
+enum { DINFO_BATCH = 32 };
+typedef union {
+    VkDescriptorBufferInfo b[DINFO_BATCH];
+    VkDescriptorImageInfo i[DINFO_BATCH];
+    VkBufferView t[DINFO_BATCH];
+} dinfo_scratch;
+static VkWriteDescriptorSet dinfo_write(VkDescriptorSet set, const vk_bind *b, const dinfo *in,
+                                        uint32_t first, dinfo_scratch *scratch) {
+    uint32_t count = MINV(b->count - first, DINFO_BATCH);
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet=set,.dstBinding=b->binding,.dstArrayElement=first,.descriptorCount=count,
+        .descriptorType=(VkDescriptorType)b->dtype};
+    in += first;
+    if (b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+        w.pBufferInfo = &in->b;
+        if (count > 1) { for (uint32_t e=0;e<count;e++) scratch->b[e]=in[e].b; w.pBufferInfo=scratch->b; }
+    } else if (b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+        w.pTexelBufferView = &in->t;
+        if (count > 1) { for (uint32_t e=0;e<count;e++) scratch->t[e]=in[e].t; w.pTexelBufferView=scratch->t; }
+    } else {
+        w.pImageInfo = &in->i;
+        if (count > 1) { for (uint32_t e=0;e<count;e++) scratch->i[e]=in[e].i; w.pImageInfo=scratch->i; }
+    }
+    return w;
+}
 static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out, int storage, int rw, uint64_t extent, vk_record_descriptor *record) {
     VkBuffer b; uint64_t off, avail; uint32_t reason = 0;
     if (!addr || !vk_resolve_for(addr, 1, &b, &off, &avail, VK_LOOKUP_UBO)) return 0;
@@ -5054,12 +5099,20 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
         /* Writes are only consumed on a cache miss; hits need only the resolved infos (also used by pass dumps). */
         static VkWriteDescriptorSet *w; static size_t capw;
         if ((size_t)sh->nb > capw) { capw = (size_t)sh->nb + 16; w = realloc(w, capw * sizeof *w); }
+        uint32_t nw=0;
         for (int i = 0, kk = 0; i < sh->nb; i++) {
             const vk_bind *b = &sh->b[i]; dinfo *in = &info[kk]; kk += b->count;
-            w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = b->binding, .descriptorCount = b->count, .descriptorType = (VkDescriptorType)b->dtype,
-                .pBufferInfo = &in->b, .pImageInfo = &in->i, .pTexelBufferView = &in->t};
+            if (b->count == 1) {
+                w[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstSet=set,.dstBinding=b->binding,.descriptorCount=1,.descriptorType=(VkDescriptorType)b->dtype,
+                    .pBufferInfo=&in->b,.pImageInfo=&in->i,.pTexelBufferView=&in->t};
+            } else for (uint32_t first=0;first<b->count;first+=DINFO_BATCH) {
+                dinfo_scratch scratch;
+                VkWriteDescriptorSet write=dinfo_write(set,b,in,first,&scratch);
+                vkUpdateDescriptorSets(V.dev,1,&write,0,NULL);
+            }
         }
-        vkUpdateDescriptorSets(V.dev, (uint32_t)sh->nb, w, 0, NULL);
+        if (nw) vkUpdateDescriptorSets(V.dev,nw,w,0,NULL);
         g_dsc[slot].sub = sub; g_dsc[slot].hash[0] = h[0]; g_dsc[slot].hash[1] = h[1]; g_dsc[slot].dsl = sh->dsl; g_dsc[slot].n = total; g_dsc[slot].set = set;
         g_stat_sets_new++;
     }
@@ -5072,11 +5125,11 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
                 if (b->dtype == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b->dtype == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
                     for (int e = 0; e < b->count; e++)
                         if (in[e].i.imageView == replay_source) in[e].i.imageView = vk_fg_canvas_view();
-                VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet=replay_set, .dstBinding=b->binding, .descriptorCount=b->count,
-                    .descriptorType=(VkDescriptorType)b->dtype, .pBufferInfo=&in->b,
-                    .pImageInfo=&in->i, .pTexelBufferView=&in->t};
-                vkUpdateDescriptorSets(V.dev,1,&write,0,NULL);
+                for (uint32_t element=0;element<b->count;element+=DINFO_BATCH) {
+                    dinfo_scratch scratch;
+                    VkWriteDescriptorSet write=dinfo_write(replay_set,b,in,element,&scratch);
+                    vkUpdateDescriptorSets(V.dev,1,&write,0,NULL);
+                }
             }
             FGX.record->final = 2; /* exact canvas input was replaced, not a shader-name-only guess */
         }
@@ -5084,12 +5137,12 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
                 atomic_load_explicit(&vk_fg_terminal_owned_active,memory_order_relaxed)) {
             for (int i=0,first=0;i<sh->nb;i++) {
                 const vk_bind *b=&sh->b[i]; dinfo *in=&info[first]; first+=b->count;
-                VkWriteDescriptorSet write={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstBinding=b->binding,.descriptorCount=b->count,
-                    .descriptorType=(VkDescriptorType)b->dtype,.pBufferInfo=&in->b,
-                    .pImageInfo=&in->i,.pTexelBufferView=&in->t};
-                if (!vk_fg_terminal_owned_binding(set_index,sh->dsl,&write,b->rw))
-                    vk_fg_terminal_owned_fail();
+                for (uint32_t element=0;element<b->count;element+=DINFO_BATCH) {
+                    dinfo_scratch scratch;
+                    VkWriteDescriptorSet write=dinfo_write(VK_NULL_HANDLE,b,in,element,&scratch);
+                    if (!vk_fg_terminal_owned_binding(set_index,sh->dsl,&write,b->rw))
+                        vk_fg_terminal_owned_fail();
+                }
             }
         }
         FGX.record->sets[set_index] = replay_set;

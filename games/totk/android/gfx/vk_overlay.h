@@ -12,7 +12,7 @@ enum { VK_OVERLAY_PAD = 2, VK_OVERLAY_ROW_H = 11, VK_OVERLAY_CELL_W = 6, VK_OVER
        VK_OVERLAY_COMPACT_COLS = sizeof("FPS 999.9") - 1, VK_OVERLAY_COMPACT_FG_COLS = sizeof("FPS 999.9->999.9") - 1,
        VK_OVERLAY_W = VK_OVERLAY_COLS * VK_OVERLAY_CELL_W + 2 * VK_OVERLAY_PAD,
        VK_OVERLAY_GRAPH = VK_OVERLAY_W - 2 * VK_OVERLAY_PAD, VK_OVERLAY_GRAPH_H = 12,
-       VK_OVERLAY_MAX_ROWS = 8, VK_OVERLAY_MAX_H = 2 * VK_OVERLAY_PAD + VK_OVERLAY_MAX_ROWS * VK_OVERLAY_ROW_H + VK_OVERLAY_GRAPH_H,
+       VK_OVERLAY_MAX_ROWS = 10, VK_OVERLAY_MAX_H = 2 * VK_OVERLAY_PAD + VK_OVERLAY_MAX_ROWS * VK_OVERLAY_ROW_H + VK_OVERLAY_GRAPH_H,
        VK_OVERLAY_MAX_SCALE = 6, VK_OVERLAY_SLOTS = VK_PRESENT_SLOT_CAPACITY };
 typedef enum {
     VK_OVERLAY_SCALE_NONE, VK_OVERLAY_SCALE_LINEAR, VK_OVERLAY_SCALE_FSR1, VK_OVERLAY_SCALE_SGSR
@@ -29,6 +29,8 @@ typedef struct { uint32_t x, y, w, h, scale; } vk_overlay_rect;
 typedef struct {
     unsigned width, height, graph_x, graph_y, graph_w, rows, compile_row, power_row, system_row;
     int framegen, power, handheld, compact, system;
+    int map_notice, notice_only;
+    unsigned notice_row;
     vk_overlay_rect rect;
     unsigned generation, position;
     uint32_t output_w, output_h;
@@ -68,6 +70,7 @@ typedef struct {
     int handheld;
     int compact; /* fps mode: rate row only, no graph; configure re-lays out when it changes */
     int system; /* full mode reserves thermal/CPU and memory rows when opted in */
+    int map_notice, notice_only; /* independent of the optional performance panel */
     vk_overlay_system sys;
     char system_text[VK_OVERLAY_COLS + 1], memory_text[VK_OVERLAY_COLS + 1];
     vk_overlay_scale_method scale_stage[2];

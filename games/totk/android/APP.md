@@ -1289,6 +1289,7 @@ Host-only does not certify gralloc, SurfaceFlinger, game-image quality or perfor
 | `TOTK_POST_SCALE=sgsr` / `fsr`, `TOTK_POST_SHARPNESS=0.2`, `TOTK_POST_SGSR_SHARPNESS=2` | Existing whole-canvas alternatives, Duo device-tested; bypassed for effective native UI. Scene SGSR shares the SGSR controls without filtering UI. |
 | `TOTK_POST_SGSR_EDGE_THRESHOLD`, `TOTK_POST_SGSR_EDGE_DIRECTION=1`, `TOTK_POST_AA=smaa` / `off` | Existing opt-in filter/control variants; host pixel coverage, no separate integrated device qualification. |
 | `TOTK_OVERLAY=off` / `fps` / `full`, `TOTK_OVERLAY_POS=tl` / `tr` / `bl` / `br`, `TOTK_OVERLAY_POWER=1` | Compact fixed-layout FPS/resolution/mode and active-FG telemetry; power/temperature opt-in, default off. Release off, development full; host pixels/timings, no inferred device benefit. |
+| `TOTK_MAP_WARN=1` | Experimental, default off: five-second background process-map warning, including with the performance overlay off. Logs at 80%, notice at 88%, clears below 84%; warning only, not a map-growth fix. See [Process map-limit warning](#process-map-limit-warning-experimental-default-off). |
 | `TOTK_FRAMEGEN_DIAG=1`, `TOTK_PRESENT_CADENCE_TRACE=1`, `TOTK_FRAME_TIMELINE=1` | Qualification-only diagnostics; Thor/Odin evidence, trace measurably perturbs Thor. Slot-exhaustion snapshots require DIAG. Never use a traced arm as ordinary-play timing. |
 | `TOTK_FRAMEGEN_WRITER_DIAG=1`, `TOTK_FRAMEGEN_UNCERTIFIED_PLANE=1`, `TOTK_FRAMEGEN_UNKNOWN_PERCENT`, `TOTK_FRAMEGEN_DUMP=<frame>`, `TOTK_VK_PASS_PROFILE`, `TOTK_VK_PASS_DUMP`, `TOTK_INPUT_FILE` | Diagnostic or experimental proof controls, off by default except the unchanged35% unknown-depth ceiling; host coverage, no new device-safe/performance qualification. Uncertified plane is explicitly not a geometric proof; changing the coverage ceiling is not a quality guarantee. |
 | `TOTK_FRAMEGEN_BACKPRESSURE=0` | Diagnostic-only unsafe async control; not a play recommendation. |
@@ -1459,6 +1460,95 @@ Record the device model/OS, requested variant/stage, clock tick rate, sampling i
 Repeat with `TOTK_XLATE_ONDEVICE=0` and without the packaged binary: both must preserve the old skip/request path.
 Device measurements are not implied by the host test, and no on-device draw, timing, CPU or RSS result is claimed
 without that run.
+
+## Process map-limit warning (experimental, default off)
+
+`TOTK_MAP_WARN=1` starts process-map counting on the existing nice+10 `totk-vmascan` worker,
+independently of `TOTK_FRAME_LAG`. The first sample is about five seconds after startup; subsequent
+samples are spaced by about five seconds plus scan time. The game/render/present threads and signal
+handlers do not scan for this feature. Warning-only scans take no pool, runtime or tracker locks.
+The existing opt-in lag budget/classification paths retain their locks and policy.
+With the switch absent or not exactly `1`, `2` or `3`, this feature starts no worker, adds no scans and displays
+no notice; presentation checks one cached enable flag.
+
+At **80%** of `vm.max_map_count`, log once. At **88%**, show a persistent small notice in the
+configured overlay corner (top-right by default), even with `TOTK_OVERLAY=off`:
+
+```text
+MAP LIMIT NEAR
+SAVE AND RESTART GAME SOON
+```
+
+The notice clears strictly below **84%**. Each threshold logs once per process, not every scan or
+re-crossing. An unreadable/zero maps count clears the notice and logs its unavailability once; a later
+valid sample resumes evaluation. If the kernel limit is unreadable, assume **65,530** (as on the
+Android 13 Thor). Samples are approximate and can miss a fast rise between scans. This is not a fix
+for map growth and cannot guarantee enough time to save. It never changes mappings, protections,
+tracker admission or game state.
+
+Startup-only test controls (integer percentages **1..100**):
+
+| Environment | Default |
+| --- | --- |
+| `TOTK_MAP_WARN_LOG_PERCENT` | `80` |
+| `TOTK_MAP_WARN_NOTICE_PERCENT` | `88` |
+| `TOTK_MAP_WARN_CLEAR_PERCENT` | `84` |
+
+Require `LOG <= CLEAR < NOTICE`; invalid ordering restores all defaults, and invalid individual
+values restore that value's default with a diagnostic. `TOTK_VMA_SCAN_MS` still governs the existing
+lag/classification work, not the warning's independent five-second deadline.
+
+### Scan attribution (`TOTK_MAP_WARN=2`, diagnostic only)
+
+`2` keeps `1`'s warning thresholds, sampling cadence and policy, and adds one fixed-format, bounded
+`[map-warn-scan]` line per completed worker traversal, written only by `totk-vmascan`:
+`start_ns`, `duration_us`, `rows`, `frame_origin_ns`, `warn`, `notice`, `test_phase`, `log`, `show`, `clear`.
+`start_ns` is absolute `CLOCK_MONOTONIC` nanoseconds, the same clock as ordinary native frame
+reports; `frame_origin_ns` is their existing process origin (`g_t0_ns`). Convert to ordinary elapsed
+seconds with `(start_ns - frame_origin_ns) / 1e9`. Zero origin means unavailable in a graphics-only
+host, not a valid conversion anchor. Duration is truncated to whole microseconds and covers traversal
+and sysctl read (plus existing lag/classification work if reused), excluding warning/logging, telemetry
+and sleep. `rows=0` denotes an unknown count.
+
+With lag/classification off this is at most one line per five-second warning scan (about 0.2 Hz).
+Existing independently requested lag/classification scans also get a line; their unchanged minimum
+period is one second. No per-row or per-frame logging is added. `warn=1` marks a warning-policy sample.
+`1` remains quiet except its one-shot threshold/read-failure logs; neither `1` nor off adds trace reads.
+Use `2`, not `3`, for standing performance attribution. Logging itself can perturb timing. Match real
+scan intervals, not modulo-five-second phases or log-delivery timestamps; ordinary long-frame rows
+are delayed/rounded sparse observations, and window maxima have no within-window event timestamp.
+
+### Same-process clear check (`TOTK_MAP_WARN=3`, TEST ONLY)
+
+`3` includes per-scan tracing and deliberately replaces **all three percentage overrides** with this
+fixed sequence on the ordinary five-second warning samples, preserving actual counts and policy state:
+
+| Warning sample | Log / notice / clear percentages | Expected notice with a stable count between 3% and 99% |
+| --- | --- | --- |
+| 1..12 (about 5..60 s after worker start) | `1 / 3 / 2` | Show |
+| 13..24 (about 65..120 s) | `1 / 100 / 2` | Hold the already-shown notice, below the new notice threshold |
+| 25 onward (about 125 s onward) | `1 / 100 / 99` | Clear below the raised clear threshold |
+
+The times include additional scan/scheduling delays; trust `warn=1` and `test_phase=1/2/3` records,
+not a wall-clock countdown. Unknown counts still clear with the normal once-only diagnostic.
+No maps are added/removed, no protections are changed, no count is fabricated, and no notice bit is
+forced. This verifies the real policy-to-overlay hold/clear path after **test threshold changes**;
+it does not prove that real map growth reverses or that a count crossed the production 84% boundary.
+Do not use `3` for ordinary play: its final thresholds intentionally suppress the normal 88% warning.
+Restart with `1` (remove percentage overrides) for the ordinary opt-in warning, or unset it to disable.
+
+The original Thor check observed the notice and default-off behavior, but did not observe a natural
+clear and could not attribute long frames to individual scans. These diagnostic modes enable those
+follow-up checks; they are not themselves a device qualification or a crash-prevention claim.
+
+For safe Thor display verification, use `TOTK_MAP_WARN=1` and percentages `1` / `3` / `2`
+(log / notice / clear), `TOTK_FRAME_LAG=0`, `TOTK_OVERLAY=off`. Start a normal save and wait for the
+worker sample: the notice should appear once the ordinary process count exceeds 3% of the limit.
+Do not create extra mappings or travel repeatedly toward the real limit. Verify that saving and menu
+input remain usable, and that the notice persists through area/menu transitions and overlay toggles.
+Restart with the switch off: no notice. Remove the three test overrides before ordinary use.
+Host policy/sampler/font-raster checks do not verify Android pixels, Thor scan cost, saving headroom
+or crash prevention.
 
 ## Dev and release builds
 
@@ -5050,6 +5140,46 @@ pass-start clears, and `TOTK_VK_STORE_CLEAR=1` also skips stores proven dead bef
 first option). Neither has device measurements yet; extra pass boundaries can cost more than they save. See
 [VULKAN.md](VULKAN.md#opt-in-attachment-work-reductions-device-measurement-pending) for the counters and A/B procedure.
 
+### Missing vertex outputs and experimental NaN min/max
+
+PR #43 supplies `(0,0,0,1)` for fragment input locations absent from their paired vertex shader,
+targeting wind/air-flow white boxes (issue #4). `TOTK_VK_VARYING_FIX` is startup-only, default **on**;
+exact `=0` keeps the old modules and avoids the IO-classification walk and its allocations.
+`TOTK_VK_NAN_MINMAX=1` separately opts into **default-off experimental** NMin/NMax/NClamp replacement
+in every loaded VS/FS/CS containing a targeted GLSL instruction. It is not necessary to enable the varying
+fix. Guest special-value equivalence and Adreno driver cost need separate qualification.
+
+Both policies change only runtime module bytes. Shader-list identifiers, variants, reflection and pack
+bytes stay unchanged: **no full shader rebuild**. Cache names append `.vary-v1` when the varying fix is
+on, then `.nan-v1` only for the NaN experiment. Explicit cache/import paths and `.pso-state` completion
+files use the same namespace. Existing completed prewarm state does not skip the new arm's modules.
+On first use, a context-matched predecessor's driver cache is merged before compilation workers start,
+without modifying that predecessor. Prewarm rechecks keys: unchanged cache hits become ready before
+play and are logged as `cache_hits`; only misses (including changed modules) need compilation.
+No old completion bits are copied. Missing/corrupt caches or a driver/device/context change fall back
+to cold warming, not stale entries. NaN and integer-fold switch chains follow the same rule.
+Old namespaces remain available for downgrade. The immediate predecessor costs about one extra
+29 MiB cache on the observed Thor case. After successful new cache save/prewarm, manually remove
+only known older-than-predecessor cache/metadata in its directory; retain the predecessor for rollback.
+No automatic deletion of ambiguous older/explicit files occurs. See VULKAN.md for admission/retention.
+
+Pair rewrites share the ordinary module postprocessing chain, including integer folding. Workers reread
+owned seed payloads using thread-safe seed IO and atomic accounting; seed warming does not permanently
+retain consumed words. Additional retained SPIR-V source budget is **0 bytes**. Patched driver modules
+and encounter-bounded per-pair records live for the session (64-byte records on the 64-bit target,
+excluding allocator overhead); there is no record eviction, fixed RSS cap or driver-memory bound.
+Statistics read independent atomic totals and never join module creation. A new cache-only pipeline
+probe uses a nonblocking lookup and defers missing/in-flight replacement modules to the ordinary
+compile-required path: it does no seed IO, SPIR-V rewriting or shader-module driver call.
+Actual capture/worker-disabled synchronous builds can still build or join the exact interface and
+wait for its storage/driver work, with no proved wall-time bound. Different interface creation does
+not hold the short lookup/publication lock, and ready-pipeline draws never enter this helper.
+At most 40 pair-detail lines report cumulative `session shader_pairs patched=N fallback=M`; changed
+totals are also reported at the existing IO-stat cadence and normal exit. Fallback retains old behavior,
+not a successful repair. Device acceptance needs nonzero patches and an explanation for any fallback,
+wind/burning-grass pictures, ordinary water/particle/menu checks, first-launch prewarm timing and a
+matched restart O/B/B/O frame-time quartet. No such device evidence is claimed by host tests.
+
 ### Packed shader IO and learned demand warming
 
 Exact integer shader-address folding is now on by default. For an unfurled A/B control, put
@@ -5060,11 +5190,11 @@ Shared guest/bind-state variant hashes, `.vk` reflection, `.vv` indexes, `seed-i
 do not change; existing packs and newly prepared seeds work in both arms. Do not pre-fold the seed.
 No full shader rebuild/import is required for this update, and the APK does not bundle game-derived packs.
 The enabled arm uses `.intfold-v1` driver-pipeline, prewarm/import, compute-history and learned-IO
-namespaces; explicit paths and alternate seeds are isolated too. The first default launch after updating
-therefore has cold driver pipelines: expect possible one-time loading/first-visit stutter while they compile
-and learn, rather than the full shader-setup wait. Exact seconds/minutes depend on the device/route and are
-not yet measured for this update. Later starts reuse the newly warmed namespace. The opt-out can still
-reuse its old unfurled caches; old files are not deleted.
+namespaces; explicit paths and alternate seeds are isolated too. An absent namespace can now seed
+driver entries from same-seed/position policy siblings with a fully matching context. Prewarm completion
+is still isolated; startup cache-only hits avoid re-compilation/first-demand takeovers for unchanged
+pipelines. Unavailable/context-mismatched sources stay cold. Old files are not modified or deleted;
+the retention/manual-cleanup rule above applies.
 
 
 Android now defaults to indexed seed IO (`TOTK_VK_SEED_IO=0` retains legacy loose IO for diagnosis).
@@ -5649,19 +5779,21 @@ lifetime oracle: verify persistent Gerudo lighting and actual target traces befo
 a capture-sync label to a real cached probe.
 
 At the standard base, the cache grows in private app storage as `state/vk-pipeline-cache.bin<namespace>`.
-Default-on integer folding appends `.intfold-v1`; only exact `TOTK_VK_INT_FOLD=0` keeps the unsuffixed off-arm name.
-An alternate seed's folder/content hash and any `.pos-v1-10`, `.pos-v1-01` or `.pos-v1-11` precision suffix come
-before `.intfold-v1`. `sh install_app.sh cache-export` copies **all existing recognized cache names** from private
+Default-on integer folding appends `.intfold-v1`, default-on varying correction appends `.vary-v1`,
+and opt-in NaN min/max appends `.nan-v1`, in that order; each disabled policy omits its suffix.
+An alternate seed's folder/content hash and any `.pos-v1-10`, `.pos-v1-01` or `.pos-v1-11` precision suffix
+come first. `sh install_app.sh cache-export` copies **all existing recognized cache names** from private
 `files/state` into a new `cache-export-<date>-<pid>/` folder on the computer. Basenames and bytes, including the
 context envelope, stay unchanged; stale/imported/temp files and graphics-key/resume sidecars are not exported.
 
 `sh install_app.sh cache-import FILE...` stages one or more such files in the standard external game folder,
 under each file's **unchanged basename**, including on a release APK. The runtime consumes only its exact selected
 namespace, validates context, and renames a successfully merged file to `<selected path>.imported`.
-An opposite integer-fold arm is left unconsumed with a startup diagnostic; it is never promoted into the selected arm.
+An opposite rewrite arm is left unconsumed and never promoted into the selected arm. Startup warnings discover
+only some opposite integer-fold filenames; they are advisory, not an exhaustive inventory of other policy arms.
 The script does not infer the phone's configuration from host variables or execute `totk.env`. It accepts only the
-standard basename grammar, including the existing seed/position suffixes. Timestamp-renamed old exports have lost
-that filename provenance and are refused; never relabel an off-arm cache as `.intfold-v1`, even for the same driver.
+standard basename grammar, including seed/position/integer-fold/varying/NaN suffixes. Timestamp-renamed old exports
+have lost that filename provenance and are refused; never relabel another arm's cache, even for the same driver.
 
 These convenience handlers cover the standard private cache and external import bases. Custom
 `TOTK_VK_PIPELINE_CACHE` / `TOTK_VK_PIPELINE_CACHE_IMPORT` bases or another selected game-data folder still require

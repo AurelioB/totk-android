@@ -37,6 +37,14 @@ enum {
 };
 void nvn_dirty_lag_enable(void);
 int nvn_dirty_lag_enabled(void);   /* set once by nvn_dirty_lag_enable before pool registration */
+/* Startup-only opt-in: 1 = warning, 2 = per-scan trace, 3 = TEST-ONLY show/hold/clear sequence.
+   All reuse the low-priority sampler; off starts none. The notice getter is one cached atomic
+   load; neither API scans procfs. See APP.md before using diagnostic modes. */
+int nvn_dirty_map_warn_init(void);
+int nvn_dirty_map_warn_notice(void);
+/* One startup publication before graphics initialization, not a recurring frame callback.
+   Reads configuration but starts no worker; only traced modes retain the immutable origin. */
+void nvn_dirty_map_warn_set_frame_origin(uint64_t origin_ns);
 /* Linux VMA guard budget. Explicit refresh/report and drain are normal-thread-only, off the recurring
    frame/recording paths. Request is non-blocking with respect to scans; pressure is an acquire-load.
    Pressure is latched until restart: no new additional lag/private-copy watches; baseline texture
