@@ -576,6 +576,28 @@ class InSessionAB(unittest.TestCase):
             self.assertEqual(fps, {300: 27.0})
             self.assertEqual([g['arm'] for g in analyze.parse_ctl(path)], ['A'])
 
+    def test_history_excludes_old_faults_provenance_and_compile_counts(self):
+        old = ('[totk] game version stale\n[totk-app] settings.env (menu): TOTK_FPS60=0\n'
+               'driver sha256=' + 'a' * 64 + '\n[vk] device lost\n' +
+               ab_log({300: (60, 99, 50, 9)}, []) +
+               '[nvn-vk] frame 300, stutter: 91 new pipelines took 1.2 ms; '
+               '92 compiled on worker threads in 3.4 ms; sync compiles 93 in 5.6 ms\n')
+        current = ('[totk] game version 1.4.3\n[totk-app] settings.env (menu): TOTK_FPS60=1\n'
+                   'driver sha256=' + 'b' * 64 + '\n' +
+                   ab_log({300: (30, 34, 10, 0)}, [
+                       (1, '[totk-ctl] gen=1 frame=1 mark ab arm=A block=1')]))
+        with tempfile.TemporaryDirectory() as d:
+            legacy, mixed = Path(d) / 'legacy.log', Path(d) / 'mixed.log'
+            legacy.write_text(current, encoding='utf-8')
+            mixed.write_text(''.join('[totk-log] ===== Launch old =====\n' + old for _ in range(9)) +
+                             '[totk-log] ===== Launch current =====\n' + current, encoding='utf-8')
+            self.assertEqual(analyze.parse_log(mixed), analyze.parse_log(legacy))
+            self.assertEqual(analyze.parse_ctl(mixed), analyze.parse_ctl(legacy))
+            info = analyze.parse_log(mixed)[-1]
+            self.assertNotIn('device_lost', info)
+            self.assertEqual(info['game_version'], '1.4.3')
+            self.assertEqual(info['turnip'], 'b' * 64)
+
     def test_explicit_pan_direction(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / 'x.log'
