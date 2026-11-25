@@ -150,6 +150,8 @@ public final class SaveMirror {
 }''',
     'com/aure/totk/ExitNotice.java': '''package com.aure.totk;
 final class ExitNotice {
+    static void attach(android.content.Context context) {}
+    static void nativeEvent(int event, byte[] log, byte[] data) {}
     void resume(android.app.Activity activity, java.util.function.BooleanSupplier ready, java.util.function.Consumer<Boolean> visible) {}
     void pause() {}
 }''',

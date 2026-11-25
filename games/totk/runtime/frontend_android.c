@@ -61,7 +61,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "adreno_gmem.h"
-#include "android_exit_notice.h"
+#include "android_exit_notice_jni.h"
 #include "overlay_chord.h"
 int totk_host_main(int argc, char **argv);
 #include "android_pause.h"
@@ -1778,7 +1778,7 @@ static int start_game(const ANativeActivity *a) {
     if (pthread_create(&t, &at, game_thread, NULL)) { fprintf(stderr, "[totk-app] game thread: %s\n", strerror(errno)); return 0; }
     pthread_attr_destroy(&at); pthread_detach(t);
     android_game_hold_marker_publish();
-    if (a->sdkVersion >= 30) android_exit_notice_start(priv, g_log_path, g_data);
+    if (a->sdkVersion >= 30) android_exit_notice_start(a, g_log_path, g_data);
     android_close_requests_start(priv);
     return 1;
 }
@@ -1919,7 +1919,7 @@ int runtime_front_request_close(void) {
     __android_log_print(ANDROID_LOG_WARN, "TotkSetup", "close game: pid=%d save=idle; native pipeline-cache flush and exit", getpid());
     fprintf(stderr, "[totk] close requested: flushing pipeline cache and exiting\n"); vk_pcache_shutdown();
     if (vk_gpuprof_shutdown) vk_gpuprof_shutdown();
-    android_exit_notice_close();
+    android_exit_notice_event(2);
     _exit(0);
 }
 /* One stat per 500 ms on this non-render thread; no activity launch, task-affinity changes or frame-loop I/O. */
@@ -2493,7 +2493,7 @@ static void android_game_lifecycle_pause(int paused) {
     game_activity_paused = paused;
     android_game_pause_update();
 }
-static void on_pause(ANativeActivity *a) { (void)a; android_game_lifecycle_pause(1); android_exit_notice_background(); }
+static void on_pause(ANativeActivity *a) { (void)a; android_game_lifecycle_pause(1); android_exit_notice_event(1); }
 static void on_stop(ANativeActivity *a) { (void)a; android_game_lifecycle_pause(1); }
 static void on_resume(ANativeActivity *a) {
     (void)a;

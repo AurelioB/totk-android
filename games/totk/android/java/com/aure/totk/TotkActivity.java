@@ -144,7 +144,10 @@ public final class TotkActivity extends NativeActivity {
             nativePresentTransformHint(epoch, -1);
         }
     }
+    /** Native-only session proof/events; START and PAUSE enqueue without IO or waits. */
+    public static void gameSessionEvent(int event, byte[] log, byte[] data) { ExitNotice.nativeEvent(event, log, data); }
     @Override protected void onCreate(Bundle state) {
+        ExitNotice.attach(this);
         super.onCreate(state);
         // NativeActivity synchronously loads totk.env in ANativeActivity_onCreate.
         // Query only after super, before constructing a controller or display listener.

@@ -2283,26 +2283,36 @@ is safe, and adding its row here. Each switch's per-300 report shows the value i
   The menu waits for the game lock/start marker to clear (bounded), then retries the selected operation. Once the
   game is gone, a stale `save-busy` left by a crash does not block completion. A timeout explains why the game was left
   running.
-- **Previous-session notice (default on; API 30+ only).** Cold launcher/menu and direct-game/title entries
-  check Android's `ApplicationExitInfo` on a Java worker, matching the default game process, native PID,
-  `/proc` start identity and session time. `:setup` exits are not game exits; a live same-identity return is not
-  a cold return. With authoritative low-memory history the focusable, controller-dismissable notice says:
+- **Previous-session notice (default on; API 30+ only).** Launcher/menu and direct-game/title entries
+  match Android `ApplicationExitInfo` to the default game process, UID, PID and a native-started session's
+  unique `setProcessStateSummary` token. `:setup` exits cannot match. With authoritative low-memory history
+  the focusable, controller-dismissable notice says:
   “Android closed the previous game session to free memory. Load a saved game; progress since the last save may be lost.”
-  Other abnormal or unclassified interrupted game sessions say: “The previous session ended unexpectedly.”
+  A matched abnormal/unknown platform reason says: “The previous session ended unexpectedly.”
   This diagnoses loss; it does not restore unsaved progress or certify saves. Normal self-exit, user stop,
-  package update/reinstall and already-consumed records show no notice. Missing exit history never implies
-  low memory. Android older than API 30 does not check or display exit notices.
+  accepted save-safe Close and package update/reinstall show no notice. Missing, rotated-away or ambiguous
+  history, missing summary tokens, and cleared/corrupt stored state show **no notice**, not a guessed warning.
+  Retained platform history alone cannot recreate a warning after app data is cleared. API <30 does no checking.
   Put exact `TOTK_EXIT_NOTICE=0` in `totk.env` to silence notices (unset/other values keep them on).
-  Silenced records are consumed, not queued to surprise the player later. One `[TotkExitNotice]` line per
-  checked previous session records reason, importance, historical PSS/RSS in KiB and exit timestamp in milliseconds;
-  missing fields say `unavailable`. Historical PSS/RSS are not final live measurements.
-  Private atomic session receipts retain up to 16 starts until checked, including across direct native startup;
-  an atomic, cross-process ledger prevents Setup and the game displaying the same session twice. Receipts
-  contain identifiers/times/log paths, not guest data. Background receipts record only an already-observed
-  committed generation, not a new save. An orderly receipt is written only after accepted save-safe Close
-  and cache shutdown, never from Activity destruction. The native destruction callback is not registered;
-  no clean-close guarantee relies on it. Record IO runs on the activity/close-poller or notice worker/UI path,
-  not the guest/game/render threads. No new foreground service, permission, Home interception or frame timeline.
+  Silenced records are consumed, not queued. The durable handled identity is process name + UID + PID +
+  the platform record's own raw exit timestamp + session token. That timestamp is never compared with
+  today's clock or used to order sessions. A persisted sequence orders up to 16 session receipts; exact
+  installed-package metadata equality suppresses updates. Clock rollback, time zones, reboot and PID reuse
+  do not change the identity of an already-handled record or suppress a different new session's record.
+  A cross-process reservation separates pending UI delivery from the shown acknowledgement. Stopped,
+  destroyed or recreated activities release an unshown reservation; coalesced checks can deliver it to
+  the eligible replacement without duplicate dialogs. If its entire owner process dies/reboots between
+  dispatch and acknowledgement, presentation is unknowable: consume that ambiguous delivery rather than
+  risk repeating it. A missing receipt, or death before asynchronous startup persistence, can therefore
+  leave a loss unannounced. This is diagnosis, not a guaranteed crash-reporting facility.
+  All exit-notice platform/proc/receipt/ledger/lock/sync and diagnostic IO runs on its dedicated Java worker.
+  Native START/PAUSE and activity callbacks only enqueue; the UI only checks lifecycle eligibility and
+  presents/focuses/dismisses the dialog. The existing non-UI accepted-Close path waits for its ordered
+  close receipt after cache shutdown. Background metadata observes an existing committed generation,
+  never creates a save. Activity destruction is not an orderly receipt; no guarantee uses its unregistered
+  native callback. One worker `[TotkExitNotice]` diagnostic records reason, importance, historical PSS/RSS
+  in KiB and raw exit timestamp in milliseconds (`unavailable` for absent fields). Historical memory is not
+  the final live measurement. No guest/render thread IO, new FGS, permission, Home interception or timeline.
 - **Settings-over-game importance experiment (off by default).** Put exact `TOTK_GAME_HOLD=1` in the game's
   `totk.env`, then restart the game. Other values/unset keep the existing service calls and manifest unchanged.
   While our Settings activity is visible over a live session it binds `GameControlService` with
@@ -2328,6 +2338,8 @@ is safe, and adding its row here. Each switch's per-300 report shows the value i
   marker communicates the launch switch and actual log path to Settings without loading the game library there.
   This marker is not proof of a game: the existing lock remains authoritative. Host contract tests cover
   lifecycle/pause policy; they do not prove Android's memory accounting or the manufacturer's kill policy.
+  Off preserves the inherited hold policy, not literally zero filesystem work: native startup still resets
+  its marker and Settings probes it, as in `fix/game-hold d34d091`; this is separate from exit-notice worker IO.
 - **Background pause (default).** `TotkActivity`'s actual `onPause`/`onStop` pauses gameplay at the next
   `nvnWindowAcquireTexture`, after releasing the guest virtual core and before taking graphics locks. `onResume`
   wakes it. On a single display, losing window focus also pauses (including live recent-apps tiles which Android can
