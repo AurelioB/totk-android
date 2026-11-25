@@ -17,12 +17,14 @@ class WritebackAliasPause(unittest.TestCase):
             self.skipTest('host C compiler required')
         source = (ROOT / 'games/totk/runtime/frontend_android.c').read_text()
         begin = source.index('static int game_activity_paused, game_focus_paused;')
-        end = source.index('void runtime_android_game_focus(', begin)
+        end = source.index('JNIEXPORT jboolean JNICALL Java_com_aure_totk_GameHold_nativeEnabled(', begin)
         transition = source[begin:end]
         prelude = r'''
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include "android_game_hold.h"
+static AndroidGameHold game_hold; /* Default-off production policy, not a substitute. */
 unsigned reports;
 static int game_pause, audio_edges, input_edges, timeline_edges, cache_edges;
 static int64_t game_input_after_ns;
@@ -69,7 +71,7 @@ void vk_wb_alias_report(const char *phase) { assert(!strcmp(phase, "pause")); re
                     executable = work / f'pause-{present}'
                     paths = [str(probe), *([str(backend)] if present else [])]
                     subprocess.run([*compiler, '-std=gnu11', '-O2', '-Wall', '-Wextra',
-                                    f'-DWITH_BACKEND={present}', *paths, '-o', str(executable)],
+                                    f'-DWITH_BACKEND={present}', '-I', str(ROOT / 'games/totk/runtime'), *paths, '-o', str(executable)],
                                    check=True, capture_output=True, text=True, timeout=60)
                     result = subprocess.run([str(executable)], check=True, capture_output=True,
                                             text=True, timeout=10)
