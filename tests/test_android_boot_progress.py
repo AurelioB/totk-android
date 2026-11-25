@@ -12,6 +12,57 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 JAVA = ROOT / 'games/totk/android/java'
 
+
+def _jni_headers(javac):
+    """Ask the compiler's JVM, since javac may be a launcher/version-manager shim."""
+    try:
+        result = subprocess.run([javac, '-J-XshowSettings:properties', '-version'],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise unittest.SkipTest(f'Cannot query selected javac JVM for JNI headers: {error}') from error
+    home = next((line.partition('=')[2].strip()
+                 for line in (result.stderr + result.stdout).splitlines()
+                 if line.strip().startswith('java.home =')), None)
+    if result.returncode or not home:
+        raise unittest.SkipTest('Selected javac JVM did not report java.home for JNI headers')
+    include = Path(home) / 'include'
+    if not all((include / name).is_file() for name in ('jni.h', 'linux/jni_md.h')):
+        raise unittest.SkipTest(f'Selected javac JDK lacks JNI headers under {include}')
+    return include
+
+
+class JniHeaderDiscovery(unittest.TestCase):
+    def test_version_manager_shim_uses_compilers_java_home(self):
+        javac = shutil.which('javac')
+        if not javac:
+            self.skipTest('requires javac')
+        expected = _jni_headers(javac)
+        with tempfile.TemporaryDirectory(prefix='jdk-shim-') as directory:
+            # Like mise, this executable lives outside the selected JDK.
+            shim = Path(directory) / 'javac'
+            shim.write_text('#!/bin/sh\nexec "$REAL_JAVAC" "$@"\n')
+            shim.chmod(0o755)
+            from unittest.mock import patch
+            with patch.dict('os.environ', {'REAL_JAVAC': javac}):
+                self.assertEqual(_jni_headers(str(shim)), expected)
+            self.assertNotEqual(shim.resolve().parent.parent / 'include', expected)
+
+    def test_missing_headers_skip_with_selected_home(self):
+        with tempfile.TemporaryDirectory(prefix='jdk-no-headers-') as directory:
+            javac = Path(directory) / 'javac'
+            javac.write_text('#!/bin/sh\nprintf "    java.home = %s\\n" "$0" >&2\n')
+            javac.chmod(0o755)
+            with self.assertRaisesRegex(unittest.SkipTest, 'lacks JNI headers under'):
+                _jni_headers(str(javac))
+
+    def test_unreported_java_home_skips_clearly(self):
+        with tempfile.TemporaryDirectory(prefix='jdk-no-home-') as directory:
+            javac = Path(directory) / 'javac'
+            javac.write_text('#!/bin/sh\necho "no java.home available" >&2\n')
+            javac.chmod(0o755)
+            with self.assertRaisesRegex(unittest.SkipTest, 'did not report java.home'):
+                _jni_headers(str(javac))
+
 STUBS = {
     'android/R.java': 'package android; public class R { public static class attr { public static int progressBarStyleHorizontal; }}',
     'android/os/Looper.java': 'package android.os; public class Looper { public static Looper getMainLooper() { return new Looper(); }}',
@@ -157,6 +208,7 @@ class AndroidBootProgress(unittest.TestCase):
         javac, cls.java, cc = shutil.which('javac'), shutil.which('java'), shutil.which('cc')
         if not javac or not cls.java or not cc:
             raise unittest.SkipTest('requires a host JDK and C compiler')
+        include = _jni_headers(javac)
         temp = tempfile.TemporaryDirectory(prefix='boot-progress-')
         cls.addClassCleanup(temp.cleanup)
         cls.directory = Path(temp.name)
@@ -187,7 +239,6 @@ JNIEXPORT void JNICALL Java_BootProbe_handoff(JNIEnv *e, jclass c) {
 '''
         native = cls.directory / 'boot.c'
         native.write_text(source)
-        include = Path(javac).resolve().parents[1] / 'include'
         cls.command([cc, '-std=c11', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC', '-pthread',
                      '-I' + str(include), '-I' + str(include / 'linux'), str(native),
                      '-o', str(cls.directory / 'libboot.so')])
