@@ -142,6 +142,7 @@ static _Atomic int spin_stop;
 static void *spin(void *arg) {
     pthread_setname_np(pthread_self(), (const char *)arg);
     volatile uint64_t x = 0; while (!atomic_load_explicit(&spin_stop, memory_order_relaxed)) x++;
+    (void)x;
     return NULL;
 }
 static void *nap(void *arg) { (void)arg; pthread_setname_np(pthread_self(), "napper"); sleep_ms(400); return NULL; }
