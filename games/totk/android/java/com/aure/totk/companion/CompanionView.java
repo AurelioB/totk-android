@@ -93,6 +93,14 @@ public final class CompanionView extends View implements SnapshotPoller.Listener
         if (assets != null) { assets.close(); assets = null; }
         super.onDetachedFromWindow();
     }
+    @Override protected void onVisibilityChanged(View changedView, int visibility) {
+        super.onVisibilityChanged(changedView, visibility);
+        if (assets != null) assets.setCacheVisible(isShown() && getWindowVisibility() == VISIBLE);
+    }
+    @Override protected void onWindowVisibilityChanged(int visibility) {
+        super.onWindowVisibilityChanged(visibility);
+        if (assets != null) assets.setCacheVisible(isShown() && visibility == VISIBLE);
+    }
     @Override protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
         updatePanelUnit(w, h);

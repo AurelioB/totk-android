@@ -32,6 +32,8 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Optional, asynchronous game art generated on the device into <game>/companion/ (never shipped in the APK).
  * No bitmap decode or file reads occur in Canvas drawing. */
@@ -39,6 +41,13 @@ public final class AssetStore {
     private final File root;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService decoder = Executors.newSingleThreadExecutor();
+    // One reusable task/snapshot; a slow native sink must not occupy the decoder or the UI thread.
+    private final ExecutorService cacheLogger = Executors.newSingleThreadExecutor();
+    private final AtomicBoolean cacheLogQueued = new AtomicBoolean();
+    private final long[] cacheSnapshot = new long[4 * 9];
+    private final Runnable cacheLogTask = this::writeCacheLog;
+    private volatile boolean cacheVisible, cacheFilled;
+    private volatile long nextCacheLogAt;
     private final BitmapCache images, tiles, overviews, decorImages;
     private final int tileFloor, tileMarginLimit;
     private final int memoryClass;
@@ -191,32 +200,56 @@ public final class AssetStore {
             highWater = Math.max(highWater, before + bytes - (old == null ? 0 : old.getAllocationByteCount()));
             filled = true;
         }
-        void append(StringBuilder line, String name) {
-            line.append(' ').append(name).append('=').append(entries).append(',').append(size()).append(',')
-                    .append(maxSize()).append(',').append(hitCount()).append(',').append(missCount()).append(',')
-                    .append(decodes).append(',').append(evictionCount()).append(',').append(largest).append(',').append(highWater);
+        void copy(long[] values, int offset) {
+            values[offset] = entries; values[offset + 1] = size(); values[offset + 2] = maxSize();
+            values[offset + 3] = hitCount(); values[offset + 4] = missCount(); values[offset + 5] = decodes;
+            values[offset + 6] = evictionCount(); values[offset + 7] = largest; values[offset + 8] = highWater;
         }
     }
     private static BitmapCache cache(int bytes) { return new BitmapCache(bytes); }
 
-    /** Called only by the visible view's draw, on the UI thread. Events coalesce within the same ten-second limit. */
+    /** UI-only admission: no cache monitor, formatting or native call on the draw path. */
     void logCaches(boolean visible, long now) {
-        if (!visible || closed || (cacheLogged && now - cacheLogTime < 10000)) return;
-        synchronized (pending) {
-            int fills = (tiles.filled ? 1 : 0) | (overviews.filled ? 2 : 0) |
-                    (decorImages.filled ? 4 : 0) | (images.filled ? 8 : 0);
-            if (fills == 0) return;
-            long evictions = (long)tiles.evictionCount() + overviews.evictionCount() +
-                    decorImages.evictionCount() + images.evictionCount();
+        setCacheVisible(visible);
+        if (!visible || closed || !cacheFilled || now < nextCacheLogAt || !cacheLogQueued.compareAndSet(false, true)) return;
+        nextCacheLogAt = now + 10000;
+        try { cacheLogger.execute(cacheLogTask); }
+        catch (RejectedExecutionException stopped) { cacheLogQueued.set(false); }
+    }
+    void setCacheVisible(boolean visible) { cacheVisible = visible; }
+    private static void appendCache(StringBuilder line, String name, long[] values, int offset) {
+        line.append(' ').append(name).append('=').append(values[offset]);
+        for (int n = 1; n < 9; n++) line.append(',').append(values[offset + n]);
+    }
+    private void writeCacheLog() {
+        try {
+            if (closed || !cacheVisible) return;
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (cacheLogged && now - cacheLogTime < 10000) return;
+            int fills;
+            synchronized (pending) {
+                if (closed) return;
+                // Copy only primitives into preallocated storage while cache publication is serialized.
+                fills = (tiles.filled ? 1 : 0) | (overviews.filled ? 2 : 0) |
+                        (decorImages.filled ? 4 : 0) | (images.filled ? 8 : 0);
+                tiles.copy(cacheSnapshot, 0); overviews.copy(cacheSnapshot, 9);
+                decorImages.copy(cacheSnapshot, 18); images.copy(cacheSnapshot, 27);
+            }
+            if (fills == 0 || closed || !cacheVisible) return;
+            long evictions = cacheSnapshot[6] + cacheSnapshot[15] + cacheSnapshot[24] + cacheSnapshot[33];
             String reason = fills != loggedFills ? "first_fill" :
                     evictions - loggedEvictions >= 8 ? "eviction_burst" : "periodic";
             StringBuilder line = new StringBuilder(640).append("cache v=1 ms=").append(now)
                     .append(" reason=").append(reason).append(" memory_class_mib=").append(memoryClass);
-            tiles.append(line, "tiles"); overviews.append(line, "overview");
-            decorImages.append(line, "decor"); images.append(line, "images");
-            CompanionNative.logCover(line.toString());
-            cacheLogged = true; cacheLogTime = now; loggedFills = fills; loggedEvictions = evictions;
-        }
+            appendCache(line, "tiles", cacheSnapshot, 0); appendCache(line, "overview", cacheSnapshot, 9);
+            appendCache(line, "decor", cacheSnapshot, 18); appendCache(line, "images", cacheSnapshot, 27);
+            if (closed || !cacheVisible) return;
+            boolean delivered = CompanionNative.logCover(line.toString());
+            // Limit from completion, not enqueue time: a delayed/slow write cannot create a catch-up burst.
+            cacheLogged = true; cacheLogTime = android.os.SystemClock.elapsedRealtime();
+            nextCacheLogAt = cacheLogTime + 10000;
+            if (delivered) { loggedFills = fills; loggedEvictions = evictions; }
+        } finally { cacheLogQueued.set(false); }
     }
     private JSONObject json(String path) {
         try (InputStream in = open(path)) {
@@ -422,6 +455,7 @@ public final class AssetStore {
                     // An image larger than its whole cache would be evicted at once and decoded again on every redraw.
                     if (result.getAllocationByteCount() > cache.maxSize()) cache.resize(result.getAllocationByteCount() + 1024 * 1024);
                     cache.store(path, result);
+                    cacheFilled = true;
                 }
             }
             if (result != null) notifyChanged();
@@ -431,6 +465,8 @@ public final class AssetStore {
     private void notifyChanged() { main.post(() -> { if (!closed) changed.run(); }); }
     public void close() {
         closed = true;
+        cacheVisible = false;
+        cacheLogger.shutdownNow();
         decoder.shutdownNow();
         synchronized (pending) {
             images.evictAll(); tiles.evictAll(); overviews.evictAll(); decorImages.evictAll();

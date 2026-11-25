@@ -24,6 +24,8 @@ PRELUDE = r'''
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.*;
 import com.aure.totk.companion.Snapshot;
 
@@ -92,9 +94,29 @@ class QueueExecutor {
     void drain() { while (!work.isEmpty()) work.remove().run(); }
     void shutdownNow() { work.clear(); }
 }
+class Clock { static volatile long now; }
 class CompanionNative {
     static final List<String> logs = new ArrayList<>();
-    static boolean logCover(String message) { logs.add(message); return true; }
+    static final Set<Thread> drawThreads = ConcurrentHashMap.newKeySet();
+    static Object[] monitors = {};
+    static volatile CountDownLatch entered, release;
+    static boolean available = true;
+    static boolean logCover(String message) {
+        CompanionMapProbe.require(!drawThreads.contains(Thread.currentThread()), "native sink on draw thread");
+        for (Object monitor : monitors)
+            CompanionMapProbe.require(!Thread.holdsLock(monitor), "native sink under cache monitor");
+        CountDownLatch start = entered, finish = release;
+        if (start != null) start.countDown();
+        if (finish != null) {
+            boolean done = false;
+            while (!done) try {
+                done = finish.await(10, TimeUnit.SECONDS);
+                CompanionMapProbe.require(done, "test sink was not released");
+            } catch (InterruptedException stopped) { /* native file writes need not respond to Java interruption */ }
+        }
+        if (!available) return false;
+        logs.add(message); return true;
+    }
 }
 class CacheProbe {
     final BitmapCache images, tiles, overviews, decorImages;
@@ -103,12 +125,20 @@ class CacheProbe {
     long cacheLogTime, loggedEvictions;
     int loggedFills;
     boolean cacheLogged;
+    final ExecutorService cacheLogger = Executors.newSingleThreadExecutor(action -> {
+        Thread thread = new Thread(action, "cache-log-probe"); thread.setDaemon(true); return thread;
+    });
+    final AtomicBoolean cacheLogQueued = new AtomicBoolean();
+    final long[] cacheSnapshot = new long[4 * 9];
+    final Runnable cacheLogTask = this::writeCacheLog;
+    volatile boolean cacheVisible, cacheFilled;
+    volatile long nextCacheLogAt;
     final Set<String> pending = new HashSet<>(), missing = new HashSet<>();
     final QueueExecutor decoder = new QueueExecutor();
     final Map<String,Integer> decodes = new HashMap<>();
     Map<String,Object> decorations = Collections.emptyMap();
     Object softPart, softImage, softShader;
-    boolean closed;
+    volatile boolean closed;
     int changes;
     CacheProbe(int memory) {
         memoryClass = memory;
@@ -130,35 +160,45 @@ CACHE_TESTS = r'''
     void checkResizeLock() { tiles.resizeLock = pending; }
     int residentBytes() { return images.size() + tiles.size() + overviews.size() + decorImages.size(); }
     static void stats(BitmapCache cache, String expected) {
+        long[] values = new long[9];
+        cache.copy(values, 0);
         StringBuilder line = new StringBuilder();
-        cache.append(line, "test");
+        appendCache(line, "test", values, 0);
         CompanionMapProbe.require(line.toString().equals(" test=" + expected), "counter mismatch: " + line);
         int bytes = cache.values.values().stream().mapToInt(Bitmap::getAllocationByteCount).sum();
         CompanionMapProbe.require(cache.entries == cache.values.size() && cache.size() == bytes, "resident sum");
     }
-    static void counterSequence() {
-        BitmapCache cache = cache(10);
-        stats(cache, "0,0,10,0,0,0,0,0,0");
-        cache.get("missing");
-        stats(cache, "0,0,10,0,1,0,0,0,0");
-        cache.store("a", new Bitmap("a", 4));
-        stats(cache, "1,4,10,0,1,0,0,4,4");
-        cache.store("b", new Bitmap("b", 6));
-        stats(cache, "2,10,10,0,1,0,0,6,10");
-        cache.get("a");
-        cache.store("c", new Bitmap("c", 5));
-        stats(cache, "2,9,10,1,1,0,1,6,15");
-        CompanionMapProbe.require(!cache.values.containsKey("b"), "LRU eviction order changed");
-        cache.store("a", new Bitmap("a", 2));
-        stats(cache, "2,7,10,1,1,0,1,6,15");
-        cache.resize(4);
-        stats(cache, "1,2,4,1,1,0,2,6,15");
-        cache.evictAll();
-        stats(cache, "0,0,4,1,1,0,3,6,15");
+    static void counterSequence() throws Exception {
+        CacheProbe owner = new CacheProbe(256);
+        // Match production's mutation discipline, including replacement, trim and clear callbacks.
+        synchronized (owner.pending) {
+            BitmapCache cache = owner.images;
+            cache.resize(10);
+            stats(cache, "0,0,10,0,0,0,0,0,0");
+            cache.get("missing");
+            stats(cache, "0,0,10,0,1,0,0,0,0");
+            cache.store("a", new Bitmap("a", 4));
+            stats(cache, "1,4,10,0,1,0,0,4,4");
+            cache.store("b", new Bitmap("b", 6));
+            stats(cache, "2,10,10,0,1,0,0,6,10");
+            cache.get("a");
+            cache.store("c", new Bitmap("c", 5));
+            stats(cache, "2,9,10,1,1,0,1,6,15");
+            CompanionMapProbe.require(!cache.values.containsKey("b"), "LRU eviction order changed");
+            cache.store("a", new Bitmap("a", 2));
+            stats(cache, "2,7,10,1,1,0,1,6,15");
+            cache.resize(4);
+            stats(cache, "1,2,4,1,1,0,2,6,15");
+            cache.evictAll();
+            stats(cache, "0,0,4,1,1,0,3,6,15");
+        }
+        owner.close();
 
         CacheProbe assets = new CacheProbe(256);
+        CompanionNative.drawThreads.add(Thread.currentThread());
+        CompanionNative.monitors = new Object[]{assets.pending, assets.tiles, assets.overviews, assets.decorImages, assets.images};
         CompanionNative.logs.clear();
-        assets.logCaches(false, 0); assets.logCaches(true, 0);
+        assets.logAndDrain(false, 0); assets.logAndDrain(true, 0);
         CompanionMapProbe.require(CompanionNative.logs.isEmpty(), "empty or hidden cache logged");
         assets.bitmap("missing.webp", false); assets.bitmap("missing.webp", false);
         stats(assets.images, "0,0,22020096,0,2,0,0,0,0");
@@ -166,9 +206,9 @@ CACHE_TESTS = r'''
         assets.bitmap("missing.webp", false);
         stats(assets.images, "0,0,22020096,0,3,1,0,0,0");
         assets.bitmap("icons/a.webp", false); assets.decoder.drain();
-        assets.logCaches(false, 0);
+        assets.logAndDrain(false, 0);
         CompanionMapProbe.require(CompanionNative.logs.isEmpty(), "first hidden fill logged");
-        assets.logCaches(true, 0);
+        assets.logAndDrain(true, 0);
         String first = "cache v=1 ms=0 reason=first_fill memory_class_mib=256" +
                 " tiles=0,0,25165824,0,0,0,0,0,0 overview=0,0,25165824,0,0,0,0,0,0" +
                 " decor=0,0,50331648,0,0,0,0,0,0 images=1,1024,22020096,0,4,2,0,1024,1024";
@@ -180,29 +220,118 @@ CACHE_TESTS = r'''
         stats(assets.tiles, "1,2822400,25165824,0,1,1,0,2822400,2822400");
         stats(assets.overviews, "1,19200000,25165824,0,1,1,0,19200000,19200000");
         stats(assets.decorImages, "1,1024,50331648,0,1,1,0,1024,1024");
-        assets.logCaches(true, 9999);
+        assets.logAndDrain(true, 9999);
         CompanionMapProbe.require(CompanionNative.logs.size() == 1, "fill bypassed ten-second limit");
-        assets.logCaches(true, 10000);
+        assets.logAndDrain(true, 10000);
         CompanionMapProbe.require(CompanionNative.logs.get(1).contains("reason=first_fill"), "coalesced fill lost");
-        assets.logCaches(true, 20000);
+        assets.logAndDrain(true, 20000);
         CompanionMapProbe.require(CompanionNative.logs.get(2).contains("reason=periodic"), "periodic line missing");
         for (int n = 1; n < 30; n++) {
             assets.bitmap("map/Ground/1/" + n + "_0.webp", true); assets.decoder.drain();
         }
-        assets.logCaches(true, 29999);
+        assets.logAndDrain(true, 29999);
         CompanionMapProbe.require(CompanionNative.logs.size() == 3, "evictions bypassed ten-second limit");
-        assets.logCaches(false, 30000);
+        assets.logAndDrain(false, 30000);
         CompanionMapProbe.require(CompanionNative.logs.size() == 3, "hidden eviction logged");
-        assets.logCaches(true, 30000);
+        assets.logAndDrain(true, 30000);
         CompanionMapProbe.require(CompanionNative.logs.get(3).contains("reason=eviction_burst"), "burst lost");
         stats(assets.tiles, "8,22579200,25165824,0,30,30,22,2822400,25401600");
-        assets.logCaches(true, 0);
+        assets.logAndDrain(true, 0);
         CompanionMapProbe.require(CompanionNative.logs.size() == 4, "backward clock reopened limit");
         assets.close();
         assets.logCaches(true, 50000);
         CompanionMapProbe.require(CompanionNative.logs.size() == 4, "closed store logged");
         CompanionMapProbe.require(assets.tiles.entries == 0 && assets.overviews.entries == 0 &&
                 assets.decorImages.entries == 0 && assets.images.entries == 0, "close entry accounting");
+        assets.awaitLoggerStop();
+        asyncLogging();
+    }
+    void logAndDrain(boolean visible, long now) throws Exception {
+        Clock.now = now;
+        logCaches(visible, now);
+        cacheLogger.submit(() -> { }).get(10, TimeUnit.SECONDS);
+    }
+    void awaitLoggerStop() throws Exception {
+        CompanionMapProbe.require(cacheLogger.awaitTermination(10, TimeUnit.SECONDS), "logger did not stop");
+    }
+    static void offThread(Runnable work) throws Exception {
+        FutureTask<Void> task = new FutureTask<>(work, null);
+        Thread thread = new Thread(task, "draw-or-cache-probe");
+        thread.setDaemon(true); thread.start();
+        task.get(10, TimeUnit.SECONDS);
+    }
+    static void asyncLogging() throws Exception {
+        CacheProbe assets = new CacheProbe(256);
+        CompanionNative.logs.clear();
+        CompanionNative.monitors = new Object[]{assets.pending, assets.tiles, assets.overviews, assets.decorImages, assets.images};
+        assets.bitmap("icons/a.webp", false); assets.decoder.drain();
+        // Admission must return even while another thread owns the cache mutation monitor.
+        synchronized (assets.pending) {
+            offThread(() -> {
+                CompanionNative.drawThreads.add(Thread.currentThread());
+                Clock.now = 0; assets.logCaches(true, 0);
+            });
+            assets.setCacheVisible(false); // queued snapshot must not log after the view/window hides
+        }
+        assets.cacheLogger.submit(() -> { }).get(10, TimeUnit.SECONDS);
+        CompanionMapProbe.require(CompanionNative.logs.isEmpty(), "queued hidden snapshot logged");
+
+        // An unavailable native bridge consumes an attempt interval, but does not lose first-fill attribution.
+        CompanionNative.available = false;
+        assets.logAndDrain(true, 10000);
+        CompanionMapProbe.require(CompanionNative.logs.isEmpty(), "unavailable bridge logged");
+        CompanionNative.available = true;
+        assets.logAndDrain(true, 19999);
+        CompanionMapProbe.require(CompanionNative.logs.isEmpty(), "unavailable attempt bypassed limit");
+        assets.logAndDrain(true, 20000);
+        CompanionMapProbe.require(CompanionNative.logs.size() == 1 &&
+                CompanionNative.logs.get(0).contains("reason=first_fill"), "unavailable bridge lost first fill");
+
+        CompanionNative.entered = new CountDownLatch(1);
+        CompanionNative.release = new CountDownLatch(1);
+        try {
+            Clock.now = 30000; assets.logCaches(true, 30000);
+            CompanionMapProbe.require(CompanionNative.entered.await(10, TimeUnit.SECONDS), "sink did not start");
+            // Native I/O is stuck. Draw admission and decoder publication still complete; no backlog accumulates.
+            offThread(() -> {
+                CompanionNative.drawThreads.add(Thread.currentThread());
+                for (int n = 0; n < 50; n++) assets.logCaches(true, 100000);
+                assets.bitmap("icons/b.webp", false); assets.decoder.drain();
+                CompanionMapProbe.require(assets.residentBytes() == 2048, "cache publication waited for sink");
+            });
+            Clock.now = 100000;
+        } finally { CompanionNative.release.countDown(); }
+        assets.cacheLogger.submit(() -> { }).get(10, TimeUnit.SECONDS);
+        CompanionNative.entered = null; CompanionNative.release = null;
+        CompanionMapProbe.require(CompanionNative.logs.size() == 2 &&
+                CompanionNative.logs.get(1).contains("images=1,1024,"), "snapshot changed or queued an I/O backlog");
+        assets.logAndDrain(true, 109999);
+        CompanionMapProbe.require(CompanionNative.logs.size() == 2, "slow sink completion bypassed limit");
+        assets.logAndDrain(true, 110000);
+        CompanionMapProbe.require(CompanionNative.logs.size() == 3, "slow sink never resumed");
+
+        // Close cancels queued delivery and does not await a native sink that ignores interruption.
+        CompanionNative.entered = new CountDownLatch(1);
+        CompanionNative.release = new CountDownLatch(1);
+        try {
+            Clock.now = 120000; assets.logCaches(true, 120000);
+            CompanionMapProbe.require(CompanionNative.entered.await(10, TimeUnit.SECONDS), "shutdown sink did not start");
+            offThread(assets::close);
+        } finally { CompanionNative.release.countDown(); }
+        assets.awaitLoggerStop();
+        CompanionNative.entered = null; CompanionNative.release = null;
+        int count = CompanionNative.logs.size();
+        assets.logCaches(true, 200000);
+        CompanionMapProbe.require(CompanionNative.logs.size() == count, "closed executor accepted a log");
+        CacheProbe canceled = new CacheProbe(256);
+        CompanionNative.monitors = new Object[]{canceled.pending, canceled.tiles, canceled.overviews, canceled.decorImages, canceled.images};
+        canceled.bitmap("icons/a.webp", false); canceled.decoder.drain();
+        synchronized (canceled.pending) {
+            Clock.now = 0; canceled.logCaches(true, 0);
+            canceled.close();
+        }
+        canceled.awaitLoggerStop();
+        CompanionMapProbe.require(CompanionNative.logs.size() == count, "queued shutdown snapshot logged");
     }
 }
 class RectF {
@@ -345,7 +474,14 @@ class CompanionMapTests(unittest.TestCase):
             source += section(view, '    private String coordinates()', '    private static String number(') + TEST_MAIN
             # The viewport body uses this exact production decoded-size constant.
             source = source.replace('class MapProbe {', 'class MapProbe {\n' + section(renderer, '    private static final long[] TILE_BYTES', '\n\n'))
+            source = source.replace('android.os.SystemClock.elapsedRealtime()', 'Clock.now')
             self.assertIn('assets.logCaches(isShown() && getWindowVisibility() == VISIBLE, android.os.SystemClock.elapsedRealtime());', view)
+            self.assertIn('assets.setCacheVisible(isShown() && getWindowVisibility() == VISIBLE);', view)
+            self.assertIn('assets.setCacheVisible(isShown() && visibility == VISIBLE);', view)
+            snapshot = section(cache, '                // Copy only primitives', '            if (fills == 0')
+            self.assertNotIn('new ', snapshot)
+            self.assertNotIn('append', snapshot)
+            self.assertNotIn('logCover', snapshot)
             probe = work / 'CompanionMapProbe.java'
             probe.write_text(source)
             self.command([javac, '--release', '17', '-cp', jars[-1], '-d', work, JAVA / 'Snapshot.java', probe])
