@@ -160,6 +160,10 @@ int main(int argc, char **argv) {
     assert(resumed.interval == 3 && resumed.desired_ns >= stale.desired_ns + 3 * hz120);
     assert(!memcmp(&queued, &saved, sizeof saved));
     assert(invalidations == 3);
+    (void)display_callback_observation;
+    (void)display_fence_observation;
+    (void)display_callback_measured_ns;
+    (void)display_callback_calibrated;
     return 0;
 }
 '''
@@ -187,6 +191,7 @@ enum { MFX_OFF, MFX_HALF, MFX_30, MFX_MAX };
 #define UNCAPPED_HZ 120
 typedef struct { int interval; } win_t;
 static int g_uncapped, g_paced_hz, g_hz = -1, g_display_mode;
+static int g_use_guest_ticks;
 static unsigned g_fps_auto_ticks;
 static uint64_t actual_refresh;
 static int mfx_enabled(void) { return MFX_OFF; }
@@ -284,7 +289,30 @@ int main(void) {
     assert(present_period(&window) == 1000000000 / 55 && g_hz == 55); /* Developer cap wins. */
     window.interval = 2;
     assert(!setenv("TOTK_UNCAPPED", "0", 1)); g_hz = -1;
-    assert(present_period(&window) == 2 * actual_refresh && !uncapped_now());
+    /* Guest intervals are 60Hz units even on a120Hz panel. The same bug
+     * made the menu's30fps choice run at60 after a touch boosted refresh. */
+    runtime_cutscene_present_ticks = NULL;
+    for (unsigned mode = 0; mode < 2; mode++) {
+        assert(!setenv("TOTK_FPS60", mode ? "1" : "0", 1));
+        for (unsigned display = 0; display < 2; display++) {
+            actual_refresh = display ? 8333333 : 16666667; g_hz = -1;
+            for (unsigned guest = 1; guest <= 3; guest++) {
+                window.interval = guest;
+                assert(present_ticks(&window) == guest * (display ? 2 : 1));
+                uint64_t period = present_period(&window);
+                assert(period == guest * (display ? 2 : 1) * actual_refresh && !uncapped_now());
+            }
+        }
+    }
+    /* Calibrated callback/fence clocks have small jitter. A60Hz panel must
+     * not acquire a third slot when its measured period is16.65ms. */
+    actual_refresh = 16650000; g_hz = -1; window.interval = 2;
+    assert(present_ticks(&window) == 2);
+    actual_refresh = 8325000; g_hz = -1;
+    assert(present_ticks(&window) == 4);
+    /* Locked frame generation supplies a 60 Hz profile and owns its interval. */
+    assert(!setenv("DM_PRESENT_HZ", "60", 1)); g_hz = -1;
+    assert(present_ticks(&window) == 2);
     return 0;
 }
 '''

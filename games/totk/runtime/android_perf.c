@@ -15,7 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/syscall.h>
+#include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -100,8 +102,22 @@ static void configure(void) {
     double ms = target && *target ? atof(target) : 33.3;
     legacy_target = ms > 0 && ms < 1000 ? (int64_t)(ms * 1e6) : 0;
     if (mode == 1 && !legacy_target) mode = 0;
-    rate_on = is_one("TOTK_FRAME_RATE_HINT"); fps60 = is_one("TOTK_FPS60");
+    const char *fg = getenv("TOTK_FRAMEGEN");
+    framegen = fg && (!strcmp(fg, "1") || !strcmp(fg, "locked") ||
+        !strcmp(fg, "interp") || !strcmp(fg, "hybrid") || !strcmp(fg, "adaptive"));
+    const char *acquire = getenv("TOTK_ACQUIRE_CLOCK"), *pace = getenv("TOTK_PACE");
+    int physical_clock = (acquire && !strcmp(acquire, "vsync")) || (pace && !strcmp(pace, "display"));
+    /* Keep a vote after Samsung's touch boost expires. Explicit profiles keep
+     * their existing content-rate, override, or opt-out behavior. */
+    const char *rate = getenv("TOTK_FRAME_RATE_HINT");
+    char manufacturer[PROP_VALUE_MAX];
+    int samsung_default = !rate && !framegen && !physical_clock && !is_one("TOTK_FPS_AUTO") && !getenv("DM_PRESENT_HZ") &&
+        __system_property_get("ro.product.manufacturer", manufacturer) > 0 &&
+        !strcasecmp(manufacturer, "samsung");
+    rate_on = samsung_default || is_one("TOTK_FRAME_RATE_HINT");
+    fps60 = is_one("TOTK_FPS60");
     const char *hint = getenv("TOTK_FRAME_RATE_HINT_HZ");
+    if (samsung_default && !hint) hint = "max";
     if (!totk_frame_rate_hint_parse(hint, &rate_request)) {
         fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%s refused: expected integer decimal Hz or max; retaining existing policy\n", hint);
         rate_request = 0;
@@ -121,13 +137,8 @@ static void configure(void) {
         target_pct_launch = 90;
     }
     target_pct_applied = target_pct_launch;
-    const char *fg = getenv("TOTK_FRAMEGEN");
-    framegen = fg && (!strcmp(fg, "1") || !strcmp(fg, "locked") ||
-        !strcmp(fg, "interp") || !strcmp(fg, "hybrid") || !strcmp(fg, "adaptive"));
-    const char *acquire = getenv("TOTK_ACQUIRE_CLOCK");
-    lattice = is_one("TOTK_PRESENT_SLOTS") || (acquire && !strcmp(acquire, "vsync"));
-    const char *pace = getenv("TOTK_PACE"), *slack = getenv("TOTK_ACQUIRE_SLACK");
-    lattice |= pace && !strcmp(pace, "display");
+    const char *slack = getenv("TOTK_ACQUIRE_SLACK");
+    lattice = is_one("TOTK_PRESENT_SLOTS") || physical_clock;
     lattice |= slack && strcmp(slack, "0");
     atomic_store_explicit(&content_rate, totk_frame_rate(fps60 ? 60 : 30, framegen, lattice), memory_order_relaxed);
     const char *hold = getenv("TOTK_RATE_HINT_HOLD");

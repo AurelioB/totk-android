@@ -50,7 +50,7 @@ fi
 mkdir -p "$OUT/logs"
 status=0
 if root "test -f $GAME/totk.log"; then
-  root "cat $GAME/totk.log" > "$OUT/logs/$DEV.log"
+  root "log=\"$GAME/totk.log\"; start=\$(grep -an \"^\[totk-log\] ===== Launch \" \"\$log\" | tail -n1 | cut -d: -f1); tail -n +\${start:-1} \"\$log\"" > "$OUT/logs/$DEV.log"
   echo "collect: $OUT/logs/$DEV.log ($(wc -l < "$OUT/logs/$DEV.log") lines)"
 else
   echo "collect: ERROR no $GAME/totk.log on $SER: the game has not run since install / data clear" >&2

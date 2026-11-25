@@ -562,6 +562,20 @@ class InSessionAB(unittest.TestCase):
         self.assertEqual(gens[1]['applied'], ['TOTK_VK_DESC_STOCK=1'])
         self.assertEqual([g['direction'] for g in gens], ['right', 'left', 'right', 'left', None])
 
+    def test_measures_only_the_latest_launch_in_an_android_history(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'totk.log'
+            path.write_text(
+                '[totk-log] ===== Launch old =====\n'
+                '[nvn-vk] frame 600: 60.0 fps over the last 300\n'
+                '[totk-ctl] gen=2 frame=600 mark ab arm=B block=2\n'
+                '[totk-log] ===== Launch current =====\n'
+                '[nvn-vk] frame 300: 27.0 fps over the last 300\n'
+                '[totk-ctl] gen=1 frame=300 mark ab arm=A block=1\n', encoding='utf-8')
+            _, _, fps, *_ = analyze.parse_log(path)
+            self.assertEqual(fps, {300: 27.0})
+            self.assertEqual([g['arm'] for g in analyze.parse_ctl(path)], ['A'])
+
     def test_explicit_pan_direction(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / 'x.log'
@@ -1029,7 +1043,7 @@ class PanMeasurement(unittest.TestCase):
             self.assertEqual(calls.count('pan 16000 24\n'), 3)
             self.assertNotIn('sleep 24\n', calls)  # sleeps are inside one device command now
             pan_index = calls.index('pan 16000 24\n')
-            final_read = calls.index("grep -ao", pan_index)
+            final_read = calls.index("awk '", pan_index)
             final_gpu = calls.index('--boundary end', pan_index)
             self.assertLess(pan_index, final_read)
             self.assertLess(final_read, final_gpu)

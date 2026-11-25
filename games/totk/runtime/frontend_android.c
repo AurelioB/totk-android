@@ -35,6 +35,7 @@
 #include <stdatomic.h>
 #include "present_clock.h"
 #include "thread_place.h"
+#include "log_history.h"
 #include "log_mirror.h"
 #include "live_ctl.h"
 #include "thread_sampler.h"
@@ -98,6 +99,33 @@ static ANativeActivity *g_activity;
 ANativeActivity *runtime_android_activity(void) { return g_activity; }   /* runtime/feedback_android.c */
 void runtime_android_feedback_hardware(ANativeActivity *a);              /* runtime/feedback_android.c */
 const char *runtime_android_private_files(void) { return g_activity ? g_activity->internalDataPath : NULL; }
+
+/* The Android UI reads startup progress independently of the game's Vulkan surface. */
+static pthread_mutex_t boot_progress_mu = PTHREAD_MUTEX_INITIALIZER;
+static char boot_stage[192];
+static jlong boot_count[2];
+
+static void android_boot_update(const char *stage, uint64_t done, uint64_t total) {
+    if (atomic_load_explicit(&presented, memory_order_relaxed)) return;
+    pthread_mutex_lock(&boot_progress_mu);
+    snprintf(boot_stage, sizeof boot_stage, "%s", stage);
+    boot_count[0] = (jlong)done;
+    boot_count[1] = (jlong)total;
+    pthread_mutex_unlock(&boot_progress_mu);
+}
+
+jstring runtime_android_boot_progress(JNIEnv *env, jclass cls, jlongArray counts) {
+    (void)cls;
+    if (atomic_load_explicit(&presented, memory_order_relaxed)) return NULL;
+    char stage[sizeof boot_stage];
+    jlong count[2];
+    pthread_mutex_lock(&boot_progress_mu);
+    memcpy(stage, boot_stage, sizeof stage);
+    memcpy(count, boot_count, sizeof count);
+    pthread_mutex_unlock(&boot_progress_mu);
+    (*env)->SetLongArrayRegion(env, counts, 0, 2, count);
+    return (*env)->NewStringUTF(env, stage);
+}
 
 /* One Looper owns the native Choreographer. Clock-only acquisition/presentation
  * must not change the legacy VI source: only TOTK_PACE=display selects real VI
@@ -1142,18 +1170,22 @@ static int android_display_vsync_start(void) {
    Straight into the file, not through a pipe and a reader thread: a failure that ends the process with _exit (or a
    signal) would lose whatever the thread had not yet copied, which is exactly the message that says why. */
 static int g_log_fd = -1;
+static int g_log_lock = -1;
+static off_t g_log_offset;
 static char g_log_path[1100];
 static void log_start(void) {
     snprintf(g_log_path, sizeof g_log_path, "%s/totk.log", g_data);
-    g_log_fd = open(g_log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644);
+    int trim_error = 0;
+    g_log_fd = log_history_open(g_log_path, &g_log_lock, &g_log_offset, &trim_error);
     if (g_log_fd < 0) { __android_log_print(ANDROID_LOG_ERROR, "totk", "cannot open %s: %s", g_log_path, strerror(errno)); return; }
     dup2(g_log_fd, 1); dup2(g_log_fd, 2);
     setvbuf(stdout, NULL, _IOLBF, 0); setvbuf(stderr, NULL, _IONBF, 0);
+    if (trim_error) fprintf(stderr, "[totk-log] Could not trim launch history: %s\n", strerror(trim_error));
     __android_log_print(ANDROID_LOG_INFO, "totk", "log: %s", g_log_path);
 }
 /* The logcat copy (log_mirror.h): a thread that sleeps until totk.log grows, then copies its new complete lines with
    tag "totk" (FATAL / CRASH / device lost as errors, red messages as warnings). It runs at nice 10, on the slower CPUs
-   when the device has them, and reads the file from its start, so lines written before it started are copied too.
+   when the device has them, and reads from this launch's heading so it copies the early startup lines too.
    TOTK_LOGCAT=1 (totk.env) opts in, off by default; started after the environment files, or at a refusal before them. */
 static log_mirror_tail g_log_tail;
 static void log_mirror_logcat(void *context, int level, const char *line) {
@@ -1180,7 +1212,7 @@ static void log_mirror_start(void) {
     started = 1;
     const char *value = getenv("TOTK_LOGCAT");
     if (!log_mirror_enabled(value)) { fprintf(stderr, "[totk-logcat] off (TOTK_LOGCAT!=1): totk.log only\n"); return; }
-    g_log_tail.path = g_log_path; g_log_tail.emit = log_mirror_logcat;
+    g_log_tail.path = g_log_path; g_log_tail.offset = g_log_offset; g_log_tail.emit = log_mirror_logcat;
     int error = log_mirror_open(&g_log_tail);
     pthread_t thread;
     if (!error) error = pthread_create(&thread, NULL, log_mirror_thread, NULL);

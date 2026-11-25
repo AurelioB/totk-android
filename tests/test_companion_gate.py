@@ -79,6 +79,13 @@ public final class UpdatePrompt {
         throw new AssertionError("update networking is outside this companion fixture");
     }
 }''',
+    'com/aure/totk/setup/BootProgress.java': '''package com.aure.totk.setup;
+public final class BootProgress {
+    public interface Source { String read(long[] counts); }
+    public BootProgress(android.app.Activity activity, Source source) {}
+    public void resume() {}
+    public void pause() {}
+}''',
     'android/os/Build.java': '''package android.os;
 public final class Build {
     public static final class VERSION { public static final int SDK_INT = 33; }
@@ -109,7 +116,14 @@ public class View {
 }''',
     'android/view/Window.java': '''package android.view;
 public class Window {
+    private WindowManager.LayoutParams attributes = new WindowManager.LayoutParams();
     public View getDecorView() { return new View(); }
+    public WindowManager.LayoutParams getAttributes() { return attributes; }
+    public void setAttributes(WindowManager.LayoutParams value) { attributes = value; }
+}''',
+    'android/view/WindowManager.java': '''package android.view;
+public interface WindowManager {
+    class LayoutParams { public float preferredRefreshRate; }
 }''',
     'android/app/Activity.java': 'package android.app; public class Activity extends android.content.Context {}',
     'android/app/NativeActivity.java': '''package android.app;
