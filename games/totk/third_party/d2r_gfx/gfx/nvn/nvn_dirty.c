@@ -294,6 +294,10 @@ static void vma_start(void);
    the only publication consumed by presentation. Warning-only scans take no tracker locks. */
 static pthread_once_t g_map_warn_once = PTHREAD_ONCE_INIT;
 static int g_map_warn_enabled;
+static unsigned g_map_warn_mode, g_map_warn_test_samples;
+/* Startup publication from the runtime's immutable ordinary-frame CLOCK_MONOTONIC origin.
+   Zero means no runtime origin was supplied (graphics-only hosts); traces never invent one. */
+static _Atomic uint64_t g_map_warn_frame_origin;
 static nvn_map_warn_thresholds g_map_warn_thresholds = {80, 88, 84};
 static nvn_map_warn_state g_map_warn_state;
 static _Atomic int g_map_warn_notice;
@@ -310,8 +314,14 @@ static unsigned map_warn_percent(const char *name, unsigned fallback) {
 }
 static void map_warn_configure(void) {
     const char *value = getenv("TOTK_MAP_WARN");
-    g_map_warn_enabled = value && !strcmp(value, "1");
+    g_map_warn_mode = value && !strcmp(value, "1") ? 1 :
+                      value && !strcmp(value, "2") ? 2 : value && !strcmp(value, "3") ? 3 : 0;
+    g_map_warn_enabled = g_map_warn_mode != 0;
     if (!g_map_warn_enabled) return;
+    if (g_map_warn_mode == 3) {
+        g_map_warn_thresholds = nvn_map_warn_test_thresholds(1);
+        return; /* Fixed test sequence deliberately ignores startup percentage overrides. */
+    }
     nvn_map_warn_thresholds t = {
         map_warn_percent("TOTK_MAP_WARN_LOG_PERCENT", 80),
         map_warn_percent("TOTK_MAP_WARN_NOTICE_PERCENT", 88),
@@ -322,6 +332,11 @@ static void map_warn_configure(void) {
         return;
     }
     g_map_warn_thresholds = t;
+}
+void nvn_dirty_map_warn_set_frame_origin(uint64_t origin_ns) {
+    pthread_once(&g_map_warn_once, map_warn_configure);
+    if (g_map_warn_mode >= 2)
+        atomic_store_explicit(&g_map_warn_frame_origin, origin_ns, memory_order_relaxed);
 }
 int nvn_dirty_map_warn_init(void) {
     pthread_once(&g_map_warn_once, map_warn_configure);
@@ -334,6 +349,10 @@ int nvn_dirty_map_warn_notice(void) {
 static void map_warn_sample(uint64_t count, uint64_t maximum) {
     /* Called only by totk-vmascan, never by vma_sample's synchronous lag callers. */
     if (!maximum) maximum = 65530;
+    if (g_map_warn_mode == 3) {
+        if (g_map_warn_test_samples < 2 * NVN_MAP_WARN_TEST_PHASE_SAMPLES + 1) g_map_warn_test_samples++;
+        g_map_warn_thresholds = nvn_map_warn_test_thresholds(g_map_warn_test_samples);
+    }
     nvn_map_warn_result result = nvn_map_warn_step(g_map_warn_state, count, maximum, g_map_warn_thresholds);
     g_map_warn_state = result.state;
     atomic_store_explicit(&g_map_warn_notice, result.state.notice, memory_order_relaxed);
@@ -569,12 +588,24 @@ static void *vma_worker(void *unused) {
             maps = vma_read("/proc/self/maps", 1);
             maximum = vma_read("/proc/sys/vm/max_map_count", 0);
         }
+        /* Trace duration covers traversal/sysctl (and existing lag/classification work), not
+           warning policy/logging, telemetry publication or sleep. Only diagnostic modes read it. */
+        uint64_t scan_elapsed = g_map_warn_mode >= 2 ? vma_clock_ns() - start : 0;
         if (warn_due) {
             map_warn_sample(maps, maximum);
             next_warn = vma_clock_ns() + warn_period;
         }
         if (scan_due) next_scan = vma_clock_ns() + scan_period;
         uint64_t elapsed = vma_clock_ns() - start;
+        if (g_map_warn_mode >= 2) {
+            unsigned phase = g_map_warn_mode == 3 ?
+                (g_map_warn_test_samples + NVN_MAP_WARN_TEST_PHASE_SAMPLES - 1) / NVN_MAP_WARN_TEST_PHASE_SAMPLES : 0;
+            LOG("[map-warn-scan] start_ns=%llu duration_us=%llu rows=%llu frame_origin_ns=%llu warn=%d notice=%d test_phase=%u log=%u show=%u clear=%u",
+                (unsigned long long)start, (unsigned long long)(scan_elapsed / 1000),
+                (unsigned long long)maps, (unsigned long long)atomic_load_explicit(&g_map_warn_frame_origin, memory_order_relaxed),
+                warn_due, nvn_dirty_map_warn_notice(), phase, g_map_warn_thresholds.log_percent,
+                g_map_warn_thresholds.notice_percent, g_map_warn_thresholds.clear_percent);
+        }
         pthread_mutex_lock(&g_vma_scan_mu);
         g_vma_scan_stats[0]++;
         g_vma_scan_stats[1] += !!(requests & VMA_EPOCH);

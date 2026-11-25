@@ -1,10 +1,12 @@
 """Production policy, sampler and overlay CPU checks; no Android/GPU claims."""
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,13 +72,38 @@ static void panel(void) {
 int main(int argc,char **argv) {
     assert(argc==2);
     if (!strcmp(argv[1],"policy")) { policy(); panel(); return 0; }
+    if (!strcmp(argv[1],"test-sequence")) {
+        map_warn_configure(); /* pure sampling test: no worker is created */
+        assert(g_map_warn_enabled && !atomic_load(&created));
+        for (unsigned sample=1;sample<=30;sample++) {
+            map_warn_sample(8542,65530); /* unchanged, safely low real-count representative */
+            if (g_map_warn_mode==3) {
+                assert(nvn_dirty_map_warn_notice()==(sample<=24));
+                assert(g_map_warn_thresholds.notice_percent==(sample<=12 ? 3u : 100u));
+                assert(g_map_warn_thresholds.clear_percent==(sample<=24 ? 2u : 99u));
+                assert(g_map_warn_test_samples==(sample<25 ? sample : 25));
+                if (sample>=13 && sample<=24)
+                    assert(8542<nvn_map_warn_boundary(65530,g_map_warn_thresholds.notice_percent));
+            } else {
+                assert(!nvn_dirty_map_warn_notice() && !g_map_warn_test_samples);
+                assert(g_map_warn_thresholds.log_percent==80 && g_map_warn_thresholds.notice_percent==88 &&
+                       g_map_warn_thresholds.clear_percent==84);
+            }
+        }
+        assert(nvn_map_warn_test_thresholds(UINT_MAX).clear_percent==99);
+        return 0;
+    }
     if (!strcmp(argv[1],"config")) {
+        nvn_dirty_map_warn_set_frame_origin(1000000000);
+        assert(!atomic_load(&created)); /* publishing the origin never starts the sampler */
         int enabled=nvn_dirty_map_warn_init();
         printf("%d %u %u %u %u %d\n",enabled,atomic_load(&created),
             g_map_warn_thresholds.log_percent,g_map_warn_thresholds.notice_percent,
             g_map_warn_thresholds.clear_percent,nvn_dirty_map_warn_notice()); return 0;
     }
     if (!strcmp(argv[1],"worker")) {
+        nvn_dirty_map_warn_set_frame_origin(1000000000);
+        assert(atomic_load(&g_map_warn_frame_origin)==(g_map_warn_mode>=2 ? 1000000000u : 0));
         assert(nvn_dirty_map_warn_init()); assert(!nvn_dirty_lag_enabled());
         assert(atomic_load(&created)==1);
         uint64_t start=vma_clock_ns(), stats[4]={0};
@@ -153,12 +180,15 @@ class MapWarning(unittest.TestCase):
         self.assertEqual(result.stderr.count('SAVE AND RESTART GAME SOON'), 1)
 
     def test_off_starts_no_thread_and_has_no_notice(self):
-        for value in (None, '0', 'off', 'true', '2'):
+        for value in (None, '0', 'off', 'true', '4', '02'):
             result = self.run_probe('config', **({} if value is None else {'TOTK_MAP_WARN': value}))
             self.assertEqual(result.stdout.strip(), '0 0 80 88 84 0')
 
     def test_enabled_only_startup_and_threshold_overrides(self):
         self.assertEqual(self.run_probe('config', TOTK_MAP_WARN='1').stdout.strip(), '1 1 80 88 84 0')
+        self.assertEqual(self.run_probe('config', TOTK_MAP_WARN='2').stdout.strip(), '1 1 80 88 84 0')
+        self.assertEqual(self.run_probe('config', TOTK_MAP_WARN='3',
+            TOTK_MAP_WARN_NOTICE_PERCENT='bad').stdout.strip(), '1 1 1 3 2 0')
         valid = dict(TOTK_MAP_WARN='1', TOTK_MAP_WARN_LOG_PERCENT='1',
                      TOTK_MAP_WARN_NOTICE_PERCENT='3', TOTK_MAP_WARN_CLEAR_PERCENT='2')
         self.assertEqual(self.run_probe('config', **valid).stdout.strip(), '1 1 1 3 2 0')
@@ -170,7 +200,42 @@ class MapWarning(unittest.TestCase):
             self.assertIn('[map-warn]', result.stderr)
 
     def test_worker_samples_with_lag_off_and_no_caller_reads(self):
-        self.assertIn('worker scans=1', self.run_probe('worker', TOTK_MAP_WARN='1').stdout)
+        result = self.run_probe('worker', TOTK_MAP_WARN='1')
+        self.assertIn('worker scans=1', result.stdout)
+        self.assertNotIn('[map-warn-scan]', result.stderr)
+
+    def test_sampler_trace_has_monotonic_time_duration_rows_and_frame_origin(self):
+        before = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        result = self.run_probe('worker', TOTK_MAP_WARN='2')
+        after = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        lines = [line for line in result.stderr.splitlines() if '[map-warn-scan]' in line]
+        self.assertEqual(len(lines), 1)
+        self.assertLess(len(lines[0]), 256)  # one fixed, bounded record, not one per maps row
+        fields = dict(re.findall(r'([a-z_]+)=(\d+)', lines[0]))
+        self.assertLessEqual(before, int(fields['start_ns']))
+        self.assertLessEqual(int(fields['start_ns']), after)
+        self.assertGreaterEqual(int(fields['duration_us']), 0)
+        self.assertLess(int(fields['duration_us']), (after - before) // 1000)
+        self.assertGreater(int(fields['rows']), 0)
+        self.assertEqual(fields['frame_origin_ns'], '1000000000')
+        self.assertEqual(fields['warn'], '1')
+        self.assertEqual(fields['notice'], '0')
+        self.assertEqual(fields['test_phase'], '0')
+        dirty = (NVN / 'nvn_dirty.c').read_text()
+        worker = dirty.split('static void *vma_worker(', 1)[1].split('static unsigned vma_scan_period(', 1)[0]
+        self.assertEqual(dirty.count('LOG("[map-warn-scan]'), 1)
+        self.assertIn('LOG("[map-warn-scan]', worker)
+        self.assertIn('g_map_warn_mode >= 2', worker)
+
+    def test_test_only_sequence_holds_then_clears_without_count_change(self):
+        for mode in ('1', '2'):
+            result = self.run_probe('test-sequence', TOTK_MAP_WARN=mode)
+            self.assertNotIn('[map-warn]', result.stderr)
+        result = self.run_probe('test-sequence', TOTK_MAP_WARN='3')
+        self.assertEqual(result.stderr.count('map limit is approaching'), 1)
+        self.assertEqual(result.stderr.count('SAVE AND RESTART GAME SOON'), 1)
+        # Direct policy execution never emits a per-scan record: only the real worker does.
+        self.assertNotIn('[map-warn-scan]', result.stderr)
 
     def test_present_path_only_consumes_cached_notice(self):
         overlay = (GFX / 'vk_overlay.c').read_text()

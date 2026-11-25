@@ -62,8 +62,13 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   sampler about every five seconds, independently of frame lag. Log at 80%; show `MAP LIMIT NEAR` /
   `SAVE AND RESTART GAME SOON` at 88%, even with the performance overlay off; clear below 84%.
   Hidden kernel limits use 65,530; unreadable counts clear the notice and log once. Startup-only
-  percentage overrides support safe low-threshold testing. This warns only: it does not fix map growth
-  or change mapping/protection/admission policy, and no Android device verification is claimed.
+  percentage overrides support safe low-threshold testing. Add diagnostic `TOTK_MAP_WARN=2`
+  per-scan monotonic start/duration/rows and ordinary-frame clock origin; `=1` logging is unchanged.
+  TEST-ONLY `=3` changes thresholds after 12 and 24 warning samples to show, hold and clear the
+  actual notice without adding mappings or restarting. It is not an ordinary-play warning mode.
+  Initial Thor checks observed a readable notice/default-off behavior; device clearing and timing
+  qualification remain unresolved, and the new test modes need device verification.
+  This warns only: it does not fix map growth or change mapping/protection/admission policy.
 - Correct fragment inputs that their vertex shader never writes, targeting wind/air-flow white boxes
   ([#4](https://github.com/AurelioB/totk-android/issues/4)). Thanks to @Dorkington
   ([#43](https://github.com/AurelioB/totk-android/pull/43)); keep the credited MIT adaptation.

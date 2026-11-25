@@ -1468,7 +1468,7 @@ independently of `TOTK_FRAME_LAG`. The first sample is about five seconds after 
 samples are spaced by about five seconds plus scan time. The game/render/present threads and signal
 handlers do not scan for this feature. Warning-only scans take no pool, runtime or tracker locks.
 The existing opt-in lag budget/classification paths retain their locks and policy.
-With the switch absent or not exactly `1`, this feature starts no worker, adds no scans and displays
+With the switch absent or not exactly `1`, `2` or `3`, this feature starts no worker, adds no scans and displays
 no notice; presentation checks one cached enable flag.
 
 At **80%** of `vm.max_map_count`, log once. At **88%**, show a persistent small notice in the
@@ -1497,6 +1497,49 @@ Startup-only test controls (integer percentages **1..100**):
 Require `LOG <= CLEAR < NOTICE`; invalid ordering restores all defaults, and invalid individual
 values restore that value's default with a diagnostic. `TOTK_VMA_SCAN_MS` still governs the existing
 lag/classification work, not the warning's independent five-second deadline.
+
+### Scan attribution (`TOTK_MAP_WARN=2`, diagnostic only)
+
+`2` keeps `1`'s warning thresholds, sampling cadence and policy, and adds one fixed-format, bounded
+`[map-warn-scan]` line per completed worker traversal, written only by `totk-vmascan`:
+`start_ns`, `duration_us`, `rows`, `frame_origin_ns`, `warn`, `notice`, `test_phase`, `log`, `show`, `clear`.
+`start_ns` is absolute `CLOCK_MONOTONIC` nanoseconds, the same clock as ordinary native frame
+reports; `frame_origin_ns` is their existing process origin (`g_t0_ns`). Convert to ordinary elapsed
+seconds with `(start_ns - frame_origin_ns) / 1e9`. Zero origin means unavailable in a graphics-only
+host, not a valid conversion anchor. Duration is truncated to whole microseconds and covers traversal
+and sysctl read (plus existing lag/classification work if reused), excluding warning/logging, telemetry
+and sleep. `rows=0` denotes an unknown count.
+
+With lag/classification off this is at most one line per five-second warning scan (about 0.2 Hz).
+Existing independently requested lag/classification scans also get a line; their unchanged minimum
+period is one second. No per-row or per-frame logging is added. `warn=1` marks a warning-policy sample.
+`1` remains quiet except its one-shot threshold/read-failure logs; neither `1` nor off adds trace reads.
+Use `2`, not `3`, for standing performance attribution. Logging itself can perturb timing. Match real
+scan intervals, not modulo-five-second phases or log-delivery timestamps; ordinary long-frame rows
+are delayed/rounded sparse observations, and window maxima have no within-window event timestamp.
+
+### Same-process clear check (`TOTK_MAP_WARN=3`, TEST ONLY)
+
+`3` includes per-scan tracing and deliberately replaces **all three percentage overrides** with this
+fixed sequence on the ordinary five-second warning samples, preserving actual counts and policy state:
+
+| Warning sample | Log / notice / clear percentages | Expected notice with a stable count between 3% and 99% |
+| --- | --- | --- |
+| 1..12 (about 5..60 s after worker start) | `1 / 3 / 2` | Show |
+| 13..24 (about 65..120 s) | `1 / 100 / 2` | Hold the already-shown notice, below the new notice threshold |
+| 25 onward (about 125 s onward) | `1 / 100 / 99` | Clear below the raised clear threshold |
+
+The times include additional scan/scheduling delays; trust `warn=1` and `test_phase=1/2/3` records,
+not a wall-clock countdown. Unknown counts still clear with the normal once-only diagnostic.
+No maps are added/removed, no protections are changed, no count is fabricated, and no notice bit is
+forced. This verifies the real policy-to-overlay hold/clear path after **test threshold changes**;
+it does not prove that real map growth reverses or that a count crossed the production 84% boundary.
+Do not use `3` for ordinary play: its final thresholds intentionally suppress the normal 88% warning.
+Restart with `1` (remove percentage overrides) for the ordinary opt-in warning, or unset it to disable.
+
+The original Thor check observed the notice and default-off behavior, but did not observe a natural
+clear and could not attribute long frames to individual scans. These diagnostic modes enable those
+follow-up checks; they are not themselves a device qualification or a crash-prevention claim.
 
 For safe Thor display verification, use `TOTK_MAP_WARN=1` and percentages `1` / `3` / `2`
 (log / notice / clear), `TOTK_FRAME_LAG=0`, `TOTK_OVERLAY=off`. Start a normal save and wait for the

@@ -7,6 +7,16 @@ typedef struct { int notice, logged_early, logged_notice, logged_unknown; } nvn_
 enum { NVN_MAP_WARN_LOG_EARLY = 1, NVN_MAP_WARN_LOG_NOTICE = 2, NVN_MAP_WARN_LOG_UNKNOWN = 4 };
 typedef struct { nvn_map_warn_state state; unsigned logs; } nvn_map_warn_result;
 
+/* TEST ONLY: real counts, changed thresholds, unchanged policy/state. Twelve samples show,
+   twelve hold below the raised notice threshold, then a raised clear threshold removes it.
+   A normal count between 3% and 99% never needs to approach the real limit. */
+enum { NVN_MAP_WARN_TEST_PHASE_SAMPLES = 12 };
+static inline nvn_map_warn_thresholds nvn_map_warn_test_thresholds(unsigned sample) {
+    if (sample <= NVN_MAP_WARN_TEST_PHASE_SAMPLES) return (nvn_map_warn_thresholds){1, 3, 2};
+    if (sample <= 2 * NVN_MAP_WARN_TEST_PHASE_SAMPLES) return (nvn_map_warn_thresholds){1, 100, 2};
+    return (nvn_map_warn_thresholds){1, 100, 99};
+}
+
 /* ceil(limit * percent / 100), without overflowing even at UINT64_MAX. */
 static inline uint64_t nvn_map_warn_boundary(uint64_t limit, unsigned percent) {
     return (limit / 100) * percent + ((limit % 100) * percent + 99) / 100;

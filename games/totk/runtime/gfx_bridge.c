@@ -8,6 +8,7 @@
 #include <string.h>
 #include "mprotect_stats.h"
 #include "../third_party/d2r_gfx/gfx/nvn/nvn_mtl.h"
+#include "../third_party/d2r_gfx/gfx/nvn/nvn_dirty.h"
 typedef struct{const char *name;void *fn;const char *why;} GfxEntry;
 uint64_t g_t0_ns;
 
@@ -81,7 +82,7 @@ struct Allocator g_nv_alloc,g_nv_devtools_alloc;
 static void graphics_allocator(Alloc a,Free f,Realloc r,void *u){g_nv_alloc=(struct Allocator){a,f,r,u};}
 static void graphics_dev_allocator(Alloc a,Free f,Realloc r,void *u){g_nv_devtools_alloc=(struct Allocator){a,f,r,u};}
 static void graphics_initialize(void *mem,unsigned long size){
- if(!mem||!size)runtime_fail("invalid graphics work memory");g_t0_ns=runtime_now_ns();mtl_init();fprintf(stderr,"[totk] native Metal graphics context initialized\n");
+ if(!mem||!size)runtime_fail("invalid graphics work memory");g_t0_ns=runtime_now_ns();nvn_dirty_map_warn_set_frame_origin(g_t0_ns);mtl_init();fprintf(stderr,"[totk] native Metal graphics context initialized\n");
 }
 __attribute__((used,TOTK_SECTION(totkgfx))) static const GfxEntry init_entry={"_ZN2nv18InitializeGraphicsEPvm",graphics_initialize,"native Metal context"};
 __attribute__((used,TOTK_SECTION(totkgfx))) static const GfxEntry alloc_entry={"_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_",graphics_allocator,"game allocator callbacks"};
