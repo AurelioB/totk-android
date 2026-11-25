@@ -3,6 +3,8 @@
 generation order, the accessor's cache, a writer / frame thread / readers race, the control thread on a real file, and
 every live switch toggled 300 times while render threads (TOTK_PRIO_RENDER by tid), game threads (TOTK_TIMER_SLACK_NS
 before their timed waits) and readers run. Both also run under ThreadSanitizer when the compiler has it.
+Slack comparisons hold the staging mutex; each game thread must also validate the final published value.
+A negative-control build drops kernel slack applications and must fail those final assertions.
 The isolated missing-file probe pins its control worker to an allowed CPU and measures thread CPU and real syscall
 counts after unrelated creates/deletes/moves, EINTR, late creation and repeated control-file deletion/recreation.
 
@@ -76,6 +78,11 @@ class LiveCtl(unittest.TestCase):
             got = self.parse(f'set {key}=1', f'unset {key}')
             self.assertTrue(all(f'{key} is startup-only' in line for line in got), got)
             self.assertTrue(all('set it in totk.env and restart' in line for line in got), got)
+
+    def test_integer_folding_is_startup_only(self):
+        got = self.parse('set TOTK_VK_INT_FOLD=0', 'unset TOTK_VK_INT_FOLD')
+        self.assertTrue(all('TOTK_VK_INT_FOLD is startup-only' in line for line in got), got)
+        self.assertTrue(all('set it in totk.env and restart' in line for line in got), got)
 
     def test_malformed_and_refused(self):
         got = self.parse('set TOTK_VK_DESC_STOCK', 'set TOTK_VK_DESC_STOCK=', 'set TOTK_VK_DESC_STOCK=2',
@@ -230,10 +237,26 @@ class LiveCtl(unittest.TestCase):
         table = (TOTK / 'runtime/live_ctl.h').read_text()
         table = table[table.index('totk_live_switches[] = {'):]
         count = table[:table.index('};')].count('{"TOTK_')
-        self.assertIn(f'ok: 300 batches toggled all {count} live switches', self.run_mode(self.probe, 'switches'))
+        out = self.run_mode(self.probe, 'switches')
+        self.assertIn(f'ok: 300 batches toggled all {count} live switches', out)
+        self.assertIn('ok: 4 game threads validated final timer slack after publication quiesced', out)
 
     def test_switches_thread_sanitizer(self):
-        self.run_mode(self.tsan_probe(), 'switches', env=os.environ | {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66'})
+        out = self.run_mode(self.tsan_probe(), 'switches', env=os.environ | {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66'})
+        self.assertIn('ok: 4 game threads validated final timer slack after publication quiesced', out)
+
+    def test_switches_lost_slack_update(self):
+        binary = self.dir / 'live-ctl-drop-slack'
+        subprocess.run([*compiler(), *FLAGS, '-DTOTK_TEST_DROP_SLACK_APPLY', str(TOTK / 'tests/live_ctl/probe.c'),
+                        '-o', str(binary)], check=True)
+        work = Path(tempfile.mkdtemp(dir=self.dir))
+        r = subprocess.run([str(binary), 'switches', str(work)], capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('negative control: dropping game-thread timer-slack applications', r.stdout)
+        for i in range(4):
+            self.assertIn(f'FAIL: game thread {i}: final slack differed from the live value', r.stdout)
+        self.assertNotIn('game threads validated final timer slack', r.stdout)
+        self.assertIn('FAIL: live switch channel', r.stdout)
 
 
 if __name__ == '__main__':

@@ -6,6 +6,34 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Make optional frame-timeline and fence-evidence ring producers single-attempt/nonblocking, with counted
+  dropped updates and skipped snapshots. Reuse per-walk elapsed clocks instead of enabling recorder
+  opcode/category probes, and batch recorder-worker draws/descriptors at slot assembly instead of each job.
+  Retain slot/walk/input/presentation evidence and ordinary default-off behavior.
+  Gate the new per-walk/per-assembly accounting bodies before all counter/slot work when disabled;
+  test both probe regions stay unentered with timeline off, including with explicit recorder profiling on.
+  Measured AYN Thor, 30-fps standing, 20-minute launches: walk CPU about 15.7 ms/frame off,
+  20.4 ms old-on (+29.6%), and 15.5 / 15.7 ms new-on (−1.3% / +0.3%, within noise).
+  New-off was −0.4% / −0.8% versus the measured main baseline, within noise; sample loss ≤0.07%
+  of producer-update attempts. Observed intervals ≥60 / ≥80 ms per 20 minutes fell from 20 / 11
+  old-on to 1 / 0 and 4 / 0 new-on. The first run's ordinary >50 ms gate failed (new-on 37 / 63,
+  off 19–37 per 20 minutes), but an eight-launch paired follow-up CLEARED the rewritten diagnostic
+  on this AYN Thor, one Hateno scene, standing only, 30-fps cap: ON 31.43 / 10.10 / 22.44 / 30.30
+  (mean 23.57) versus OFF 21.32 / 39.27 / 33.67 / 35.92 (mean 32.55) per 20 minutes;
+  paired ON-minus-OFF +10.10 / −29.17 / −11.23 / −5.62 and walk-CPU overhead +0.19%.
+  Frozen rule: mean difference ≤10, ON mean ≤1.30×OFF mean, not all pair differences positive,
+  at most one ON value above OFF maximum; all passed. The first run's single high launch is
+  consistent with launch-to-launch variation, not a demonstrated diagnostic effect.
+  It still adds per-frame work when on and remains a diagnostic: prefer OFF for final tail/performance
+  acceptance unless present identically in both arms. Old-on worst-frame figures are suspect and
+  walk CPU about 30% inflated. CPU uses medians of ordinary block means; >50 ms rates use
+  complete-report exposure estimates, unlike exact 20-minute timeline windows. Fixed-order,
+  single-device/scene standing evidence does not establish general tail safety. Measurements are
+  old/main 8bbbce5 versus rewritten 8dc331f, not the integrated head; see DEBUGGING.md and
+  `.scratch/perf/frame-timeline-fix/thor-pairs/report.md` for the follow-up source and limitations.
+- Add enabled-only `TOTK_WB_ALIAS=1` path coverage: cumulative operations/bytes by landing, report/event store
+  and publication, separated into alias and fallback reasons at periodic memory reports, Android pause and normal exit.
+  Publish pause-report enablement atomically so early Android lifecycle callbacks can race Vulkan initialization safely.
 - Add launch-only, default-off `TOTK_BENCH_TIME=HH:MM` for restored-save benchmark arms.
   It pins the native effective clock, overriding timeline/sleep/day progression; weather and randomness remain uncontrolled.
   Host guards and ARM64 state fixtures do not establish device HUD/sky or unchanged-save behavior.
@@ -30,6 +58,89 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Follow Link's environment-based map layer, display in-game map coordinates without losing integer-boundary
+  precision, and separate overview/detail caches to stop stationary tile eviction loops. Reject invalid, unreadable
+  or replaced layer samples using the previous layer heuristic; always keep the visible detail tiles plus one, scale
+  only the extra cache margin by Android memory class, and serialize resize decisions. Use plain layer parameters
+  even when their flag bits are clear: the tested Thor surface scene had `01,01,00` and the plain values gave the
+  correct layer; scenes where overrides differ remain untested. Log fallback reason classes at most once per minute.
+  Thanks to @Dorkington ([#47](https://github.com/AurelioB/totk-android/pull/47)).
+  Host regressions cover native layer guards, native JSON → Java coordinates and deterministic cache convergence;
+  surface/sky/Depths transitions, zoom appearance, memory and decoder CPU still need dual-screen device checks.
+- Add experimental, default-off `TOTK_MAP_WARN=1`: count process maps on the existing low-priority
+  sampler about every five seconds, independently of frame lag. Log at 80%; show `MAP LIMIT NEAR` /
+  `SAVE AND RESTART GAME SOON` at 88%, even with the performance overlay off; clear below 84%.
+  Hidden kernel limits use 65,530; unreadable counts clear the notice and log once. Startup-only
+  percentage overrides support safe low-threshold testing. Add diagnostic `TOTK_MAP_WARN=2`
+  per-scan monotonic start/duration/rows and ordinary-frame clock origin; `=1` logging is unchanged.
+  TEST-ONLY `=3` changes thresholds after 12 and 24 warning samples to show, hold and clear the
+  actual notice without adding mappings or restarting. It is not an ordinary-play warning mode.
+  Initial Thor checks observed a readable notice/default-off behavior; device clearing and timing
+  qualification remain unresolved, and the new test modes need device verification.
+  This warns only: it does not fix map growth or change mapping/protection/admission policy.
+- Correct fragment inputs that their vertex shader never writes, targeting wind/air-flow white boxes
+  ([#4](https://github.com/AurelioB/totk-android/issues/4)). Thanks to @Dorkington
+  ([#43](https://github.com/AurelioB/totk-android/pull/43)); keep the credited MIT adaptation.
+  The varying correction is on by default (`TOTK_VK_VARYING_FIX=0` opts out); integer folding and all
+  other module postprocessing still apply. New cache namespaces seed unchanged driver entries from a
+  context-matched predecessor without reusing its prewarm completion bits or changing shader packs.
+  Startup cache-only probes publish hits before play; only misses queue for compilation. Rollback files
+  remain untouched. Worker seed-IO accounting is thread-safe and session logs count patched/fallback
+  shader pairs. The contributor's independent NaN min/max/clamp rewrite is retained as
+  **default-off** `TOTK_VK_NAN_MINMAX=1`, pending separate device qualification. Host checks cannot establish
+  the wind picture, ordinary-scene regressions, prewarm time or frame-time effects on devices.
+  Keep presentation-time varying statistics independent of module creation. Cache-only probes now defer
+  absent/in-flight replacements without IO or a shader-module wait; unrelated interfaces build concurrently.
+  Mandatory synchronous builds can still wait for required driver work; no device latency bound is claimed.
+- Retire cached and deferred texel-buffer views of an owning pool's exact Vulkan buffer before unbacking destroys it,
+  using the existing arena-buffer release mechanism and existing GPU-use wait. Image/storage invalidation is unchanged.
+  Restore guest pages/private aliases under the pool lock before view retirement, so concurrent same-range
+  registration cannot have its new backing overwritten by the old pool's restoration.
+- Pack multi-element direct and frame-generation descriptor writes into fixed Vulkan-typed scratch arrays.
+  Singleton direct writes retain the existing batched path; descriptor hashing and immutable ownership are unchanged.
+- Retry transient image creation/allocation OOM failures after 1–64 submissions, with at most four retry attempts
+  per submission across recorder threads. Permanent unsupported-format/type failures remain failed; retry logs are bounded.
+- Refresh the shared shader list with seven more upstream variants applicable to game 1.4.3
+  (`5fb080496ab7`, V rows only). Fresh host translation prepares 25,039 modules instead of 25,032,
+  with zero failures and about 430 KiB of additional packed data. Existing shader packs stay valid;
+  run a full shader rebuild to receive the added coverage.
+- Add experimental, launch-only `TOTK_WB_ALIAS=1` (default off): use a retained same-backing private CPU mapping
+  for supported dirty-tracked write-back extents and eligible report/event/uniform stores, without temporarily
+  making protected guest pages writable. Preserve CPU-write detection, GPU synchronization and zero-on-recommit;
+  unsupported backing and contended report/event/uniform publications keep the old path. This closes the
+  protected-page temporary-RW race, not already-writable/unwatched aliases. Cost is extra mappings/VA, not copied backing.
+  Off preserves the original path and logs. First AYN Thor device evidence, over five common completed loads:
+  texture GPU-unprotect boundaries 0 versus 17,214; whole-process row growth averaged +1,025 versus +4,535/load.
+  No switch-attributable picture corruption was observed. Pooled standing frame tails were SAME, but some individual
+  phases had worse tails; this one ordered alias/legacy pair is not a speed proof. Odin and Duo remain untested.
+  Keep the switch default off; it prevents this fragmentation source, not all mapping growth.
+- Correct the experimental private writer's virtual-mapping authority across production MapVirtual replacements,
+  including anonymous unmaps and fallback remaps; serialize replacement and invalidation with borrowed writers.
+  Watch-slot-exhausted synchronous records keep the original no-token guest-store path rather than bypass ownership.
+- Fix shader translation for compute texture gathers with runtime offsets.
+  The translator now lowers those offsets before emitting SPIR-V instead of putting runtime values in constants.
+  Existing generated shader seeds need replacement to receive the corrected modules.
+  Replace seeds while the game is stopped; stale loose shader files must not override the corrected pack.
+- Enable the companion's opaque cover by default on devices with a built-in second screen;
+  `TOTK_COMPANION_COVER=0` turns it off. A companion window alone does not make Android stop the app
+  underneath it; an opaque activity does. Tested only with the Cocoon launcher: it was stopped in every
+  cover-on launch on both the Retroid Pocket Duo and AYN Thor.
+  On Duo, launches started from the launcher pooled 28.70 fps and 101 frames over 50 ms per 24 windows
+  without the cover, versus 29.22 fps and 40 with it. The frame-rate difference is inside the comparison
+  tool's tolerance; the tool rates the pooled result better.
+  On Thor, launcher CPU use during gameplay fell from about 27% of one core to about 0.05%, and compositor
+  CPU use from about 19% to about 17%, with no frame-rate change (44.80 → 45.32 fps standing;
+  44.65 → 44.69 fps panning).
+- Add experimental `TOTK_VK_REC_ONE_PRIMARY=1`, off by default: record each submitted chunk into one main
+  command buffer instead of one per render pass. On the AYN Thor, measured GPU time per frame was about 5% lower:
+  18.67 → 17.65 ms standing and 18.64 → 17.63 ms while panning. Frame rate was about 2% higher
+  (45.20 → 46.04 fps standing; 44.45 → 45.34 fps panning), which is inside the comparison tool's tolerance,
+  so it is not counted as confirmed. The AYN Odin 3 showed no frame-rate change;
+  adoption remains undecided on the Retroid Pocket Duo.
+- Fill screens larger than the docked 1920×1080 canvas instead of showing it 1:1 inside black bars (e.g. a
+  2400×1504 tablet used 57% of the panel, now 90%). The front buffer keeps the canvas size; the compositor
+  destination (or the copy fallback's blit) is aspect-fitted to the window. Panels no larger than the canvas,
+  such as the Odin's 1920×1080, are unchanged. Thanks to @kestrelshader42 ([#21](https://github.com/AurelioB/totk-android/pull/21)).
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
   Normal launches no longer start its tail thread or wake logd for every frame log. Crash reports remain enabled.
 - Let the live-control reader sleep when `totk.ctl` is absent, including after unrelated files are created or deleted.
@@ -55,6 +166,26 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   shutdown authority, retaining unavailable endpoints as outstanding. Profiling remains default-off.
   Limit qualified pipeline captures to ≤30 fps (Duo or capped Thor); 45-fps/uncapped captures remain
   unqualified and must fail closed on footer drops/missing coverage. The fixed lease pool is not enlarged.
+- Refresh the shared shader list with the 301 upstream variant rows that apply to game 1.4.3
+  (upstream list commit `a8ff9bc429bf`, V rows only): a full shader rebuild now prepares 25,032 variants
+  instead of 24,783 and the shader pack grows by about 29 MiB. Existing shader packs stay valid; the added
+  variants arrive when the user runs the full shader rebuild. Upstream's new compressed pipeline-row and
+  recipe-row formats are not imported.
+- Enable exact integer shader-address folding by default (`TOTK_VK_INT_FOLD=0` turns it off).
+  Earlier tests reduced total native shader instructions by 6.58%; capped GPU-work estimates fell about
+  2.3% on Duo and 4–5% on Odin (not confirmed battery savings), while Thor throughput stayed the same.
+  Odin's uncapped standing sample rose from
+  61.93 to 63.81 fps; these are workload-specific results, not a general frame-rate promise.
+  With this port: pictures were correct on the Odin (six scenes) and the Duo (15 minutes). On the Duo, uncapped,
+  frame rate was unchanged (31.81 → 31.85 fps standing, 30.67 → 30.52 panning) and GPU time per frame fell from
+  24.61 to 23.93 ms and from 25.08 to 24.47 ms; no measured value was worse, but the comparison counts as
+  inconclusive because the GPU clock differed by 3.3% between the two settings. On the Thor, on against off:
+  45.44 → 48.24 fps standing and 45.03 → 46.84 fps panning, GPU time 18.57 → 18.00 ms and 18.53 → 17.94 ms
+  (both rated better); the slowest 1% of frames changed by -1.3 / +1.4 ms, inside this device's
+  launch-to-launch spread. On the Odin: 75.68 → 75.88 fps standing and 71.65 → 71.99 fps panning (same),
+  GPU time 9.36 → 8.87 ms and 9.46 → 9.00 ms, nothing worse. The driver's pipeline cache is rebuilt once in
+  the background after this change (about 5 minutes on the Odin, about 17 minutes on the Thor, much longer on
+  the Duo while playing); the shipped shader set stays valid.
 
 ### Menu
 - Add **Unlimited** to Frame rate: variable real-game updates up to the existing 120 fps safety ceiling, with

@@ -22,6 +22,8 @@ static int legacy_primary;
 static int primary_loaded;
 const char *vk_pcache_loaded_path(void) { return primary_loaded ? cache_path : NULL; }
 const char *vk_pcache_current_path(void) { return cache_path; }
+static int seeded;
+int vk_pcache_seeded(void) { return seeded; }
 /* Called after Vulkan device selection, hence after frontend env_file/A722 policy and driver load.
  * Identity is immutable before the saver starts. A hash failure disables persistence/import rather
  * than labeling an unknown custom binary as the system driver. APK identity is deliberately absent. */
@@ -66,6 +68,63 @@ void *vk_pcache_load(const char *path, size_t *size, int primary) {
              kept < 0 ? strerror(error) : "");
     } else if (result == PCACHE_READ_IO) LOGV("pipeline cache: %s unreadable; not used", path);
     return data;
+}
+/* Vulkan owns the content keys: modules/entry points, specialization, layout and pipeline state.
+ * Only opaque driver cache data is shared, never portable completion bits or module handles. */
+static int merge_cache(const char *path, void *data, size_t size) {
+    VkPipelineCache source;
+    VkPipelineCacheCreateInfo info = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize=size, .pInitialData=data};
+    VkResult result = vkCreatePipelineCache(V.dev, &info, NULL, &source);
+    if (!result) {
+        result = vkMergePipelineCaches(V.dev, V.pcache, 1, &source);
+        vkDestroyPipelineCache(V.dev, source, NULL);
+    }
+    if (result) { RED(4, "pipeline cache: merging %s failed: %d; source retained", path, result); return 0; }
+    vk_pcache_changed();
+    return 1;
+}
+static int seed_from(const char *base) {
+    char path[1100];
+    for (unsigned i = 0; i < 7; i++) {
+        if (!vk_shader_cache_predecessor(base, i, path, sizeof path)) continue;
+        size_t size; int status;
+        void *data = pcache_read_context(path, identity, V.props.vendorID, V.props.deviceID,
+                                         V.props.pipelineCacheUUID, &size, &status);
+        /* Automatic migration requires a full context record, unlike explicit legacy imports.
+         * Reject missing/corrupt/opposite-context sources without quarantine, rename or deletion. */
+        int ok = data && status == PCACHE_READ_MATCH && merge_cache(path, data, size);
+        free(data);
+        if (ok) {
+            LOGV("pipeline cache: seeded %zu KiB from %s (read-only; prewarm completion not copied)", size >> 10, path);
+            return 1;
+        }
+    }
+    return 0;
+}
+void vk_pcache_imports(const char *cache_base, const char *import_base) {
+    if (!prepare_identity()) return;
+    /* First-use only; exact primary admission remains the sole authority for resume state. */
+    if (cache_base && strcmp(cache_base, "0") && !primary_loaded) {
+        seeded = seed_from(cache_base);
+        if (!seeded && import_base && strcmp(import_base, cache_base)) seeded = seed_from(import_base);
+    }
+    char path[1100];
+    const char *ip = vk_shader_cache_path(import_base, path, sizeof path);
+    if (ip && !seeded) {
+        char other[1100];
+        for (unsigned i = 0; i < 7; i++) if (vk_shader_cache_predecessor(import_base, i, other, sizeof other) && !access(other, F_OK)) {
+            LOGV("[pipeline-cache] import skipped: %s does not match effective namespace %s", other, ip);
+            break;
+        }
+    }
+    size_t size; void *data = vk_pcache_load(ip, &size, 0);
+    if (data && merge_cache(ip, data, size)) {
+        if (!primary_loaded) seeded = 1;
+        char done[1200]; snprintf(done, sizeof done, "%s.imported", ip);
+        if (!rename(ip, done)) LOGV("pipeline cache: merged %zu KiB from %s (now %s)", size >> 10, ip, done);
+        else RED(4, "pipeline cache: importing %s: rename %s", ip, strerror(errno));
+    }
+    free(data);
 }
 #ifdef TOTK_VK_TESTS
 static uint64_t published[7]; /* mu-owned completed-iteration snapshot, never expose mutable scratch/policy */

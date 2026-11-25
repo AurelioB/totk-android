@@ -92,6 +92,8 @@ typedef struct { VkDeviceMemory mem; uint32_t type; span_t *free; int nfree, cap
 static block_t *g_blocks; static int g_nblocks;
 static pthread_mutex_t g_mem_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_mem_dedicated_bytes, g_mem_block_bytes;
+/* Preserve allocation failure class for the image-realization retry policy. */
+static _Thread_local VkResult g_mem_failure;
 
 static void block_free_insert(block_t *b, VkDeviceSize off, VkDeviceSize size) {
     int i = 0; while (i < b->nfree && b->free[i].off < off) i++;
@@ -101,15 +103,16 @@ static void block_free_insert(block_t *b, VkDeviceSize off, VkDeviceSize size) {
     if (i > 0 && b->free[i - 1].off + b->free[i - 1].size == b->free[i].off) { b->free[i - 1].size += b->free[i].size; memmove(b->free + i, b->free + i + 1, (size_t)(b->nfree - i - 1) * sizeof *b->free); b->nfree--; }
 }
 int vk_mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk_alloc *out) {
+    g_mem_failure = VK_SUCCESS;
     int type = vk_pick_type(req->memoryTypeBits, want);
     if (type < 0) type = vk_pick_type(req->memoryTypeBits, 0);
-    if (type < 0) return 0;
+    if (type < 0) { g_mem_failure = VK_ERROR_FEATURE_NOT_PRESENT; return 0; }
     memset(out, 0, sizeof *out);
     VkDeviceSize align = req->alignment ? req->alignment : 1;
     if (align < V.props.limits.bufferImageGranularity) align = V.props.limits.bufferImageGranularity;
     if (req->size > BLOCK_SIZE / 4) {
         VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req->size, .memoryTypeIndex = (uint32_t)type};
-        if (vk_memory_allocate(&mai, &out->mem, VK_MEMORY_IMAGE_DEDICATED)) return 0;
+        if ((g_mem_failure = vk_memory_allocate(&mai, &out->mem, VK_MEMORY_IMAGE_DEDICATED))) return 0;
         out->size = req->size; out->block = -1;
         pthread_mutex_lock(&g_mem_mu); g_mem_dedicated_bytes += req->size; pthread_mutex_unlock(&g_mem_mu);
         return 1;
@@ -135,7 +138,7 @@ int vk_mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk
         if (pass) break;
         VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = BLOCK_SIZE, .memoryTypeIndex = (uint32_t)type};
         VkDeviceMemory m;
-        if (vk_memory_allocate(&mai, &m, VK_MEMORY_IMAGE_BLOCK)) break;
+        if ((g_mem_failure = vk_memory_allocate(&mai, &m, VK_MEMORY_IMAGE_BLOCK))) break;
         int bi = g_nblocks++;
         g_blocks = realloc(g_blocks, (size_t)g_nblocks * sizeof *g_blocks);
         block_t *b = &g_blocks[bi]; memset(b, 0, sizeof *b); b->mem = m; b->type = (uint32_t)type;
@@ -230,12 +233,20 @@ struct vk_tex {
     _Atomic uint64_t memo_sub;            /* TOTK_VK_TEX_MEMO: last submission whose tex_get_inner work for it is done */
     int cpu_pool;                         /* tex_mirrored at creation: GPU writes re-arm settled/opt-in invalidate write-back */
     int canvas_window;                   /* registration cached at object creation, not on every draw */
+    uint64_t retry_sub; uint32_t retry_shift; /* empty image: OOM backoff only, zero means permanent */
     VkBufferView tbv;                     /* TARGET_BUFFER textures */
     VkBuffer tb_buffer; VkDeviceSize tb_offset, tb_range;
 };
 static nvn_hmap g_by_serial = {.klen = 8};          /* serial -> vk_tex */
 static nvn_hmap g_by_storage = {.klen = sizeof(stor_key)};   /* stor_key -> vk_img (shared) */
 static nvn_hmap g_window_serials = {.klen = 8};
+enum { IMAGE_RETRIES_PER_SUB = 4, IMAGE_RETRY_SHIFT_MAX = 6 };
+static _Thread_local VkResult g_img_failure; /* creation result on this caller; siblings may also create images */
+static uint64_t g_image_retry_sub, g_stat_image_retries, g_stat_image_retry_ok;
+static unsigned g_image_retry_count;
+static int image_memory_failure(VkResult r) {
+    return r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
 static _Atomic uint64_t g_native_extent = (uint64_t)1080 << 32 | 1920;
 static uint64_t g_native_frame = 1;
 /* Texture upload/texel resolution may acquire a retired arena while holding
@@ -454,6 +465,7 @@ static VkFormat srgb_twin(VkFormat f) {
     }
 }
 static vk_img *img_create_ex(const tex_t *t, int all_formats) {
+    g_img_failure = VK_ERROR_FORMAT_NOT_SUPPORTED;
     VkFormat f; VkComponentMapping fs;
     if (!vk_fmt(t->d.format, &f, &fs) || !f) { RED(8, "texture format %#x has no Vulkan format (ser %llu %ux%u)", t->d.format, (unsigned long long)t->serial, t->d.width, t->d.height); return NULL; }
     VkFormatFeatureFlags ff = fmt_features(f);
@@ -461,6 +473,7 @@ static vk_img *img_create_ex(const tex_t *t, int all_formats) {
         RED(8, "texture format %#x (Vulkan %d) is not supported by this driver", t->d.format, f); return NULL;
     }
     vk_img *im = calloc(1, sizeof *im);
+    if (!im) { g_img_failure = VK_ERROR_OUT_OF_HOST_MEMORY; return NULL; }
     image_layers(t, &im->type, &im->w, &im->h, &im->d, &im->layers, &im->samples);
     uint32_t biggest = MAXV(im->w, im->h); if (im->type == VK_IMAGE_TYPE_3D) biggest = MAXV(biggest, im->d);
     uint32_t allowed = 1; for (uint32_t v = biggest; v > 1; v >>= 1) allowed++;
@@ -495,13 +508,13 @@ static vk_img *img_create_ex(const tex_t *t, int all_formats) {
     }
     if (blk_rt) ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VkResult r = vkCreateImage(V.dev, &ci, NULL, &im->img);
-    if (r && ci.pNext) { ci.pNext = NULL; im->nlst = 0; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
-    if (r && blk_rt) { blk_rt = 0; ci.usage = im->usage; ci.flags &= ~(VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT); r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
-    if (r && (ci.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)) { ci.flags &= ~VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
+    if (r && !image_memory_failure(r) && ci.pNext) { ci.pNext = NULL; im->nlst = 0; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
+    if (r && !image_memory_failure(r) && blk_rt) { blk_rt = 0; ci.usage = im->usage; ci.flags &= ~(VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT); r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
+    if (r && !image_memory_failure(r) && (ci.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)) { ci.flags &= ~VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
     im->usage = ci.usage; im->blk_rt = blk_rt; im->arr3d = !!(ci.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT);
-    if (r) { RED(8, "vkCreateImage %ux%ux%u fmt %d levels %u layers %u: %d", im->w, im->h, im->d, f, im->levels, im->layers, r); free(im); return NULL; }
+    if (r) { g_img_failure=r; RED(8, "vkCreateImage %ux%ux%u fmt %d levels %u layers %u: %d", im->w, im->h, im->d, f, im->levels, im->layers, r); free(im); return NULL; }
     VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, im->img, &req);
-    if (!vk_mem_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &im->mem)) { RED(8, "out of GPU memory for a %ux%u texture (%llu MiB)", im->w, im->h, (unsigned long long)(req.size >> 20)); vkDestroyImage(V.dev, im->img, NULL); free(im); return NULL; }
+    if (!vk_mem_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &im->mem)) { g_img_failure=g_mem_failure; RED(8, "GPU memory allocation failed (%d) for a %ux%u texture (%llu MiB)", g_img_failure, im->w, im->h, (unsigned long long)(req.size >> 20)); vkDestroyImage(V.dev, im->img, NULL); free(im); return NULL; }
     VKCHECK(vkBindImageMemory(V.dev, im->img, im->mem.mem, im->mem.off));
     image_barrier_init(vk_pre_cb(), im->img, im->aspect);
     g_stat_images++;
@@ -703,18 +716,34 @@ static vk_tex *tex_get_inner(const tex_t *t) {
     /* TOTK_VK_TEX_MEMO: whatever this submission needs for x (above) is done; memo hits on mirrored textures wait for it. */
     if (x && vk_tex_memo_on() && atomic_load_explicit(&x->memo_sub, memory_order_relaxed) != sub)
         atomic_store_explicit(&x->memo_sub, sub, memory_order_release);
-    if (x) { pthread_mutex_unlock(&g_tex_mu); return x->im || x->tbv ? x : NULL; }
-    x = calloc(1, sizeof *x); x->serial = t->serial; x->t = *t; x->csub = sub; atomic_init(&x->memo_sub, sub);
-    x->identity = tex_stamp_new();
-    if (vk_canvas_on) x->canvas_window = nvn_hm_get(&g_window_serials, &t->serial) != NULL;
-    nvn_hm_put(&g_by_serial, &t->serial, x);
-    if (t->d.target == 10) { pthread_mutex_unlock(&g_tex_mu); return x; }   /* buffer textures: vk_tbuf_by_id */
-    x->mirrored = x->cpu_pool = tex_mirrored(t);
+    int retrying = 0;
+    if (x && !x->im && t->d.target != 10 && x->retry_sub && sub >= x->retry_sub) {
+        if (g_image_retry_sub != sub) { g_image_retry_sub=sub; g_image_retry_count=0; }
+        if (g_image_retry_count < IMAGE_RETRIES_PER_SUB) {
+            g_image_retry_count++; retrying=1; g_stat_image_retries++;
+            if (g_stat_image_retries <= 16)
+                LOGV("[image-retry] attempt=%llu sub=%llu serial=%llu (cap %u/sub, delay <=%u submissions)",
+                    (unsigned long long)g_stat_image_retries,(unsigned long long)sub,
+                    (unsigned long long)t->serial,IMAGE_RETRIES_PER_SUB,1u<<IMAGE_RETRY_SHIFT_MAX);
+            tex_stamp_bump(&x->identity); tex_epoch_bump();
+        }
+    }
+    if (x && !retrying) { pthread_mutex_unlock(&g_tex_mu); return x->im || x->tbv ? x : NULL; }
+    if (!x) {
+        x = calloc(1, sizeof *x); x->serial = t->serial; x->t = *t; x->csub = sub; atomic_init(&x->memo_sub, sub);
+        x->identity = tex_stamp_new();
+        if (vk_canvas_on) x->canvas_window = nvn_hm_get(&g_window_serials, &t->serial) != NULL;
+        nvn_hm_put(&g_by_serial, &t->serial, x);
+        if (t->d.target == 10) { pthread_mutex_unlock(&g_tex_mu); return x; }   /* buffer textures: vk_tbuf_by_id */
+        x->mirrored = x->cpu_pool = tex_mirrored(t);
+    }
+    x->retry_sub=0;
     stor_key k;
     if (x->mirrored && mirshare_on() && stor_key_of(t, &k)) {   /* a GPU-written image already holds this storage */
         vk_img *g = nvn_hm_get(&g_by_storage, &k);
         if (g && g->gpu_written) {
             x->mirrored = 0; g->refs++; x->im = g; g_stat_shared_hits++;
+            if (retrying) g_stat_image_retry_ok++;
             texcopy_resource("realize-shared-gpu-hit", x); pthread_mutex_unlock(&g_tex_mu); return x;
         }
     }
@@ -739,6 +768,11 @@ static vk_tex *tex_get_inner(const tex_t *t) {
         texcopy_resource(x->mirrored ? "realize-own-upload" : "realize-gpu-only-undefined", x);
         if (x->im && x->mirrored) { upload(x); g_stat_uploads++; }
     }
+    if (!x->im && image_memory_failure(g_img_failure)) {
+        x->retry_sub=sub+(1ull<<x->retry_shift);
+        if (x->retry_shift < IMAGE_RETRY_SHIFT_MAX) x->retry_shift++;
+    }
+    if (x->im && retrying) g_stat_image_retry_ok++;
     pthread_mutex_unlock(&g_tex_mu);
     return x->im ? x : NULL;
 }
@@ -1209,6 +1243,21 @@ static int wb_copy(wb_ent *e) {
     if (!result) wb_tile_event(e->tile_version, "copy-allocation-failed", 0, 0);
     wb_diag_end(WB_D_COPY, start); return result;
 }
+/* Pool lifetime is already pinned by vk_wb_pool_lock. Every destination pointer
+   denotes a real mapped owner span, never an artificial whole-texture base
+   before an alias allocation. The encoder leaves padding untouched. */
+static int wb_swizzle_alias(const tex_t *t, unsigned level, unsigned layer,
+                            const void *source, size_t pitch, uint64_t first, uint64_t bytes) {
+    uint64_t storage = (uint64_t)layer * t->L.layer_size + nvn_tex_level_offset(&t->d, level);
+    while (bytes) {
+        size_t available = 0;
+        void *destination = vk_wb_alias_span_locked((uintptr_t)t->mem + storage + first, (size_t)bytes, &available);
+        if (!destination || !available) return -1; /* prevalidated under the same lifetime lock */
+        if (nvn_swizzle_span_into(&t->d, level, layer, source, pitch, destination, first, available)) return -1;
+        first += available; bytes -= available;
+    }
+    return 0;
+}
 /* Returns 3 for partial progress, 2 to defer without waiting, 1 if complete, 0 if CPU-newer, -1 if invalid. */
 static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint64_t *advanced) {
     const tex_t *t = &e->t; int settled = mode != WB_SYNC; wb_shape s = wb_layout(e);
@@ -1227,10 +1276,25 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
     if (settled) nvn_dirty_test_wb_phase(t->mem, NVN_DIRTY_TEST_WB_BEFORE_OWNERSHIP);
 #endif
     void *token = NULL;
+    /* Mixed/unsupported backing and records without watch/ownership eligibility
+       retain the original protocol for this landing extent. Range registration
+       alone must not select a private destination for a no-token synchronous record. */
+    int alias_enabled = vk_wb_alias_enabled();
+    vk_wb_alias_reason alias_reason = VK_WB_ALIAS_PATH_OTHER;
+    if (alias_enabled) {
+        alias_reason = !e->tracked || !nvn_dirty_tracked(t->mem + offset, span) ?
+            VK_WB_ALIAS_PATH_OWNERSHIP :
+            vk_wb_alias_reason_locked((uintptr_t)t->mem + offset, (size_t)span);
+    }
+    int private_alias = alias_enabled && alias_reason == VK_WB_ALIAS_PATH_ALIAS;
     if (mode == WB_IDLE || mode == WB_INVALIDATE_TRY) {
-        if (!nvn_dirty_gpu_write_try_begin((void *)(t->mem + offset), span, &token)) { vk_wb_pool_unlock(); return 2; }
+        int ready = private_alias ?
+            nvn_dirty_gpu_write_alias_try_begin((void *)(t->mem + offset), span, &token) :
+            nvn_dirty_gpu_write_try_begin((void *)(t->mem + offset), span, &token);
+        if (!ready) { vk_wb_pool_unlock(); return 2; }
     } else if (e->tracked) {
-        token = nvn_dirty_gpu_write_begin(t->mem, t->L.size);
+        token = private_alias ? nvn_dirty_gpu_write_alias_begin(t->mem, t->L.size) :
+            nvn_dirty_gpu_write_begin(t->mem, t->L.size);
         if (!token) { vk_wb_pool_unlock(); wb_tile_event(e->tile_version, "ownership-untracked", 0, 0); return -1; }
     }
 #ifdef TOTK_VK_TESTS
@@ -1238,10 +1302,10 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
 #endif
     /* Check AFTER taking the existing dirty page/unit ownership: a writer already in the fault handler either wins
        first (and its newer stamp rejects us) or waits until restoration. Keep the pool lifetime locked through end.
-       CPU-visible physical pools have no private RW alias (totk_vpool_backing names the game's physical view), so this
-       uses the synchronous write-back's temporary-RW protocol. Residual window: a fresh direct game store while these
-       pages are temporarily RW can bypass the handler, including just BEFORE this freshness check. Only writers
-       which fault while RO participate in dirty ownership; this is not strict exclusion of arbitrary stores. */
+       The private-alias path leaves the guest mapping RO throughout ownership:
+       a fresh raw CPU store faults, waits on PG_BUSY, and is observed after end.
+       Unsupported backing keeps the old temporary-RW protocol and its documented
+       residual window; no stronger exclusion is claimed for that fallback. */
     int fresh = !(settled && !e->tracked) && !wb_cpu_newer(e);
 #ifdef TOTK_VK_TESTS
     if (settled) nvn_dirty_test_wb_phase(t->mem, NVN_DIRTY_TEST_WB_AFTER_FRESHNESS);
@@ -1250,13 +1314,18 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
         totk_texcopy_log(vk_submit_serial(), "phase=res event=invalidate-freshness ser=%llu image=%#llx result=%s",
             (unsigned long long)t->serial, (unsigned long long)(uintptr_t)e->im->img, fresh ? "gpu-authoritative" : "skip-cpu-newer");
     int ok = 1;
+    uint64_t dispatched_bytes = 0;
     if (fresh) do {
         unsigned l = e->land_level;
         uint64_t level = nvn_tex_level_offset(&t->d, l);
         uint64_t end = l + 1 < s.levels ? nvn_tex_level_offset(&t->d, l + 1) : t->L.layer_size;
         uint64_t n = mode == WB_IDLE ? span : end - level - e->land_pos;
         size_t pitch = (size_t)((MAXV(e->im->w >> l, 1u) + s.bw - 1) / s.bw) * s.bpb;
-        if (nvn_swizzle_span(&t->d, l, e->land_layer, e->bytes + e->land_src, pitch, (void *)t->mem, e->land_pos, n)) { ok = 0; break; }
+        if (alias_enabled) dispatched_bytes += n;
+        int encoded = private_alias ?
+            wb_swizzle_alias(t, l, e->land_layer, e->bytes + e->land_src, pitch, e->land_pos, n) :
+            nvn_swizzle_span(&t->d, l, e->land_layer, e->bytes + e->land_src, pitch, (void *)t->mem, e->land_pos, n);
+        if (encoded) { ok = 0; break; }
         e->land_pos += n; if (advanced) *advanced += n;
         if (e->land_pos == end - level) {
             e->land_pos = 0; e->land_src += wb_level_size(e, s, l);
@@ -1264,6 +1333,8 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
         }
         if (mode == WB_IDLE) break;
     } while (e->land_level < s.levels);
+    if (alias_enabled && dispatched_bytes)
+        vk_wb_alias_account(VK_WB_ALIAS_LANDING, alias_reason, dispatched_bytes);
     nvn_dirty_gpu_write_end(token);
 #ifdef TOTK_VK_TESTS
     if (settled) nvn_dirty_test_wb_phase(t->mem, NVN_DIRTY_TEST_WB_RESTORED);
@@ -2660,6 +2731,9 @@ void vk_res_mem(uint64_t v[8]) {
 }
 void vk_res_stats(void) {
     pthread_mutex_lock(&g_tex_mu);
+    if (g_stat_image_retries) LOGV("[image-retry] cumulative attempts=%llu recovered=%llu (cap %u/sub, max delay %u submissions)",
+        (unsigned long long)g_stat_image_retries,(unsigned long long)g_stat_image_retry_ok,
+        IMAGE_RETRIES_PER_SUB,1u<<IMAGE_RETRY_SHIFT_MAX);
     if (g_wb_done || g_nwb || g_wb_skip_cpu) LOGV("GPU write-back: %llu renderings written back (%llu MiB), %llu skipped (CPU wrote since), %llu superseded by GPU copies, %llu aged out, %llu unsupported; %d waiting",
         (unsigned long long)g_wb_done, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu, (unsigned long long)g_wb_superseded, (unsigned long long)g_wb_aged, (unsigned long long)g_wb_skip_fmt, g_nwb);
     LOGV("textures: %u live, %llu images made (%llu storage-shared reuses; %llu CPU-pool images the GPU rendered into shared, %llu serials switched to them; %llu compressible format splits, %llu cross-format shares), %llu uploads + %llu re-uploads (%llu MiB); GPU memory %llu MiB in blocks + %llu MiB dedicated",

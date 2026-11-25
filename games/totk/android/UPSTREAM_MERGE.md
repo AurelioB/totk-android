@@ -6,6 +6,65 @@ This ledger classifies all 57 upstream-only commits before merging. **Useful** m
 Historical upstream device evidence is in `DEBUGGING.md`; dev device evidence is in `VULKAN.md`.
 The per-round sections below distinguish later owner-reported combined-build results from host-only verification.
 
+## November 17 shader-list refresh (V rows only)
+
+Repeat the November 11 identifier-only procedure against MacNativeGames
+`5fb080496ab7dc45af03fa02caa42f8ac3f87e11`, using the exact `(shader key, canonical dependency JSON)`
+identity and authenticated 1.4.3 inventory membership. The source adds 955 V rows since `a8ff9bc429bf`;
+seven apply to our inventory and are absent locally, while the earlier 301 remain present.
+Merge only those seven with `games/totk/scripts/shader_list.py merge`; preserve all existing rows
+and ordered non-V content, with no R/A/B/T/S imports or reference code/payloads.
+
+Final V/R/S/C counts are **58,073 / 61,613 / 1,557 / 63**; list SHA-256:
+`c4668305ac5838fbc30a22bb7de7d6a1329c0f291a641209c0203dc489ec995b`.
+Fresh current-source Vulkan translation produces **25,032 → 25,039 modules**, zero failures,
+and **+440,192 packed bytes**. The seven rows have no default/listed dependency duplicates;
+all surviving-name SPIR-V/reflection payloads are unchanged, and seven `.vv` indexes gain entries.
+Full pack layout/hash/identity/index/reflection checks pass on both sides.
+
+Existing packs remain valid: this data-only change requires no chain/epoch or driver-cache invalidation.
+To gain coverage, explicitly perform a full shader rebuild, regenerating `seed.vkpack` and `seed-id.txt`;
+preparation and interrupted-setup reuse identities change with the list digest. Preserve deployed desktop
+exact names using the existing procedure below. No APK update alone replaces an installed seed.
+Evidence: `.scratch/ref-updates-2026-11-17/apply/report.md` and `item1.json`.
+No device timing, visual qualification or steady-state speedup is claimed.
+
+## November 11 shader-list refresh (V rows only)
+
+Source: switch2mac fetched `origin/main` `b2ad88d8cc2e880f5d895d7a2580e1355f00652b`
+pins MacNativeGames `a8ff9bc429bf451dd1040807c6dae6fa2a0cba55` in its TotK `game.json`.
+The reference check mis-attributed MacNativeGames `a4bd59576479` to switch2mac: wrapper commit
+`ef0b08c` quotes that engine commit's subject; 17,335 is the source list's V-row total, not our additions.
+The previous import is `ff63a162b35d8b486b941191785d8e957c1f5df2` plus the four local Sky V rows
+documented in `APP.md`. All 13,619 V rows of that upstream checkpoint survive in our existing union.
+The imported identifiers remain covered by the unchanged root MIT licence, copyright 2026
+MacNativeGames contributors. No shader code, translated output or Nintendo material is imported.
+
+The reviewed V-only selection adds **301** rows for **197** shader keys in our authenticated
+1.4.3 inventory. Of 3,358 V rows absent from our prior list, 3,057 name shaders this build
+does not have and are excluded. Keep all existing rows, including Vulkan attr/fout and local-fill
+coverage: upstream's 43,788 missing prior V rows are not deletions to apply here.
+Final V/R/S/C counts: **58,066 / 61,613 / 1,557 / 63**; non-V rows are byte-for-byte unchanged.
+The new list SHA-256 is `9b00d9a9083df6d2d8667969f9b105192851fd7e52d7fa93874ff0a7e5eb90b9`
+(previous `74aa399c…`). The translation chain and early-fragment policy do not change.
+
+Unlike the prior V/R union, this selection explicitly excludes all source R/A/B/T/S rows.
+Upstream now packs its 79,365 R keys as two variant names plus 384 bytes of fixed state,
+with zero runs encoded as `z<hex count>.`; our hex-only parser cannot import that representation.
+Its 1,118 A rows preserve the answers behind warm-row variant suffixes after V pruning.
+They are not V rows and are not silently reinterpreted. B/T remain unsupported Metal recipes.
+A separate change would need bounded packed-key validation in Python and the C list validator,
+A suffix/answer validation and seed-aware warm-name resolution, plus parity/malformed-input tests.
+Even then Metal R rows do not directly supply Android's distinct Vulkan portable-key/prewarm formats.
+
+The list digest automatically changes preparation/resume identity; no separate epoch constant is
+bumped for data-only additions. APK updates do not automatically rebuild an already completed
+on-device shader stage or invalidate the driver pipeline-cache envelope. Existing installs must
+explicitly rebuild shaders to gain this coverage; desktop generation still requires `--shaders`
+and the exact-name retention procedure below. See `APP.md` for update and device-qualification costs.
+Host measurements, validation and test totals are recorded in
+`.scratch/shader-list-refresh/report.md`; no APK build or device qualification is claimed.
+
 
 ## Native-UI follow-on to round 10.1
 

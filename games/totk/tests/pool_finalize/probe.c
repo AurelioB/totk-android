@@ -61,9 +61,27 @@ static uint64_t copy_gate(uint8_t *src, VkBuffer dst, uint64_t dst_offset, VkEve
 }
 static void inflight(int shutdown) {
     size_t n = 131072, pg = (size_t)getpagesize(); uint8_t *src = pages(n), *alias = pages(n);
-    memset(src, 0x4d, n); register_pool(src, n); mtl_pool_add(src + pg, pg);
+    int alias_fd = -1;
+    const char *alias_setting = getenv("TOTK_WB_ALIAS");
+    if (alias_setting && !strcmp(alias_setting, "1")) {
+        alias_fd = memfd_create("finalize-private-alias", MFD_CLOEXEC);
+        need(alias_fd >= 0 && !ftruncate(alias_fd, n), "private alias fixture backing");
+        need(mmap(src, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, alias_fd, 0) == src,
+            "real shared owner backing before host import");
+    }
+    memset(src, 0x4d, n); register_pool(src, n);
+    if (alias_fd >= 0) {
+        need(vk_wb_test_alias_attach(src, n, alias_fd, 0), "private writer attached during genuine finalize/completion race");
+        close(alias_fd);
+    }
+    mtl_pool_add(src + pg, pg);
     if (mremap(src, 0, n, MREMAP_MAYMOVE | MREMAP_FIXED, alias) != alias) runtime_fail("shared alias");
     vk_record_test_alias(alias, (uint64_t)(uintptr_t)src, n);
+    /* Texel lookup also guards known aliases in lag mode. Give this synthetic
+       CPU alias real dirty tracking before the host-gated submission; otherwise
+       the required untracked-alias fallback waits on our own unopened gate. */
+    nvn_dirty_add_range(alias, n);
+    nvn_dirty_protect(alias, n);
     nvn_dirty_protect(src, n);
     VkBuffer dst; VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 512, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, &dst));
@@ -73,12 +91,25 @@ static void inflight(int shutdown) {
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)type};
     VkDeviceMemory memory; VKCHECK(vkAllocateMemory(V.dev, &ai, NULL, &memory)); VKCHECK(vkBindBufferMemory(V.dev, dst, memory, 0));
     uint8_t *out; VKCHECK(vkMapMemory(V.dev, memory, 0, 512, 0, (void **)&out));
+    tex_t tex={.serial=0xdefec7,.mem=src+pg,
+        .d={.target=10,.format=0x25,.width=64},.L={.size=256}};
+    mtl_reg_tex(901,&tex,NULL);
+    VkBufferView view=vk_tbuf_by_id(901,0);
+    need(view!=VK_NULL_HANDLE,"pool owns a live cached texel view before submitted use");
+    tex_t retired=tex;retired.serial++;
+    mtl_reg_tex(902,&retired,NULL);
+    need(vk_tbuf_by_id(902,0)!=VK_NULL_HANDLE,"second pool view realized before deferred release");
     VkEvent first, second; uint64_t ticket = copy_gate(src + pg, dst, 0, &first);
     if (nvn_dirty_lag_enabled())
         need(nvn_dirty_lag_protect(src + pg, 256, ticket), "arm genuine in-flight GPU guard before finalization");
     finalizer f = {.p = src}; init(&f.t); pthread_t thread; pthread_create(&thread, NULL, finalize_run, &f);
     await_ticket(&f, ticket);
     need(!atomic_load(&f.done) && !mtl_wait(ticket, 0), "finalize waits for a genuine gated GPU read");
+    /* Observe the recorder resolver without announcing a new immediate GPU
+       use in the next copy-only submission. No descriptor consumes this query. */
+    VkDescriptorBufferInfo observed_live; uint32_t observed_reason;
+    need(vk_tbuf_by_id_record(901,0,&observed_live,&observed_reason)==view,
+        "cached view remains valid while submitted work is gated");
     if (shutdown) { puts("PASS pool-finalize shutdown during genuine GPU wait"); fflush(stdout); _exit(0); }
     if (g_vcore_release) {
         uint64_t start = now_ns();
@@ -106,6 +137,9 @@ static void inflight(int shutdown) {
            must not authorize destruction; recording exclusion must force retry. */
         VKCHECK(vkSetEvent(V.dev, first)); await(&f.waited);
         uint64_t later = copy_gate(alias + pg, dst, 256, &second);
+        /* Queue both gated reads before deferring this unused view: lavapipe
+           may wait for the whole buffer during a commit's view sweep. */
+        mtl_tex_release(&retired);
         need(later > ticket, "new submission extends the snapshot frontier");
         atomic_store(&f.retry, 1); await_ticket(&f, later);
         need(!atomic_load(&f.done) && !mtl_wait(later, 0), "new references are waited safely after the first snapshot");
@@ -116,12 +150,14 @@ static void inflight(int shutdown) {
             fini(&concurrent[i].t); munmap(concurrent[i].p, n);
         }
         vkDestroyEvent(V.dev, second, NULL); finalize(other); munmap(other, n);
-    } else { VKCHECK(vkSetEvent(V.dev, first)); pthread_join(thread, NULL); }
+    } else { mtl_tex_release(&retired); VKCHECK(vkSetEvent(V.dev, first)); pthread_join(thread, NULL); }
     need(atomic_load(&f.done) && mtl_wait(ticket, 0), "finalize returns only after actual read completion");
     for (unsigned i = 0; i < (g_vcore_release ? 512u : 256u); i++) if (out[i] != 0x4d) runtime_fail("GPU read data changed before retirement");
     need(1, "all in-flight GPU reads preserved bytes");
     VkBuffer b; uint64_t off;
     need(!vk_resolve((uint64_t)(uintptr_t)src, n, &b, &off) && !vk_resolve((uint64_t)(uintptr_t)alias, n, &b, &off), "owner/view/alias lookup invalidated");
+    nvn_dirty_remove_range(alias);
+    mtl_reg_tex(901,NULL,NULL);mtl_reg_tex(902,NULL,NULL);mtl_tex_release(&tex);
     need(!nvn_dirty_tracked(src, n) && src[pg] == 0x4d && alias[pg] == 0x4d, "dirty removal restores writable storage and preserves aliases");
     memset(src, 0xa5, n); need(alias[pg] == 0xa5, "immediate guest stores remain coherent before address reuse");
     need(mmap(src, n, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0) == src, "guest immediately replaces finalized address with MAP_FIXED");

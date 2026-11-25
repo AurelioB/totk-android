@@ -444,16 +444,24 @@ frame identity or optical quality. API admission remains limited to the internal
 
 
 **Docked (`TOTK_OPERATION_MODE=docked`):** unset/empty `TOTK_APP_WIDTH` becomes process-only effective `guest`
-whether `TOTK_NATIVE_UI` is unset, `0`, or `1`. Both front-buffer dimensions follow the current guest canvas/crop,
+whether `TOTK_NATIVE_UI` is unset, `0`, or `1`. The render-buffer fit follows the current guest canvas/crop,
 aspect-fit without upsampling and capped by the live render-window extent; ordinary docked play no longer
-downscales a shipping 1920×1080 canvas through the handheld 1280×720 default.
+downscales a shipping 1920×1080 canvas through the handheld 1280×720 default. The displayed rectangle is separate:
+if neither fitted dimension reaches the window, it is enlarged to aspect-fit the window. For a 1920×1080 canvas
+on a 2400×1504 panel, the buffer fit stays 1920×1080 while the picture becomes 2400×1350 at `(0,77)`.
+A fit already touching either window edge is unchanged, including 1920×1080, 1920×1200, 1280×800 and 2560×1080
+windows with that canvas. This is relative to the effective canvas/crop: a deliberately smaller canvas is enlarged too.
 If `TOTK_NATIVE_UI=1` was requested, startup also logs `requested=1 effective=0`: the shipping docked canvas
 already has native UI and must not require a handheld promoted sibling. Only in that requested-native-UI path,
 unset/empty/`auto` `TOTK_OUTPUT_RES` becomes effective `0` (shipping canvas, no larger output heap);
 explicit `0` or dimensions remain authoritative. A smaller/non-16:9 panel is fitted and
-letterboxed; no fixed Odin/Thor width is assumed. AHB uses the fitted buffer and centered destination; copy
-fallback paints its bars into a full window-sized buffer. A missing/zero window defers work; subsequent
-resize/recreation uses an event-refreshed extent, not a fixed startup size or per-frame native-window polling.
+letterboxed; no fixed Odin/Thor width is assumed. AHB uses the fitted buffer and the separate centered display
+destination; copy fallback paints its bars into an already full-window-sized buffer and uses a linear blit by default.
+Optional copy-path `TOTK_POST_SCALE=fsr|sgsr` instead runs at the enlarged picture size; see `VULKAN.md`,
+"Zero-copy presentation", for its pixel/memory cost. We do not select the AHB compositor's scaling filter;
+SurfaceControl enlargement is not an FSR-quality or HWC-admission guarantee.
+A missing/zero window defers work; subsequent resize/recreation uses an event-refreshed extent,
+not a fixed startup size or per-frame native-window polling.
 Create/recreate, resize/redraw, content/configuration and focus/resume notifications refresh the atomic width/height
 cache. Guest canvas/crop changes refresh the cached aspect-fit geometry; steady real/generated frames reuse it.
 Attachment epochs reject stale callbacks, and a changed guest-window extent advances the queued-frame generation
@@ -1281,6 +1289,7 @@ Host-only does not certify gralloc, SurfaceFlinger, game-image quality or perfor
 | `TOTK_POST_SCALE=sgsr` / `fsr`, `TOTK_POST_SHARPNESS=0.2`, `TOTK_POST_SGSR_SHARPNESS=2` | Existing whole-canvas alternatives, Duo device-tested; bypassed for effective native UI. Scene SGSR shares the SGSR controls without filtering UI. |
 | `TOTK_POST_SGSR_EDGE_THRESHOLD`, `TOTK_POST_SGSR_EDGE_DIRECTION=1`, `TOTK_POST_AA=smaa` / `off` | Existing opt-in filter/control variants; host pixel coverage, no separate integrated device qualification. |
 | `TOTK_OVERLAY=off` / `fps` / `full`, `TOTK_OVERLAY_POS=tl` / `tr` / `bl` / `br`, `TOTK_OVERLAY_POWER=1` | Compact fixed-layout FPS/resolution/mode and active-FG telemetry; power/temperature opt-in, default off. Release off, development full; host pixels/timings, no inferred device benefit. |
+| `TOTK_MAP_WARN=1` | Experimental, default off: five-second background process-map warning, including with the performance overlay off. Logs at 80%, notice at 88%, clears below 84%; warning only, not a map-growth fix. See [Process map-limit warning](#process-map-limit-warning-experimental-default-off). |
 | `TOTK_FRAMEGEN_DIAG=1`, `TOTK_PRESENT_CADENCE_TRACE=1`, `TOTK_FRAME_TIMELINE=1` | Qualification-only diagnostics; Thor/Odin evidence, trace measurably perturbs Thor. Slot-exhaustion snapshots require DIAG. Never use a traced arm as ordinary-play timing. |
 | `TOTK_FRAMEGEN_WRITER_DIAG=1`, `TOTK_FRAMEGEN_UNCERTIFIED_PLANE=1`, `TOTK_FRAMEGEN_UNKNOWN_PERCENT`, `TOTK_FRAMEGEN_DUMP=<frame>`, `TOTK_VK_PASS_PROFILE`, `TOTK_VK_PASS_DUMP`, `TOTK_INPUT_FILE` | Diagnostic or experimental proof controls, off by default except the unchanged35% unknown-depth ceiling; host coverage, no new device-safe/performance qualification. Uncertified plane is explicitly not a geometric proof; changing the coverage ceiling is not a quality guarantee. |
 | `TOTK_FRAMEGEN_BACKPRESSURE=0` | Diagnostic-only unsafe async control; not a play recommendation. |
@@ -1452,6 +1461,95 @@ Repeat with `TOTK_XLATE_ONDEVICE=0` and without the packaged binary: both must p
 Device measurements are not implied by the host test, and no on-device draw, timing, CPU or RSS result is claimed
 without that run.
 
+## Process map-limit warning (experimental, default off)
+
+`TOTK_MAP_WARN=1` starts process-map counting on the existing nice+10 `totk-vmascan` worker,
+independently of `TOTK_FRAME_LAG`. The first sample is about five seconds after startup; subsequent
+samples are spaced by about five seconds plus scan time. The game/render/present threads and signal
+handlers do not scan for this feature. Warning-only scans take no pool, runtime or tracker locks.
+The existing opt-in lag budget/classification paths retain their locks and policy.
+With the switch absent or not exactly `1`, `2` or `3`, this feature starts no worker, adds no scans and displays
+no notice; presentation checks one cached enable flag.
+
+At **80%** of `vm.max_map_count`, log once. At **88%**, show a persistent small notice in the
+configured overlay corner (top-right by default), even with `TOTK_OVERLAY=off`:
+
+```text
+MAP LIMIT NEAR
+SAVE AND RESTART GAME SOON
+```
+
+The notice clears strictly below **84%**. Each threshold logs once per process, not every scan or
+re-crossing. An unreadable/zero maps count clears the notice and logs its unavailability once; a later
+valid sample resumes evaluation. If the kernel limit is unreadable, assume **65,530** (as on the
+Android 13 Thor). Samples are approximate and can miss a fast rise between scans. This is not a fix
+for map growth and cannot guarantee enough time to save. It never changes mappings, protections,
+tracker admission or game state.
+
+Startup-only test controls (integer percentages **1..100**):
+
+| Environment | Default |
+| --- | --- |
+| `TOTK_MAP_WARN_LOG_PERCENT` | `80` |
+| `TOTK_MAP_WARN_NOTICE_PERCENT` | `88` |
+| `TOTK_MAP_WARN_CLEAR_PERCENT` | `84` |
+
+Require `LOG <= CLEAR < NOTICE`; invalid ordering restores all defaults, and invalid individual
+values restore that value's default with a diagnostic. `TOTK_VMA_SCAN_MS` still governs the existing
+lag/classification work, not the warning's independent five-second deadline.
+
+### Scan attribution (`TOTK_MAP_WARN=2`, diagnostic only)
+
+`2` keeps `1`'s warning thresholds, sampling cadence and policy, and adds one fixed-format, bounded
+`[map-warn-scan]` line per completed worker traversal, written only by `totk-vmascan`:
+`start_ns`, `duration_us`, `rows`, `frame_origin_ns`, `warn`, `notice`, `test_phase`, `log`, `show`, `clear`.
+`start_ns` is absolute `CLOCK_MONOTONIC` nanoseconds, the same clock as ordinary native frame
+reports; `frame_origin_ns` is their existing process origin (`g_t0_ns`). Convert to ordinary elapsed
+seconds with `(start_ns - frame_origin_ns) / 1e9`. Zero origin means unavailable in a graphics-only
+host, not a valid conversion anchor. Duration is truncated to whole microseconds and covers traversal
+and sysctl read (plus existing lag/classification work if reused), excluding warning/logging, telemetry
+and sleep. `rows=0` denotes an unknown count.
+
+With lag/classification off this is at most one line per five-second warning scan (about 0.2 Hz).
+Existing independently requested lag/classification scans also get a line; their unchanged minimum
+period is one second. No per-row or per-frame logging is added. `warn=1` marks a warning-policy sample.
+`1` remains quiet except its one-shot threshold/read-failure logs; neither `1` nor off adds trace reads.
+Use `2`, not `3`, for standing performance attribution. Logging itself can perturb timing. Match real
+scan intervals, not modulo-five-second phases or log-delivery timestamps; ordinary long-frame rows
+are delayed/rounded sparse observations, and window maxima have no within-window event timestamp.
+
+### Same-process clear check (`TOTK_MAP_WARN=3`, TEST ONLY)
+
+`3` includes per-scan tracing and deliberately replaces **all three percentage overrides** with this
+fixed sequence on the ordinary five-second warning samples, preserving actual counts and policy state:
+
+| Warning sample | Log / notice / clear percentages | Expected notice with a stable count between 3% and 99% |
+| --- | --- | --- |
+| 1..12 (about 5..60 s after worker start) | `1 / 3 / 2` | Show |
+| 13..24 (about 65..120 s) | `1 / 100 / 2` | Hold the already-shown notice, below the new notice threshold |
+| 25 onward (about 125 s onward) | `1 / 100 / 99` | Clear below the raised clear threshold |
+
+The times include additional scan/scheduling delays; trust `warn=1` and `test_phase=1/2/3` records,
+not a wall-clock countdown. Unknown counts still clear with the normal once-only diagnostic.
+No maps are added/removed, no protections are changed, no count is fabricated, and no notice bit is
+forced. This verifies the real policy-to-overlay hold/clear path after **test threshold changes**;
+it does not prove that real map growth reverses or that a count crossed the production 84% boundary.
+Do not use `3` for ordinary play: its final thresholds intentionally suppress the normal 88% warning.
+Restart with `1` (remove percentage overrides) for the ordinary opt-in warning, or unset it to disable.
+
+The original Thor check observed the notice and default-off behavior, but did not observe a natural
+clear and could not attribute long frames to individual scans. These diagnostic modes enable those
+follow-up checks; they are not themselves a device qualification or a crash-prevention claim.
+
+For safe Thor display verification, use `TOTK_MAP_WARN=1` and percentages `1` / `3` / `2`
+(log / notice / clear), `TOTK_FRAME_LAG=0`, `TOTK_OVERLAY=off`. Start a normal save and wait for the
+worker sample: the notice should appear once the ordinary process count exceeds 3% of the limit.
+Do not create extra mappings or travel repeatedly toward the real limit. Verify that saving and menu
+input remain usable, and that the notice persists through area/menu transitions and overlay toggles.
+Restart with the switch off: no notice. Remove the three test overrides before ordinary use.
+Host policy/sampler/font-raster checks do not verify Android pixels, Thor scan cost, saving headroom
+or crash prevention.
+
 ## Dev and release builds
 
 `build_android.py` makes a **dev build by default**, including `--runtime-only` and `--apk` rebuilds.
@@ -1517,6 +1615,28 @@ no snapshot and shortcuts return false without reading guest state or synthesizi
 other than exactly `0` retain the existing default-on behavior; an eligible second display is still required.
 This is a startup option, not a live file watcher: edit `totk.env` before restarting the app. `--no-companion`
 instead omits the companion Java and assets at build time and keeps the original `android.app.NativeActivity`.
+
+The companion uses an opaque, non-interactive cover beneath the unchanged Presentation on built-in secondary
+displays by default. Exact `TOTK_COMPANION_COVER=0` in `totk.env` turns it off; unset, `1` and other values keep
+it on. It requires the companion enabled and does nothing for single-screen or external displays.
+Start waits for owner window focus and top-resumed readiness.
+Ordinary touch/game-input reclaim keeps its window-focus guard; separate one-use, token-bound 1000 ms startup recovery
+may front the verified, still-resumed game task after the cover takes top-resumed state. Creation waits for no gesture;
+recovery stays within its deadline and is checked on final UP/CANCEL. Pause, close, competing top-resumed loss, or a
+stale/expired token suppresses it. The cover remains non-focusable and non-interactive.
+
+Tested only with Cocoon: the launcher was stopped in every cover-on launch on Retroid Pocket Duo and AYN Thor.
+Duo launches started from the launcher pooled 28.70 → 29.22 fps and 101 → 40 frames over 50 ms per 24 windows;
+the frame-rate difference is inside the comparison tool's tolerance, while the tool rates the pooled result better.
+Thor launcher CPU use fell from about 27% of one core to about 0.05%, and compositor CPU use from about 19% to
+about 17%, with no frame-rate change (44.80 → 45.32 fps standing; 44.65 → 44.69 fps panning).
+Cover start/finish/refusal/restart/policy/recovery diagnostics use `[TotkCompanion] cover ...` in canonical
+`<game>/totk.log`, independently of Android INFO filtering. The policy line retains the raw startup request:
+`requested=unset effective=true` for an eligible default-on launch, or `requested=0 effective=false` for opt-out.
+The existing `TOTK_LOGCAT=1` opt-in mirrors the file to Android logcat under tag `totk`, where platform filtering may
+still drop INFO; inspect `totk.log`. With the switch off, the native query, disabled CoverSession allocation and
+policy log remain, but no cover activity/window, reclaim or cover lifecycle callback registration occurs.
+Owner stop/dismiss/close and process teardown clean up the cover. This startup setting requires restarting the app.
 
 Startup ordering is deliberate: `TotkActivity.onCreate` first calls `NativeActivity.super.onCreate`, which invokes
 `ANativeActivity_onCreate`; its `start_game` reads `totk.env` synchronously. Only after `super.onCreate` returns does
@@ -1688,7 +1808,7 @@ not game-memory writes or guest-function calls, and require both an enabled comp
 | --- | --- |
 | hearts, extra/gloom hearts, rupees, poes, stamina and battery capacity, current ability, meal effect | GameData flags (`PlayerStatus.*`) of `gmd::GameDataMgr` (`*(main+0x3ad66b0)`), committed values |
 | position, heading | the scene's resident `Player` actor (the `world_survey.c` chain: position `+0x2b4`, rotation `+0x2c0`); `World_PlayerPos` if no actor |
-| map layer | `MapData.CurrentLayer`, corrected by height (below -400 is always the Depths) |
+| map layer | guarded 1.4.3 environment depth line and blended sky-floor/ground-top grids at Link's position; rejected samples fall back to `MapData.CurrentLayer` with the old height correction |
 | inventory, equipped items, unlocked slots, abilities | `Pouch.<Category>.*` arrays, current partition from `*(main+0x3a81678)+0x188` |
 | sages | `PlayerStatus.Companion.<Wind/Fire/Water/Electric/Soul>.*` |
 | map pins and stamps | `MapData.IconData.MapPinData.*` / `StampData.*` |
@@ -1701,6 +1821,37 @@ rather than mixed values if they move again; a field whose read fails or does no
 identifiers, counts and indexes are bounded) is left out. Without a readable pouch partition the inventory is left out
 instead of guessing one. Values the game queued but has not committed yet appear one update later. Current stamina
 and current battery charge are not in GameData and are not shown.
+
+The layer reader traverses `*(main+0x3a83968)` → environment `+0xb8`, parameter owner `+0x28` → local parameters
+`+0x150`, and grids `+0x218`. It compares the environment's depth/sky vtable slots with the expected 1.4.3 addresses;
+it never calls them. The contributor notes that the game can resolve these parameters through an override chain when
+bit 0 of flags `+0x126..+0x128` is clear. This reader uses the plain values without reading those flags or following
+the chain. On the tested Thor surface scene (Hateno), flags `01,01,00` and the plain values gave the correct Ground
+layer; our earlier all-three-bit guard rejected that normal sample and incorrectly fell back to a stale Sky selection.
+Behaviour where an override differs from the plain value remains untested. The contributor's code does not map each
+flag byte to a specific parameter, so no such mapping is assumed here.
+Depth numerator values must be finite, the denominator finite and positive, and the resulting ratio finite; the sky
+band must be finite and positive. Missing/invalid parameters return no answer (there is no constant 150 m band fallback). Actor and
+`World_PlayerPos` fallback positions obey the same finite ±8000 m bounds; grid axes are clamped before integer casts.
+After sampling it re-reads the manager, environment/vtable, owner, parameter and grid pointers plus sampled grid
+header/data pointers and dimensions. Any replacement rejects the computed layer. This cannot detect all in-place
+updates or ABA and does not make reads synchronized. Fallback uses the last selected map layer, forcing Depths
+below −400 m and correcting a stale Depths selection to Ground above −100 m.
+
+The fallback log is rate-limited globally to one line per 60 seconds on the snapshot caller (the companion poller),
+with a fixed reason class: `validation` (bad values/type expectation), `unreadable` (missing/unreadable required data)
+or `changed` (a revalidated pointer or dimension differed). This is not the diagnostic branch's raw-value/reason-code
+logger. Computed-layer changes are still logged, so field logs can distinguish engagement from repeated fallback.
+
+Position JSON uses nine significant digits to round-trip each guest float. Java recovers those floats before
+computing x, −z and `y - 105.5f`, then truncates toward zero for display. `tests/test_companion_map.py` runs the
+native ASan/UBSan fixture (invalid parameters, plain values with clear flag bits, pointer replacements and fallback positions), parses its
+actual JSON through the production `Snapshot` on a host JVM, and drives the production cache/viewport bodies with
+deterministic framework doubles. It needs JDK 17+ and a host `org.json` jar (`COMPANION_JSON_JAR`, or Gradle's cache).
+It covers stationary overview/detail convergence, the 500 px LOD boundary, all layers, cold/missing/oversized images
+and the common resize lock. It does not qualify real Android bitmap pressure or terrain semantics on a device.
+The exact per-memory-class cache budgets and oversized-image exception are in
+[the companion reference](../../../docs/companion.md#bitmap-memory-limits).
 
 `TOTK_COMPANION_LOG=1` in `totk.env` logs each status change and the first full ready snapshot to `totk.log` (to check
 a device or save without looking at the second screen). The reader's host test lays out a fake 1.4.3 `main`,
@@ -1747,6 +1898,50 @@ the script checks `run-as` before creating an export and reports the limitation 
 To export data while preserving it, install a dev APK signed with the same key over the release APK **without
 uninstalling**, run the export, then install the release APK again if wanted. Do not uninstall between builds: that
 deletes app data, including saves. Both builds must use the same signing key for an in-place update.
+`cache-import FILE...` only stages public import files and still works with a release APK; it does not use `run-as`.
+Keep each exported cache's original basename: the suffix, not the host's environment, identifies its shader-policy arm.
+
+### November 11 list-only shader update
+
+The current list adds 301 applicable V rows from MacNativeGames `a8ff9bc429bf451dd1040807c6dae6fa2a0cba55`,
+selected through switch2mac's engine pin. `UPSTREAM_MERGE.md` records the exact provenance, exclusions
+and previous import. All existing R/S/C and V rows remain; no upstream packed R or A/B/T/S rows are imported.
+The list digest is now `9b00d9a9083df6d2d8667969f9b105192851fd7e52d7fa93874ff0a7e5eb90b9`.
+The October 27 identity/count tables below are historical, not the identity of this refreshed list.
+
+Installing an updated APK alone keeps an already completed seed usable: there is no automatic
+shader-list epoch gate in `InstallState`. Use the setup UI's explicit shader rebuild to gain the
+new coverage; it rebuilds the full default-plus-listed seed from the player's existing game files,
+not just the added rows. The changed digest prevents reuse of an interrupted old-list preparation.
+The translation chain remains `totk-native-v5-unverified`; no translator update or forced cache wipe
+is part of this data refresh. Driver pipeline caches are keyed by driver/TU_DEBUG/Vulkan identity,
+not the APK/list digest. Seed-bound warm-run comparisons must nevertheless use the same rebuilt seed;
+new variants/pipelines can still need first-use work. Preserve saves and never uninstall to refresh.
+For desktop-generated seeds, retain existing exact loose variant names and use explicit `--shaders`
+as described below; these host measurements do not replace that retention/deployment gate.
+
+Fresh host runs of the production Android C seed stage (four services, current-source isolated
+Linux Vulkan translator, same authenticated 1.4.3 inputs) measure:
+
+| Quantity | Before | Refreshed |
+|---|---:|---:|
+| Default translation requests / completed default variants | 12,456 | 12,456 |
+| Listed translation requests | 24,864 | 25,165 |
+| Completed listed variants after dependency deduplication | 12,327 | 12,576 |
+| SPIR-V modules / total completed variants | 24,783 | 25,032 |
+| Packed bytes | 1,479,997,164 | 1,509,968,940 |
+| Full generation wall time (seconds, one run each) | 37.43 | 40.56 |
+
+That is **249 net modules and 29,971,776 bytes** more, not 301 modules. Both runs have zero
+failed translations; these are not the historical Metal/SPIRV-Cross seed or a retained deployed seed.
+Fresh dependency deduplication selects two different listed representative names; their old SPIR-V
+and reflection bytes have identical same-key replacements. Desktop deployment must still retain
+persisted exact names. Host timings are observations, not phone update-time estimates or a controlled
+performance benchmark. Source/prebuilt translators, installed seeds and caches were not replaced.
+
+Device qualification remains required: time the update's cold full shader rebuild and scratch/storage
+cost, compare first-use hitches on the same cold-area route, and inspect the picture (depth/alpha,
+textures, effects and UI). No steady-state FPS gain or hitch elimination is promised.
 
 ### Refresh the shader seed after the October 27 upstream additions
 
@@ -3935,6 +4130,7 @@ HUD/sky through load, static, pan and reload; unchanged save behavior is not yet
 | `TOTK_VK_CHUNK_DRAWS` | `75` by default; `600` when resolved lag is on and native VMA pressure is absent | Explicit positive value or `0` wins (`0` disables automatic chunking). The resolved startup policy is logged once. |
 | `TOTK_VK_SPLIT_PASS_DRAWS` | `0` (off) | `n > 0` ends a still-open pass after `n` draws, submits that part through the chunk path and reopens the same targets with `loadOp=LOAD`. Each split adds a store and load of every attachment on tiled GPUs; try 512 or 256 and read `[split-pass]` every 300 presents (VULKAN.md). |
 | `TOTK_VK_REC_THREADS` | `2` on Android; `0` on other platforms | Explicit `0` keeps the synchronous recorder for A/B; positive overrides select up to four workers. `TOTK_VK_GPU_PROFILE` retains workers, including when pass sampling is enabled; other diagnostic guards still force inline recording. Keep profiler and sample/statistics settings fixed when comparing worker counts (VULKAN.md). |
+| `TOTK_VK_REC_ONE_PRIMARY` | `0` (off) | Experimental, startup-only: exact `1` records each submitted chunk into one main command buffer instead of one per render pass. Auxiliary command buffers retain their order; diagnostic fallbacks and recorder details are documented in VULKAN.md. |
 | `TOTK_VK_GPU_PROFILE` | `0` (off) | `1` collects pass-part timings with recorder workers; `2` also logs every split; `3` also retains a per-frame ring and dumps every over-threshold frame's observed passes. Every 300-frame window writes schema-3 aggregates by exact key + scene reference + scene role; ordinal `0` means all frame ordinals. Without `GPU_PROFILE_SAMPLE`, every pass is timed as before. Absolute areas remain available for driver joins and DRS-aware families (VULKAN.md). Compare profiling-off/on separately before interpreting performance. |
 | `TOTK_VK_GPU_PROFILE_SAMPLE` | `0` (full profiling unchanged) | With `GPU_PROFILE=1/2/3`, a strict positive integer `1`–`16` limits timestamped/statistics-enabled pass parts per frame; recommended **`2`**, initially with stats off. Deterministic ordinal rotation retains all observed keys, draws and scene metadata. Each frame also has one completion-accurate whole-main-frame timestamp pair; actual profiler-owned `vkCmdWriteTimestamp2` `timestamp_count` (including deferred assembly ends, excluding independent game reports) is at most `2k+2`, without pre/slot envelopes. If Android has already submitted the final command buffer before CPU present, SAMPLE adds **one small marker-only main submission** for the real end timestamp; the query-count bound still holds, but that extra submission has explicit cost. Pass `gpu_ms` is sampled-only, never an extrapolated total. Use the analyzer's whole-interval coverage, sampled mean and histogram percentiles; absent/`0` keeps the old full mode. |
 | `TOTK_VK_GPU_PROFILE_PIPELINES` | `0` (off) | With `GPU_PROFILE=1/2/3`, `1`–`16` adds at most `2k` GPU timestamp writes/frame for contiguous actual-pipeline + full VS/FS-variant groups (compute separate), independently of pass sampling. Start with `GPU_PROFILE=1 SAMPLE=2 PIPELINES=4 STATS=0`. Default output is sampled-key 300-frame compact windows with interned exact variants, actual inclusion weights and explicit coverage/loss; global per-frame JSON rows are suppressed, pass/window aggregates remain. Estimates are withheld on true loss/missing authority. Calibrate off/on with the same APK in ABBA order (VULKAN.md). |
@@ -4944,7 +5140,62 @@ pass-start clears, and `TOTK_VK_STORE_CLEAR=1` also skips stores proven dead bef
 first option). Neither has device measurements yet; extra pass boundaries can cost more than they save. See
 [VULKAN.md](VULKAN.md#opt-in-attachment-work-reductions-device-measurement-pending) for the counters and A/B procedure.
 
+### Missing vertex outputs and experimental NaN min/max
+
+PR #43 supplies `(0,0,0,1)` for fragment input locations absent from their paired vertex shader,
+targeting wind/air-flow white boxes (issue #4). `TOTK_VK_VARYING_FIX` is startup-only, default **on**;
+exact `=0` keeps the old modules and avoids the IO-classification walk and its allocations.
+`TOTK_VK_NAN_MINMAX=1` separately opts into **default-off experimental** NMin/NMax/NClamp replacement
+in every loaded VS/FS/CS containing a targeted GLSL instruction. It is not necessary to enable the varying
+fix. Guest special-value equivalence and Adreno driver cost need separate qualification.
+
+Both policies change only runtime module bytes. Shader-list identifiers, variants, reflection and pack
+bytes stay unchanged: **no full shader rebuild**. Cache names append `.vary-v1` when the varying fix is
+on, then `.nan-v1` only for the NaN experiment. Explicit cache/import paths and `.pso-state` completion
+files use the same namespace. Existing completed prewarm state does not skip the new arm's modules.
+On first use, a context-matched predecessor's driver cache is merged before compilation workers start,
+without modifying that predecessor. Prewarm rechecks keys: unchanged cache hits become ready before
+play and are logged as `cache_hits`; only misses (including changed modules) need compilation.
+No old completion bits are copied. Missing/corrupt caches or a driver/device/context change fall back
+to cold warming, not stale entries. NaN and integer-fold switch chains follow the same rule.
+Old namespaces remain available for downgrade. The immediate predecessor costs about one extra
+29 MiB cache on the observed Thor case. After successful new cache save/prewarm, manually remove
+only known older-than-predecessor cache/metadata in its directory; retain the predecessor for rollback.
+No automatic deletion of ambiguous older/explicit files occurs. See VULKAN.md for admission/retention.
+
+Pair rewrites share the ordinary module postprocessing chain, including integer folding. Workers reread
+owned seed payloads using thread-safe seed IO and atomic accounting; seed warming does not permanently
+retain consumed words. Additional retained SPIR-V source budget is **0 bytes**. Patched driver modules
+and encounter-bounded per-pair records live for the session (64-byte records on the 64-bit target,
+excluding allocator overhead); there is no record eviction, fixed RSS cap or driver-memory bound.
+Statistics read independent atomic totals and never join module creation. A new cache-only pipeline
+probe uses a nonblocking lookup and defers missing/in-flight replacement modules to the ordinary
+compile-required path: it does no seed IO, SPIR-V rewriting or shader-module driver call.
+Actual capture/worker-disabled synchronous builds can still build or join the exact interface and
+wait for its storage/driver work, with no proved wall-time bound. Different interface creation does
+not hold the short lookup/publication lock, and ready-pipeline draws never enter this helper.
+At most 40 pair-detail lines report cumulative `session shader_pairs patched=N fallback=M`; changed
+totals are also reported at the existing IO-stat cadence and normal exit. Fallback retains old behavior,
+not a successful repair. Device acceptance needs nonzero patches and an explanation for any fallback,
+wind/burning-grass pictures, ordinary water/particle/menu checks, first-launch prewarm timing and a
+matched restart O/B/B/O frame-time quartet. No such device evidence is claimed by host tests.
+
 ### Packed shader IO and learned demand warming
+
+Exact integer shader-address folding is now on by default. For an unfurled A/B control, put
+`TOTK_VK_INT_FOLD=0` in `totk.env` and restart; removing it restores the default. It is read once
+and logs `requested=... effective=... (startup-only)` once. Floating-point math/NaN guards are unchanged.
+The loader folds the original seed SPIR-V immediately before creating each Vulkan shader module.
+Shared guest/bind-state variant hashes, `.vk` reflection, `.vv` indexes, `seed-id.txt` and `seed.vkpack`
+do not change; existing packs and newly prepared seeds work in both arms. Do not pre-fold the seed.
+No full shader rebuild/import is required for this update, and the APK does not bundle game-derived packs.
+The enabled arm uses `.intfold-v1` driver-pipeline, prewarm/import, compute-history and learned-IO
+namespaces; explicit paths and alternate seeds are isolated too. An absent namespace can now seed
+driver entries from same-seed/position policy siblings with a fully matching context. Prewarm completion
+is still isolated; startup cache-only hits avoid re-compilation/first-demand takeovers for unchanged
+pipelines. Unavailable/context-mismatched sources stay cold. Old files are not modified or deleted;
+the retention/manual-cleanup rule above applies.
+
 
 Android now defaults to indexed seed IO (`TOTK_VK_SEED_IO=0` retains legacy loose IO for diagnosis).
 The build machine, not the APK or device, translates the user's own verified RomFS with
@@ -5527,9 +5778,28 @@ capture-correctness rule. Dimension-based policy is conservative inference, not 
 lifetime oracle: verify persistent Gerudo lighting and actual target traces before attributing
 a capture-sync label to a real cached probe.
 
-The cache lives in the app's private storage (`state/vk-pipeline-cache.bin`) and grows as you play.
-`sh install_app.sh cache-export` copies it to the computer; `sh install_app.sh cache-import FILE` gives it to the app
-(on this or another device), which merges it at its next start and renames the file to `vk-pipeline-cache.bin.imported`.
+At the standard base, the cache grows in private app storage as `state/vk-pipeline-cache.bin<namespace>`.
+Default-on integer folding appends `.intfold-v1`, default-on varying correction appends `.vary-v1`,
+and opt-in NaN min/max appends `.nan-v1`, in that order; each disabled policy omits its suffix.
+An alternate seed's folder/content hash and any `.pos-v1-10`, `.pos-v1-01` or `.pos-v1-11` precision suffix
+come first. `sh install_app.sh cache-export` copies **all existing recognized cache names** from private
+`files/state` into a new `cache-export-<date>-<pid>/` folder on the computer. Basenames and bytes, including the
+context envelope, stay unchanged; stale/imported/temp files and graphics-key/resume sidecars are not exported.
+
+`sh install_app.sh cache-import FILE...` stages one or more such files in the standard external game folder,
+under each file's **unchanged basename**, including on a release APK. The runtime consumes only its exact selected
+namespace, validates context, and renames a successfully merged file to `<selected path>.imported`.
+An opposite rewrite arm is left unconsumed and never promoted into the selected arm. Startup warnings discover
+only some opposite integer-fold filenames; they are advisory, not an exhaustive inventory of other policy arms.
+The script does not infer the phone's configuration from host variables or execute `totk.env`. It accepts only the
+standard basename grammar, including seed/position/integer-fold/varying/NaN suffixes. Timestamp-renamed old exports
+have lost that filename provenance and are refused; never relabel another arm's cache, even for the same driver.
+
+These convenience handlers cover the standard private cache and external import bases. Custom
+`TOTK_VK_PIPELINE_CACHE` / `TOTK_VK_PIPELINE_CACHE_IMPORT` bases or another selected game-data folder still require
+manual transfer to the runtime-selected full paths, retaining the complete seed/position/fold namespace. No automatic
+path discovery or compatibility fallback is promised for those overrides.
+
 Both primary and import paths validate the same **app context envelope**: exact effective `TU_DEBUG` string
 (unset and empty normalize to empty), SHA256 of the actual private copied `driver.so` when selected, and
 the opaque Vulkan payload's vendor/device/cache UUID. Context is captured after `totk.env`, the A722 default
@@ -5637,8 +5907,9 @@ MAY-read is conservative, not a shader texel-fetch measurement; double-buffered 
 neither transience nor history. No half/quarter classification relaxation follows merely from dimensions.
 No extra game-derived seed/cache payload is required by this change. The APK carries the native saver code; existing
 shader provisioning remains `sh install_app.sh data` (or `data-packed` with its existing packed-seed prerequisites).
-The cache is learned in private app storage; optional same-driver `cache-import FILE` remains supported. Never commit
-or redistribute the generated cache/seed/game data with this code.
+The cache is learned in private app storage; optional same-driver `cache-import FILE...` remains supported at the
+standard import base, preserving each exported namespace basename as described above. Never commit or redistribute
+the generated cache/seed/game data with this code.
 
 `TOTK_PSO_COLLECT=1` records all successful graphics pipeline keys (screen, capture, async and
 cache hits) off the render thread through the existing pcache saver. Collections are portable

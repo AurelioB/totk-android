@@ -19,7 +19,7 @@ enum { FT_RING = 1024, FT_WALKS = 32, FT_SLOTS = 64 };
     X(GUARD_REGS, guard_regs) X(PIPE_CREATES, pipe_creates) X(DESC_CREATES, desc_creates) \
     X(TEX_UPLOADS, tex_uploads) X(TEX_REALIZATIONS, tex_realizations) \
     X(CPU_STEPS, cpu_steps) X(REC_S_NS, rec_s_ns) X(REC_P_NS, rec_p_ns) \
-    X(REC_O_NS, rec_o_ns) X(REC_SAMPLES, rec_samples)
+    X(REC_O_NS, rec_o_ns) X(REC_SAMPLES, rec_samples) X(REC_WALL_NS, rec_wall_ns)
 #define FT_COUNTER_ENUM(symbol, label) FT_COUNT_##symbol,
 enum totk_ft_counter { FT_COUNTERS(FT_COUNTER_ENUM) FT_COUNT_N };
 #undef FT_COUNTER_ENUM
@@ -65,6 +65,11 @@ static inline int totk_ft_on(void) {
     int on = atomic_load_explicit(&totk_ft_enabled, memory_order_acquire);
     return on < 0 ? totk_ft_init() : on;
 }
+/* Steady-state admission only: never initialize the diagnostic or touch TLS.
+ * Use once to guard a new optional region, not once per field in that region. */
+static inline int totk_ft_cached_on(void) {
+    return atomic_load_explicit(&totk_ft_enabled, memory_order_relaxed) > 0;
+}
 static inline uint64_t totk_ft_now(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
@@ -85,6 +90,9 @@ static inline void totk_ft_count(enum totk_ft_counter counter, uint64_t n) {
 void totk_ft_work_begin(uint64_t frame);
 void totk_ft_work_end(void);
 void totk_ft_count_frame(uint64_t frame, enum totk_ft_counter counter, uint64_t n);
+/* Joined recorder-worker totals: one publication per assembled slot, or TLS
+ * accumulation when that slot is assembled inside its originating walk. */
+void totk_ft_recorded(uint64_t frame, uint64_t draws, uint64_t descriptors);
 void runtime_frame_timeline_walking(void);
 /* Called after state formation; frame is captured before releasing inputLock.
  * Per-sender TLS groups are consumed at main->walking WaitForAddress wake.
@@ -117,9 +125,16 @@ void totk_ft_present(uint64_t frame, uint64_t target, uint64_t now);
 int totk_ft_snapshot(uint64_t frame, totk_ft_record *out);
 #include <stdio.h>
 void totk_ft_test_report(FILE *out, uint64_t first, uint64_t last);
+void totk_ft_test_hold(uint64_t frame);
+void totk_ft_test_release(uint64_t frame);
+uint64_t totk_ft_test_dropped(void);
+enum totk_ft_test_probe { FT_TEST_WALK_WALL, FT_TEST_ASSEMBLY_WORK, FT_TEST_PROBES };
+void totk_ft_test_probe_hit(enum totk_ft_test_probe probe);
+uint64_t totk_ft_test_probe_hits(enum totk_ft_test_probe probe);
 #endif
 #else
 static inline int totk_ft_on(void) { return 0; }
+static inline int totk_ft_cached_on(void) { return 0; }
 static inline uint64_t totk_ft_now(void) { return 0; }
 static inline uint64_t totk_ft_current(void) { return 0; }
 static inline void runtime_frame_timeline_walking(void) {}
@@ -128,6 +143,7 @@ static inline uint64_t totk_ft_work_frame(void) { return 0; }
 #define totk_ft_work_begin(...) ((void)0)
 #define totk_ft_work_end(...) ((void)0)
 #define totk_ft_count_frame(...) ((void)0)
+#define totk_ft_recorded(...) ((void)0)
 #define totk_ft_acquire_wait(...) ((void)0)
 #define totk_ft_input_read(...) ((void)0)
 #define totk_ft_input_take(...) ((void)0)

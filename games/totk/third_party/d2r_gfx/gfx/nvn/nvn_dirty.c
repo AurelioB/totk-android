@@ -7,6 +7,7 @@
 // (measured: the game writes streamed assets into texture storage that is still being sampled, without re-registering).
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
 #include "nvn_dirty.h"
+#include "nvn_map_warn.h"
 #include "../../host/dm.h"
 #include <stdatomic.h>
 #include <pthread.h>
@@ -39,6 +40,8 @@
 // BUSY lasts at most one mprotect (plus the atomic page-state updates). The wait has an upper limit BUSY_WAIT_MS:
 // in the page-fault handler, exceeding it returns "not our page" and lets the crash handler report the crash truthfully instead of spinning silently. The wait only reads atomics and takes no lock.
 enum { PG_NONE = 0, PG_PROT = 1, PG_BUSY = 2 };
+/* A private-alias GPU store also owns PG_BUSY, but leaves the guest mapping read-only throughout:
+   PG_PROT -> PG_BUSY -> PG_PROT without permission changes or CPU-generation publication. */
 enum { WATCH_EXACT = 1, WATCH_TEXTURE = 2 }; /* retained in the existing per-page exact byte */
 enum { BUSY_WAIT_MS = 2000 };
 // 跟踪区间 = 各内存池（MemoryPoolInitialize 登记）。池销毁后复用 live=0 的槽，信号处理里无锁扫描。
@@ -287,6 +290,81 @@ static _Atomic unsigned g_vma_requests;
 static _Atomic uint64_t g_vma_epoch = UINT64_MAX;
 enum { VMA_EPOCH = 1, VMA_CLASSES = 2 };
 static void vma_start(void);
+/* Startup-only configuration; immutable before the shared worker is created. The notice is
+   the only publication consumed by presentation. Warning-only scans take no tracker locks. */
+static pthread_once_t g_map_warn_once = PTHREAD_ONCE_INIT;
+static int g_map_warn_enabled;
+static unsigned g_map_warn_mode, g_map_warn_test_samples;
+/* Startup publication from the runtime's immutable ordinary-frame CLOCK_MONOTONIC origin.
+   Zero means no runtime origin was supplied (graphics-only hosts); traces never invent one. */
+static _Atomic uint64_t g_map_warn_frame_origin;
+static nvn_map_warn_thresholds g_map_warn_thresholds = {80, 88, 84};
+static nvn_map_warn_state g_map_warn_state;
+static _Atomic int g_map_warn_notice;
+enum { MAP_WARN_PERIOD_MS = 5000 };
+static unsigned map_warn_percent(const char *name, unsigned fallback) {
+    const char *value = getenv(name);
+    if (!value) return fallback;
+    char *end; errno = 0; unsigned long parsed = strtoul(value, &end, 10);
+    if (!*value || *end || errno || parsed < 1 || parsed > 100) {
+        LOG("[map-warn] invalid %s; using %u percent", name, fallback);
+        return fallback;
+    }
+    return (unsigned)parsed;
+}
+static void map_warn_configure(void) {
+    const char *value = getenv("TOTK_MAP_WARN");
+    g_map_warn_mode = value && !strcmp(value, "1") ? 1 :
+                      value && !strcmp(value, "2") ? 2 : value && !strcmp(value, "3") ? 3 : 0;
+    g_map_warn_enabled = g_map_warn_mode != 0;
+    if (!g_map_warn_enabled) return;
+    if (g_map_warn_mode == 3) {
+        g_map_warn_thresholds = nvn_map_warn_test_thresholds(1);
+        return; /* Fixed test sequence deliberately ignores startup percentage overrides. */
+    }
+    nvn_map_warn_thresholds t = {
+        map_warn_percent("TOTK_MAP_WARN_LOG_PERCENT", 80),
+        map_warn_percent("TOTK_MAP_WARN_NOTICE_PERCENT", 88),
+        map_warn_percent("TOTK_MAP_WARN_CLEAR_PERCENT", 84)
+    };
+    if (t.log_percent > t.clear_percent || t.clear_percent >= t.notice_percent) {
+        LOG("[map-warn] thresholds require log <= clear < notice; using 80/84/88 percent");
+        return;
+    }
+    g_map_warn_thresholds = t;
+}
+void nvn_dirty_map_warn_set_frame_origin(uint64_t origin_ns) {
+    pthread_once(&g_map_warn_once, map_warn_configure);
+    if (g_map_warn_mode >= 2)
+        atomic_store_explicit(&g_map_warn_frame_origin, origin_ns, memory_order_relaxed);
+}
+int nvn_dirty_map_warn_init(void) {
+    pthread_once(&g_map_warn_once, map_warn_configure);
+    if (g_map_warn_enabled) pthread_once(&g_vma_once, vma_start);
+    return g_map_warn_enabled;
+}
+int nvn_dirty_map_warn_notice(void) {
+    return atomic_load_explicit(&g_map_warn_notice, memory_order_relaxed);
+}
+static void map_warn_sample(uint64_t count, uint64_t maximum) {
+    /* Called only by totk-vmascan, never by vma_sample's synchronous lag callers. */
+    if (!maximum) maximum = 65530;
+    if (g_map_warn_mode == 3) {
+        if (g_map_warn_test_samples < 2 * NVN_MAP_WARN_TEST_PHASE_SAMPLES + 1) g_map_warn_test_samples++;
+        g_map_warn_thresholds = nvn_map_warn_test_thresholds(g_map_warn_test_samples);
+    }
+    nvn_map_warn_result result = nvn_map_warn_step(g_map_warn_state, count, maximum, g_map_warn_thresholds);
+    g_map_warn_state = result.state;
+    atomic_store_explicit(&g_map_warn_notice, result.state.notice, memory_order_relaxed);
+    if (result.logs & NVN_MAP_WARN_LOG_UNKNOWN)
+        LOG("[map-warn] maps count unavailable; no notice until a valid sample");
+    if (result.logs & NVN_MAP_WARN_LOG_EARLY)
+        LOG("[map-warn] maps %llu/%llu >= %u percent; map limit is approaching",
+            (unsigned long long)count, (unsigned long long)maximum, g_map_warn_thresholds.log_percent);
+    if (result.logs & NVN_MAP_WARN_LOG_NOTICE)
+        LOG("[map-warn] maps %llu/%llu >= %u percent; SAVE AND RESTART GAME SOON",
+            (unsigned long long)count, (unsigned long long)maximum, g_map_warn_thresholds.notice_percent);
+}
 static uint64_t vma_read(const char *path, int lines) {
 #ifdef TOTK_VK_TESTS
     g_vma_test_reads++;
@@ -478,21 +556,56 @@ static void *vma_worker(void *unused) {
     /* Linux nice is per-thread. Failure to lower priority is harmless; never renice the game thread. */
     nice(10);
 #endif
+    uint64_t scan_period = (uint64_t)g_vma_period_ms * 1000000;
+    uint64_t warn_period = (uint64_t)MAP_WARN_PERIOD_MS * 1000000;
+    uint64_t next_scan = vma_clock_ns() + scan_period, next_warn = vma_clock_ns() + warn_period;
     for (;;) {
-        /* End-to-start spacing also covers the first worker scan after the synchronous startup sample.
-           Only this thread sleeps: requests cannot shorten the period or accumulate extra scans. */
-        struct timespec delay = {g_vma_period_ms / 1000, (g_vma_period_ms % 1000) * 1000000L};
+        /* Independent deadlines preserve lag's configured cadence. Requests never advance either.
+           No game/render/present thread scans for this feature, including its startup sample. */
+        uint64_t now = vma_clock_ns(), due = next_scan;
+        if (g_map_warn_enabled && next_warn < due) due = next_warn;
+        uint64_t wait = due > now ? due - now : 0;
+        struct timespec delay = {wait / 1000000000, wait % 1000000000};
         while (nanosleep(&delay, &delay)) if (errno != EINTR) die("VMA sampler sleep: %d", errno);
-        unsigned requests = atomic_exchange_explicit(&g_vma_requests, 0, memory_order_acquire);
-        if (!g_lag_enabled && !requests) continue; /* lag-off diagnostic worker has no periodic scans */
-        uint64_t start = vma_clock_ns();
-        /* Exactly one maps traversal per scheduled scan, even when classification was requested. */
+        now = vma_clock_ns();
+        int scan_due = now >= next_scan, warn_due = g_map_warn_enabled && now >= next_warn;
+        unsigned requests = scan_due ? atomic_exchange_explicit(&g_vma_requests, 0, memory_order_acquire) : 0;
+        int lag_scan = scan_due && (g_lag_enabled || requests);
+        if (scan_due) next_scan = now + scan_period;
+        if (!lag_scan && !warn_due) continue;
+        uint64_t start = vma_clock_ns(), maps = 0, maximum = 0;
+        if (lag_scan) {
+            /* Reuse the existing traversal, including classification when explicitly requested. */
 #ifdef __linux__
-        if (requests & VMA_CLASSES) nvn_dirty_lag_vma_report();
-        else
+            if (requests & VMA_CLASSES) nvn_dirty_lag_vma_report();
+            else
 #endif
-            nvn_dirty_lag_vma_refresh();
+                nvn_dirty_lag_vma_refresh();
+            maps = atomic_load(&g_vma_missing_maps) ? 0 : atomic_load(&g_vma_count);
+            maximum = atomic_load(&g_vma_max);
+        } else {
+            /* No g_vma_mu, g_slot_mu, pool or runtime locks in warning-only sampling. */
+            maps = vma_read("/proc/self/maps", 1);
+            maximum = vma_read("/proc/sys/vm/max_map_count", 0);
+        }
+        /* Trace duration covers traversal/sysctl (and existing lag/classification work), not
+           warning policy/logging, telemetry publication or sleep. Only diagnostic modes read it. */
+        uint64_t scan_elapsed = g_map_warn_mode >= 2 ? vma_clock_ns() - start : 0;
+        if (warn_due) {
+            map_warn_sample(maps, maximum);
+            next_warn = vma_clock_ns() + warn_period;
+        }
+        if (scan_due) next_scan = vma_clock_ns() + scan_period;
         uint64_t elapsed = vma_clock_ns() - start;
+        if (g_map_warn_mode >= 2) {
+            unsigned phase = g_map_warn_mode == 3 ?
+                (g_map_warn_test_samples + NVN_MAP_WARN_TEST_PHASE_SAMPLES - 1) / NVN_MAP_WARN_TEST_PHASE_SAMPLES : 0;
+            LOG("[map-warn-scan] start_ns=%llu duration_us=%llu rows=%llu frame_origin_ns=%llu warn=%d notice=%d test_phase=%u log=%u show=%u clear=%u",
+                (unsigned long long)start, (unsigned long long)(scan_elapsed / 1000),
+                (unsigned long long)maps, (unsigned long long)atomic_load_explicit(&g_map_warn_frame_origin, memory_order_relaxed),
+                warn_due, nvn_dirty_map_warn_notice(), phase, g_map_warn_thresholds.log_percent,
+                g_map_warn_thresholds.notice_percent, g_map_warn_thresholds.clear_percent);
+        }
         pthread_mutex_lock(&g_vma_scan_mu);
         g_vma_scan_stats[0]++;
         g_vma_scan_stats[1] += !!(requests & VMA_EPOCH);
@@ -517,6 +630,7 @@ static unsigned vma_scan_period(const char *period) {
 static void vma_start(void) {
     /* pthread_once makes a clamping diagnostic a startup-only message, never one per scan/request. */
     g_vma_period_ms = vma_scan_period(getenv("TOTK_VMA_SCAN_MS"));
+    pthread_once(&g_map_warn_once, map_warn_configure);
     pthread_attr_t attr;
     if (pthread_attr_init(&attr)) die("VMA sampler thread attributes");
     if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED)) die("VMA sampler detach");
@@ -733,7 +847,9 @@ static void lag_gate_wait(lag_unit_t *u, const range_t *r, uintptr_t index, int 
 #endif
     lag_wait_watchdog(start, &reported, r, index, ticket, host, 1);
 }
-static uint64_t lag_lock_pages(range_t *r, uintptr_t index, int host, uintptr_t watch_first, uintptr_t watch_end, unsigned watch_flags) {
+/* Claim only ownership, without changing permissions or reserving VMA split credit. Alias writers use
+   this directly: even a pressure-triggered lag-only drain would violate their read-only guest contract. */
+static uint64_t lag_lock_gate(range_t *r, uintptr_t index, int host) {
     lag_unit_t *u = &r->lag[index];
     uint64_t old = atomic_load_explicit(&u->gate, memory_order_acquire);
     for (;;) {
@@ -741,24 +857,27 @@ static uint64_t lag_lock_pages(range_t *r, uintptr_t index, int host, uintptr_t 
             lag_gate_wait(u, r, index, host); old = atomic_load_explicit(&u->gate, memory_order_acquire); continue;
         }
         uint64_t busy = (old & ~(uint64_t)LAG_STATE_MASK) | LAG_BUSY;
-        if (atomic_compare_exchange_weak_explicit(&u->gate, &old, busy, memory_order_acquire, memory_order_acquire)) {
-            /* Watch stamps precede this call. Preserve baseline authority before a pressure drain can
-               dirty additional lag-only neighbours; only a real CPU store may revoke these stamps. */
-            for (uintptr_t p = watch_first; p < watch_end; p++) {
-                unsigned old_flags = atomic_load_explicit(&r->exact[p], memory_order_relaxed);
-                atomic_store_explicit(&r->exact[p], old_flags | watch_flags, memory_order_relaxed);
-            }
-            if (!vma_charge(u)) {
-                /* Baseline texture/exact watches must remain valid. Temporary writer/split credit is
-                   not a new lag guard, and is returned when the gate is released. */
-                atomic_fetch_add_explicit(&g_vma_regions, g_unit, memory_order_acq_rel); u->regions += g_unit;
-                lag_wait(old >> 2, host, u, r, index);
-                vma_unprotect_unit(r, index);
-                old &= ~(uint64_t)LAG_STATE_MASK;
-            }
-            return old;
-        }
+        if (atomic_compare_exchange_weak_explicit(&u->gate, &old, busy, memory_order_acquire, memory_order_acquire)) return old;
     }
+}
+static uint64_t lag_lock_pages(range_t *r, uintptr_t index, int host, uintptr_t watch_first, uintptr_t watch_end, unsigned watch_flags) {
+    lag_unit_t *u = &r->lag[index];
+    uint64_t old = lag_lock_gate(r, index, host);
+    /* Watch stamps precede this call. Preserve baseline authority before a pressure drain can
+       dirty additional lag-only neighbours; only a real CPU store may revoke these stamps. */
+    for (uintptr_t p = watch_first; p < watch_end; p++) {
+        unsigned old_flags = atomic_load_explicit(&r->exact[p], memory_order_relaxed);
+        atomic_store_explicit(&r->exact[p], old_flags | watch_flags, memory_order_relaxed);
+    }
+    if (!vma_charge(u)) {
+        /* Baseline texture/exact watches must remain valid. Temporary writer/split credit is
+           not a new lag guard, and is returned when the gate is released. */
+        atomic_fetch_add_explicit(&g_vma_regions, g_unit, memory_order_acq_rel); u->regions += g_unit;
+        lag_wait(old >> 2, host, u, r, index);
+        vma_unprotect_unit(r, index);
+        old &= ~(uint64_t)LAG_STATE_MASK;
+    }
+    return old;
 }
 static uint64_t lag_lock(range_t *r, uintptr_t index, int host) { return lag_lock_pages(r, index, host, 0, 0, 0); }
 static void lag_unlock(range_t *r, uintptr_t index, uint64_t value) {
@@ -1046,10 +1165,11 @@ static void prep_write(void *addr, size_t len) {
 
 /* Writes on behalf of the GPU (a rendering written back into CPU-visible memory): the bytes change without counting as
    a CPU write. Protected pages are taken to BUSY (a guest write meanwhile waits in the fault handler, then faults again
-   and is recorded as usual), made writable, and protected again by nvn_dirty_gpu_write_end with their generation kept.
-   Pages already unprotected are left as they are. Returns a token for nvn_dirty_gpu_write_end (NULL: nothing tracked). */
-typedef struct { range_t *r; uintptr_t p0, p1, u0, nu; uint8_t *was; uint64_t *gates; } gpu_write_tok;
-static void *gpu_write_begin(void *addr, size_t len, int wait, int *ready) {
+   and is recorded as usual). Ordinary stores temporarily unprotect; private-alias stores leave the guest read-only.
+   End restores each taken page to PROT with its generation kept. Pages already unprotected are left as they are.
+   Returns a token for nvn_dirty_gpu_write_end (NULL: nothing tracked). */
+typedef struct { range_t *r; uintptr_t p0, p1, u0, nu; uint8_t *was; uint64_t *gates; int alias; } gpu_write_tok;
+static void *gpu_write_begin(void *addr, size_t len, int wait, int alias, int *ready) {
     *ready = 1;
     if (!len) return NULL;
     range_t *r = find((uintptr_t)addr); if (!r || len > r->end - (uintptr_t)addr) return NULL;
@@ -1058,11 +1178,14 @@ static void *gpu_write_begin(void *addr, size_t len, int wait, int *ready) {
     gpu_write_tok *t = malloc(sizeof *t); uint8_t *was = calloc(p1 - p0 + 1, 1);
     uint64_t *gates = r->lag ? malloc(nu * sizeof *gates) : NULL;
     if (!t || !was || (r->lag && !gates)) { free(t); free(was); free(gates); *ready = 0; return NULL; }
-    *t = (gpu_write_tok){ r, p0, p1, u0, nu, was, gates };
+    *t = (gpu_write_tok){ r, p0, p1, u0, nu, was, gates, alias };
     /* Retain gates through end. Asynchronous texture landing never waits for GPU readers or a BUSY owner:
        unwind and retry at a later sweep instead. The blocking API retains its existing semantics. */
     if (gates) for (uintptr_t i = 0; i < nu; i++) {
-        if (wait) { gates[i] = lag_lock(r, u0 + i, 1); lag_wait(gates[i] >> 2, 1, NULL, r, u0 + i); }
+        if (wait) {
+            gates[i] = alias ? lag_lock_gate(r, u0 + i, 1) : lag_lock(r, u0 + i, 1);
+            lag_wait(gates[i] >> 2, 1, NULL, r, u0 + i);
+        }
         else {
             lag_unit_t *u = &r->lag[u0 + i];
             uint64_t old = atomic_load_explicit(&u->gate, memory_order_acquire);
@@ -1089,7 +1212,7 @@ static void *gpu_write_begin(void *addr, size_t len, int wait, int *ready) {
 #ifdef TOTK_VK_TESTS
     nvn_dirty_test_wb_phase(addr, NVN_DIRTY_TEST_WB_PROTECTED);
 #endif
-    for (uintptr_t p = p0, run = 0, open = 0; p <= p1 + 1; p++) {   /* runs of taken pages: one mprotect each */
+    if (!alias) for (uintptr_t p = p0, run = 0, open = 0; p <= p1 + 1; p++) {   /* runs of taken pages: one mprotect each */
         int w = p <= p1 && was[p - p0];
         if (w && !open) { run = p; open = 1; }
         if (!w && open) { mp(r->base + (run << g_shift), (p - run) << g_shift, PROT_READ | PROT_WRITE, NVN_DIRTY_MP_GPU_WRITE); open = 0; }
@@ -1097,15 +1220,24 @@ static void *gpu_write_begin(void *addr, size_t len, int wait, int *ready) {
     return t;
 }
 void *nvn_dirty_gpu_write_begin(void *addr, size_t len) {
-    int ready; return gpu_write_begin(addr, len, 1, &ready);
+    int ready; return gpu_write_begin(addr, len, 1, 0, &ready);
 }
 int nvn_dirty_gpu_write_try_begin(void *addr, size_t len, void **token) {
-    int ready; *token = gpu_write_begin(addr, len, 0, &ready); return ready;
+    int ready; *token = gpu_write_begin(addr, len, 0, 0, &ready); return ready;
+}
+void *nvn_dirty_gpu_write_alias_begin(void *addr, size_t len) {
+    int ready; return gpu_write_begin(addr, len, 1, 1, &ready);
+}
+int nvn_dirty_gpu_write_alias_try_begin(void *addr, size_t len, void **token) {
+    int ready; *token = gpu_write_begin(addr, len, 0, 1, &ready); return ready;
 }
 void nvn_dirty_gpu_write_end(void *tok) {
     gpu_write_tok *t = tok; if (!t) return;
     int restored = 1;
-    for (uintptr_t p = t->p0, run = 0, open = 0; p <= t->p1 + 1; p++) {
+    if (t->alias) {
+        for (uintptr_t p = t->p0; p <= t->p1; p++)
+            if (t->was[p - t->p0]) atomic_store(&t->r->state[p], PG_PROT);
+    } else for (uintptr_t p = t->p0, run = 0, open = 0; p <= t->p1 + 1; p++) {
         int w = p <= t->p1 && t->was[p - t->p0];
         if (w && !open) { run = p; open = 1; }
         if (!w && open) {
@@ -1121,19 +1253,35 @@ void nvn_dirty_gpu_write_end(void *tok) {
 /* GPU reports/events are implemented with host C stores. A prepare-before-write alone is insufficient: a replay can
    re-arm between the prepare and the actual store (and libc/TSan describes memcpy before its first fault). Keep the
    unit gate through the store itself, restoring only pages that were protected. No token allocation is needed. */
-static int lag_store(void *address, const void *data, size_t len, int add32) {
+static int lag_store(void *address, void *write_address, const void *data, size_t len, int add32, int alias) {
     uintptr_t a = (uintptr_t)address;
+    uint8_t *dst = write_address;
     const uint8_t *src = data;
     while (len) {
         range_t *r = find(a);
         if (!r || !r->lag) {
             size_t n = g_pg ? g_pg - (a & (g_pg - 1)) : len; if (n > len) n = len;
-            if (add32) { uint32_t v; memcpy(&v, (void *)a, 4); v += *(const uint32_t *)src; memcpy((void *)a, &v, 4); return 1; }
-            memcpy((void *)a, src, n); a += n; src += n; len -= n; continue;
+            /* Lag-off still has baseline/exact dirty watches. Claim this guest page while the alias
+               store runs so a CPU fault cannot revoke ownership concurrently; one page needs no token allocation. */
+            uintptr_t p = 0; int taken = 0;
+            if (alias && r) {
+                p = (a - r->base) >> g_shift;
+                for (;;) {
+                    uint8_t st = PG_PROT;
+                    if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { taken = 1; break; }
+                    if (st < PG_BUSY) break;
+                    if (!busy_wait(r, p)) return 0;
+                }
+            }
+            if (add32) { uint32_t v; memcpy(&v, dst, 4); v += *(const uint32_t *)src; memcpy(dst, &v, 4); }
+            else memcpy(dst, src, n);
+            if (taken) atomic_store(&r->state[p], PG_PROT);
+            if (add32) return 1;
+            a += n; dst += n; src += n; len -= n; continue;
         }
         uintptr_t p0 = (a - r->base) >> g_shift, index = p0 / g_unit;
         lag_unit_t *u = &r->lag[index];
-        uint64_t gate = lag_lock(r, index, 1);
+        uint64_t gate = alias ? lag_lock_gate(r, index, 1) : lag_lock(r, index, 1);
         lag_wait(gate >> 2, 1, u, r, index);
         uintptr_t end = unit_addr(r, (index + 1) * g_unit); if (end > r->end) end = r->end;
         size_t n = end - a; if (n > len) n = len;
@@ -1141,25 +1289,31 @@ static int lag_store(void *address, const void *data, size_t len, int add32) {
         for (uintptr_t p = p0; p <= p1; p++) {
             uint8_t st = PG_PROT;
             while (!atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY) && st >= PG_BUSY) {
-                if (!busy_wait(r, p)) { lag_unlock(r, index, gate); return 0; }
+                if (!busy_wait(r, p)) {
+                    /* Permission changes have not started. Earlier BUSY pages are ours; leave the
+                       timed-out page with its original owner and unwind only our successful claims. */
+                    for (uintptr_t q = p0; q < p; q++)
+                        if (atomic_load(&r->state[q]) == PG_BUSY) atomic_store(&r->state[q], PG_PROT);
+                    lag_unlock(r, index, gate); return 0;
+                }
                 st = PG_PROT;
             }
         }
         int ok = 1, restored = 1;
-        for (uintptr_t p = p0, run = p0, open = 0; p <= p1 + 1; p++) {
+        if (!alias) for (uintptr_t p = p0, run = p0, open = 0; p <= p1 + 1; p++) {
             int protected = p <= p1 && atomic_load(&r->state[p]) == PG_BUSY;
             if (protected && !open) { run = p; open = 1; }
             if (!protected && open) { ok &= mp(unit_addr(r, run), unit_len(r, run, p - run), PROT_READ | PROT_WRITE, NVN_DIRTY_MP_GPU_WRITE); open = 0; }
         }
         if (ok) {
-            if (add32) { uint32_t v; memcpy(&v, (void *)a, 4); v += *(const uint32_t *)src; memcpy((void *)a, &v, 4); }
-            else memcpy((void *)a, src, n);
+            if (add32) { uint32_t v; memcpy(&v, dst, 4); v += *(const uint32_t *)src; memcpy(dst, &v, 4); }
+            else memcpy(dst, src, n);
         }
         for (uintptr_t p = p0, run = p0, open = 0; p <= p1 + 1; p++) {
             int protected = p <= p1 && atomic_load(&r->state[p]) == PG_BUSY;
             if (protected && !open) { run = p; open = 1; }
             if (!protected && open) {
-                int read_only = mp(unit_addr(r, run), unit_len(r, run, p - run), PROT_READ, NVN_DIRTY_MP_RESTORE);
+                int read_only = alias || mp(unit_addr(r, run), unit_len(r, run, p - run), PROT_READ, NVN_DIRTY_MP_RESTORE);
                 for (uintptr_t k = run; k < p; k++) atomic_store(&r->state[k], read_only ? PG_PROT : PG_NONE);
                 restored &= read_only; open = 0;
             }
@@ -1167,12 +1321,15 @@ static int lag_store(void *address, const void *data, size_t len, int add32) {
         lag_unlock(r, index, restored ? gate : gate & ~(uint64_t)LAG_STATE_MASK);
         if (!ok || !restored) return 0;
         if (add32) return 1;   /* NVN events are aligned 32-bit words and cannot cross a protection unit. */
-        a += n; src += n; len -= n;
+        a += n; dst += n; src += n; len -= n;
     }
     return 1;
 }
-int nvn_dirty_lag_store(void *addr, const void *data, size_t len) { return lag_store(addr, data, len, 0); }
-int nvn_dirty_lag_store32(volatile uint32_t *addr, uint32_t value, int add) { return lag_store((void *)addr, &value, 4, add); }
+int nvn_dirty_lag_store(void *addr, const void *data, size_t len) { return lag_store(addr, addr, data, len, 0, 0); }
+int nvn_dirty_lag_store32(volatile uint32_t *addr, uint32_t value, int add) { return lag_store((void *)addr, (void *)addr, &value, 4, add, 0); }
+int nvn_dirty_lag_store_alias(void *guest, void *alias, const void *data, size_t len, int add32) {
+    return lag_store(guest, alias, data, len, add32, 1);
+}
 
 void nvn_dirty_add_range(const void *mem, size_t size) {
     static int inited;
