@@ -191,6 +191,7 @@ public final class CompanionView extends View implements SnapshotPoller.Listener
     @Override protected void onDraw(Canvas c) {
         super.onDraw(c);
         if (assets == null) return;
+        assets.logCaches(isShown() && getWindowVisibility() == VISIBLE, android.os.SystemClock.elapsedRealtime());
         targets.clear(); buttonRequests.clear();
         actionView = poller.actions.state();
         INK = assets.color("text", 0xffe9e5d5); MUTED = assets.color("textDim", 0xffaaa997);

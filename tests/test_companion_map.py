@@ -42,11 +42,20 @@ class BitmapFactory {
 // Android LruCache's byte-accounted access-order contract, without allocating image pixels.
 class LruCache<K,V> {
     final LinkedHashMap<K,V> values = new LinkedHashMap<>(0, .75f, true);
-    int max, size, evictions;
+    int max, size, evictions, hits, misses;
     Object resizeLock;
     LruCache(int max) { this.max = max; }
     protected int sizeOf(K key, V value) { return 1; }
-    synchronized V get(K key) { return values.get(key); }
+    protected void entryRemoved(boolean evicted, K key, V oldValue, V newValue) { }
+    synchronized V get(K key) {
+        V value = values.get(key);
+        if (value == null) misses++; else hits++;
+        return value;
+    }
+    synchronized int size() { return size; }
+    synchronized int hitCount() { return hits; }
+    synchronized int missCount() { return misses; }
+    synchronized int evictionCount() { return evictions; }
     synchronized int maxSize() {
         if (resizeLock != null && !Thread.holdsLock(resizeLock)) throw new AssertionError("resize check outside shared lock");
         return max;
@@ -55,18 +64,27 @@ class LruCache<K,V> {
         if (resizeLock != null && !Thread.holdsLock(resizeLock)) throw new AssertionError("resize outside shared lock");
         max = next; trim();
     }
-    synchronized void put(K key, V value) {
+    synchronized V put(K key, V value) {
         V old = values.put(key, value);
         if (old != null) size -= sizeOf(key, old);
-        size += sizeOf(key, value); trim();
+        size += sizeOf(key, value);
+        if (old != null) entryRemoved(false, key, old, value);
+        trim();
+        return old;
     }
     void trim() {
         while (size > max && !values.isEmpty()) {
             Map.Entry<K,V> first = values.entrySet().iterator().next();
             size -= sizeOf(first.getKey(), first.getValue()); values.remove(first.getKey()); evictions++;
+            entryRemoved(true, first.getKey(), first.getValue(), null);
         }
     }
-    synchronized void evictAll() { evictions += values.size(); values.clear(); size = 0; }
+    synchronized void evictAll() {
+        for (Map.Entry<K,V> entry : values.entrySet()) {
+            evictions++; entryRemoved(true, entry.getKey(), entry.getValue(), null);
+        }
+        values.clear(); size = 0;
+    }
 }
 class QueueExecutor {
     final ArrayDeque<Runnable> work = new ArrayDeque<>();
@@ -74,9 +92,17 @@ class QueueExecutor {
     void drain() { while (!work.isEmpty()) work.remove().run(); }
     void shutdownNow() { work.clear(); }
 }
+class CompanionNative {
+    static final List<String> logs = new ArrayList<>();
+    static boolean logCover(String message) { logs.add(message); return true; }
+}
 class CacheProbe {
-    final LruCache<String,Bitmap> images, tiles, overviews, decorImages;
+    final BitmapCache images, tiles, overviews, decorImages;
     final int tileFloor, tileMarginLimit;
+    final int memoryClass;
+    long cacheLogTime, loggedEvictions;
+    int loggedFills;
+    boolean cacheLogged;
     final Set<String> pending = new HashSet<>(), missing = new HashSet<>();
     final QueueExecutor decoder = new QueueExecutor();
     final Map<String,Integer> decodes = new HashMap<>();
@@ -85,6 +111,7 @@ class CacheProbe {
     boolean closed;
     int changes;
     CacheProbe(int memory) {
+        memoryClass = memory;
 '''
 
 CACHE_TESTS = r'''
@@ -100,6 +127,83 @@ CACHE_TESTS = r'''
     int decoded() { return decodes.values().stream().mapToInt(Integer::intValue).sum(); }
     int evicted() { return images.evictions + tiles.evictions + overviews.evictions + decorImages.evictions; }
     int tileMax() { synchronized (pending) { return tiles.maxSize(); } }
+    void checkResizeLock() { tiles.resizeLock = pending; }
+    int residentBytes() { return images.size() + tiles.size() + overviews.size() + decorImages.size(); }
+    static void stats(BitmapCache cache, String expected) {
+        StringBuilder line = new StringBuilder();
+        cache.append(line, "test");
+        CompanionMapProbe.require(line.toString().equals(" test=" + expected), "counter mismatch: " + line);
+        int bytes = cache.values.values().stream().mapToInt(Bitmap::getAllocationByteCount).sum();
+        CompanionMapProbe.require(cache.entries == cache.values.size() && cache.size() == bytes, "resident sum");
+    }
+    static void counterSequence() {
+        BitmapCache cache = cache(10);
+        stats(cache, "0,0,10,0,0,0,0,0,0");
+        cache.get("missing");
+        stats(cache, "0,0,10,0,1,0,0,0,0");
+        cache.store("a", new Bitmap("a", 4));
+        stats(cache, "1,4,10,0,1,0,0,4,4");
+        cache.store("b", new Bitmap("b", 6));
+        stats(cache, "2,10,10,0,1,0,0,6,10");
+        cache.get("a");
+        cache.store("c", new Bitmap("c", 5));
+        stats(cache, "2,9,10,1,1,0,1,6,15");
+        CompanionMapProbe.require(!cache.values.containsKey("b"), "LRU eviction order changed");
+        cache.store("a", new Bitmap("a", 2));
+        stats(cache, "2,7,10,1,1,0,1,6,15");
+        cache.resize(4);
+        stats(cache, "1,2,4,1,1,0,2,6,15");
+        cache.evictAll();
+        stats(cache, "0,0,4,1,1,0,3,6,15");
+
+        CacheProbe assets = new CacheProbe(256);
+        CompanionNative.logs.clear();
+        assets.logCaches(false, 0); assets.logCaches(true, 0);
+        CompanionMapProbe.require(CompanionNative.logs.isEmpty(), "empty or hidden cache logged");
+        assets.bitmap("missing.webp", false); assets.bitmap("missing.webp", false);
+        stats(assets.images, "0,0,22020096,0,2,0,0,0,0");
+        assets.decoder.drain();
+        assets.bitmap("missing.webp", false);
+        stats(assets.images, "0,0,22020096,0,3,1,0,0,0");
+        assets.bitmap("icons/a.webp", false); assets.decoder.drain();
+        assets.logCaches(false, 0);
+        CompanionMapProbe.require(CompanionNative.logs.isEmpty(), "first hidden fill logged");
+        assets.logCaches(true, 0);
+        String first = "cache v=1 ms=0 reason=first_fill memory_class_mib=256" +
+                " tiles=0,0,25165824,0,0,0,0,0,0 overview=0,0,25165824,0,0,0,0,0,0" +
+                " decor=0,0,50331648,0,0,0,0,0,0 images=1,1024,22020096,0,4,2,0,1024,1024";
+        CompanionMapProbe.require(CompanionNative.logs.equals(List.of(first)), "unstable log format: " + CompanionNative.logs);
+        assets.bitmap("map/Ground/1/0_0.webp", true);
+        assets.bitmap("map/Ground/overview.webp", true);
+        assets.bitmap("decor/window.webp", false);
+        assets.decoder.drain();
+        stats(assets.tiles, "1,2822400,25165824,0,1,1,0,2822400,2822400");
+        stats(assets.overviews, "1,19200000,25165824,0,1,1,0,19200000,19200000");
+        stats(assets.decorImages, "1,1024,50331648,0,1,1,0,1024,1024");
+        assets.logCaches(true, 9999);
+        CompanionMapProbe.require(CompanionNative.logs.size() == 1, "fill bypassed ten-second limit");
+        assets.logCaches(true, 10000);
+        CompanionMapProbe.require(CompanionNative.logs.get(1).contains("reason=first_fill"), "coalesced fill lost");
+        assets.logCaches(true, 20000);
+        CompanionMapProbe.require(CompanionNative.logs.get(2).contains("reason=periodic"), "periodic line missing");
+        for (int n = 1; n < 30; n++) {
+            assets.bitmap("map/Ground/1/" + n + "_0.webp", true); assets.decoder.drain();
+        }
+        assets.logCaches(true, 29999);
+        CompanionMapProbe.require(CompanionNative.logs.size() == 3, "evictions bypassed ten-second limit");
+        assets.logCaches(false, 30000);
+        CompanionMapProbe.require(CompanionNative.logs.size() == 3, "hidden eviction logged");
+        assets.logCaches(true, 30000);
+        CompanionMapProbe.require(CompanionNative.logs.get(3).contains("reason=eviction_burst"), "burst lost");
+        stats(assets.tiles, "8,22579200,25165824,0,30,30,22,2822400,25401600");
+        assets.logCaches(true, 0);
+        CompanionMapProbe.require(CompanionNative.logs.size() == 4, "backward clock reopened limit");
+        assets.close();
+        assets.logCaches(true, 50000);
+        CompanionMapProbe.require(CompanionNative.logs.size() == 4, "closed store logged");
+        CompanionMapProbe.require(assets.tiles.entries == 0 && assets.overviews.entries == 0 &&
+                assets.decorImages.entries == 0 && assets.images.entries == 0, "close entry accounting");
+    }
 }
 class RectF {
     float left, top, right, bottom;
@@ -156,6 +260,7 @@ public class CompanionMapProbe {
 
 TEST_MAIN = r'''
     public static void main(String[] args) throws Exception {
+        CacheProbe.counterSequence();
         CompanionMapProbe probe = new CompanionMapProbe();
         String[] expected = {"1234, 1234, 0000", "-1234, -1234, 0000", "0001, 0001, -0107", "8000, 8000, 7894"};
         List<String> lines = Files.readAllLines(Path.of(args[0]));
@@ -168,7 +273,7 @@ TEST_MAIN = r'''
         for (int memory : new int[]{96, 128, 192, 256, 384, 512, 1024}) {
             CacheProbe assets = new CacheProbe(memory);
             // Both the UI budget and decoder's oversized growth must hold the very same lock at check and resize.
-            assets.tiles.resizeLock = assets.pending;
+            assets.checkResizeLock();
             require(assets.tileMarginLimit == Math.min(64, Math.max(32, memory / 8)) * 1024 * 1024, "class margin limit");
             MapProbe map = new MapProbe(assets);
             map.draw(501); require(assets.decoded() == 0, "draw decoded synchronously");
@@ -192,8 +297,7 @@ TEST_MAIN = r'''
             int grown = assets.tileMax(); assets.tileBudget(12L * 840 * 840 * 4, 840L * 840 * 4);
             require(assets.tileMax() == grown && grown == 81 * 1024 * 1024, "budget shrank oversized exception");
             assets.close();
-            require(assets.images.size == 0 && assets.tiles.size == 0 && assets.overviews.size == 0 && assets.decorImages.size == 0,
-                    "close did not clear every cache");
+            require(assets.residentBytes() == 0, "close did not clear every cache");
             new MapProbe(new CacheProbe(memory)).settle(501);
             // Panels whose map area straddles 4 x 3 (1167 x 757 map area of a 1240 x 1080 panel) and 5 x 3
             // (1920-wide) LOD-1 tiles just above the 500 px switch: 12 or 15 tiles exceed a 32 MiB class limit.
@@ -234,13 +338,14 @@ class CompanionMapTests(unittest.TestCase):
             source = PRELUDE + section(cache, '        int budget =', '        decoder.execute(() -> {') + CACHE_TESTS
             # Insert the production methods before closing CacheProbe; no policy formula is duplicated in the harness.
             insertion = source.index('\n}\nclass RectF')
-            source = (source[:insertion] + '\n' + section(cache, '    private static LruCache', '    private JSONObject json(')
+            source = (source[:insertion] + '\n' + section(cache, '    private static final class BitmapCache', '    private JSONObject json(')
                       + section(cache, '    public Bitmap bitmap(String path, boolean tile)', '    private void notifyChanged()')
                       + section(cache, '    public void close()', '\n}') + source[insertion:])
             source += section(renderer, '        int cols =', '        JSONObject dynamic =') + MAP_TESTS
             source += section(view, '    private String coordinates()', '    private static String number(') + TEST_MAIN
             # The viewport body uses this exact production decoded-size constant.
             source = source.replace('class MapProbe {', 'class MapProbe {\n' + section(renderer, '    private static final long[] TILE_BYTES', '\n\n'))
+            self.assertIn('assets.logCaches(isShown() && getWindowVisibility() == VISIBLE, android.os.SystemClock.elapsedRealtime());', view)
             probe = work / 'CompanionMapProbe.java'
             probe.write_text(source)
             self.command([javac, '--release', '17', '-cp', jars[-1], '-d', work, JAVA / 'Snapshot.java', probe])

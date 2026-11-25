@@ -39,8 +39,12 @@ public final class AssetStore {
     private final File root;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService decoder = Executors.newSingleThreadExecutor();
-    private final LruCache<String, Bitmap> images, tiles, overviews, decorImages;
+    private final BitmapCache images, tiles, overviews, decorImages;
     private final int tileFloor, tileMarginLimit;
+    private final int memoryClass;
+    private long cacheLogTime, loggedEvictions;
+    private int loggedFills;
+    private boolean cacheLogged;
     private final Set<String> pending = new HashSet<>(), missing = new HashSet<>();
     private final Runnable changed;
     public volatile JSONObject index = new JSONObject(), text = new JSONObject();
@@ -106,6 +110,7 @@ public final class AssetStore {
         this.changed = changed;
         ActivityManager manager = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
         int memory = manager == null ? 128 : manager.getMemoryClass();
+        memoryClass = memory;
         int budget = Math.min(32, Math.max(8, memory / 12)) * 1024 * 1024;
         images = cache(budget);
         tileFloor = Math.max(24 * 1024 * 1024, budget);
@@ -166,10 +171,52 @@ public final class AssetStore {
             notifyChanged();
         });
     }
-    private static LruCache<String, Bitmap> cache(int bytes) {
-        return new LruCache<String, Bitmap>(bytes) {
-            @Override protected int sizeOf(String key, Bitmap value) { return value.getAllocationByteCount(); }
-        };
+    /** Mutations and these extra counters use the existing pending monitor. LruCache already counts lookups,
+     * allocation bytes and evictions under its own monitor; do not wrap or allocate on the lookup path. */
+    private static final class BitmapCache extends LruCache<String, Bitmap> {
+        int entries;
+        long decodes, largest, highWater;
+        boolean filled;
+        BitmapCache(int bytes) { super(bytes); }
+        @Override protected int sizeOf(String key, Bitmap value) { return value.getAllocationByteCount(); }
+        @Override protected void entryRemoved(boolean evicted, String key, Bitmap oldValue, Bitmap newValue) {
+            entries--;
+        }
+        void store(String path, Bitmap image) {
+            long before = size(), bytes = image.getAllocationByteCount();
+            entries++;
+            Bitmap old = put(path, image);
+            largest = Math.max(largest, bytes);
+            // Include the insertion before LruCache trims, not just the final below-budget size.
+            highWater = Math.max(highWater, before + bytes - (old == null ? 0 : old.getAllocationByteCount()));
+            filled = true;
+        }
+        void append(StringBuilder line, String name) {
+            line.append(' ').append(name).append('=').append(entries).append(',').append(size()).append(',')
+                    .append(maxSize()).append(',').append(hitCount()).append(',').append(missCount()).append(',')
+                    .append(decodes).append(',').append(evictionCount()).append(',').append(largest).append(',').append(highWater);
+        }
+    }
+    private static BitmapCache cache(int bytes) { return new BitmapCache(bytes); }
+
+    /** Called only by the visible view's draw, on the UI thread. Events coalesce within the same ten-second limit. */
+    void logCaches(boolean visible, long now) {
+        if (!visible || closed || (cacheLogged && now - cacheLogTime < 10000)) return;
+        synchronized (pending) {
+            int fills = (tiles.filled ? 1 : 0) | (overviews.filled ? 2 : 0) |
+                    (decorImages.filled ? 4 : 0) | (images.filled ? 8 : 0);
+            if (fills == 0) return;
+            long evictions = (long)tiles.evictionCount() + overviews.evictionCount() +
+                    decorImages.evictionCount() + images.evictionCount();
+            String reason = fills != loggedFills ? "first_fill" :
+                    evictions - loggedEvictions >= 8 ? "eviction_burst" : "periodic";
+            StringBuilder line = new StringBuilder(640).append("cache v=1 ms=").append(now)
+                    .append(" reason=").append(reason).append(" memory_class_mib=").append(memoryClass);
+            tiles.append(line, "tiles"); overviews.append(line, "overview");
+            decorImages.append(line, "decor"); images.append(line, "images");
+            CompanionNative.logCover(line.toString());
+            cacheLogged = true; cacheLogTime = now; loggedFills = fills; loggedEvictions = evictions;
+        }
     }
     private JSONObject json(String path) {
         try (InputStream in = open(path)) {
@@ -356,7 +403,7 @@ public final class AssetStore {
             if (size > tiles.maxSize()) tiles.resize(size);
         }
     }
-    private Bitmap bitmap(String path, LruCache<String, Bitmap> cache) {
+    private Bitmap bitmap(String path, BitmapCache cache) {
         if (closed) return null;
         Bitmap hit = cache.get(path);
         if (hit != null) return hit;
@@ -369,11 +416,12 @@ public final class AssetStore {
             catch (Exception ignored) { }
             synchronized (pending) {
                 pending.remove(path);
+                cache.decodes++;
                 if (result == null) missing.add(path);
                 else if (!closed) {
                     // An image larger than its whole cache would be evicted at once and decoded again on every redraw.
                     if (result.getAllocationByteCount() > cache.maxSize()) cache.resize(result.getAllocationByteCount() + 1024 * 1024);
-                    cache.put(path, result);
+                    cache.store(path, result);
                 }
             }
             if (result != null) notifyChanged();
@@ -384,7 +432,9 @@ public final class AssetStore {
     public void close() {
         closed = true;
         decoder.shutdownNow();
-        images.evictAll(); tiles.evictAll(); overviews.evictAll(); decorImages.evictAll();
+        synchronized (pending) {
+            images.evictAll(); tiles.evictAll(); overviews.evictAll(); decorImages.evictAll();
+        }
         decorations = java.util.Collections.emptyMap();
         softPart = null; softImage = null; softShader = null;
     }
