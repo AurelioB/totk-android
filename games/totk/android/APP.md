@@ -1808,7 +1808,7 @@ not game-memory writes or guest-function calls, and require both an enabled comp
 | --- | --- |
 | hearts, extra/gloom hearts, rupees, poes, stamina and battery capacity, current ability, meal effect | GameData flags (`PlayerStatus.*`) of `gmd::GameDataMgr` (`*(main+0x3ad66b0)`), committed values |
 | position, heading | the scene's resident `Player` actor (the `world_survey.c` chain: position `+0x2b4`, rotation `+0x2c0`); `World_PlayerPos` if no actor |
-| map layer | `MapData.CurrentLayer`, corrected by height (below -400 is always the Depths) |
+| map layer | guarded 1.4.3 environment depth line and blended sky-floor/ground-top grids at Link's position; rejected samples fall back to `MapData.CurrentLayer` with the old height correction |
 | inventory, equipped items, unlocked slots, abilities | `Pouch.<Category>.*` arrays, current partition from `*(main+0x3a81678)+0x188` |
 | sages | `PlayerStatus.Companion.<Wind/Fire/Water/Electric/Soul>.*` |
 | map pins and stamps | `MapData.IconData.MapPinData.*` / `StampData.*` |
@@ -1821,6 +1821,37 @@ rather than mixed values if they move again; a field whose read fails or does no
 identifiers, counts and indexes are bounded) is left out. Without a readable pouch partition the inventory is left out
 instead of guessing one. Values the game queued but has not committed yet appear one update later. Current stamina
 and current battery charge are not in GameData and are not shown.
+
+The layer reader traverses `*(main+0x3a83968)` → environment `+0xb8`, parameter owner `+0x28` → local parameters
+`+0x150`, and grids `+0x218`. It compares the environment's depth/sky vtable slots with the expected 1.4.3 addresses;
+it never calls them. The contributor notes that the game can resolve these parameters through an override chain when
+bit 0 of flags `+0x126..+0x128` is clear. This reader uses the plain values without reading those flags or following
+the chain. On the tested Thor surface scene (Hateno), flags `01,01,00` and the plain values gave the correct Ground
+layer; our earlier all-three-bit guard rejected that normal sample and incorrectly fell back to a stale Sky selection.
+Behaviour where an override differs from the plain value remains untested. The contributor's code does not map each
+flag byte to a specific parameter, so no such mapping is assumed here.
+Depth numerator values must be finite, the denominator finite and positive, and the resulting ratio finite; the sky
+band must be finite and positive. Missing/invalid parameters return no answer (there is no constant 150 m band fallback). Actor and
+`World_PlayerPos` fallback positions obey the same finite ±8000 m bounds; grid axes are clamped before integer casts.
+After sampling it re-reads the manager, environment/vtable, owner, parameter and grid pointers plus sampled grid
+header/data pointers and dimensions. Any replacement rejects the computed layer. This cannot detect all in-place
+updates or ABA and does not make reads synchronized. Fallback uses the last selected map layer, forcing Depths
+below −400 m and correcting a stale Depths selection to Ground above −100 m.
+
+The fallback log is rate-limited globally to one line per 60 seconds on the snapshot caller (the companion poller),
+with a fixed reason class: `validation` (bad values/type expectation), `unreadable` (missing/unreadable required data)
+or `changed` (a revalidated pointer or dimension differed). This is not the diagnostic branch's raw-value/reason-code
+logger. Computed-layer changes are still logged, so field logs can distinguish engagement from repeated fallback.
+
+Position JSON uses nine significant digits to round-trip each guest float. Java recovers those floats before
+computing x, −z and `y - 105.5f`, then truncates toward zero for display. `tests/test_companion_map.py` runs the
+native ASan/UBSan fixture (invalid parameters, plain values with clear flag bits, pointer replacements and fallback positions), parses its
+actual JSON through the production `Snapshot` on a host JVM, and drives the production cache/viewport bodies with
+deterministic framework doubles. It needs JDK 17+ and a host `org.json` jar (`COMPANION_JSON_JAR`, or Gradle's cache).
+It covers stationary overview/detail convergence, the 500 px LOD boundary, all layers, cold/missing/oversized images
+and the common resize lock. It does not qualify real Android bitmap pressure or terrain semantics on a device.
+The exact per-memory-class cache budgets and oversized-image exception are in
+[the companion reference](../../../docs/companion.md#bitmap-memory-limits).
 
 `TOTK_COMPANION_LOG=1` in `totk.env` logs each status change and the first full ready snapshot to `totk.log` (to check
 a device or save without looking at the second screen). The reader's host test lays out a fake 1.4.3 `main`,

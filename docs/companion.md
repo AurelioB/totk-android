@@ -20,6 +20,71 @@ The pictures (map, icons, item art) are made on your device from your own game d
 and can be rebuilt from *Game data*. They are optional: the game runs without them. Art made by an earlier version of
 the app is updated on its own when the menu opens; the game stays playable meanwhile.
 
+## Map coordinates and loading
+
+Automatic mode uses Link's position and the 1.4.3 environment's depth line and terrain/sky grids, rather than
+the layer last selected in the game map. Invalid, unreadable or replaced samples fall back to that last-selected layer,
+corrected for depth (below −400 m is Depths; a stale Depths selection above −100 m becomes surface). This fallback can
+still show an old sky selection during loads. These are guarded background reads, not a synchronized game snapshot.
+
+The contributor notes that the game can take parameters through an override chain when certain flag bits are clear;
+this implementation uses the plain values, without reading the flags or resolving that chain. On the tested AYN Thor
+surface scene, flags were `01,01,00` and the plain values gave the right layer. Behaviour in scenes where an override
+differs from the plain value is untested.
+
+When falling back, `totk.log` reports a short reason class (`validation`, `unreadable` or `changed`) at most once per
+60 seconds, rather than once per process. Computed-layer changes retain their own log line.
+
+Coordinates read **x, north (−z), height above 105.5 m**, truncated toward zero, with at least four digits and no plus
+sign. Native JSON preserves the position float before the Java display conversion.
+
+Map overviews have a separate cache, so they do not evict detailed tiles. While a requested detail level loads, an
+already-decoded tile at the other level can fill the same area; otherwise the overview shows through. The detail
+cache always holds every visible tile plus one, so a stationary viewport settles; cold loads and fast layer/zoom
+changes can still show loading.
+
+### Bitmap memory limits
+
+All values below are **MiB (1,048,576 bytes)** of retained decoded bitmap cache capacity, not allocations made up
+front or process RSS. `M` is Android's existing `ActivityManager.getMemoryClass()` in MiB, **not physical device RAM**
+(128 if unavailable). For every memory class:
+
+- ordinary images: `B = min(32, max(8, floor(M / 12)))`;
+- detail tiles: start at `max(24, B)`. With `n` visible tiles of `t` decoded bytes (840 px: 2,822,400 B;
+  300 px: 360,000 B), they grow to `max(max(24, B), (n + 1)·t, min(T, n·t + 16))` with margin limit
+  `T = min(64, max(32, floor(M / 8)))`. The memory class limits only the 16 MiB margin, **never the visible tiles
+  plus one**;
+- overviews: 24; menu decorations: 48;
+- total initial capacity: `B + max(24, B) + 72`; total ceiling: `B + tile ceiling + 72`.
+
+`n` is set by the map area's size. Just above the 500 px detail switch, a W×H px map area shows at most
+`(floor(W / 500) + 2) × (floor(H / 500) + 2)` 840 px tiles: 12 (4×3) for a 1240×1080 panel's map area or 1280×960,
+15 (5×3) for a 1920-wide strip, at most 20 (5×4) for a full 1920×1080 area. 300 px tiles never exceed T there
+(at most 77 × 360,000 B + one tile = 28,080,000 B).
+
+| Android memory class M | Images | Tiles start | T | Tile ceiling 12 / 15 / 20 tiles | Overviews | Decor | Total start → ceiling (20 tiles) | Previous total |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 96 | 8 | 24 | 32 | 34.99 / 43.07 / 56.52 | 24 | 48 | 104 → 136.52 | 80 |
+| 128 (also unavailable) | 10 | 24 | 32 | 34.99 / 43.07 / 56.52 | 24 | 48 | 106 → 138.52 | 82 |
+| 192 | 16 | 24 | 32 | 34.99 / 43.07 / 56.52 | 24 | 48 | 112 → 144.52 | 88 |
+| 256 | 21 | 24 | 32 | 34.99 / 43.07 / 56.52 | 24 | 48 | 117 → 149.52 | 93 |
+| 384 | 32 | 32 | 48 | 48 / 48 / 56.52 | 24 | 48 | 136 → 160.52 | 112 |
+| 512 or more | 32 | 32 | 64 | 48.30 / 56.375 / 64 | 24 | 48 | 136 → 168 | 112 |
+
+In bytes, the 12 / 15 / 20-tile ceilings are 36,691,200 / 45,158,400 / 59,270,400 for M = 96–256 (T = 32 MiB),
+50,331,648 / 50,331,648 / 59,270,400 for M = 384 and 50,646,016 / 59,113,216 / 67,108,864 for M ≥ 512; classes in
+between scale T linearly by `floor(M / 8)`. Views of up to 10 840-px tiles stay at or below T.
+Previously there was no separate overview cache; detail tiles and overviews shared `max(24, B)` MiB. The budget only
+grows. Smaller heap classes get less margin, but never less than the screen; an 8 GB device is not assumed to have any
+particular M (the AYN Thor's recorded heap growth limit is 256 MiB).
+
+**Oversized-image exception:** if a decoded image exceeds its selected cache's current capacity, that cache grows
+to the image's allocation byte count **plus 1 MiB**, even above the nominal ceilings above. Later tile budget calls
+cannot shrink that exception. This applies separately to all four caches; there is no universal hard total ceiling
+in that case. Standard generated overviews (19,200,000 bytes) and tiles (2,822,400 / 360,000 bytes) do not trigger it.
+In-flight decodes, decoration-held references and GPU copies are outside these sums. Device checks must still
+measure companion memory and decoder CPU on dual-screen hardware; host convergence is not a performance claim.
+
 ## Item actions
 
 While playing (no game menu open), the selected item offers the actions the game itself would allow:
