@@ -96,12 +96,35 @@ Everything not in the menu is a developer switch. A selection:
 | `TOTK_PSO_PREWARM=0` | Turns off the startup pipeline prewarm from the packaged key list. |
 | `TOTK_VK_VARYING_FIX=0` | Startup-only opt-out of the default-on, pair-specific missing vertex-output correction for wind/air-flow white boxes (#4). Off performs no varying classification/rewrite work. Changes the driver-cache and prewarm-resume namespace; restart after editing. |
 | `TOTK_VK_NAN_MINMAX=1` | Startup-only, **default-off experiment**: replace GLSL FMin/FMax/FClamp with NMin/NMax/NClamp in loaded VS/FS/CS modules. Has its own `.nan-v1` cache namespace; special-value semantics and driver cost await separate device qualification. Not required to enable the varying fix. |
+| `TOTK_MENU_CAPTURE_FIX=1` | Startup-only, **default-off 1.4.3 experiment** for randomly black ability-wheel / quick-selector backgrounds. Draw accepts an already-armed pane or a pending request passing the native visibility checks. Other values leave code untouched; iOS does not install it. Does not synchronize update/draw or change texture layouts, aliases, copies or cache identities. See the qualification limits below. |
 | `TU_DEBUG=…` | Turnip debug flags (e.g. `noslabcs`); on Adreno 722 an absent `TU_DEBUG` defaults to `sysmem`. |
 
 The complete, current list of switches with their status and evidence is in
 [games/totk/android/APP.md](../games/totk/android/APP.md) (the *Integration opt-in qualification index* under
 [Device profiles](../games/totk/android/APP.md#device-profiles), and the sections on the picture, frame rate and
 presentation) and the diagnostic switches in [games/totk/android/DEBUGGING.md](../games/totk/android/DEBUGGING.md).
+
+### Quick-menu capture experiment
+
+PR #44 reports a capture recorded after the world target was cleared, rather than a missing Vulkan layout transition.
+The guarded veneer can admit a visible request before the pane's update arms it. Native update also prepares state
+after arming; completion republishes the request from a pane flag instead of always clearing it. Consequently this
+remains opt-in: host instruction tests cannot establish safe publication, the source target's lifetime, a world-frame
+guarantee, or a once-per-opening capture limit. No device acceptance is claimed.
+
+There is no unconditional per-frame framebuffer copy, allocation, GPU wait or readback added by the patch.
+Each visit adds an instruction detour; newly admitted requests use the existing capture/blur body, possibly repeatedly
+for continuing requests. The author's extra blur per opening is an observation on their Thor, not a general cost bound.
+The veneer uses only the original result register, preserves flags and other registers, and occupies 36 existing
+padding bytes after the FPS60-hardening veneers. The real text tail has only 1024 bytes: thermal-step owns
+`+916..1024`, so `TOTK_THERMAL_STEP=1` takes priority and skips the menu experiment with an explicit log.
+
+`tests/test_menu_capture.py` runs the production C guard/layout fixture without game data. With `TOTK_MAIN_NSO`
+pointing to the player's 1.4.3 main and Unicorn/lz4 installed it also checks actual update eligibility, draw continuation,
+register/flag preservation and completion semantics. This is not a substitute for repeated matched off/on openings
+on current main, with frame lag off/on, one-primary off and write-back alias off/on; include hidden/transparent panes,
+camera/photo mode, save thumbnails, screenshots, companion cover, held-open/reopened menus and pause/resume.
+Keep frame-timeline diagnostics disabled for device acceptance.
 
 ## Benchmark clock (restored saves only)
 

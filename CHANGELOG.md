@@ -6,6 +6,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Retain PR #44's quick-menu capture idea as the default-off `TOTK_MENU_CAPTURE_FIX=1` experiment.
+  Preserve native visibility eligibility for request-only captures, prefer thermal-step if its veneer space is needed,
+  validate bounds/branches before writes, and test production guards plus player-supplied ARM64 admission,
+  continuation and completion. Update/draw publication and device capture safety remain unqualified;
+  there is no unconditional per-frame copy or default behavior change.
 - Make optional frame-timeline and fence-evidence ring producers single-attempt/nonblocking, with counted
   dropped updates and skipped snapshots. Reuse per-walk elapsed clocks instead of enabling recorder
   opcode/category probes, and batch recorder-worker draws/descriptors at slot assembly instead of each job.
