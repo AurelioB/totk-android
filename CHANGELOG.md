@@ -58,6 +58,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Stop startup-popup polling and dismiss the popup when its activity finishes or is destroyed;
+  repeated resume calls keep a single poll queued. Host tests execute the production Java UI
+  with framework doubles and the native progress snapshot through a real host JVM/JNI bridge.
 - Follow Link's environment-based map layer, display in-game map coordinates without losing integer-boundary
   precision, and separate overview/detail caches to stop stationary tile eviction loops. Reject invalid, unreadable
   or replaced layer samples using the previous layer heuristic; always keep the visible detail tiles plus one, scale

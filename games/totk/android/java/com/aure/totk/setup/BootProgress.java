@@ -42,6 +42,7 @@ public final class BootProgress {
     }
 
     public void resume() {
+        main.removeCallbacks(tick);
         if (!finished) main.post(tick);
     }
 
@@ -51,7 +52,10 @@ public final class BootProgress {
     }
 
     private void refresh() {
-        if (owner.isFinishing()) return;
+        if (owner.isFinishing() || owner.isDestroyed()) {
+            pause();
+            return;
+        }
         String stage = source.read(counts);
         if (stage == null) {
             finished = true;
