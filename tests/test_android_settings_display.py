@@ -195,6 +195,7 @@ class SetupActivity extends Activity {
     boolean pendingAsked;
     void requestedUpdate() {}
     void offerPendingUpdate() {}
+    void updateGameHold() {} // Covered independently by the setup control/lifecycle fixture.
     void showUi(){ui=true;shown++;screen=recovery;}
     boolean returnToRunningGame(Intent intent){return false;}
     void replace(Screen value){screen=value;replacements++;} void render(){}

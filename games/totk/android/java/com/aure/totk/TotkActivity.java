@@ -28,10 +28,11 @@ public final class TotkActivity extends NativeActivity {
     private long presentEpoch;
     private boolean displayMoveRequested;
     private static boolean updateChecked;
-    private boolean updateOpen;
+    private boolean updateOpen, exitNoticeOpen;
+    private final ExitNotice exitNotice = new ExitNotice();
     private String updateVersion;
     private void showUpdate() {
-        if (!resumed || updateVersion == null || updateOpen || isFinishing()) return;
+        if (!resumed || updateVersion == null || updateOpen || exitNoticeOpen || isFinishing()) return;
         String version = updateVersion;
         updateVersion = null;
         updateOpen = true;
@@ -47,6 +48,7 @@ public final class TotkActivity extends NativeActivity {
             }
             boolean single = PresentationController.secondScreen(this, getDisplay()) == DisplayClass.NONE;
             nativeGameFocus(hasWindowFocus(), single);
+            checkExitNotice();
         });
     }
     private static native void nativePresentTransformHint(long epoch, int hint);
@@ -148,6 +150,7 @@ public final class TotkActivity extends NativeActivity {
         // Query only after super, before constructing a controller or display listener.
         // The companion art is generated on the device by the optional setup stage; without it the companion stays off.
         if (CompanionNative.isEnabled() && AssetStore.available(this)) companion = new PresentationController(this, new CompanionNative());
+        GameHold.initialize(); // CompanionNative above has associated libtotk with this JVM; never called by an empty service.
         saves = SaveMirror.Watcher.start(this);
         int given = nativeFeedbackEnabled();   // what start_game gave the game (TOTK_RUMBLE / TOTK_GYRO and the hardware)
         if (given != 0 && !isFinishing()) feedback = new GameFeedback(this, given);
@@ -190,10 +193,21 @@ public final class TotkActivity extends NativeActivity {
     @Override protected void onResume() {
         super.onResume();
         resumed = true;
+        GameHold.resumed();
+        checkExitNotice();
         ensureMainDisplay();
         GameFeedback f = feedback;
         if (f != null) f.resume();
         showUpdate();
+    }
+    private void checkExitNotice() {
+        exitNotice.resume(this, () -> resumed && !updateOpen, open -> {
+            exitNoticeOpen = open;
+            boolean single = PresentationController.secondScreen(this, getDisplay()) == DisplayClass.NONE;
+            nativeGameFocus(hasWindowFocus() && !updateOpen && !open, single || updateOpen || open);
+            GameHold.updatePause();
+            if (!open) showUpdate();
+        });
     }
     @Override public void onTopResumedActivityChanged(boolean top) {
         super.onTopResumedActivityChanged(top);
@@ -206,7 +220,8 @@ public final class TotkActivity extends NativeActivity {
         // focus loss must pause too, and focus return need not call onResume.
         // Never apply that policy to multi-resume on a second display.
         boolean single = PresentationController.secondScreen(this, getDisplay()) == DisplayClass.NONE;
-        nativeGameFocus(focused && !updateOpen, single || updateOpen);
+        nativeGameFocus(focused && !updateOpen && !exitNoticeOpen, single || updateOpen || exitNoticeOpen);
+        GameHold.updatePause();
         GameFeedback f = feedback;
         if (single && f != null) {
             if (focused && resumed) f.resume();
@@ -215,9 +230,11 @@ public final class TotkActivity extends NativeActivity {
     }
     @Override protected void onPause() {
         resumed = false;
+        exitNotice.pause();
         GameFeedback f = feedback;
         if (f != null) f.pause();   // no motion in the background, and no motor left running
         super.onPause();
+        GameHold.paused(this);
     }
     @Override protected void onStop() {
         // Leaving the foreground may be the last chance before the process is killed: push a save made just now.
@@ -225,6 +242,8 @@ public final class TotkActivity extends NativeActivity {
         super.onStop();
     }
     @Override protected void onDestroy() {
+        exitNotice.pause();
+        GameHold.destroyed();
         updatePresentPrerotate(0);
         if (companion != null) { companion.close(); companion = null; }
         if (saves != null) { saves.close(1500); saves = null; }

@@ -54,7 +54,25 @@ interface ServiceConnection {
     void onNullBinding(ComponentName name);
 }
 class GameControlService {}
-class Intent { Intent(Object context, Class<?> service) {} }
+class ExitNotice {
+    void resume(SetupActivity activity, java.util.function.BooleanSupplier ready, java.util.function.Consumer<Boolean> visible) {}
+    void pause() {}
+}
+class Intent {
+    final Class<?> service;
+    String action;
+    Intent(Object context, Class<?> service) { this.service = service; }
+    Intent setAction(String value) { action = value; return this; }
+}
+class GameHold {
+    static final String ACTION = "com.aure.totk.action.GAME_HOLD";
+    static boolean on;
+    static int endedSessions;
+    static final List<String> lines = new ArrayList<>();
+    static boolean enabled(SetupActivity activity) { return on; }
+    static void log(SetupActivity activity, String message) { lines.add(message); }
+    static void endSessionLog() { endedSessions++; }
+}
 class TextView { void setText(String text) {} }
 class StorageManager {
     int registered, removed;
@@ -72,7 +90,14 @@ class Strings {
     static final String SAVE_WAIT_TIMEOUT = "save timeout", CLOSE_GAME_TIMEOUT = "close timeout";
     static String gameLockError(String reason) { return reason; }
 }
-class BaseActivity { protected void onStart() {} protected void onStop() {} }
+class BaseActivity {
+    protected void onStart() {}
+    protected void onResume() {}
+    protected void onStop() {}
+    protected void onDestroy() {}
+}
+class Updater { void dispose() {} }
+class Worker { void shutdownNow() {} void shutdown() {} }
 class Handler {
     final Set<Runnable> pending = new HashSet<>();
     int posted;
@@ -82,7 +107,7 @@ class Handler {
 }
 class InstallState {
     static GameLock.Result next = new GameLock.Result(GameLock.State.FREE, "lock=free marker=absent");
-    static GameLock.Result gameState(SetupActivity activity) { return next; }
+    static GameLock.Result gameState(SetupActivity activity) { activity.checks++; return next; }
 '''
 
 JAVA_ACTIVITY = r'''
@@ -96,11 +121,18 @@ public final class SetupActivity extends BaseActivity {
     String blockedNeed = "", closeId = "probe";
     String note = "";
     TextView gameNotice;
-    ServiceConnection closeConnection;
-    static final int BIND_AUTO_CREATE = 1;
+    final ExitNotice exitNotice = new ExitNotice();
+    ServiceConnection closeConnection, gameHoldConnection;
+    boolean gameHoldFailed, gameHoldOpening, finishing, destroyed;
+    static final int BIND_AUTO_CREATE = 1, BIND_IMPORTANT = 64;
     int binds, unbinds, bindFlags;
-    boolean bindAccepted = true;
+    boolean bindAccepted = true, unbindThrows;
+    RuntimeException bindFailure;
     Runnable duringBind;
+    final List<Intent> bindIntents = new ArrayList<>();
+    final List<ServiceConnection> bindConnections = new ArrayList<>(), unboundConnections = new ArrayList<>();
+    final List<Integer> bindingFlags = new ArrayList<>();
+    final Set<ServiceConnection> activeBindings = Collections.newSetFromMap(new IdentityHashMap<>());
     long closeDeadline = 10000, closeStartedAt, gameCheckedAt, cancelArmedAt;
     final Handler main = new Handler();
     final StorageManager storage = new StorageManager();
@@ -108,7 +140,9 @@ public final class SetupActivity extends BaseActivity {
     static final long REFRESH_MS = 500;
     Screen screen = Screen.HOME;
     final File files;
-    Object updater;
+    Updater updater;
+    final Worker worker = new Worker(), saveWorker = new Worker();
+    void completeSettingsMove() {}
     void requestedUpdate() {}
     void offerPendingUpdate() {}
     void updateInstallResult() {}
@@ -116,18 +150,25 @@ public final class SetupActivity extends BaseActivity {
     int renders, statuses, syncs, checks, notices;
     SetupActivity(File files) throws IOException { this.files = files; Files.createDirectories(new File(files, "state").toPath()); }
     File getFilesDir() { return files; }
-    boolean isDestroyed() { return false; }
+    boolean isFinishing() { return finishing; }
+    boolean isDestroyed() { return destroyed; }
     void render() { renders++; }
     void updateGameNotice() { notices++; }
     boolean bindService(Intent intent, ServiceConnection connection, int flags) {
         binds++; bindFlags = flags;
+        bindIntents.add(intent); bindConnections.add(connection); bindingFlags.add(flags);
+        if (bindFailure != null) throw bindFailure;
+        if (bindAccepted) activeBindings.add(connection);
         if (duringBind != null) duringBind.run();
         return bindAccepted;
     }
-    void unbindService(ServiceConnection connection) { unbinds++; }
+    void unbindService(ServiceConnection connection) {
+        unbinds++; unboundConnections.add(connection);
+        boolean registered = activeBindings.remove(connection);
+        if (unbindThrows || !registered) throw new IllegalArgumentException("connection not registered");
+    }
     void onStatus() { statuses++; }
     void syncMirror(boolean manual) { syncs++; }
-    void refreshGameState() { checks++; }
     void disarmCancel() { cancelArmedAt = 0; }
     Object getMainExecutor() { return this; }
     <T> T getSystemService(Class<T> type) { return type.cast(storage); }
@@ -135,6 +176,24 @@ public final class SetupActivity extends BaseActivity {
 '''
 
 JAVA_TESTS = r'''
+    private static ServiceConnection startHold(SetupActivity activity) {
+        GameHold.on = true;
+        InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+        activity.started = false;
+        activity.onStart();
+        require(activity.gameHoldConnection != null && activity.binds == 1, "visible GAME did not acquire its hold");
+        require(activity.bindFlags == (BIND_AUTO_CREATE | BIND_IMPORTANT), "hold binding lost its exact importance flags");
+        require(activity.bindIntents.get(0).service == GameControlService.class
+                && GameHold.ACTION.equals(activity.bindIntents.get(0).action), "hold did not use its dedicated service action");
+        require(activity.closeConnection == null && !activity.closingGame, "opening Settings started Close");
+        return activity.gameHoldConnection;
+    }
+    private static void lateCallbacks(ServiceConnection connection) {
+        connection.onServiceConnected(null, null);
+        connection.onServiceDisconnected(null);
+        connection.onBindingDied(null);
+        connection.onNullBinding(null);
+    }
     public static void main(String[] args) throws Exception {
         SetupActivity activity = new SetupActivity(new File(args[1]));
         int[] mutations = {0}, details = {0};
@@ -298,6 +357,298 @@ JAVA_TESTS = r'''
                 require(activity.binds == 0 && mutations[0] == 1 && !activity.closingGame, "FREE lock spawned a service process");
                 break;
             }
+            case "hold-opening":
+            case "hold-opening-stop": {
+                GameHold.on = true;
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.started = false; activity.gameHoldOpening = true;
+                activity.duringBind = () -> require(!activity.ui && !activity.uiStarted,
+                        "cold Settings allocated its UI before acquiring importance");
+                activity.updateGameHold();
+                ServiceConnection connection = activity.gameHoldConnection;
+                require(activity.binds == 1 && connection != null && !activity.started
+                        && activity.bindFlags == (BIND_AUTO_CREATE | BIND_IMPORTANT)
+                        && GameHold.ACTION.equals(activity.bindIntents.get(0).action),
+                        "cold Settings did not bind before onStart");
+                if (args[0].equals("hold-opening")) {
+                    activity.onStart(); activity.onResume();
+                    require(!activity.gameHoldOpening && activity.gameHoldConnection == connection && activity.binds == 1,
+                            "onStart duplicated or discarded the cold-opening hold");
+                }
+                activity.onStop();
+                int logs = GameHold.lines.size();
+                activity.updateGameHold(); lateCallbacks(connection);
+                require(!activity.started && !activity.gameHoldOpening && activity.gameHoldConnection == null
+                        && activity.binds == 1 && activity.unbinds == 1 && activity.activeBindings.isEmpty()
+                        && GameHold.lines.size() == logs, "stopped cold opening retained or revived its hold");
+                break;
+            }
+            case "hold-opening-bind-false":
+            case "hold-opening-bind-throw":
+            case "hold-opening-disconnect": {
+                GameHold.on = true;
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.started = false; activity.gameHoldOpening = true;
+                activity.bindAccepted = !args[0].equals("hold-opening-bind-false");
+                if (args[0].equals("hold-opening-bind-throw")) activity.bindFailure = new SecurityException("cold bind denied");
+                activity.updateGameHold();
+                require(activity.binds == 1, "cold failure did not exercise binding");
+                ServiceConnection failed = activity.bindConnections.get(0);
+                if (args[0].equals("hold-opening-disconnect")) failed.onServiceDisconnected(null);
+                require(activity.gameHoldConnection == null && activity.unbinds == 1 && activity.activeBindings.isEmpty(),
+                        "failed cold opening retained its binding");
+                activity.bindAccepted = true; activity.bindFailure = null;
+                int logs = GameHold.lines.size();
+                activity.onStart(); activity.onResume(); activity.updateGameHold(); lateCallbacks(failed);
+                require(activity.binds == 1 && activity.unbinds == 1 && activity.gameHoldConnection == null
+                        && GameHold.lines.size() == logs, "onStart retried a failed cold bind in the same visible lifecycle");
+                activity.onStop(); activity.onStart();
+                require(activity.binds == 2 && activity.gameHoldConnection != null && activity.gameHoldConnection != failed,
+                        "new visible lifecycle could not retry a failed cold opening");
+                break;
+            }
+            case "hold-start": {
+                activity.duringBind = () -> require(activity.started && !activity.uiStarted
+                        && activity.storage.registered == 0, "hold acquisition ran after UI listeners");
+                ServiceConnection connection = startHold(activity);
+                require(!activity.ui && activity.main.pending.isEmpty(), "hold forced UI allocation or polling");
+                activity.onStart();
+                activity.onResume();
+                activity.updateGameHold();
+                connection.onServiceConnected(null, null);
+                activity.showUi();
+                activity.onResume();
+                require(activity.binds == 1 && activity.gameHoldConnection == connection
+                        && activity.activeBindings.size() == 1, "start/resume/connected callbacks duplicated the hold");
+                require(!new File(activity.files, "state/close-request").exists(), "hold sent a native close command");
+                break;
+            }
+            case "hold-non-game": {
+                GameHold.on = true;
+                activity.started = false;
+                activity.onStart();
+                InstallState.next = new GameLock.Result(GameLock.State.ERROR, "lock probe denied");
+                activity.onResume();
+                activity.refreshGameState();
+                activity.updateGameHold();
+                require(activity.binds == 0 && activity.unbinds == 0 && GameHold.lines.isEmpty(),
+                        "FREE or ERROR created an empty service process");
+                break;
+            }
+            case "hold-invisible": {
+                GameHold.on = true;
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.started = false;
+                activity.updateGameHold();
+                activity.finishing = true;
+                activity.onStart();
+                activity.finishing = false; activity.destroyed = true;
+                activity.onStart();
+                require(activity.binds == 0 && activity.unbinds == 0 && GameHold.lines.isEmpty(),
+                        "stopped, finishing or destroyed Settings acquired a hold");
+                break;
+            }
+            case "hold-rotation": {
+                ServiceConnection old = startHold(activity);
+                activity.onStop();
+                require(!activity.started && activity.gameHoldConnection == null && activity.unbinds == 1
+                        && activity.activeBindings.isEmpty(), "rotation stop leaked its hold");
+                int logs = GameHold.lines.size();
+                activity.onStop(); activity.onDestroy();
+                lateCallbacks(old);
+                require(activity.unbinds == 1 && GameHold.lines.size() == logs && activity.main.pending.isEmpty(),
+                        "stop/destroy or late callbacks repeated release");
+                SetupActivity rotated = new SetupActivity(activity.files);
+                rotated.started = false;
+                rotated.onStart();
+                ServiceConnection next = rotated.gameHoldConnection;
+                require(next != null && next != old && rotated.binds == 1, "rotation failed to acquire a new connection");
+                lateCallbacks(old);
+                require(rotated.gameHoldConnection == next && rotated.unbinds == 0,
+                        "old activity callback changed the recreated activity's hold");
+                rotated.onStop();
+                rotated.onStart();
+                require(rotated.binds == 2 && rotated.gameHoldConnection != next, "stop/start reused a released hold");
+                lateCallbacks(next);
+                require(rotated.gameHoldConnection != null && rotated.unbinds == 1,
+                        "stale connection callback released a newer hold");
+                break;
+            }
+            case "hold-finish": {
+                ServiceConnection connection = startHold(activity);
+                activity.finishing = true;
+                activity.updateGameHold();
+                require(activity.gameHoldConnection == null && activity.unbinds == 1 && activity.activeBindings.isEmpty(),
+                        "finishing Settings retained its hold");
+                int logs = GameHold.lines.size();
+                activity.onResume(); activity.onStop(); activity.onDestroy();
+                lateCallbacks(connection);
+                require(activity.binds == 1 && activity.unbinds == 1 && GameHold.lines.size() == logs,
+                        "finish lifecycle or late callback revived its hold");
+                break;
+            }
+            case "hold-destroy": {
+                ServiceConnection connection = startHold(activity);
+                activity.destroyed = true;
+                activity.onDestroy();
+                int logs = GameHold.lines.size();
+                activity.onDestroy(); activity.updateGameHold();
+                lateCallbacks(connection);
+                require(activity.binds == 1 && activity.unbinds == 1 && activity.gameHoldConnection == null
+                        && activity.activeBindings.isEmpty() && GameHold.lines.size() == logs,
+                        "destroy leaked, duplicated or revived a hold without onStop");
+                break;
+            }
+            case "hold-disconnect":
+            case "hold-binding-died":
+            case "hold-null-binding": {
+                ServiceConnection connection = startHold(activity);
+                connection.onServiceConnected(null, null);
+                if (args[0].equals("hold-disconnect")) connection.onServiceDisconnected(null);
+                else if (args[0].equals("hold-binding-died")) connection.onBindingDied(null);
+                else connection.onNullBinding(null);
+                require(activity.gameHoldConnection == null && activity.unbinds == 1 && activity.activeBindings.isEmpty(),
+                        "dead/disconnected/null hold was not released immediately");
+                int logs = GameHold.lines.size();
+                lateCallbacks(connection);
+                activity.onResume(); activity.refreshGameState(); activity.updateGameHold();
+                require(activity.binds == 1 && activity.unbinds == 1 && GameHold.lines.size() == logs
+                        && activity.main.pending.isEmpty(), "failed visible lifecycle restarted the empty game process");
+                activity.onStop(); activity.onStart();
+                ServiceConnection next = activity.gameHoldConnection;
+                require(activity.binds == 2 && next != null && next != connection, "new visible lifecycle did not clear failure");
+                lateCallbacks(connection);
+                require(activity.gameHoldConnection == next && activity.unbinds == 1,
+                        "late failure callback poisoned a newer connection");
+                break;
+            }
+            case "hold-bind-false":
+            case "hold-bind-throw": {
+                GameHold.on = true;
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.bindAccepted = !args[0].equals("hold-bind-false");
+                if (args[0].equals("hold-bind-throw")) activity.bindFailure = new SecurityException("bind denied");
+                activity.unbindThrows = true;
+                activity.started = false;
+                activity.onStart();
+                require(activity.binds == 1 && activity.unbinds == 1 && activity.gameHoldConnection == null
+                        && activity.activeBindings.isEmpty(), "refused/throwing bind leaked its connection");
+                require(GameHold.endedSessions == 1, "failed unbind did not clear the cached hold log target");
+                ServiceConnection failed = activity.bindConnections.get(0);
+                activity.bindAccepted = true; activity.bindFailure = null; activity.unbindThrows = false;
+                int logs = GameHold.lines.size();
+                lateCallbacks(failed);
+                activity.onResume(); activity.refreshGameState(); activity.updateGameHold();
+                require(activity.binds == 1 && activity.unbinds == 1 && GameHold.lines.size() == logs && GameHold.endedSessions == 1
+                        && activity.main.pending.isEmpty(), "bind failure repeatedly restarted service in the same lifecycle");
+                activity.onStop(); activity.onStart();
+                require(activity.binds == 2 && activity.gameHoldConnection != null && activity.gameHoldConnection != failed,
+                        "bind failure prevented a later visible lifecycle from retrying");
+                lateCallbacks(failed);
+                require(activity.gameHoldConnection != null && activity.unbinds == 1,
+                        "late failed-bind callback released the replacement");
+                break;
+            }
+            case "hold-free-refresh": {
+                ServiceConnection old = startHold(activity);
+                InstallState.next = new GameLock.Result(GameLock.State.FREE, "game exited");
+                activity.refreshGameState();
+                require(activity.gameState.free() && activity.gameHoldConnection == null && activity.unbinds == 1
+                        && activity.activeBindings.isEmpty(), "FREE refresh did not release the hold");
+                int logs = GameHold.lines.size();
+                activity.refreshGameState(); lateCallbacks(old);
+                require(activity.binds == 1 && activity.unbinds == 1 && GameHold.lines.size() == logs,
+                        "FREE refresh or stale callback revived a hold");
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "new running game");
+                activity.refreshGameState();
+                ServiceConnection next = activity.gameHoldConnection;
+                require(activity.binds == 2 && next != null && next != old, "later GAME refresh failed to acquire a fresh hold");
+                lateCallbacks(old);
+                require(activity.gameHoldConnection == next, "old connection replaced the new game's hold");
+                InstallState.next = new GameLock.Result(GameLock.State.ERROR, "probe failed");
+                activity.refreshGameState();
+                require(activity.gameHoldConnection == null && activity.unbinds == 2 && activity.activeBindings.isEmpty(),
+                        "ERROR refresh retained an unproven game hold");
+                break;
+            }
+            case "hold-bind-race": {
+                activity.duringBind = () -> InstallState.next = new GameLock.Result(GameLock.State.FREE, "game died during bind");
+                GameHold.on = true;
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.started = false;
+                activity.onStart();
+                require(activity.binds == 1, "game/hold race never exercised binding");
+                ServiceConnection connection = activity.bindConnections.get(0);
+                connection.onServiceConnected(null, null);
+                require(activity.binds == 1 && activity.unbinds == 1 && activity.gameHoldConnection == null
+                        && activity.activeBindings.isEmpty(), "connected callback retained an empty default process");
+                require(!new File(activity.files, "state/close-request").exists() && activity.main.pending.isEmpty(),
+                        "hold bind/death race entered the close protocol");
+                break;
+            }
+            case "hold-session-ended": {
+                ServiceConnection connection = startHold(activity);
+                GameHold.on = false;
+                activity.updateGameHold();
+                require(activity.gameHoldConnection == null && activity.unbinds == 1 && activity.activeBindings.isEmpty(),
+                        "ended hold session retained its existing binding");
+                int logs = GameHold.lines.size();
+                lateCallbacks(connection);
+                activity.onResume(); activity.refreshGameState(); activity.onStop(); activity.onDestroy();
+                require(activity.binds == 1 && activity.unbinds == 1 && GameHold.lines.size() == logs,
+                        "ended session callback or lifecycle revived its binding");
+                break;
+            }
+            case "hold-close":
+            case "hold-close-disconnect": {
+                ServiceConnection hold = startHold(activity);
+                activity.blockedAction = () -> mutations[0]++;
+                activity.closeGame();
+                ServiceConnection close = activity.closeConnection;
+                require(activity.binds == 2 && close != null && close != hold && activity.gameHoldConnection == hold
+                        && activity.activeBindings.size() == 2, "Close reused or replaced the visible-menu hold");
+                require(activity.bindingFlags.get(1) == BIND_AUTO_CREATE
+                        && activity.bindIntents.get(1).action == null
+                        && activity.bindIntents.get(1).service == GameControlService.class,
+                        "Close inherited hold action or importance flags");
+                if (args[0].equals("hold-close-disconnect")) {
+                    hold.onServiceDisconnected(null);
+                    require(activity.closeConnection == close && activity.closingGame
+                            && !activity.unboundConnections.contains(close), "hold death cancelled the independent Close binding");
+                }
+                activity.main.pending.remove(activity.closePoll); activity.closePoll.run();
+                File request = new File(activity.files, "state/close-request");
+                require(activity.closeSent && request.exists()
+                        && Files.readString(request.toPath()).trim().equals(activity.closeId),
+                        "Close stopped using the native request protocol");
+                require(mutations[0] == 0 && activity.closeConnection == close,
+                        "Close completed before the game lock cleared");
+                InstallState.next = new GameLock.Result(GameLock.State.FREE, "game closed");
+                activity.main.pending.remove(activity.closePoll); activity.closePoll.run();
+                require(mutations[0] == 1 && !activity.closingGame && activity.closeConnection == null
+                        && activity.gameHoldConnection == null && activity.unbinds == 2 && activity.activeBindings.isEmpty(),
+                        "completed Close failed to independently release both bindings and retry");
+                require(!request.exists() && activity.main.pending.isEmpty(), "completed Close leaked its request or poll");
+                int logs = GameHold.lines.size();
+                lateCallbacks(hold); lateCallbacks(close);
+                require(activity.binds == 2 && activity.unbinds == 2 && mutations[0] == 1
+                        && GameHold.lines.size() == logs && activity.main.pending.isEmpty(),
+                        "late Close/hold callbacks revived completed work");
+                break;
+            }
+            case "hold-off": {
+                require(!GameHold.on, "hold test double must default off");
+                InstallState.next = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.updateGameHold();
+                require(activity.checks == 0, "disabled hold probed the game lock");
+                activity.onStart(); activity.onResume(); activity.refreshGameState();
+                activity.releaseGameHold("disabled");
+                activity.onStop(); activity.onDestroy();
+                require(activity.binds == 0 && activity.unbinds == 0 && GameHold.lines.isEmpty()
+                        && GameHold.endedSessions == 0 && android.util.Log.lines.isEmpty() && activity.main.pending.isEmpty(),
+                        "disabled hold performed binding, logging or lifecycle work");
+                break;
+            }
             case "logging": {
                 InstallState.logGameDecision("game decision=GAME branch=lock pid=42 marker=absent");
                 require(android.util.Log.lines.size() == 1, "branch log was filtered out with INFO disabled");
@@ -362,18 +713,22 @@ class SetupControlTests(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory(prefix='controls-', dir=scratch)
         cls.addClassCleanup(cls.temp.cleanup)
         cls.work = Path(cls.temp.name)
-        source = (JAVA / 'SetupActivity.java').read_text()
+        cls.source = source = (JAVA / 'SetupActivity.java').read_text()
         state = (JAVA / 'InstallState.java').read_text()
         methods = section(source, '    private void gameControl(', '    private void gameBanner(')
+        game_refresh = section(source, '    private void refreshGameState()', '    /** A foreground binding')
         close = section(source, '    private void closeGame()', '    // ---------- lifecycle')
         start = section(source, '    @Override protected void onStart()', '    @Override protected void onResume()')
+        resume = section(source, '    @Override protected void onResume()', '    @Override protected void onStop()')
         stop = section(source, '    @Override protected void onStop()', '    /** A card mounted,')
         refresh = section(source, '    private final Runnable refresh', '    @Override protected void onDestroy()')
+        destroy = section(source, '    @Override protected void onDestroy()', '    @Override public void onConfigurationChanged(')
         show = section(source, '    private void showUi()', '    /** A move killed')
         show_tail = show.rsplit('        render();', 1)[1]
         logger = section(state, '    static void logGameDecision(', '    /** Only an acquired game lock')
         probe = cls.work / 'SetupActivity.java'
-        probe.write_text(JAVA_PRELUDE + logger + JAVA_ACTIVITY + methods + close + start + stop + refresh
+        probe.write_text(JAVA_PRELUDE + logger + JAVA_ACTIVITY + methods + game_refresh + close
+                         + start + resume + stop + refresh + destroy
                          + '    private void showUi() { ui = true; render();' + show_tail + JAVA_TESTS)
         log = cls.work / 'android/util/Log.java'; log.parent.mkdir(parents=True); log.write_text(LOG)
         process = cls.work / 'android/os/Process.java'; process.parent.mkdir(parents=True)
@@ -426,6 +781,49 @@ int main(int argc, char **argv) {
 
     def test_ui_created_after_onstart_registers_one_refresh_and_removes_it(self):
         self.probe('late-ui')
+
+    def test_game_hold_only_acquires_one_visible_game_binding(self):
+        for mode in ('hold-opening', 'hold-opening-stop', 'hold-start', 'hold-non-game', 'hold-invisible', 'hold-off'):
+            with self.subTest(mode=mode):
+                self.probe(mode)
+
+    def test_game_hold_releases_and_reacquires_across_visible_lifecycles(self):
+        for mode in ('hold-rotation', 'hold-finish', 'hold-destroy', 'hold-free-refresh', 'hold-session-ended'):
+            with self.subTest(mode=mode):
+                self.probe(mode)
+
+    def test_game_hold_failed_callbacks_and_binds_do_not_restart_in_same_lifecycle(self):
+        for mode in ('hold-disconnect', 'hold-binding-died', 'hold-null-binding',
+                     'hold-bind-false', 'hold-bind-throw', 'hold-bind-race',
+                     'hold-opening-bind-false', 'hold-opening-bind-throw', 'hold-opening-disconnect'):
+            with self.subTest(mode=mode):
+                self.probe(mode)
+
+    def test_game_hold_and_close_keep_independent_connections_and_protocols(self):
+        for mode in ('hold-close', 'hold-close-disconnect'):
+            with self.subTest(mode=mode):
+                self.probe(mode)
+
+    def test_game_hold_lifecycle_integration_precedes_ui_and_keeps_close_flags(self):
+        create = section(self.source, '    @Override protected void onCreate(', '    @Override protected void onNewIntent(')
+        self.assertLess(create.index('if (returnToRunningGame(getIntent())) return;'), create.index('gameHoldOpening = true;'))
+        self.assertLess(create.index('gameHoldOpening = true;'), create.index('updateGameHold();'))
+        self.assertLess(create.index('updateGameHold();'), create.index('if (gameError == null'))
+        self.assertLess(create.index('updateGameHold();'), create.index('showUi();'))
+        start = section(self.source, '    @Override protected void onStart()', '    /** showUi')
+        self.assertLess(start.index('started = true;'), start.index('updateGameHold();'))
+        self.assertLess(start.index('updateGameHold();'), start.index('startUi();'))
+        resume = section(self.source, '    @Override protected void onResume()', '    @Override protected void onStop()')
+        self.assertLess(resume.index('updateGameHold();'), resume.index('if (ui)'))
+        intent = section(self.source, '    @Override protected void onNewIntent(', '    @Override protected void onStart()')
+        self.assertLess(intent.index('setIntent(intent);'), intent.index('updateGameHold();'))
+        self.assertLess(intent.index('updateGameHold();'), intent.index('if (moveSettingsToMain(intent))'))
+        self.assertIn('private ServiceConnection gameHoldConnection;', self.source)
+        self.assertIn('private ServiceConnection closeConnection;', self.source)
+        close = section(self.source, '    private void closeGame()', '    private void releaseCloseBinding()')
+        self.assertIn('bindService(new Intent(this, GameControlService.class), closeConnection, BIND_AUTO_CREATE)', close)
+        self.assertNotIn('GameHold.ACTION', close)
+        self.assertNotIn('BIND_IMPORTANT', close)
 
     def test_branch_warning_survives_info_filter_and_reports_effective_levels(self):
         self.probe('logging')

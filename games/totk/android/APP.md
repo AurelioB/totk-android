@@ -2283,6 +2283,51 @@ is safe, and adding its row here. Each switch's per-300 report shows the value i
   The menu waits for the game lock/start marker to clear (bounded), then retries the selected operation. Once the
   game is gone, a stale `save-busy` left by a crash does not block completion. A timeout explains why the game was left
   running.
+- **Previous-session notice (default on; API 30+ only).** Cold launcher/menu and direct-game/title entries
+  check Android's `ApplicationExitInfo` on a Java worker, matching the default game process, native PID,
+  `/proc` start identity and session time. `:setup` exits are not game exits; a live same-identity return is not
+  a cold return. With authoritative low-memory history the focusable, controller-dismissable notice says:
+  “Android closed the previous game session to free memory. Load a saved game; progress since the last save may be lost.”
+  Other abnormal or unclassified interrupted game sessions say: “The previous session ended unexpectedly.”
+  This diagnoses loss; it does not restore unsaved progress or certify saves. Normal self-exit, user stop,
+  package update/reinstall and already-consumed records show no notice. Missing exit history never implies
+  low memory. Android older than API 30 does not check or display exit notices.
+  Put exact `TOTK_EXIT_NOTICE=0` in `totk.env` to silence notices (unset/other values keep them on).
+  Silenced records are consumed, not queued to surprise the player later. One `[TotkExitNotice]` line per
+  checked previous session records reason, importance, historical PSS/RSS in KiB and exit timestamp in milliseconds;
+  missing fields say `unavailable`. Historical PSS/RSS are not final live measurements.
+  Private atomic session receipts retain up to 16 starts until checked, including across direct native startup;
+  an atomic, cross-process ledger prevents Setup and the game displaying the same session twice. Receipts
+  contain identifiers/times/log paths, not guest data. Background receipts record only an already-observed
+  committed generation, not a new save. An orderly receipt is written only after accepted save-safe Close
+  and cache shutdown, never from Activity destruction. The native destruction callback is not registered;
+  no clean-close guarantee relies on it. Record IO runs on the activity/close-poller or notice worker/UI path,
+  not the guest/game/render threads. No new foreground service, permission, Home interception or frame timeline.
+- **Settings-over-game importance experiment (off by default).** Put exact `TOTK_GAME_HOLD=1` in the game's
+  `totk.env`, then restart the game. Other values/unset keep the existing service calls and manifest unchanged.
+  While our Settings activity is visible over a live session it binds `GameControlService` with
+  `BIND_AUTO_CREATE | BIND_IMPORTANT`, independently of the existing Close binding. Stop/destruction, game exit,
+  or binding death releases it; recreation acquires a fresh connection. No foreground service, notification,
+  permission, task or display-policy change is needed. Android's
+  [BIND_IMPORTANT contract](https://developer.android.com/reference/android/content/Context#BIND_IMPORTANT)
+  brings the service to foreground-process importance while its client is foreground;
+  [process dependencies](https://developer.android.com/guide/components/activities/process-lifecycle)
+  propagate the visible menu's importance to the game process. This is not immunity from low-memory kills;
+  actual Duo `oom_score_adj` and survival still require device testing. This protects only the Settings interval
+  **before Close is pressed**; it does not protect ordinary Home or preserve unsaved progress.
+  The same switch gives pause-triggered pipeline-cache flush a 750 ms binding grace, then defers that
+  forced flush while Settings is bound. Leaving Settings while still paused starts another 750 ms grace
+  (recreation can rebind); a real background transition still requests the normal flush. Resuming cancels
+  the pending forced flush; accepted Close still performs normal cache shutdown. Destruction is not a clean-close receipt.
+  Periodic persistence and atomic cache replacement are unchanged. A kill during deferral can lose cache
+  additions since the last completed snapshot (more shader recompilation next launch). Atomic cache replacement
+  and the game-save protocol are unchanged; neither switch guarantees saves survive a mid-write process kill.
+  Opaque Vulkan cache data cannot be safely streamed by offset.
+  `[TotkGameHold]` lines in `totk.log` record binding/cache lifecycle and the game's own
+  `/proc/self/oom_score_adj` at pause, one second and five seconds later. A private, native-published session
+  marker communicates the launch switch and actual log path to Settings without loading the game library there.
+  This marker is not proof of a game: the existing lock remains authoritative. Host contract tests cover
+  lifecycle/pause policy; they do not prove Android's memory accounting or the manufacturer's kill policy.
 - **Background pause (default).** `TotkActivity`'s actual `onPause`/`onStop` pauses gameplay at the next
   `nvnWindowAcquireTexture`, after releasing the guest virtual core and before taking graphics locks. `onResume`
   wakes it. On a single display, losing window focus also pauses (including live recent-apps tiles which Android can

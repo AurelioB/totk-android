@@ -148,6 +148,21 @@ public final class SaveMirror {
         public void close(long waitMs) {}
     }
 }''',
+    'com/aure/totk/ExitNotice.java': '''package com.aure.totk;
+final class ExitNotice {
+    void resume(android.app.Activity activity, java.util.function.BooleanSupplier ready, java.util.function.Consumer<Boolean> visible) {}
+    void pause() {}
+}''',
+    'com/aure/totk/GameHold.java': '''package com.aure.totk;
+final class GameHold {
+    static void initialize() {
+        if (!android.app.NativeActivity.initialized) throw new AssertionError("hold initialized before NativeActivity");
+    }
+    static void resumed() {}
+    static void paused(android.content.Context context) {}
+    static void updatePause() {}
+    static void destroyed() {}
+}''',
     'com/aure/totk/GameFeedback.java': '''package com.aure.totk;
 final class GameFeedback {
     GameFeedback(Object activity, int enabled) { throw new AssertionError("the probe gives the game no rumble or motion"); }
