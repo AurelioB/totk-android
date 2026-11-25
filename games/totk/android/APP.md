@@ -1289,7 +1289,7 @@ Host-only does not certify gralloc, SurfaceFlinger, game-image quality or perfor
 | `TOTK_POST_SCALE=sgsr` / `fsr`, `TOTK_POST_SHARPNESS=0.2`, `TOTK_POST_SGSR_SHARPNESS=2` | Existing whole-canvas alternatives, Duo device-tested; bypassed for effective native UI. Scene SGSR shares the SGSR controls without filtering UI. |
 | `TOTK_POST_SGSR_EDGE_THRESHOLD`, `TOTK_POST_SGSR_EDGE_DIRECTION=1`, `TOTK_POST_AA=smaa` / `off` | Existing opt-in filter/control variants; host pixel coverage, no separate integrated device qualification. |
 | `TOTK_OVERLAY=off` / `fps` / `full`, `TOTK_OVERLAY_POS=tl` / `tr` / `bl` / `br`, `TOTK_OVERLAY_POWER=1` | Compact fixed-layout FPS/resolution/mode and active-FG telemetry; power/temperature opt-in, default off. Release off, development full; host pixels/timings, no inferred device benefit. |
-| `TOTK_MAP_WARN=1` | Experimental, default off: five-second background process-map warning, including with the performance overlay off. Logs at 80%, notice at 88%, clears below 84%; warning only, not a map-growth fix. See [Process map-limit warning](#process-map-limit-warning-experimental-default-off). |
+| `TOTK_MAP_WARN=0` | Default on when unset (mode `1`): five-second background game-process map warning, including with the performance overlay off. Logs at 80%, notice at 88%, clears below 84%; warns but does not prevent the map-limit abort. `0` disables this feature and starts no sampler for it; diagnostic `2` / TEST-ONLY `3` remain opt-in. See [Process map-limit warning](#process-map-limit-warning-default-on). |
 | `TOTK_FRAMEGEN_DIAG=1`, `TOTK_PRESENT_CADENCE_TRACE=1`, `TOTK_FRAME_TIMELINE=1` | Qualification-only diagnostics; Thor/Odin evidence, trace measurably perturbs Thor. Slot-exhaustion snapshots require DIAG. Never use a traced arm as ordinary-play timing. |
 | `TOTK_FRAMEGEN_WRITER_DIAG=1`, `TOTK_FRAMEGEN_UNCERTIFIED_PLANE=1`, `TOTK_FRAMEGEN_UNKNOWN_PERCENT`, `TOTK_FRAMEGEN_DUMP=<frame>`, `TOTK_VK_PASS_PROFILE`, `TOTK_VK_PASS_DUMP`, `TOTK_INPUT_FILE` | Diagnostic or experimental proof controls, off by default except the unchanged35% unknown-depth ceiling; host coverage, no new device-safe/performance qualification. Uncertified plane is explicitly not a geometric proof; changing the coverage ceiling is not a quality guarantee. |
 | `TOTK_FRAMEGEN_BACKPRESSURE=0` | Diagnostic-only unsafe async control; not a play recommendation. |
@@ -1461,15 +1461,22 @@ Repeat with `TOTK_XLATE_ONDEVICE=0` and without the packaged binary: both must p
 Device measurements are not implied by the host test, and no on-device draw, timing, CPU or RSS result is claimed
 without that run.
 
-## Process map-limit warning (experimental, default off)
+## Process map-limit warning (default on)
 
-`TOTK_MAP_WARN=1` starts process-map counting on the existing nice+10 `totk-vmascan` worker,
-independently of `TOTK_FRAME_LAG`. The first sample is about five seconds after startup; subsequent
-samples are spaced by about five seconds plus scan time. The game/render/present threads and signal
-handlers do not scan for this feature. Warning-only scans take no pool, runtime or tracker locks.
-The existing opt-in lag budget/classification paths retain their locks and policy.
-With the switch absent or not exactly `1`, `2` or `3`, this feature starts no worker, adds no scans and displays
-no notice; presentation checks one cached enable flag.
+Unset `TOTK_MAP_WARN` or exact `1` enables process-map counting on the existing nice+10
+`totk-vmascan` worker, independently of `TOTK_FRAME_LAG`. It starts lazily when the game's Vulkan
+overlay/presenter is first used, not when the native library is loaded or the frame origin is published.
+The separate `:setup` process does not link this sampler. The first sample is about five seconds after
+worker startup; subsequent samples are spaced by about five seconds plus scan time. The
+game/render/present threads and signal handlers do not scan for this feature. Warning-only scans take
+no pool, runtime or tracker locks. Independently requested lag budget/classification work may start
+the shared worker earlier, as before; its locks and policy are unchanged. One `[map-warn] started mode=1 period_ms=5000 log=80 notice=88 clear=84; warning only, does not prevent map-limit abort`
+line records the ordinary default startup.
+
+Set `TOTK_MAP_WARN=0` in `totk.env` and restart to disable it entirely: no worker starts for this
+feature, no warning scans or log lines are added, and no notice is displayed. Other explicit values
+except exact `1`, `2` or `3` also remain disabled. Independently enabled lag/classification work may
+still use the shared sampler. This is not a menu option; the menu writes no override to `settings.env`.
 
 At **80%** of `vm.max_map_count`, log once. At **88%**, show a persistent small notice in the
 configured overlay corner (top-right by default), even with `TOTK_OVERLAY=off`:
@@ -1482,9 +1489,9 @@ SAVE AND RESTART GAME SOON
 The notice clears strictly below **84%**. Each threshold logs once per process, not every scan or
 re-crossing. An unreadable/zero maps count clears the notice and logs its unavailability once; a later
 valid sample resumes evaluation. If the kernel limit is unreadable, assume **65,530** (as on the
-Android 13 Thor). Samples are approximate and can miss a fast rise between scans. This is not a fix
-for map growth and cannot guarantee enough time to save. It never changes mappings, protections,
-tracker admission or game state.
+Android 13 Thor). Samples are approximate and can miss a fast rise between scans. This warns only:
+it **does not prevent the map-limit abort**, fix map growth or guarantee enough time to save.
+It never changes mappings, protections, tracker admission or game state.
 
 Startup-only test controls (integer percentages **1..100**):
 
@@ -1513,7 +1520,7 @@ and sleep. `rows=0` denotes an unknown count.
 With lag/classification off this is at most one line per five-second warning scan (about 0.2 Hz).
 Existing independently requested lag/classification scans also get a line; their unchanged minimum
 period is one second. No per-row or per-frame logging is added. `warn=1` marks a warning-policy sample.
-`1` remains quiet except its one-shot threshold/read-failure logs; neither `1` nor off adds trace reads.
+`1` remains quiet except its once-only startup and threshold/read-failure logs; neither `1` nor off adds trace reads.
 Use `2`, not `3`, for standing performance attribution. Logging itself can perturb timing. Match real
 scan intervals, not modulo-five-second phases or log-delivery timestamps; ordinary long-frame rows
 are delayed/rounded sparse observations, and window maxima have no within-window event timestamp.
@@ -1535,7 +1542,7 @@ No maps are added/removed, no protections are changed, no count is fabricated, a
 forced. This verifies the real policy-to-overlay hold/clear path after **test threshold changes**;
 it does not prove that real map growth reverses or that a count crossed the production 84% boundary.
 Do not use `3` for ordinary play: its final thresholds intentionally suppress the normal 88% warning.
-Restart with `1` (remove percentage overrides) for the ordinary opt-in warning, or unset it to disable.
+Restart with the switch unset or `1` (remove percentage overrides) for the ordinary warning; use `0` to disable.
 
 The original Thor check observed the notice and default-off behavior, but did not observe a natural
 clear and could not attribute long frames to individual scans. These diagnostic modes enable those
@@ -1546,7 +1553,7 @@ For safe Thor display verification, use `TOTK_MAP_WARN=1` and percentages `1` / 
 worker sample: the notice should appear once the ordinary process count exceeds 3% of the limit.
 Do not create extra mappings or travel repeatedly toward the real limit. Verify that saving and menu
 input remain usable, and that the notice persists through area/menu transitions and overlay toggles.
-Restart with the switch off: no notice. Remove the three test overrides before ordinary use.
+Restart with `TOTK_MAP_WARN=0`: no notice or map-warn startup line. Remove the three test overrides before ordinary use.
 Host policy/sampler/font-raster checks do not verify Android pixels, Thor scan cost, saving headroom
 or crash prevention.
 

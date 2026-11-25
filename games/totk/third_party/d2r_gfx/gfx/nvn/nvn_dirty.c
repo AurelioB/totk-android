@@ -314,7 +314,7 @@ static unsigned map_warn_percent(const char *name, unsigned fallback) {
 }
 static void map_warn_configure(void) {
     const char *value = getenv("TOTK_MAP_WARN");
-    g_map_warn_mode = value && !strcmp(value, "1") ? 1 :
+    g_map_warn_mode = !value || !strcmp(value, "1") ? 1 :
                       value && !strcmp(value, "2") ? 2 : value && !strcmp(value, "3") ? 3 : 0;
     g_map_warn_enabled = g_map_warn_mode != 0;
     if (!g_map_warn_enabled) return;
@@ -638,10 +638,15 @@ static void vma_start(void) {
     pthread_attr_t attr;
     if (pthread_attr_init(&attr)) die("VMA sampler thread attributes");
     if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED)) die("VMA sampler detach");
+    const nvn_map_warn_thresholds startup_thresholds = g_map_warn_thresholds;
     pthread_t thread;
     int result = pthread_create(&thread, &attr, vma_worker, NULL);
     pthread_attr_destroy(&attr);
     if (result) die("VMA sampler thread: %d", result);
+    if (g_map_warn_enabled)
+        LOG("[map-warn] started mode=%u period_ms=%u log=%u notice=%u clear=%u; warning only, does not prevent map-limit abort",
+            g_map_warn_mode, (unsigned)MAP_WARN_PERIOD_MS, startup_thresholds.log_percent,
+            startup_thresholds.notice_percent, startup_thresholds.clear_percent);
 }
 #ifdef TOTK_VK_TESTS
 void nvn_dirty_lag_test_vma_limit(uint64_t limit) {

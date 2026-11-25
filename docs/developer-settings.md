@@ -86,6 +86,7 @@ Everything not in the menu is a developer switch. A selection:
 | `TOTK_ASPECT=21:9` (or `4:3`, …) | Shows the game's view at that ratio with black bars instead of stretching it; the HUD and menus keep their proportions. |
 | `TOTK_AUTOLOAD=1` | Loads the newest save again at start. |
 | `TOTK_BENCH_TIME=02:00` | Benchmark-only, launch-time 1.4.3 effective clock override; strict `HH:MM` (`00:00`–`23:59`). Absent/`off` keeps native code/data unchanged, without a veneer; any other value logs one rejection and stays off. |
+| `TOTK_MAP_WARN=0` | Startup-only opt-out of the default-on game-process map warning (unset or `1`). Log at 80%, show a notice at 88%, clear below 84%; warns but does not prevent the map-limit abort. `0` starts no sampler for this feature; `2` (per-scan trace) and `3` (TEST-ONLY) remain opt-in. Not a menu option; no `settings.env` migration is needed. See [APP.md](../games/totk/android/APP.md#process-map-limit-warning-default-on). |
 | `TOTK_COMPANION=0` | Disables the second-screen companion at runtime (no controller, display listener or poller is started). |
 | `TOTK_COMPANION_LOG=1` | Logs each companion status change and the first full snapshot to `totk.log`. |
 | `TOTK_INPUT_LOG=1` | Logs each **−** / **R** overlay-chord decision as `[chord] …`. |

@@ -131,17 +131,19 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Thanks to @Dorkington ([#47](https://github.com/AurelioB/totk-android/pull/47)).
   Host regressions cover native layer guards, native JSON → Java coordinates and deterministic cache convergence;
   surface/sky/Depths transitions, zoom appearance, memory and decoder CPU still need dual-screen device checks.
-- Add experimental, default-off `TOTK_MAP_WARN=1`: count process maps on the existing low-priority
+- Enable `TOTK_MAP_WARN` mode `1` by default when unset; `=0` disables it and starts no sampler for this feature.
+  Start lazily in the game presenter, not on library load or in `:setup`; log one startup line. Count maps on the existing low-priority
   sampler about every five seconds, independently of frame lag. Log at 80%; show `MAP LIMIT NEAR` /
   `SAVE AND RESTART GAME SOON` at 88%, even with the performance overlay off; clear below 84%.
   Hidden kernel limits use 65,530; unreadable counts clear the notice and log once. Startup-only
   percentage overrides support safe low-threshold testing. Add diagnostic `TOTK_MAP_WARN=2`
-  per-scan monotonic start/duration/rows and ordinary-frame clock origin; `=1` logging is unchanged.
+  per-scan monotonic start/duration/rows and ordinary-frame clock origin; mode `1` adds no per-scan logging.
   TEST-ONLY `=3` changes thresholds after 12 and 24 warning samples to show, hold and clear the
   actual notice without adding mappings or restarting. It is not an ordinary-play warning mode.
   Initial Thor checks observed a readable notice/default-off behavior; device clearing and timing
   qualification remain unresolved, and the new test modes need device verification.
-  This warns only: it does not fix map growth or change mapping/protection/admission policy.
+  Final device checks are required before landing the default-on change. This warns only: it does not prevent the map-limit abort,
+  fix map growth or change mapping/protection/admission policy. Diagnostic modes `2` and `3` remain opt-in.
 - Correct fragment inputs that their vertex shader never writes, targeting wind/air-flow white boxes
   ([#4](https://github.com/AurelioB/totk-android/issues/4)). Thanks to @Dorkington
   ([#43](https://github.com/AurelioB/totk-android/pull/43)); keep the credited MIT adaptation.

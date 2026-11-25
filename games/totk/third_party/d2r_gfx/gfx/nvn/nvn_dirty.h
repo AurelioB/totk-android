@@ -37,9 +37,10 @@ enum {
 };
 void nvn_dirty_lag_enable(void);
 int nvn_dirty_lag_enabled(void);   /* set once by nvn_dirty_lag_enable before pool registration */
-/* Startup-only opt-in: 1 = warning, 2 = per-scan trace, 3 = TEST-ONLY show/hold/clear sequence.
-   All reuse the low-priority sampler; off starts none. The notice getter is one cached atomic
-   load; neither API scans procfs. See APP.md before using diagnostic modes. */
+/* Startup-only: unset or 1 = warning (default on), 0 = off; 2 = opt-in per-scan trace,
+   3 = TEST-ONLY show/hold/clear sequence. All reuse the low-priority sampler; off starts none.
+   The notice getter is one cached atomic load; neither API scans procfs. Warns, does not prevent
+   the map-limit abort. See APP.md before using diagnostic modes. */
 int nvn_dirty_map_warn_init(void);
 int nvn_dirty_map_warn_notice(void);
 /* Frozen effective startup mode for the once-per-launch benchmark state marker; starts no worker. */

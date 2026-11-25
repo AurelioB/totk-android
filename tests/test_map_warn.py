@@ -78,6 +78,12 @@ int main(int argc,char **argv) {
     assert(argc==2);
     if (!strcmp(argv[1],"policy")) { policy(); panel(); return 0; }
     if (!strcmp(argv[1],"marker")) { vk_overlay_mode(); vk_overlay_mode(); return 0; }
+    if (!strcmp(argv[1],"cold")) {
+        assert(!atomic_load(&created) && !nvn_dirty_map_warn_notice());
+        nvn_dirty_map_warn_set_frame_origin(1000000000);
+        assert(!atomic_load(&created) && !g_vma_test_reads);
+        puts("cold no-worker no-proc-reads"); return 0;
+    }
     if (!strcmp(argv[1],"test-sequence")) {
         map_warn_configure(); /* pure sampling test: no worker is created */
         assert(g_map_warn_enabled && !atomic_load(&created));
@@ -103,6 +109,7 @@ int main(int argc,char **argv) {
         nvn_dirty_map_warn_set_frame_origin(1000000000);
         assert(!atomic_load(&created)); /* publishing the origin never starts the sampler */
         int enabled=nvn_dirty_map_warn_init();
+        assert(nvn_dirty_map_warn_init()==enabled); /* repeated overlay queries share one worker */
         printf("%d %u %u %u %u %d\n",enabled,atomic_load(&created),
             g_map_warn_thresholds.log_percent,g_map_warn_thresholds.notice_percent,
             g_map_warn_thresholds.clear_percent,nvn_dirty_map_warn_notice()); return 0;
@@ -201,11 +208,45 @@ class MapWarning(unittest.TestCase):
             self.assertTrue(lines[0].endswith(' TOTK_MENU_CAPTURE_FIX=' + state))
 
     def test_off_starts_no_thread_and_has_no_notice(self):
-        for value in (None, '0', 'off', 'true', '4', '02'):
-            result = self.run_probe('config', **({} if value is None else {'TOTK_MAP_WARN': value}))
+        for value in ('', '0', 'off', 'true', '4', '02'):
+            result = self.run_probe('config', TOTK_MAP_WARN=value)
             self.assertEqual(result.stdout.strip(), '0 0 80 88 84 0')
+            self.assertNotIn('[map-warn]', result.stderr)
+            self.assertNotIn('[map-warn-scan]', result.stderr)
 
-    def test_enabled_only_startup_and_threshold_overrides(self):
+    def test_default_and_explicit_one_start_one_warning_worker(self):
+        for settings in ({}, {'TOTK_MAP_WARN': '1'}):
+            result = self.run_probe('config', **settings)
+            self.assertEqual(result.stdout.strip(), '1 1 80 88 84 0')
+            self.assertEqual(result.stderr.count('[map-warn] started mode=1 '), 1)
+            self.assertIn('period_ms=5000 log=80 notice=88 clear=84', result.stderr)
+            self.assertIn('does not prevent map-limit abort', result.stderr)
+            self.assertNotIn('[map-warn-scan]', result.stderr)
+
+    def test_loading_and_frame_origin_do_not_start_sampling(self):
+        for settings in ({}, {'TOTK_MAP_WARN': '0'}, {'TOTK_MAP_WARN': '2'}, {'TOTK_MAP_WARN': '3'}):
+            result = self.run_probe('cold', **settings)
+            self.assertEqual(result.stdout.strip(), 'cold no-worker no-proc-reads')
+            self.assertNotIn('[map-warn]', result.stderr)
+
+    def test_setup_library_does_not_link_graphics_sampler(self):
+        if not shutil.which('make'):
+            self.skipTest('needs make to expand the production setup source list')
+        setup = ROOT / 'games/totk/android/setup/setup.mk'
+        result = subprocess.run(['make', '-s', '-f', str(setup), '-f', '-',
+            'OUT=' + str(Path(self.temp.name) / 'setup-boundary'), 'map-warn-sources'],
+            input="map-warn-sources:\n\t@printf '%s\\n' $(SETUP_ANDROID_SRCS)\n",
+            capture_output=True, text=True, check=True, timeout=20)
+        sources = [Path(line) for line in result.stdout.splitlines()]
+        self.assertIn(setup.with_name('setup_jni.c'), sources)
+        self.assertFalse(any(path.name in ('nvn_dirty.c', 'vk_overlay.c', 'frontend_android.c')
+                             for path in sources))
+        native_setup = setup.parents[1] / 'java/com/aure/totk/setup/NativeSetup.java'
+        native_setup_source = native_setup.read_text()
+        self.assertIn('System.loadLibrary("totk_setup")', native_setup_source)
+        self.assertNotIn('System.loadLibrary("totk")', native_setup_source)
+
+    def test_threshold_overrides_and_opt_in_modes(self):
         self.assertEqual(self.run_probe('config', TOTK_MAP_WARN='1').stdout.strip(), '1 1 80 88 84 0')
         self.assertEqual(self.run_probe('config', TOTK_MAP_WARN='2').stdout.strip(), '1 1 80 88 84 0')
         self.assertEqual(self.run_probe('config', TOTK_MAP_WARN='3',
@@ -221,9 +262,10 @@ class MapWarning(unittest.TestCase):
             self.assertIn('[map-warn]', result.stderr)
 
     def test_worker_samples_with_lag_off_and_no_caller_reads(self):
-        result = self.run_probe('worker', TOTK_MAP_WARN='1')
-        self.assertIn('worker scans=1', result.stdout)
-        self.assertNotIn('[map-warn-scan]', result.stderr)
+        for settings in ({}, {'TOTK_MAP_WARN': '1'}):
+            result = self.run_probe('worker', **settings)
+            self.assertIn('worker scans=1', result.stdout)
+            self.assertNotIn('[map-warn-scan]', result.stderr)
 
     def test_sampler_trace_has_monotonic_time_duration_rows_and_frame_origin(self):
         before = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
