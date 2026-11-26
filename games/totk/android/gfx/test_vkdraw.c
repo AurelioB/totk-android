@@ -1736,7 +1736,7 @@ static void settled_expected(const tex_t *t, uint8_t *expected) {
 static uint8_t *settled_guest_memory(size_t bytes, int *fd) {
     const char *setting = getenv("TOTK_WB_ALIAS");
     *fd = -1;
-    if (setting && !strcmp(setting, "1")) {
+    if (!setting || !strcmp(setting, "1")) {
         *fd = memfd_create("totk-wb-alias-fixture", MFD_CLOEXEC);
         if (*fd < 0 || ftruncate(*fd, bytes)) DIE("write-back alias fixture backing");
     }

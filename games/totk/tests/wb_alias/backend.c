@@ -549,7 +549,7 @@ static int pause_init_race(int enabled) {
     return failures != 0;
 }
 int main(int argc, char **argv) {
-    int gem = argc > 1 && !strcmp(argv[1], "i915"); const char *option = getenv("TOTK_WB_ALIAS"); int enabled = option && !strcmp(option, "1");
+    int gem = argc > 1 && !strcmp(argv[1], "i915"); const char *option = getenv("TOTK_WB_ALIAS"); int enabled = !option || !strcmp(option, "1");
     if (argc > 1 && !strcmp(argv[1], "pause-init")) return pause_init_race(enabled);
     CHECK(!vk_wb_alias_enabled(), "backend getter does not lazily initialize switch"); vk_wb_test_alias_init();
     CHECK(vk_wb_alias_enabled() == enabled, "backend exact startup environment switch");

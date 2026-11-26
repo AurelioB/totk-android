@@ -517,7 +517,8 @@ void vk_wb_stats(void);                          /* present's 300-frame summary 
 uint64_t vk_wb_pool_identity(const pool_t *pool, const void *address, uint64_t size);
 int vk_wb_pool_lock(uint64_t identity, const void *address, uint64_t size);
 void vk_wb_pool_unlock(void);
-/* Exact startup opt-in; no lazy initialization. The locked APIs require a successful vk_wb_pool_lock
+/* Frozen startup policy: unset or exact 1 enables, explicit 0 opts out; no lazy initialization.
+   The locked APIs require a successful vk_wb_pool_lock
    (or equivalent g_pool_mu ownership), retained through every store using the returned pointer.
    Span returns at most requested bytes, clipped at the next owner/virtual-alias transition; a NULL
    span may describe an unsupported gap in *available. Range requires every byte to be supported. */

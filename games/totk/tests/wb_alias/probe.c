@@ -243,7 +243,7 @@ static void alias_completion_store(backing *b) {
 }
 int main(int argc, char **argv) {
     int gem = argc > 1 && !strcmp(argv[1], "i915");
-    const char *option = getenv("TOTK_WB_ALIAS"); alias_on = option && !strcmp(option, "1");
+    const char *option = getenv("TOTK_WB_ALIAS"); alias_on = !option || !strcmp(option, "1");
     if (getenv("TOTK_FRAME_LAG") && !strcmp(getenv("TOTK_FRAME_LAG"), "1")) nvn_dirty_lag_enable();
     size_t page = (size_t)getpagesize(); backing b; int result = backing_open(&b, TEST_PAGES * page, gem, 1);
     if (result) { backing_close(&b); return result; }
