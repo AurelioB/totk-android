@@ -82,7 +82,7 @@ public final class UpdatePrompt {
     'com/aure/totk/setup/BootProgress.java': '''package com.aure.totk.setup;
 public final class BootProgress {
     public interface Source { String read(long[] counts); }
-    public BootProgress(android.app.Activity activity, Source source) {}
+    public BootProgress(android.app.Activity activity, Source source, Runnable onFinished) {}
     public void resume() {}
     public void pause() {}
 }''',

@@ -26,6 +26,7 @@ public final class BootProgress {
     private static final int REFRESH_MS = 250;
     private final Activity owner;
     private final Source source;
+    private final Runnable onFinished;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable tick = this::refresh;
     private final long[] counts = new long[2];
@@ -36,9 +37,10 @@ public final class BootProgress {
     private boolean finished;
     private int lastPercent = -2;
 
-    public BootProgress(Activity owner, Source source) {
+    public BootProgress(Activity owner, Source source, Runnable onFinished) {
         this.owner = owner;
         this.source = source;
+        this.onFinished = onFinished;
     }
 
     public void resume() {
@@ -64,6 +66,7 @@ public final class BootProgress {
             title = null;
             percent = null;
             bar = null;
+            onFinished.run(); // The popup is already dismissed before modal UI may take focus.
             return;
         }
         View anchor = owner.getWindow().getDecorView();

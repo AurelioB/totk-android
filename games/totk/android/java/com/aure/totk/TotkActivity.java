@@ -31,11 +31,11 @@ public final class TotkActivity extends NativeActivity {
     private long presentEpoch;
     private boolean displayMoveRequested;
     private static boolean updateChecked;
-    private boolean updateOpen, exitNoticeOpen;
+    private boolean updateOpen, exitNoticeOpen, bootReady;
     private final ExitNotice exitNotice = new ExitNotice();
     private String updateVersion;
     private void showUpdate() {
-        if (!resumed || updateVersion == null || updateOpen || exitNoticeOpen || isFinishing()) return;
+        if (!resumed || !bootReady || updateVersion == null || updateOpen || exitNoticeOpen || isFinishing()) return;
         String version = updateVersion;
         updateVersion = null;
         updateOpen = true;
@@ -181,7 +181,12 @@ public final class TotkActivity extends NativeActivity {
         // Query only after super, before constructing a controller or display listener.
         // The companion art is generated on the device by the optional setup stage; without it the companion stays off.
         if (CompanionNative.isEnabled() && AssetStore.available(this)) companion = new PresentationController(this, new CompanionNative());
-        bootProgress = new BootProgress(this, TotkActivity::nativeBootProgress);
+        bootProgress = new BootProgress(this, TotkActivity::nativeBootProgress, () -> {
+            bootReady = true;
+            // Startup popup first, then an already pending update, then the previous-session notice.
+            showUpdate();
+            checkExitNotice();
+        });
         GameHold.initialize(); // CompanionNative above has associated libtotk with this JVM; never called by an empty service.
         saves = SaveMirror.Watcher.start(this);
         int given = nativeFeedbackEnabled();   // what start_game gave the game (TOTK_RUMBLE / TOTK_GYRO and the hardware)
@@ -227,15 +232,15 @@ public final class TotkActivity extends NativeActivity {
         resumed = true;
         applyFrameRateHint();
         GameHold.resumed();
-        checkExitNotice();
         ensureMainDisplay();
         GameFeedback f = feedback;
         if (f != null) f.resume();
         bootProgress.resume();
         showUpdate();
+        checkExitNotice();
     }
     private void checkExitNotice() {
-        exitNotice.resume(this, () -> resumed && !updateOpen, open -> {
+        exitNotice.resume(this, () -> resumed && bootReady && !updateOpen, open -> {
             exitNoticeOpen = open;
             boolean single = PresentationController.secondScreen(this, getDisplay()) == DisplayClass.NONE;
             nativeGameFocus(hasWindowFocus() && !updateOpen && !open, single || updateOpen || open);
@@ -279,6 +284,7 @@ public final class TotkActivity extends NativeActivity {
     }
     @Override protected void onDestroy() {
         exitNotice.pause();
+        bootProgress.pause();
         GameHold.destroyed();
         updatePresentPrerotate(0);
         if (companion != null) { companion.close(); companion = null; }

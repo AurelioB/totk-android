@@ -305,11 +305,22 @@ class Window {
 class NativeActivity { protected void onResume() {} protected void onPause() {} }
 class GameFeedback { void resume() {} void pause() {} }
 class BootProgress { void resume() {} void pause() {} }
+class GameHold { static void resumed() {} static void paused(Object a) {} static void updatePause() {} }
+class ExitNotice {
+    void pause() {}
+    void resume(Object a, java.util.function.BooleanSupplier ready, java.util.function.Consumer<Boolean> visible) {}
+}
+class PresentationController { static int secondScreen(Object a, Display d) { return 0; } }
+class DisplayClass { static final int NONE = 0; }
 public class HintProbe extends NativeActivity {
     final Window window = new Window(); Window getWindow() { return window; }
-    boolean resumed; float frameRateHint;
+    boolean resumed, bootReady, updateOpen, exitNoticeOpen; float frameRateHint;
     GameFeedback feedback;
     final BootProgress bootProgress = new BootProgress();
+    final ExitNotice exitNotice = new ExitNotice();
+    boolean hasWindowFocus() { return true; }
+    Display getDisplay() { return window.decor.display; }
+    static void nativeGameFocus(boolean focused, boolean single) {}
     void ensureMainDisplay() {} void showUpdate() {}
 ''' + method + lifecycle + r'''
     static void require(boolean value) { if (!value) throw new AssertionError(); }

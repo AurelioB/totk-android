@@ -2296,6 +2296,11 @@ is safe, and adding its row here. Each switch's per-300 report shows the value i
   the focusable, controller-dismissable notice says:
   “Android closed the previous game session to free memory. Load a saved game; progress since the last save may be lost.”
   A matched abnormal/unknown platform reason says: “The previous session ended unexpectedly.”
+  On the direct-game/title path, the startup indicator is dismissed after the first real compositor
+  handoff before a modal can appear: an already pending update prompt comes first, then this notice.
+  Pause/resume does not resurrect a completed indicator or repeat an acknowledged notice. Native
+  session-token recording still begins at successful game-thread creation, not at indicator dismissal;
+  the Settings hold and foreground refresh preference retain their independent lifecycle.
   This diagnoses loss; it does not restore unsaved progress or certify saves. Normal self-exit, user stop,
   accepted save-safe Close and package update/reinstall show no notice. Missing, rotated-away or ambiguous
   history, missing summary tokens, and cleared/corrupt stored state show **no notice**, not a guessed warning.

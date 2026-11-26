@@ -162,10 +162,15 @@ public class BootProbe {
     static native String read(long[] counts);
     static native void update(String stage, long done, long total);
     static native void handoff();
+    static int completions;
+    static void finished() {
+        require(PopupWindow.last == null || !PopupWindow.last.showing);
+        completions++;
+    }
     static void require(boolean ok) { if (!ok) throw new AssertionError(); }
     public static void main(String[] args) {
         System.loadLibrary("boot"); java.util.Locale.setDefault(java.util.Locale.US);
-        Activity owner = new Activity(); BootProgress ui = new BootProgress(owner, BootProbe::read);
+        Activity owner = new Activity(); BootProgress ui = new BootProgress(owner, BootProbe::read, BootProbe::finished);
         update("", 0, 0); ui.resume(); Handler.step();
         PopupWindow popup = PopupWindow.last;
         require(popup.showing && !popup.touchable && !popup.focusable);
@@ -194,9 +199,11 @@ public class BootProbe {
         require(popup.showing && popup.anchor == owner.window.decor && popup.width == 268);
         handoff(); Handler.step(); require(!popup.showing && Handler.queue.isEmpty());
         ui.resume(); require(Handler.queue.isEmpty()); // no resurrection after real handoff
+        require(completions == 1);
         update("late work", 1, 2); require(read(new long[2]) == null);
-        BootProgress recreated = new BootProgress(new Activity(), BootProbe::read);
+        BootProgress recreated = new BootProgress(new Activity(), BootProbe::read, BootProbe::finished);
         recreated.resume(); Handler.step(); require(Handler.queue.isEmpty() && !popup.showing);
+        require(completions == 2); // one completion per owner, never before dismissal
     }
 }
 '''
