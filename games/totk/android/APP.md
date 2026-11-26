@@ -1463,7 +1463,7 @@ without that run.
 
 ## Process map-limit warning (default on)
 
-Unset `TOTK_MAP_WARN` or exact `1` enables process-map counting on the existing nice+10
+Unset `TOTK_MAP_WARN` or exact `1` enables process-map counting on the existing
 `totk-vmascan` worker, independently of `TOTK_FRAME_LAG`. It starts lazily when the game's Vulkan
 overlay/presenter is first used, not when the native library is loaded or the frame origin is published.
 The separate `:setup` process does not link this sampler. The first sample is about five seconds after
@@ -1472,6 +1472,23 @@ game/render/present threads and signal handlers do not scan for this feature. Wa
 no pool, runtime or tracker locks. Independently requested lag budget/classification work may start
 the shared worker earlier, as before; its locks and policy are unchanged. One `[map-warn] started mode=1 period_ms=5000 log=80 notice=88 clear=84; warning only, does not prevent map-limit abort`
 line records the ordinary default startup.
+
+Warning-only creation explicitly requests absolute nice **at least +10** (retaining a lower-priority
+inherited value), not relative `nice(10)`. It restores the launch cpuset captured before guest pinning,
+excludes GAME plus explicit WALK/RECW pins when spare CPUs exist, and reuses the background-capacity
+selector to prefer a genuinely slower tier. Without spare CPUs/topology or when the OS refuses placement,
+it cannot promise isolation. One `[vma-schedule]` record reports requested and kernel-read-back nice,
+affinity, creator policy and errors; this is not a zero-interference guarantee.
+
+**Lag-created workers keep their existing scheduling:** inherited affinity and relative `nice(10)`,
+not the warning-only spare-core policy. Lag establishes an admission budget synchronously before pool
+registration; subsequent scans refresh that budget and detect non-tracker map growth. Their configured
+period remains `TOTK_VMA_SCAN_MS` (1–30 s, default 10 s), plus scan/scheduling delay. There is no hard
+wall-clock freshness bound from the ordinary OS scheduler. To avoid introducing new starvation risk,
+this change does not demote or move a lag-created worker; no timely-scan guarantee is newly claimed.
+Lag is enabled before presenter startup in the supported launch lifecycle.
+Classification-only creation with `TOTK_MAP_WARN=0` also retains its old scheduling; the new normalization
+belongs only to warning-only creation, not to an independently requested diagnostic worker.
 
 Set `TOTK_MAP_WARN=0` in `totk.env` and restart to disable it entirely: no worker starts for this
 feature, no warning scans or log lines are added, and no notice is displayed. Other explicit values

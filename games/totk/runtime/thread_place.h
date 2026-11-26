@@ -183,7 +183,22 @@ static inline void totk_thread_background_select(const char *root, const cpu_set
 #if defined(__ANDROID__) || defined(TOTK_THREAD_PLACE_TEST)
 void totk_thread_game_startup(void);
 void totk_thread_game_auto(void);
+/* Original launch cpuset, before any guest narrows its own affinity. */
+int totk_thread_launch_affinity(cpu_set_t *allowed);
 #ifdef TOTK_THREAD_PLACE_IMPLEMENTATION
+static pthread_once_t totk_launch_affinity_once = PTHREAD_ONCE_INIT;
+static cpu_set_t totk_launch_affinity_mask;
+static int totk_launch_affinity_error;
+static void totk_thread_launch_capture(void) {
+    totk_launch_affinity_error = sched_getaffinity(0, sizeof totk_launch_affinity_mask,
+                                                 &totk_launch_affinity_mask) ? errno : 0;
+}
+int totk_thread_launch_affinity(cpu_set_t *allowed) {
+    int saved = errno;
+    pthread_once(&totk_launch_affinity_once, totk_thread_launch_capture);
+    if (!totk_launch_affinity_error) *allowed = totk_launch_affinity_mask;
+    errno = saved; return totk_launch_affinity_error;
+}
 /* One process-wide snapshot, shared by Android startup, g-main and every g-N.
  * Startup runs after totk.env and before guest creation. pthread_once also
  * covers the native command-line entry and publishes the immutable snapshot. */
@@ -212,6 +227,7 @@ static void totk_thread_game_init(void) {
 }
 void totk_thread_game_startup(void) {
     int saved = errno; const char *value = getenv("TOTK_AFFINITY_GAME");
+    pthread_once(&totk_launch_affinity_once, totk_thread_launch_capture);
     if (!value || !strcmp(value, "auto")) pthread_once(&totk_game_affinity_once, totk_thread_game_init);
     errno = saved;
 }
@@ -222,6 +238,11 @@ void totk_thread_game_auto(void) {
     totk_thread_setting_log("TOTK_AFFINITY_GAME", "auto", error ? -1 : 0, error);
 }
 #endif
+#endif
+#if !defined(__ANDROID__) && !defined(TOTK_THREAD_PLACE_TEST)
+static inline int totk_thread_launch_affinity(cpu_set_t *allowed) {
+    return sched_getaffinity(0, sizeof *allowed, allowed) ? errno : 0;
+}
 #endif
 static inline void totk_thread_affinity(const char *key) {
     if (!key) return; const char *value = getenv(key);

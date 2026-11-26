@@ -23,6 +23,8 @@ static int observed_create(pthread_t *thread, const pthread_attr_t *attr,
     atomic_fetch_add(&created, 1);
     return pthread_create(thread, attr, fn, arg);
 }
+#define TOTK_THREAD_PLACE_TEST
+#define TOTK_THREAD_PLACE_IMPLEMENTATION
 #define pthread_create observed_create
 #include "nvn_dirty.c"
 #undef pthread_create
@@ -78,6 +80,33 @@ int main(int argc,char **argv) {
     assert(argc==2);
     if (!strcmp(argv[1],"policy")) { policy(); panel(); return 0; }
     if (!strcmp(argv[1],"marker")) { vk_overlay_mode(); vk_overlay_mode(); return 0; }
+    if (!strncmp(argv[1],"schedule-",9)) {
+        int lag = !strcmp(argv[1],"schedule-lag");
+        int diagnostic = !strcmp(argv[1],"schedule-diagnostic");
+        cpu_set_t launch, parent, spare;
+        totk_thread_game_startup();
+        assert(!totk_thread_launch_affinity(&launch) && CPU_COUNT(&launch)>=2);
+        unsigned first=0; while (!CPU_ISSET(first,&launch)) first++;
+        CPU_ZERO(&parent); CPU_SET(first,&parent); spare=launch; CPU_CLR(first,&spare);
+        char game[64], spare_text[CPU_SETSIZE*6];
+        snprintf(game,sizeof game,"%u",first);
+        totk_thread_mask_text(&spare,spare_text,sizeof spare_text);
+        assert(!setenv("TOTK_AFFINITY_GAME",game,1));
+        assert(!sched_setaffinity(0,sizeof parent,&parent));
+        int caller_nice=getpriority(PRIO_PROCESS,0);
+        if (lag) nvn_dirty_lag_enable();
+        else if (diagnostic) nvn_dirty_lag_vma_request(1);
+        else assert(nvn_dirty_map_warn_init());
+        uint64_t start=vma_clock_ns(), stats[4]={0};
+        do { usleep(10000); nvn_dirty_lag_vma_scan_stats(stats,0); }
+        while (!stats[0] && vma_clock_ns()-start<15000000000ull);
+        assert(stats[0] && stats[2]>0 && atomic_load(&created)==1);
+        cpu_set_t after; assert(!sched_getaffinity(0,sizeof after,&after) && CPU_EQUAL(&parent,&after));
+        assert(getpriority(PRIO_PROCESS,0)==caller_nice);
+        printf("schedule caller_nice=%d parent=%s spare=%s scans=%llu\n",caller_nice,game,spare_text,
+            (unsigned long long)stats[0]);
+        return 0;
+    }
     if (!strcmp(argv[1],"cold")) {
         assert(!atomic_load(&created) && !nvn_dirty_map_warn_notice());
         nvn_dirty_map_warn_set_frame_origin(1000000000);
@@ -266,6 +295,39 @@ class MapWarning(unittest.TestCase):
             result = self.run_probe('worker', **settings)
             self.assertIn('worker scans=1', result.stdout)
             self.assertNotIn('[map-warn-scan]', result.stderr)
+
+    def test_actual_worker_priority_affinity_and_scans_on_both_creation_paths(self):
+        if len(os.sched_getaffinity(0)) < 2:
+            self.skipTest('needs two allowed CPUs for the real inherited-affinity check')
+        for creator in ('warning', 'lag', 'diagnostic'):
+            result = self.run_probe('schedule-' + creator, TOTK_MAP_WARN='1' if creator == 'warning' else '0',
+                                    TOTK_VMA_SCAN_MS='1000')
+            lines = [line for line in result.stderr.splitlines() if '[vma-schedule]' in line]
+            self.assertEqual(len(lines), 1, result.stderr)
+            fields = dict(re.findall(r'([a-z_]+)=(\S+)', lines[0]))
+            caller = dict(re.findall(r'([a-z_]+)=(\S+)', result.stdout))
+            inherited = int(caller['caller_nice'])
+            expected = max(10, inherited) if creator == 'warning' else min(19, inherited + 10)
+            self.assertEqual(fields['creator'], creator)
+            self.assertEqual(int(fields['requested_nice']), expected)
+            self.assertEqual(int(fields['nice']), expected)  # kernel readback, not a hook argument
+            self.assertTrue(all(fields[key] == '0' for key in
+                ('nice_errno', 'nice_read_errno', 'affinity_errno', 'affinity_read_errno')), lines[0])
+            actual = set()
+            for span in fields['affinity'].split(','):
+                endpoints = list(map(int, span.split('-')))
+                actual.update(range(endpoints[0], endpoints[-1] + 1))
+            parent = int(caller['parent'])
+            if creator != 'warning':
+                self.assertEqual(fields['policy'], creator + '-inherited')
+                self.assertEqual(actual, {parent})
+            else:
+                self.assertEqual(fields['policy'], 'warning-background-spare')
+                self.assertNotIn(parent, actual)
+                self.assertTrue(actual <= os.sched_getaffinity(0))
+                self.assertGreaterEqual(int(fields['nice']), 10)
+            self.assertEqual(fields['requested_affinity'], fields['affinity'])
+            self.assertGreaterEqual(int(caller['scans']), 1)
 
     def test_sampler_trace_has_monotonic_time_duration_rows_and_frame_origin(self):
         before = time.clock_gettime_ns(time.CLOCK_MONOTONIC)

@@ -140,8 +140,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   per-scan monotonic start/duration/rows and ordinary-frame clock origin; mode `1` adds no per-scan logging.
   TEST-ONLY `=3` changes thresholds after 12 and 24 warning samples to show, hold and clear the
   actual notice without adding mappings or restarting. It is not an ordinary-play warning mode.
-  Initial Thor checks observed a readable notice/default-off behavior; device clearing and timing
-  qualification remain unresolved, and the new test modes need device verification.
+  Initial Thor checks observed the notice/default-off state; later TEST-mode checks showed hold/clear after
+  threshold changes, not natural recovery through 84%. Thor/Duo scan-cost observations used inherited scheduling.
+  Normalize warning-only workers to absolute nice >=10 and launch-cpuset spare/background CPUs; log actual
+  priority/affinity and placement errors. Preserve lag-created scheduling and its existing scan period rather than
+  claiming a new scheduler freshness bound. Re-check scheduling, scan durations and long-frame coincidence on
+  the final APK on lag-off Thor/Duo and lag-on Odin before qualifying this change.
   Final device checks are required before landing the default-on change. This warns only: it does not prevent the map-limit abort,
   fix map growth or change mapping/protection/admission policy. Diagnostic modes `2` and `3` remain opt-in.
 - Correct fragment inputs that their vertex shader never writes, targeting wind/air-flow white boxes

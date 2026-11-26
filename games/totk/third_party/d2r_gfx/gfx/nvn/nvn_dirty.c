@@ -20,6 +20,7 @@
 #include <sys/syscall.h>
 #include <fcntl.h>
 #ifdef __linux__
+#include "thread_place.h"
 #include <linux/futex.h>
 #include <limits.h>
 #include <sys/prctl.h>
@@ -553,12 +554,63 @@ static uint64_t vma_clock_ns(void) {
     struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
 }
-static void *vma_worker(void *unused) {
-    (void)unused;
+enum { VMA_CREATE_WARNING, VMA_CREATE_LAG, VMA_CREATE_DIAGNOSTIC };
 #ifdef __linux__
-    prctl(PR_SET_NAME, "totk-vmascan", 0, 0, 0);
-    /* Linux nice is per-thread. Failure to lower priority is harmless; never renice the game thread. */
-    nice(10);
+static void vma_place(int creator) {
+    int legacy = creator != VMA_CREATE_WARNING;
+    totk_thread_start("totk-vmascan", NULL);
+    errno = 0; int inherited_nice = getpriority(PRIO_PROCESS, 0);
+    int requested_nice = legacy ? (inherited_nice + 10 > 19 ? 19 : inherited_nice + 10) :
+                                     (inherited_nice > 10 ? inherited_nice : 10);
+    errno = 0;
+    int nice_error = 0;
+    if (legacy) { if (nice(10) == -1 && errno) nice_error = errno; }
+    else if (setpriority(PRIO_PROCESS, 0, requested_nice)) nice_error = errno;
+    cpu_set_t allowed, preferred, actual;
+    const char *source = "inherited", *policy = creator == VMA_CREATE_LAG ? "lag-inherited" :
+        creator == VMA_CREATE_DIAGNOSTIC ? "diagnostic-inherited" : "warning-background-unavailable";
+    int affinity_error = 0, have_preferred = 0;
+    if (legacy) {
+        affinity_error = sched_getaffinity(0, sizeof preferred, &preferred) ? errno : 0;
+        have_preferred = !affinity_error;
+    } else if (!(affinity_error = totk_thread_launch_affinity(&allowed))) {
+        cpu_set_t game, spare; unsigned capacity[CPU_SETSIZE]; const char *decision;
+        totk_thread_game_select("/sys/devices/system/cpu", &allowed, getenv("TOTK_AFFINITY_GAME"),
+                               &game, capacity, &source, &decision);
+        /* Explicit frame-thread pins may differ from GAME. Exclude their union when spare CPUs exist. */
+        static const char *const keys[] = {"TOTK_AFFINITY_WALK", "TOTK_AFFINITY_RECW"};
+        for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++) {
+            const char *value = getenv(keys[i]); cpu_set_t pins;
+            if (value && totk_thread_cpu_parse(value, &pins)) CPU_OR(&game, &game, &pins);
+        }
+        spare = allowed;
+        for (unsigned cpu = 0; cpu < CPU_SETSIZE; cpu++) if (CPU_ISSET(cpu, &game)) CPU_CLR(cpu, &spare);
+        int isolated = CPU_COUNT(&spare) != 0;
+        totk_thread_background_select("/sys/devices/system/cpu", isolated ? &spare : &allowed,
+                                      &preferred, capacity, &source, &decision);
+        policy = isolated ? "warning-background-spare" : "warning-background-shared";
+        have_preferred = 1;
+        if (sched_setaffinity(0, sizeof preferred, &preferred)) affinity_error = errno;
+    }
+    char requested[CPU_SETSIZE * 6], effective[CPU_SETSIZE * 6];
+    if (have_preferred) totk_thread_mask_text(&preferred, requested, sizeof requested);
+    else snprintf(requested, sizeof requested, "?");
+    int read_error = sched_getaffinity(0, sizeof actual, &actual) ? errno : 0;
+    if (!read_error) totk_thread_mask_text(&actual, effective, sizeof effective);
+    else snprintf(effective, sizeof effective, "?");
+    errno = 0; int actual_nice = getpriority(PRIO_PROCESS, 0), nice_read_error = errno;
+    LOG("[vma-schedule] creator=%s policy=%s requested_nice=%d nice=%d nice_errno=%d nice_read_errno=%d requested_affinity=%s affinity=%s affinity_errno=%d affinity_read_errno=%d source=%s",
+        creator == VMA_CREATE_LAG ? "lag" : creator == VMA_CREATE_DIAGNOSTIC ? "diagnostic" : "warning",
+        policy, requested_nice, actual_nice, nice_error, nice_read_error,
+        requested, effective, affinity_error, read_error, source);
+}
+#endif
+static void *vma_worker(void *creator) {
+#ifdef __linux__
+    /* Preserve lag and independently requested diagnostic scheduling; normalize only warning-only creation. */
+    vma_place((int)(uintptr_t)creator);
+#else
+    (void)creator;
 #endif
     uint64_t scan_period = (uint64_t)g_vma_period_ms * 1000000;
     uint64_t warn_period = (uint64_t)MAP_WARN_PERIOD_MS * 1000000;
@@ -640,7 +692,9 @@ static void vma_start(void) {
     if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED)) die("VMA sampler detach");
     const nvn_map_warn_thresholds startup_thresholds = g_map_warn_thresholds;
     pthread_t thread;
-    int result = pthread_create(&thread, &attr, vma_worker, NULL);
+    uintptr_t creator = g_lag_enabled ? VMA_CREATE_LAG :
+                        g_map_warn_enabled ? VMA_CREATE_WARNING : VMA_CREATE_DIAGNOSTIC;
+    int result = pthread_create(&thread, &attr, vma_worker, (void *)creator);
     pthread_attr_destroy(&attr);
     if (result) die("VMA sampler thread: %d", result);
     if (g_map_warn_enabled)

@@ -2461,7 +2461,11 @@ limit (minimum 1,024 maps); new-run credit uses the worst-case two additional VM
 registration requests a sample when tracking-range lifetimes change; walking seals also request one
 after pool/span/alias version changes. Requests only mark pending work; they never wake the worker,
 advance its deadline or take the sampling mutex. A lazily started, detached process-lifetime
-`totk-vmascan` thread runs at nice +10 where permitted. `TOTK_VMA_SCAN_MS` selects its period in
+`totk-vmascan` thread keeps its creator's affinity and requests **relative** `nice(10)` when lag creates it;
+that is not an absolute nice +10 guarantee. Warning-only creation instead normalizes absolute nice >=10
+and prefers launch-cpuset spare/background CPUs (APP.md); `[vma-schedule]` reports the actual policy/readback.
+Lag scheduling is deliberately not further demoted or restricted, since budget refresh must keep its existing
+opportunities to run; no hard OS-scheduler freshness bound is claimed. `TOTK_VMA_SCAN_MS` selects its period in
 integer milliseconds (default **10,000**, clamped to **[1,000, 30,000]** with a one-time startup log
 when clamped; malformed values retain the default). It sleeps that
 period before its first scan and between completed scans; periodic, epoch-change and diagnostic
