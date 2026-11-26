@@ -201,6 +201,27 @@ class EffectiveSwitches(unittest.TestCase):
         self.assertEqual(self.compare(one, two)[0], {'mismatch'})
         self.assertIn('TOTK_MAP_WARN mode: 1 -> 2', self.compare(one, two)[1])
 
+    def test_review_marker_before_build_cannot_authenticate_current_startup(self):
+        # R2 finding 1: an imported off/off marker precedes the sole current launch.
+        doc = self.document(self.marker() + self.START)
+        self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
+        self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+        self.assertIn('NOT COMPARABLE', self.compare(doc, doc)[1])
+
+    def test_review_warning_conflicts_are_not_overwritten_or_hidden_by_provenance(self):
+        # R2 finding 2a: mode 1 is overwritten by mode 2 and a mode-2 marker.
+        # Finding 2b: exact pre-switch provenance hides a positive mode-1 startup.
+        cases = (
+            (self.START + self.WARN + self.WARN.replace('mode=1', 'mode=2') + self.marker('off', 2), None),
+            (self.START + self.WARN, benchlib.load_result(BASELINE)['build']),
+        )
+        for text, build in cases:
+            with self.subTest(build=build):
+                doc = self.document(text, build)
+                self.assertEqual(self.values(doc), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'})
+                self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+                self.assertIn('TOTK_MAP_WARN=UNKNOWN', self.compare(doc, doc)[1])
+
     def test_unknown_never_creates_or_admits_a_ledger_baseline(self):
         unknown = self.document('')
         for record in unknown['runs']:
