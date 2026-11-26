@@ -4,8 +4,9 @@
 #include "test_v143_fps60_patch_table.c"
 #undef main
 int main(void) {
-    image = calloc(1, IMAGE_SIZE);
+    image = aligned_alloc(0x4000, IMAGE_SIZE);
     if (!image) return 2;
+    memset(image, 0, IMAGE_SIZE);
     module = (Module){.base = image, .text_end = TEXT_END, .file_size = FILE_SIZE, .size = IMAGE_SIZE};
     for (unsigned i = 0; i < sizeof fps60 / sizeof *fps60; i++)
         put_word(image, fps60[i].off, fps60[i].replacement);

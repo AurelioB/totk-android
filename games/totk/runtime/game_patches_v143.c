@@ -443,10 +443,10 @@ static void patch_fps60_hardening(Module *m){
 
 /* The FPS60 selects override stored min=2. Clamp their RESULTS, not the stored
  * bounds, so the game's own candidate/current update and NVN interval setter
- * stay authoritative. Installed only with startup TOTK_THERMAL_STEP=1; off
- * retains the original seven-word policy and allocates no thermal veneer.
- * Each veneer preserves incoming NZCV and x16/x17, replaying its select first.
- * The aligned literal is a single machine-word publication, with no side data. */
+ * stay authoritative. Startup TOTK_THERMAL_STEP=1 only; off allocates nothing.
+ * Preserve x16/x17 and NZCV. The floor is published only as 1 or 2.
+ * Use ADRP+LDR: the real rewritten image's private data page is about 25 MiB
+ * past this native text tail, far outside LDR-literal's +/-1 MiB range. */
 #if (defined(__ANDROID__) && defined(TOTK_ANDROID_APP)) || defined(TOTK_THERMAL_PATCH_TEST)
 static void patch_thermal_step(Module *m) {
     const char *enabled = getenv("TOTK_THERMAL_STEP");
@@ -473,17 +473,17 @@ static void patch_thermal_step(Module *m) {
     uint32_t code[COUNT * WORDS], jumps[COUNT];
     for (unsigned i = 0; i < COUNT; i++) {
         uint64_t at = stub + i * WORDS * 4;
-        int64_t delta = (int64_t)data - (int64_t)(at + 12);
-        if ((delta & 3) || delta < -(1 << 20) || delta >= (1 << 20))
-            runtime_fail("1.4.3 thermal literal outside range");
         unsigned d = destinations[i], index = indices[i];
+        uintptr_t floor_address=(uintptr_t)m->base+data;
         uint32_t veneer[] = {
             fps60[index].replacement,
-            0xa9bf47f0, 0xd53b4210, /* save x16/x17; mrs x16,nzcv */
-            0x18000011u | (((uint32_t)(delta >> 2) & 0x7ffff) << 5),
-            0x6b11001fu | (d << 5), /* cmp wD,w17 (floor) */
-            0x1a912000u | (d << 5) | d, /* csel wD,wD,w17,hs */
-            0xd51b4210, 0xa8c147f0, /* msr nzcv,x16; restore x16/x17 */
+            0xa9bf47f0, /* save x16/x17; all following instructions retain NZCV */
+            adrp(17,(uintptr_t)m->base+at+8,floor_address),
+            0xb9400231u|((uint32_t)(floor_address&0xfff)/4<<10),
+            0x53017c10u|(d<<5), /* lsr w16,wD,#1: retain every result >=2 */
+            0x35000050,         /* cbnz w16,restore */
+            0x2a1103e0u|d,      /* mov wD,w17: max(0 or 1,published 1 or 2) */
+            0xa8c147f0, /* restore x16/x17 */
             branch(at + 32, fps60[index].off + 4),
         };
         memcpy(code + i * WORDS, veneer, sizeof veneer);

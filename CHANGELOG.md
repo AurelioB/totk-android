@@ -6,6 +6,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Fix the pre-existing thermal-step veneer on the real 1.4.3 Android rewrite: its mutable floor
+  is about 25 MiB past native text, outside an LDR-literal's reach. Use ADRP+LDR and a flag-free
+  clamp for the published one/two-tick floor, retaining the same 108-byte tail allocation.
+  Model the full rewritten image in host fixtures and verify all floor addresses/register semantics.
 - Keep PR #44's quick-menu capture fix default off (`TOTK_MENU_CAPTURE_FIX=1` opts in), but restore
   the contributor's original armed-OR-requested admission. Our added visibility guard suppressed the fix:
   Odin requests were pending while hidden; original admission removed the black backgrounds in the finite

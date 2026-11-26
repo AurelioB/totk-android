@@ -49,8 +49,8 @@ static struct { uint64_t off; uint32_t word; } expected_guards[]={
 };
 enum { NSITES=sizeof expected_sites/sizeof *expected_sites,
        NGUARDS=sizeof expected_guards/sizeof *expected_guards, NFADES=4,
-       TEXT_END=0x2bb9c00, FILE_SIZE=0x2bc4000, IMAGE_SIZE=FILE_SIZE+0x4000,
-       STUB=TEXT_END+416, VENEER_BYTES=500, DATA=FILE_SIZE };
+       TEXT_END=0x2bb9c00, FILE_SIZE=0x451cdd8, DATA=(FILE_SIZE+0x3fff)&~0x3fff,
+       IMAGE_SIZE=DATA+0x4000, STUB=TEXT_END+416, VENEER_BYTES=500 };
 
 static uint8_t *image,*pristine;
 static Module module;
