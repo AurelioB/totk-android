@@ -62,10 +62,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "adreno_gmem.h"
+#include "android_exit_notice_jni.h"
 #include "overlay_chord.h"
 int totk_host_main(int argc, char **argv);
 #include "android_pause.h"
 static AndroidGamePause game_pause = ANDROID_GAME_PAUSE_INIT;
+#include "android_game_hold.h"
+static AndroidGameHold game_hold; /* NativeActivity and service hooks share the UI thread. */
 int runtime_android_game_paused(void) {
     return atomic_load_explicit(&game_pause.paused, memory_order_acquire);
 }
@@ -1183,6 +1186,33 @@ static void log_start(void) {
     if (trim_error) fprintf(stderr, "[totk-log] Could not trim launch history: %s\n", strerror(trim_error));
     __android_log_print(ANDROID_LOG_INFO, "totk", "log: %s", g_log_path);
 }
+
+/* A new attempt must clear the previous session before taking the game lock.
+ * Only a successfully started, exact-opt-in session publishes PID + log path. */
+static char g_game_hold_marker[1200];
+static int android_game_hold_marker_reset(const char *private_files) {
+    int n = snprintf(g_game_hold_marker, sizeof g_game_hold_marker, "%s/state/game-hold", private_files);
+    if (n < 0 || (size_t)n >= sizeof g_game_hold_marker) { errno = ENAMETOOLONG; return -1; }
+    return unlink(g_game_hold_marker) && errno != ENOENT ? -1 : 0;
+}
+static void android_game_hold_marker_publish(void) {
+    if (!game_hold.enabled) return;
+    char temporary[1232];
+    snprintf(temporary, sizeof temporary, "%s.tmp", g_game_hold_marker);
+    FILE *out = g_log_fd >= 0 && g_log_path[0] == '/' ? fopen(temporary, "w") : NULL;
+    int ok = 0;
+    if (out) {
+        ok = fprintf(out, "%d\n%s\n", (int)getpid(), g_log_path) > 0;
+        if (fclose(out)) ok = 0;
+        if (ok && rename(temporary, g_game_hold_marker)) ok = 0;
+    }
+    if (!ok) {
+        unlink(temporary);
+        fprintf(stderr, "[TotkGameHold] session marker unavailable; Settings cannot hold this game\n");
+    }
+    fprintf(stderr, "[TotkGameHold] enabled pid=%d log=%s; pause/release cache grace <=1s, periodic saver and exit flush unchanged\n",
+            (int)getpid(), g_log_path);
+}
 /* The logcat copy (log_mirror.h): a thread that sleeps until totk.log grows, then copies its new complete lines with
    tag "totk" (FATAL / CRASH / device lost as errors, red messages as warnings). It runs at nice 10, on the slower CPUs
    when the device has them, and reads from this launch's heading so it copies the early startup lines too.
@@ -1653,6 +1683,10 @@ static int start_game(const ANativeActivity *a) {
        the internal app folder those versions used. */
     char state[1100], chosen[1024], why[600], p[1200], package[256];
     snprintf(state, sizeof state, "%s/state", a->internalDataPath); mkdir(state, 0700);
+    if (android_game_hold_marker_reset(a->internalDataPath)) {
+        __android_log_print(ANDROID_LOG_ERROR, "TotkSetup", "game hold marker reset: %s; not starting", strerror(errno));
+        return -1;
+    }
     snprintf(p, sizeof p, "%s/settings.env", a->internalDataPath);
     android_package_name(a->internalDataPath, package, sizeof package);
     if (settings_data_dir(p, chosen, sizeof chosen)) {
@@ -1687,6 +1721,7 @@ static int start_game(const ANativeActivity *a) {
     snprintf(p, sizeof p, "%s/settings.env", a->internalDataPath); settings_file(p);
     snprintf(p, sizeof p, "%s/totk.env", g_data); env_file(p);
     android_driver_env_policy(); /* freeze driver options before any app worker or driver call */
+    game_hold.enabled = android_game_hold_enabled(getenv("TOTK_GAME_HOLD"));
     gpu_profile_identity(a);
     log_mirror_start();   /* TOTK_LOGCAT is final now */
     live_ctl_start();     /* after totk.env: its values are the launch values a live "unset" returns to */
@@ -1774,6 +1809,8 @@ static int start_game(const ANativeActivity *a) {
     pthread_t t; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 64u << 20);
     if (pthread_create(&t, &at, game_thread, NULL)) { fprintf(stderr, "[totk-app] game thread: %s\n", strerror(errno)); return 0; }
     pthread_attr_destroy(&at); pthread_detach(t);
+    android_game_hold_marker_publish();
+    if (a->sdkVersion >= 30) android_exit_notice_start(a, g_log_path, g_data);
     android_close_requests_start(priv);
     return 1;
 }
@@ -1914,6 +1951,7 @@ int runtime_front_request_close(void) {
     __android_log_print(ANDROID_LOG_WARN, "TotkSetup", "close game: pid=%d save=idle; native pipeline-cache flush and exit", getpid());
     fprintf(stderr, "[totk] close requested: flushing pipeline cache and exiting\n"); vk_pcache_shutdown();
     if (vk_gpuprof_shutdown) vk_gpuprof_shutdown();
+    android_exit_notice_event(2);
     _exit(0);
 }
 /* One stat per 500 ms on this non-render thread; no activity launch, task-affinity changes or frame-loop I/O. */
@@ -2432,9 +2470,41 @@ static void android_game_pause_update(void) {
     runtime_audio_output_pause(paused);
     runtime_input_clear();
     present_timeline_lifecycle(-1, paused);
-    vk_pcache_background(paused);
+    if (game_hold.enabled) {
+        AndroidGameHoldEffect effect = android_game_hold_pause(&game_hold, paused);
+        if (effect == ANDROID_GAME_HOLD_FOREGROUND) vk_pcache_background(0);
+        fprintf(stderr, "[TotkGameHold] cache pause=%d Settings=%d action=%s generation=%llu\n",
+                paused, game_hold.settings_active,
+                effect == ANDROID_GAME_HOLD_FOREGROUND ? "resume-cancel" :
+                effect == ANDROID_GAME_HOLD_DEFER ? "Settings-defer" : "background-grace",
+                (unsigned long long)game_hold.generation);
+    } else vk_pcache_background(paused);
     fprintf(stderr, "[totk-app] game and audio %s: lifecycle=%d single-display-focus=%d\n",
             paused ? "paused (pending saves may finish)" : "resumed", game_activity_paused, game_focus_paused);
+}
+JNIEXPORT jboolean JNICALL Java_com_aure_totk_GameHold_nativeEnabled(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    return game_hold.enabled ? JNI_TRUE : JNI_FALSE;
+}
+JNIEXPORT void JNICALL Java_com_aure_totk_GameHold_nativeSettingsActive(JNIEnv *env, jclass cls, jboolean active) {
+    (void)env; (void)cls;
+    if (!game_hold.enabled) return;
+    AndroidGameHoldEffect effect = android_game_hold_settings(&game_hold, !!active);
+    fprintf(stderr, "[TotkGameHold] cache Settings=%d paused=%d action=%s generation=%llu\n",
+            game_hold.settings_active, runtime_android_game_paused(),
+            effect == ANDROID_GAME_HOLD_DEFER ? "Settings-defer" :
+            effect == ANDROID_GAME_HOLD_GRACE ? "release-grace" : "unchanged",
+            (unsigned long long)game_hold.generation);
+}
+JNIEXPORT jlong JNICALL Java_com_aure_totk_GameHold_nativePendingPause(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    return (jlong)android_game_hold_pending(&game_hold);
+}
+JNIEXPORT void JNICALL Java_com_aure_totk_GameHold_nativeFlushPause(JNIEnv *env, jclass cls, jlong generation) {
+    (void)env; (void)cls;
+    if (!runtime_android_game_paused() || !android_game_hold_flush(&game_hold, (uint64_t)generation)) return;
+    fprintf(stderr, "[TotkGameHold] cache background flush after grace generation=%llu\n", (unsigned long long)generation);
+    vk_pcache_background(1);
 }
 void runtime_android_game_focus(JNIEnv *env, jclass cls, jboolean focused, jboolean single_display) {
     (void)env; (void)cls;
@@ -2455,7 +2525,7 @@ static void android_game_lifecycle_pause(int paused) {
     game_activity_paused = paused;
     android_game_pause_update();
 }
-static void on_pause(ANativeActivity *a) { (void)a; android_game_lifecycle_pause(1); }
+static void on_pause(ANativeActivity *a) { (void)a; android_game_lifecycle_pause(1); android_exit_notice_event(1); }
 static void on_stop(ANativeActivity *a) { (void)a; android_game_lifecycle_pause(1); }
 static void on_resume(ANativeActivity *a) {
     (void)a;

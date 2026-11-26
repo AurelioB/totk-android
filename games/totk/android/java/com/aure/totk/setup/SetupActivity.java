@@ -46,6 +46,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import com.aure.totk.GameLaunch;
 import com.aure.totk.GameControlService;
+import com.aure.totk.GameHold;
+import com.aure.totk.ExitNotice;
 import com.aure.totk.UpdateRules;
 import com.aure.totk.Updates;
 import org.json.JSONArray;
@@ -89,6 +91,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private enum Screen { WELCOME, SETUP_STORAGE, ROUTE, FILES, UPDATES, UPDATE_DOWNLOAD, INSTALL, ERROR, INTERRUPTED, HOME, GRAPHICS, CONTROLS, DATA, STORAGE, ABOUT, LICENSES,
         LICENSE_TEXT, CONFIRM_DELETE, SAVE_ERROR, SAVES, BACKUPS, SAVE_IMPORT, SAVE_CONFLICT, CHOICE }
 
+    private final ExitNotice exitNotice = new ExitNotice();
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     /** Save operations (export, import, backups, the save folder) run in order on their own thread, so a slow folder
@@ -184,6 +187,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private long closeDeadline, closeStartedAt, gameCheckedAt;
     private String closeId = "";
     private ServiceConnection closeConnection;
+    private ServiceConnection gameHoldConnection;
+    private boolean gameHoldFailed, gameHoldOpening;
     private TextView gameNotice;
     private boolean started, uiStarted;
     private Widgets.Action closeGameAction;
@@ -347,6 +352,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         GameLock.Result next = InstallState.gameState(this);
         boolean changed = next.state != gameState.state || next.state == GameLock.State.ERROR && !next.reason.equals(gameState.reason);
         gameState = next;
+        updateGameHold();
         if (changed && ui && screen != Screen.INSTALL) {
             if (next.free() && !closingGame) blockedAction = null;
             render();
@@ -416,6 +422,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 closingGame = false; blockedAction = null; gameState = state;
                 main.removeCallbacks(closePoll);
                 releaseCloseBinding();
+                updateGameHold();
                 render();
                 if (retry != null) retry.run();
                 return;
@@ -453,6 +460,51 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         note = message; noteOk = false;
         render();
         if (gameNotice != null) gameNotice.setText(message);
+    }
+
+    /** Separate from Close: only our visible menu inherits importance, never an arbitrary background client. */
+    private void updateGameHold() {
+        if (!GameHold.enabled(this)) { releaseGameHold("session-ended"); return; }
+        if ((!started && !gameHoldOpening) || isFinishing() || isDestroyed()) { releaseGameHold("not-visible"); return; }
+        if (InstallState.gameState(this).state != GameLock.State.GAME) { releaseGameHold("game-exited"); return; }
+        if (gameHoldConnection != null || gameHoldFailed) return;
+        ServiceConnection connection = new ServiceConnection() {
+            private void ended(String reason) {
+                if (gameHoldConnection != this) return;
+                gameHoldFailed = true;
+                releaseGameHold(reason);
+            }
+            @Override public void onServiceConnected(ComponentName name, IBinder service) {
+                if (gameHoldConnection != this) return;
+                GameHold.log(SetupActivity.this, "binding connected");
+                updateGameHold(); // The lock may have cleared while Android was creating the service.
+            }
+            @Override public void onServiceDisconnected(ComponentName name) { ended("disconnected"); }
+            @Override public void onBindingDied(ComponentName name) { ended("binding-died"); }
+            @Override public void onNullBinding(ComponentName name) { ended("null-binding"); }
+        };
+        gameHoldConnection = connection;
+        GameHold.log(this, "binding requested flags=AUTO_CREATE|IMPORTANT");
+        try {
+            if (!bindService(new Intent(this, GameControlService.class).setAction(GameHold.ACTION),
+                    connection, BIND_AUTO_CREATE | BIND_IMPORTANT)) {
+                gameHoldFailed = true;
+                releaseGameHold("bind-refused");
+            }
+        } catch (RuntimeException failed) {
+            gameHoldFailed = true;
+            GameHold.log(this, "binding failed " + failed);
+            releaseGameHold("bind-exception");
+        }
+    }
+    private void releaseGameHold(String reason) {
+        ServiceConnection connection = gameHoldConnection;
+        gameHoldConnection = null;
+        if (connection == null) return;
+        GameHold.log(this, "binding released reason=" + reason);
+        try { unbindService(connection); }
+        catch (IllegalArgumentException absent) { /* Android may have refused the original bind. */ }
+        finally { GameHold.endSessionLog(); }
     }
 
     // ---------- lifecycle ----------
@@ -564,6 +616,9 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         if (settingsOverGame(getIntent())) return;
         if (moveSettingsToMain(getIntent())) return;
         if (returnToRunningGame(getIntent())) return;
+        // Request importance before constructing the cold menu and its save thumbnails.
+        gameHoldOpening = true;
+        updateGameHold();
         // After a game error the menu is shown (with the reason) even when it is set to start the game directly.
         if (gameError == null && !settingsShortcut && !getIntent().getBooleanExtra(EXTRA_UPDATE, false) && pendingUpdate() == null
                 && !SetupService.status.running && !SetupService.jobActive(this) && InstallState.read(this).playable()
@@ -587,6 +642,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         super.onNewIntent(intent);
         boolean hadUi = ui && !intent.getBooleanExtra(EXTRA_COLD_SETTINGS, false);
         setIntent(intent);
+        updateGameHold();
         if (moveSettingsToMain(intent)) return;
         if (!ui && intent.getBooleanExtra(EXTRA_SETTINGS, false)) showUi();
         if (returnToRunningGame(intent)) return;
@@ -604,6 +660,9 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     @Override protected void onStart() {
         super.onStart();
         started = true;
+        if (!gameHoldOpening) gameHoldFailed = false;
+        gameHoldOpening = false;
+        updateGameHold();
         startUi();
         requestedUpdate();
     }
@@ -623,13 +682,18 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     @Override protected void onResume() {
         super.onResume();
+        updateGameHold();
         completeSettingsMove();
+        if (ui) exitNotice.resume(this, () -> started && ui, open -> {});
         if (ui) refreshGameState();
         if (ui) updateInstallResult();
     }
     @Override protected void onStop() {
         started = false;
+        gameHoldOpening = false;
         cancelClose();
+        releaseGameHold("stop");
+        exitNotice.pause();
         if (uiStarted) {
             uiStarted = false;
             StorageManager storage = getSystemService(StorageManager.class);
@@ -667,6 +731,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         }
     };
     @Override protected void onDestroy() {
+        releaseGameHold("destroy");
+        exitNotice.pause();
         cancelClose();
         if (updater != null) updater.dispose();
         worker.shutdownNow();
@@ -735,6 +801,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         if (screen == Screen.INSTALL && !SetupService.status.running && result.has("ok")) main.post(this::finished);
         render();
         startUi();
+        if (started) exitNotice.resume(this, () -> started && ui, open -> {});
         offerPendingUpdate();
         updateInstallResult();
     }

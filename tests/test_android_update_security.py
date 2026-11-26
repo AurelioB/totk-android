@@ -83,7 +83,7 @@ class InstallState { static InstallState read(Object context){return new Install
 class SetupActivity extends Activity {
     static final String EXTRA_UPDATE="update", EXTRA_UPDATE_AUTH="authorization", EXTRA_COLD_SETTINGS="cold", EXTRA_SETTINGS="settings", EXTRA_GAME_ERROR="error";
     enum Screen {HOME,INSTALL,WELCOME,ABOUT}
-    boolean ui=true, started, pendingAsked, closingGame, runningGame;
+    boolean ui=true, started, pendingAsked, closingGame, runningGame, gameHoldOpening, gameHoldFailed;
     Object updater; Runnable blockedAction; String gameError;
     Intent intent; Screen screen=Screen.ABOUT;
     int prompts, downloads, closes;
@@ -96,6 +96,7 @@ class SetupActivity extends Activity {
     boolean returnToRunningGame(Intent intent){return false;}
     void showUi(){ui=true; screen=Screen.HOME;}
     void render(){} void startUi(){}
+    void updateGameHold() {} // Covered independently by the setup control/lifecycle fixture.
 '''
 AUTH_TEST = r'''
     static void require(boolean condition,String why){if(!condition)throw new AssertionError(why);}

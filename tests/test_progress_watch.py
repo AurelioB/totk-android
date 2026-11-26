@@ -260,8 +260,8 @@ class ProgressWatch(unittest.TestCase):
         self.assertIn('runtime_progress_pause(watch_paused);', lifecycle)
         self.assertIn('game_focus_paused = !focused && single_display;', source)
         self.assertIn('game_activity_paused = paused;\n    android_game_pause_update();', source)
-        for callback in ('on_pause', 'on_stop'):
-            self.assertIn(f'static void {callback}(ANativeActivity *a) {{ (void)a; android_game_lifecycle_pause(1); }}', source)
+        for callback, receipt in (('on_pause', ' android_exit_notice_event(1);'), ('on_stop', '')):
+            self.assertIn(f'static void {callback}(ANativeActivity *a) {{ (void)a; android_game_lifecycle_pause(1);{receipt} }}', source)
         resume = source.split('static void on_resume(ANativeActivity *a) {', 1)[1].split('\n}', 1)[0]
         self.assertIn('android_game_lifecycle_pause(0);', resume)
 

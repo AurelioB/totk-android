@@ -42,6 +42,8 @@ int nvn_dirty_lag_enabled(void);   /* set once by nvn_dirty_lag_enable before po
    load; neither API scans procfs. See APP.md before using diagnostic modes. */
 int nvn_dirty_map_warn_init(void);
 int nvn_dirty_map_warn_notice(void);
+/* Frozen effective startup mode for the once-per-launch benchmark state marker; starts no worker. */
+unsigned nvn_dirty_map_warn_mode(void);
 /* One startup publication before graphics initialization, not a recurring frame callback.
    Reads configuration but starts no worker; only traced modes retain the immutable origin. */
 void nvn_dirty_map_warn_set_frame_origin(uint64_t origin_ns);
