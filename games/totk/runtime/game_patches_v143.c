@@ -1041,14 +1041,15 @@ void runtime_diag_xpoke(unsigned off,float value){
     fprintf(stderr,"[totk] xpoke X+%#x: %g -> %g\n",off,old,value);
 }
 #endif
-/* Experimental quick-menu capture admission. A pending request can reach draw
-   before update arms +0xd5. Only admit that request while the pane passes the
-   native +0x58/+0x59 visibility checks; preserve the already-armed path.
-   This is not synchronization: update also prepares pane state after arming.
-   The native completion assigns +0xd4 from flag +0xd2 bit 6, so a continuing
-   request may capture again. Keep opt-in until ordered device traces qualify
-   the preparation/lifetime contract and the second capture. */
-enum { MENU_CAPTURE_STUB = 960, MENU_CAPTURE_WORDS = 9 };
+/* Experimental quick-menu capture admission: reproduce PR #44's armed OR
+   requested gate, including w9 scratch use. Our former visibility guard
+   excluded the hidden-pending window and suppressed the observed Odin fix.
+   This is not synchronization: update prepares state after arming, and the
+   native completion can republish requests. Device traces also show a second
+   completion on the next present. Keep opt-in pending cross-device safety
+   and cost qualification. */
+enum { MENU_CAPTURE_STUB = 276, MENU_CAPTURE_TAIL = 340,
+       MENU_CAPTURE_HEAD_WORDS = 3, MENU_CAPTURE_TAIL_WORDS = 2 };
 static void patch_menu_capture(Module *m){
     const char *e=getenv("TOTK_MENU_CAPTURE_FIX");
     if(!e||strcmp(e,"1")){
@@ -1058,44 +1059,42 @@ static void patch_menu_capture(Module *m){
 #if TARGET_OS_IPHONE
     (void)m;return;
 #else
-    /* Native 1.4.3 has only 1024 padding bytes. Thermal-step owns
-       +916..1024; prefer that policy to a menu experiment if both are set.
-       Check its configuration now, before its later installer can run. */
-    const char *thermal=getenv("TOTK_THERMAL_STEP");
-    if(thermal&&!strcmp(thermal,"1")){
-        fprintf(stderr,"[totk] 1.4.3 menu capture fix skipped: TOTK_THERMAL_STEP=1 owns veneer space\n");return;
-    }
     const uint64_t site=0x105bbcc;
     const Patch guards[]={{0x105bbcc,0},{0x105bbd0,0}};
     uint32_t orig[2];
     if(m->text_end>UINT64_MAX-0xfff||m->text_end>m->size||m->text_end<site+8){
         fprintf(stderr,"[totk] 1.4.3 menu capture fix skipped: text bounds\n");return;
     }
-    /* FPS60 hardening ends at +916. With thermal-step off, +960..996
-       fits inside the real 1024-byte text tail without touching rodata. */
-    uint64_t stub=((m->text_end+15)&~15ULL)+MENU_CAPTURE_STUB;
-    if(stub>m->size||MENU_CAPTURE_WORDS*4>m->size-stub||
-       stub+MENU_CAPTURE_WORDS*4>((m->text_end+0xfff)&~0xfffULL)||
-       stub-site>=(1u<<27)||stub+(MENU_CAPTURE_WORDS-1)*4-site>(1u<<27)){
+    /* The real text tail has only 1024 bytes. Use two existing gaps:
+       +276..288 after bounce, +340..348 after DRS60. One extra branch
+       joins them, leaving DRS/framegen, hardening and thermal-step intact. */
+    uint64_t base=(m->text_end+15)&~15ULL;
+    uint64_t stub=base+MENU_CAPTURE_STUB,tail=base+MENU_CAPTURE_TAIL;
+    if(tail>m->size||MENU_CAPTURE_TAIL_WORDS*4>m->size-tail||
+       tail+MENU_CAPTURE_TAIL_WORDS*4>((m->text_end+0xfff)&~0xfffULL)||
+       stub-site>=(1u<<27)||tail+4-(site+4)>(1u<<27)){
         fprintf(stderr,"[totk] 1.4.3 menu capture fix skipped: veneer layout/range\n");return;
     }
     if(!code_guard(m,SITES(guards),orig,"a5e2a3003d86bfbb936dc67e51990369aea8bf463786eea310b99463fc3a901d")){
         fprintf(stderr,"[totk] 1.4.3 menu capture fix skipped: original instruction mismatch\n");return;
     }
-    for(unsigned i=0;i<MENU_CAPTURE_WORDS*4;i++)if(m->base[stub+i]){
+    for(unsigned i=0;i<MENU_CAPTURE_HEAD_WORDS*4;i++)if(m->base[stub+i]){
         fprintf(stderr,"[totk] 1.4.3 menu capture fix skipped: veneer space in use\n");return;
     }
-    const uint32_t veneer[]={orig[0],    /* armed: retain native admission */
-        0x350000e8,                      /* cbnz w8, veneer end */
-        0x39416008,0x12000108,            /* ldrb w8,[x0,#0x58]; and w8,w8,#1 */
-        0x34000088,                      /* cbz w8, veneer end */
-        0x39416408,0x34000048,            /* ldrb w8,[x0,#0x59]; cbz w8, veneer end */
-        0x39435008,                      /* ldrb w8,[x0,#0xd4]: visible request */
-        branch(stub+32,site+4)};
-    uint32_t word=branch(site,stub);     /* validate both branches before any write */
-    memcpy(m->base+stub,veneer,sizeof veneer);
+    for(unsigned i=0;i<MENU_CAPTURE_TAIL_WORDS*4;i++)if(m->base[tail+i]){
+        fprintf(stderr,"[totk] 1.4.3 menu capture fix skipped: veneer space in use\n");return;
+    }
+    const uint32_t head[]={orig[0],       /* ldrb w8,[x0,#0xd5]: armed */
+        0x39435009,                       /* ldrb w9,[x0,#0xd4]: requested */
+        branch(stub+8,tail)};
+    const uint32_t end[]={0x2a090108,     /* orr w8,w8,w9: original admission */
+        branch(tail+4,site+4)};
+    uint32_t word=branch(site,stub);     /* validate every branch before any write */
+    memcpy(m->base+stub,head,sizeof head);
+    memcpy(m->base+tail,end,sizeof end);
     memcpy(m->base+site,&word,4);
-    fprintf(stderr,"[totk] 1.4.3 menu capture experiment: armed or visible requested pane, veneer +%#llx\n",(unsigned long long)stub);
+    fprintf(stderr,"[totk] 1.4.3 menu capture experiment: armed or requested pane (original admission), veneers +%#llx/+%#llx\n",
+            (unsigned long long)stub,(unsigned long long)tail);
 #endif
 }
 static void patch_output_res(Module *m);

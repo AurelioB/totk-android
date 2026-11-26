@@ -6,11 +6,14 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
-- Retain PR #44's quick-menu capture idea as the default-off `TOTK_MENU_CAPTURE_FIX=1` experiment.
-  Preserve native visibility eligibility for request-only captures, prefer thermal-step if its veneer space is needed,
-  validate bounds/branches before writes, and test production guards plus player-supplied ARM64 admission,
-  continuation and completion. Update/draw publication and device capture safety remain unqualified;
-  there is no unconditional per-frame copy or default behavior change.
+- Keep PR #44's quick-menu capture fix default off (`TOTK_MENU_CAPTURE_FIX=1` opts in), but restore
+  the contributor's original armed-OR-requested admission. Our added visibility guard suppressed the fix:
+  Odin requests were pending while hidden; original admission removed the black backgrounds in the finite
+  30/60-fps comparison, while the guarded version did not. Remove the guarded alternative entirely.
+  Retain all-before-any-write bounds, original-word, padding and branch checks. Split the veneer across
+  two existing text-tail gaps so thermal-step and FPS60 hardening coexist without moving their code.
+  Test real ARM admission/continuation/completion and all six install orders. Three-device safety,
+  preparation/publication and repeated-capture cost remain unqualified; no default-on claim is made.
 - Log the frozen effective write-back-alias state and map-warning mode once at first presenter startup,
   including explicit opt-outs, so benchmark tools need not infer build-dependent defaults from menu settings.
 - Record effective alias/warning states from complete startup evidence, including the warning mode, in benchmark

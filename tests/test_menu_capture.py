@@ -17,6 +17,11 @@ SCRIPTS = ROOT / 'games/totk/scripts'
 MAIN_NSO = Path(os.environ.get('TOTK_MAIN_NSO', ROOT.parent / 'build/TOTK_build/totk/extracted/v143/exefs/main'))
 SITE, UPDATE, CONSUME = 0x105bbcc, 0x105ba70, 0x105c36c
 GUARD = 'a5e2a3003d86bfbb936dc67e51990369aea8bf463786eea310b99463fc3a901d'
+HARDENING_SITES = [
+    0x0a7ac4, 0x95dd24, 0x6155e4, 0x615660, 0x45c700, 0x2b23c7c,
+    0x42c3bc, 0xa5a188, 0x2db238, 0xa5a670,
+    0xa5a18c, 0xa5a660, 0xa5a664, 0xa5a668, 0xa5a66c, 0xa5a674,
+]
 
 
 class MenuCapture(unittest.TestCase):
@@ -48,24 +53,27 @@ class MenuCapture(unittest.TestCase):
         self.seeds.check(original, [SITE, SITE + 4], GUARD)
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            seeds = self.seeds.write_seeds(directory / 'seeds.bin', original, [SITE, SITE + 4])
+            seeds = self.seeds.write_seeds(directory / 'seeds.bin', original, [SITE, SITE + 4, *HARDENING_SITES])
             executable = self.seeds.build(SCRIPTS / 'v143_menu_capture_fixture.c', directory / 'fixture')
-            image_path = directory / 'patched.bin'
-            self.run_fixture(executable, [image_path], seeds)
-            image = bytearray(image_path.read_bytes())
-        # The production patch replays only one authenticated word. Supply the
-        # actual native continuation, update gate and completion from this NSO.
-        image[SITE + 4:0x105bc10] = original(SITE + 4, 0x105bc10 - SITE - 4)
-        image[UPDATE:0x105bba8] = original(UPDATE, 0x105bba8 - UPDATE)
-        image[CONSUME:0x105c388] = original(CONSUME, 0x105c388 - CONSUME)
+            images = {}
+            for enabled in (0, 1):
+                image_path = directory / f'patched-{enabled}.bin'
+                self.run_fixture(executable, [image_path, str(enabled)], seeds)
+                image = bytearray(image_path.read_bytes())
+                # Supply native dispatch, continuation, update and completion;
+                # only the production installer decides admission.
+                image[SITE + 4:0x105bc10] = original(SITE + 4, 0x105bc10 - SITE - 4)
+                image[UPDATE:0x105bba8] = original(UPDATE, 0x105bba8 - UPDATE)
+                image[CONSUME:0x105c388] = original(CONSUME, 0x105c388 - CONSUME)
+                images[enabled] = image
         registers = [getattr(reg, f'UC_ARM64_REG_X{i}') for i in range(31)]
         vectors = [getattr(reg, f'UC_ARM64_REG_Q{i}') for i in range(32)]
         pane, context, data, stop = 0x10000000, 0x10001000, 0x10002000, 0x10008000
 
-        def machine(request, armed, vis, alpha, flags=0):
+        def machine(request, armed, vis, alpha, flags=0, enabled=1):
             mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
-            mu.mem_map(0, len(image))
-            mu.mem_write(0, bytes(image))
+            mu.mem_map(0, len(images[enabled]))
+            mu.mem_write(0, bytes(images[enabled]))
             mu.mem_map(pane, 0x10000)
             for i, register in enumerate(registers):
                 mu.reg_write(register, 0x123400000000 + i)
@@ -83,37 +91,39 @@ class MenuCapture(unittest.TestCase):
             return mu
 
         cases = 0
-        for request in (0, 1, 255):
-            for armed in (0, 1, 255):
-                for vis, alpha in ((0, 0), (0, 1), (1, 0), (1, 1), (64, 1), (65, 2)):
-                    mu = machine(request, armed, vis, alpha)
-                    before = [mu.reg_read(r) for r in registers]
-                    before_vectors = [mu.reg_read(r) for r in vectors]
-                    before_memory = bytes(mu.mem_read(pane, 0x10000))
-                    mu.emu_start(SITE, SITE + 4, count=20)
-                    self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_PC), SITE + 4)
-                    expected = armed or (request if vis & 1 and alpha else 0)
-                    self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_X8), expected)
-                    self.assertEqual([mu.reg_read(r) for i, r in enumerate(registers) if i != 8],
-                                     [v for i, v in enumerate(before) if i != 8])
-                    self.assertEqual([mu.reg_read(r) for r in vectors], before_vectors)
-                    self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_NZCV), 0xa0000000)
-                    self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_SP), 0x1000f000)
-                    self.assertEqual(bytes(mu.mem_read(pane, 0x10000)), before_memory)
-                    # Execute the real consumer dispatch; no synthetic predicate.
-                    mu.emu_start(SITE + 4, stop, count=1)
-                    self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_PC), 0x105bbf8 if expected else 0x105bbd4)
-                    if expected:
-                        for resource in (0, pane + 0x3000):
-                            mu.mem_write(context + 0x1a0, struct.pack('<Q', resource))
-                            mu.mem_write(pane + 0x3000, struct.pack('<Q', pane + 0x4000))
-                            mu.emu_start(0x105bbf8, stop, count=3)
-                            self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_PC), 0x105bc04 if resource else 0x105bbd4)
-                            if resource:
-                                mu.emu_start(0x105bc04, 0x105bc10, count=3)
-                                self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_X9), 0x3968000)
-                    cases += 1
-        self.assertEqual(cases, 54)
+        for enabled in (0, 1):
+            for request in (0, 1, 255):
+                for armed in (0, 1, 255):
+                    for vis, alpha in ((0, 0), (0, 1), (1, 0), (1, 1), (64, 1), (65, 2)):
+                        mu = machine(request, armed, vis, alpha, enabled=enabled)
+                        before = [mu.reg_read(r) for r in registers]
+                        before_vectors = [mu.reg_read(r) for r in vectors]
+                        before_memory = bytes(mu.mem_read(pane, 0x10000))
+                        mu.emu_start(SITE, SITE + 4, count=20)
+                        self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_PC), SITE + 4)
+                        expected = armed | request if enabled else armed
+                        self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_X8), expected)
+                        self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_X9), request if enabled else before[9])
+                        self.assertEqual([mu.reg_read(r) for i, r in enumerate(registers) if i not in (8, 9)],
+                                         [v for i, v in enumerate(before) if i not in (8, 9)])
+                        self.assertEqual([mu.reg_read(r) for r in vectors], before_vectors)
+                        self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_NZCV), 0xa0000000)
+                        self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_SP), 0x1000f000)
+                        self.assertEqual(bytes(mu.mem_read(pane, 0x10000)), before_memory)
+                        # Execute the real consumer dispatch; no synthetic predicate.
+                        mu.emu_start(SITE + 4, stop, count=1)
+                        self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_PC), 0x105bbf8 if expected else 0x105bbd4)
+                        if expected:
+                            for resource in (0, pane + 0x3000):
+                                mu.mem_write(context + 0x1a0, struct.pack('<Q', resource))
+                                mu.mem_write(pane + 0x3000, struct.pack('<Q', pane + 0x4000))
+                                mu.emu_start(0x105bbf8, stop, count=3)
+                                self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_PC), 0x105bc04 if resource else 0x105bbd4)
+                                if resource:
+                                    mu.emu_start(0x105bc04, 0x105bc10, count=3)
+                                    self.assertEqual(mu.reg_read(reg.UC_ARM64_REG_X9), 0x3968000)
+                        cases += 1
+        self.assertEqual(cases, 108)
 
         # Authenticate the native eligibility gate: request OR continuous bit 9,
         # then pane-visible bit 0 and nonzero effective alpha. Stop before calls

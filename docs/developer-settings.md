@@ -96,7 +96,7 @@ Everything not in the menu is a developer switch. A selection:
 | `TOTK_PSO_PREWARM=0` | Turns off the startup pipeline prewarm from the packaged key list. |
 | `TOTK_VK_VARYING_FIX=0` | Startup-only opt-out of the default-on, pair-specific missing vertex-output correction for wind/air-flow white boxes (#4). Off performs no varying classification/rewrite work. Changes the driver-cache and prewarm-resume namespace; restart after editing. |
 | `TOTK_VK_NAN_MINMAX=1` | Startup-only, **default-off experiment**: replace GLSL FMin/FMax/FClamp with NMin/NMax/NClamp in loaded VS/FS/CS modules. Has its own `.nan-v1` cache namespace; special-value semantics and driver cost await separate device qualification. Not required to enable the varying fix. |
-| `TOTK_MENU_CAPTURE_FIX=1` | Startup-only, **default-off 1.4.3 experiment** for randomly black ability-wheel / quick-selector backgrounds. Draw accepts an already-armed pane or a pending request passing the native visibility checks. Other values leave code untouched; iOS does not install it. Does not synchronize update/draw or change texture layouts, aliases, copies or cache identities. See the qualification limits below. |
+| `TOTK_MENU_CAPTURE_FIX=1` | Startup-only, **default-off 1.4.3 experiment** for randomly black ability-wheel / quick-selector backgrounds. Draw accepts an already-armed pane OR any pending request, reproducing contributor PR #44. Unset and all other values leave code untouched; there is no guarded alternative. iOS does not install it. Does not synchronize update/draw or change texture layouts, aliases, copies or cache identities. See the qualification limits below. |
 | `TU_DEBUG=…` | Turnip debug flags (e.g. `noslabcs`); on Adreno 722 an absent `TU_DEBUG` defaults to `sysmem`. |
 
 The complete, current list of switches with their status and evidence is in
@@ -106,18 +106,24 @@ presentation) and the diagnostic switches in [games/totk/android/DEBUGGING.md](.
 
 ### Quick-menu capture experiment
 
-PR #44 reports a capture recorded after the world target was cleared, rather than a missing Vulkan layout transition.
-The guarded veneer can admit a visible request before the pane's update arms it. Native update also prepares state
-after arming; completion republishes the request from a pane flag instead of always clearing it. Consequently this
-remains opt-in: host instruction tests cannot establish safe publication, the source target's lifetime, a world-frame
-guarantee, or a once-per-opening capture limit. No device acceptance is claimed.
+PR #44 admits a request before the pane's update arms it. Our added visibility guard suppressed that early path:
+Odin traces show pending requests while the visibility bit is still zero. In the finite diagnostic comparison,
+original admission gave 0/20 black backgrounds per menu at both 30 and 60 fps; off gave 11/20 ability and 5/20 weapon
+at 30, and 20/20 each at 60. Guarded admission still gave 8/20 and 3/20 at 30. We therefore removed our guard,
+not the contributor's admission. These clustered, observer-perturbed Odin results are not three-device acceptance.
+
+Native update prepares state after arming; completion can republish requests. The original admission produced
+two completion-site visits per trace-covered opening, including one on the next present, not a proven once-only
+capture. The smoke set showed no new wrong picture, but does not establish global preparation/lifetime safety.
+Keep the switch default off until matched final-tree Thor/Odin/Duo results and repeated-capture cost qualify it.
 
 There is no unconditional per-frame framebuffer copy, allocation, GPU wait or readback added by the patch.
-Each visit adds an instruction detour; newly admitted requests use the existing capture/blur body, possibly repeatedly
-for continuing requests. The author's extra blur per opening is an observation on their Thor, not a general cost bound.
-The veneer uses only the original result register, preserves flags and other registers, and occupies 36 existing
-padding bytes after the FPS60-hardening veneers. The real text tail has only 1024 bytes: thermal-step owns
-`+916..1024`, so `TOTK_THERMAL_STEP=1` takes priority and skips the menu experiment with an explicit log.
+Newly admitted requests use the existing capture/blur body. The veneer reproduces the contributor's `w8 |= w9`
+result and `w9` request scratch, preserving other registers, flags, stack and memory. Twenty padding bytes in
+two gaps (`+276..288` and `+340..348`, end-exclusive from aligned text end) add one branch to the original
+four instructions. No other owner moves: both the `+416..916` FPS60 hardening and `+916..1024` thermal-step
+veneers coexist in either order. Full bounds, original-word hashes, both empty slots and all branch ranges
+are checked before any write; refusal logs and leaves the menu patch untouched.
 
 `tests/test_menu_capture.py` runs the production C guard/layout fixture without game data. With `TOTK_MAIN_NSO`
 pointing to the player's 1.4.3 main and Unicorn/lz4 installed it also checks actual update eligibility, draw continuation,
