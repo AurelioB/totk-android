@@ -15,8 +15,18 @@ NVN = ROOT / 'games/totk/third_party/d2r_gfx/gfx/nvn'
 
 PROBE = r'''
 #include <assert.h>
+#include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <time.h>
+/* Deterministic elapsed time for production worker-poll tests; procfs traversals stay real. */
+static uint64_t poll_now;
+static int poll_clock_gettime(clockid_t clock, struct timespec *now) {
+    if (poll_now && clock==CLOCK_MONOTONIC) {
+        now->tv_sec=poll_now/1000000000; now->tv_nsec=poll_now%1000000000; return 0;
+    }
+    return clock_gettime(clock,now);
+}
 static _Atomic unsigned created;
 static int observed_create(pthread_t *thread, const pthread_attr_t *attr,
                            void *(*fn)(void *), void *arg) {
@@ -26,8 +36,10 @@ static int observed_create(pthread_t *thread, const pthread_attr_t *attr,
 #define TOTK_THREAD_PLACE_TEST
 #define TOTK_THREAD_PLACE_IMPLEMENTATION
 #define pthread_create observed_create
+#define clock_gettime poll_clock_gettime
 #include "nvn_dirty.c"
 #undef pthread_create
+#undef clock_gettime
 #include "vk_overlay.h"
 int runtime_handheld_mode(void) { return 1; }
 int vk_wb_alias_enabled(void) { return 0; } /* This warning-only fixture does not link the Vulkan pool backend. */
@@ -80,6 +92,53 @@ int main(int argc,char **argv) {
     assert(argc==2);
     if (!strcmp(argv[1],"policy")) { policy(); panel(); return 0; }
     if (!strcmp(argv[1],"marker")) { vk_overlay_mode(); vk_overlay_mode(); return 0; }
+    if (!strncmp(argv[1],"reuse-",6)) {
+        map_warn_configure();
+        assert(g_map_warn_mode==2 && !atomic_load(&created));
+        const uint64_t second=1000000000, period=(uint64_t)MAP_WARN_PERIOD_MS*1000000;
+        vma_worker_sample sample={0};
+        unsigned scans=0, warnings=0;
+        if (!strcmp(argv[1],"reuse-lag-fast") || !strcmp(argv[1],"reuse-lag-period")) {
+            unsigned cadence=!strcmp(argv[1],"reuse-lag-fast") ? 1 : 5;
+            for (unsigned tick=cadence;tick<=600;tick+=cadence) {
+                poll_now=tick*second;
+                vma_worker_poll(&sample,1,0,0); scans++;
+                if (tick%5==0) {
+                    poll_now+=second/2; /* warning and lag deadlines need not coincide */
+                    vma_worker_poll(&sample,0,0,1); warnings++;
+                }
+            }
+            assert(sample.warning_scans==0 && sample.warning_reuses==120 && warnings==120);
+        } else if (!strcmp(argv[1],"reuse-warning-only")) {
+            for (unsigned tick=1;tick<=120;tick++) {
+                /* Production schedules the next warning after the completed poll, not before it. */
+                poll_now=tick*(period+1);
+                vma_worker_poll(&sample,0,0,1); scans++; warnings++;
+            }
+            assert(sample.warning_scans==120 && !sample.warning_reuses);
+        } else if (!strcmp(argv[1],"reuse-stale")) {
+            poll_now=second;
+            vma_worker_poll(&sample,1,VMA_CLASSES,0); scans++;
+            poll_now+=period;
+            vma_worker_poll(&sample,0,0,1); warnings++;
+            assert(!sample.warning_scans && sample.warning_reuses==1); /* inclusive 5 s bound */
+            poll_now++;
+            vma_worker_poll(&sample,0,0,1); scans++; warnings++;
+            assert(sample.warning_scans==1 && sample.warning_reuses==1);
+            /* A completed missing-count sample is fresh but unknown, not a reason to rescan. */
+            sample.maps=0;
+            poll_now++;
+            vma_worker_poll(&sample,0,0,1); warnings++;
+            assert(sample.warning_scans==1 && sample.warning_reuses==2 && !nvn_dirty_map_warn_notice());
+        } else return 2;
+        assert(g_vma_test_reads==2*scans && g_vma_scan_stats[0]==scans);
+        assert(g_map_warn_thresholds.log_percent==80 && g_map_warn_thresholds.notice_percent==88 &&
+               g_map_warn_thresholds.clear_percent==84);
+        printf("reuse scans=%u reads=%llu warnings=%u warning_scans=%llu warning_reuses=%llu\n",
+            scans,(unsigned long long)g_vma_test_reads,warnings,
+            (unsigned long long)sample.warning_scans,(unsigned long long)sample.warning_reuses);
+        return 0;
+    }
     if (!strncmp(argv[1],"schedule-",9)) {
         int lag = !strcmp(argv[1],"schedule-lag");
         int diagnostic = !strcmp(argv[1],"schedule-diagnostic");
@@ -329,13 +388,36 @@ class MapWarning(unittest.TestCase):
             self.assertEqual(fields['requested_affinity'], fields['affinity'])
             self.assertGreaterEqual(int(caller['scans']), 1)
 
+    def test_lag_samples_add_zero_warning_traversals_over_many_periods(self):
+        for cadence, scans in (('fast', 600), ('period', 120)):
+            result = self.run_probe('reuse-lag-' + cadence, TOTK_MAP_WARN='2')
+            self.assertIn(f'reuse scans={scans} reads={2 * scans} warnings=120 '
+                          'warning_scans=0 warning_reuses=120', result.stdout)
+            warnings = [line for line in result.stderr.splitlines() if 'warn=1 ' in line]
+            self.assertEqual(len(warnings), 120)
+            self.assertTrue(all('scanned=0 ' in line and 'duration_us=0 ' in line for line in warnings))
+            self.assertIn('warning_scans=0 warning_reuses=120', warnings[-1])
+
+    def test_warning_only_requests_one_traversal_per_period(self):
+        result = self.run_probe('reuse-warning-only', TOTK_MAP_WARN='2')
+        self.assertIn('reuse scans=120 reads=240 warnings=120 warning_scans=120 warning_reuses=0',
+                      result.stdout)
+        self.assertEqual(result.stderr.count('[map-warn-scan]'), 120)
+        self.assertIn('scanned=1 warning_scans=120 warning_reuses=0', result.stderr)
+
+    def test_five_second_sample_reuse_is_inclusive_and_stale_requests_once(self):
+        result = self.run_probe('reuse-stale', TOTK_MAP_WARN='2')
+        self.assertIn('reuse scans=2 reads=4 warnings=3 warning_scans=1 warning_reuses=2',
+                      result.stdout)
+        self.assertEqual(result.stderr.count('maps count unavailable'), 1)
+
     def test_sampler_trace_has_monotonic_time_duration_rows_and_frame_origin(self):
         before = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
         result = self.run_probe('worker', TOTK_MAP_WARN='2')
         after = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
         lines = [line for line in result.stderr.splitlines() if '[map-warn-scan]' in line]
         self.assertEqual(len(lines), 1)
-        self.assertLess(len(lines[0]), 256)  # one fixed, bounded record, not one per maps row
+        self.assertLess(len(lines[0]), 384)  # one fixed, bounded record, not one per maps row
         fields = dict(re.findall(r'([a-z_]+)=(\d+)', lines[0]))
         self.assertLessEqual(before, int(fields['start_ns']))
         self.assertLessEqual(int(fields['start_ns']), after)
@@ -346,8 +428,11 @@ class MapWarning(unittest.TestCase):
         self.assertEqual(fields['warn'], '1')
         self.assertEqual(fields['notice'], '0')
         self.assertEqual(fields['test_phase'], '0')
+        self.assertEqual(fields['scanned'], '1')
+        self.assertEqual(fields['warning_scans'], '1')
+        self.assertEqual(fields['warning_reuses'], '0')
         dirty = (NVN / 'nvn_dirty.c').read_text()
-        worker = dirty.split('static void *vma_worker(', 1)[1].split('static unsigned vma_scan_period(', 1)[0]
+        worker = dirty.split('static void vma_worker_poll(', 1)[1].split('static void *vma_worker(', 1)[0]
         self.assertEqual(dirty.count('LOG("[map-warn-scan]'), 1)
         self.assertIn('LOG("[map-warn-scan]', worker)
         self.assertIn('g_map_warn_mode >= 2', worker)

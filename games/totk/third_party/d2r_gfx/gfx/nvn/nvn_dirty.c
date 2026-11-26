@@ -605,6 +605,61 @@ static void vma_place(int creator) {
         requested, effective, affinity_error, read_error, source);
 }
 #endif
+/* Worker-owned completed sample: warning evaluation never changes lag's budget or deadline. */
+typedef struct {
+    uint64_t maps, maximum, completed_ns, warning_scans, warning_reuses;
+} vma_worker_sample;
+static void vma_worker_poll(vma_worker_sample *sample, int lag_scan, unsigned requests, int warn_due) {
+    uint64_t start = vma_clock_ns();
+    int scanned = lag_scan;
+    if (lag_scan) {
+        /* Reuse the existing traversal, including classification when explicitly requested. */
+#ifdef __linux__
+        if (requests & VMA_CLASSES) nvn_dirty_lag_vma_report();
+        else
+#endif
+            nvn_dirty_lag_vma_refresh();
+        sample->maps = atomic_load(&g_vma_missing_maps) ? 0 : atomic_load(&g_vma_count);
+        sample->maximum = atomic_load(&g_vma_max);
+        sample->completed_ns = vma_clock_ns();
+    }
+    if (warn_due) {
+        uint64_t now = vma_clock_ns();
+        if (sample->completed_ns && now >= sample->completed_ns &&
+            now - sample->completed_ns <= (uint64_t)MAP_WARN_PERIOD_MS * 1000000) {
+            sample->warning_reuses++;
+        } else {
+            /* No g_vma_mu, g_slot_mu, pool or runtime locks in warning-only sampling. */
+            sample->warning_scans++;
+            scanned = 1; start = now;
+            sample->maps = vma_read("/proc/self/maps", 1);
+            sample->maximum = vma_read("/proc/sys/vm/max_map_count", 0);
+            sample->completed_ns = vma_clock_ns();
+        }
+        map_warn_sample(sample->maps, sample->maximum);
+    }
+    /* Reuse-only evaluations are not traversals: keep scan telemetry and duration truthful. */
+    uint64_t elapsed = vma_clock_ns() - start;
+    if (g_map_warn_mode >= 2) {
+        unsigned phase = g_map_warn_mode == 3 ?
+            (g_map_warn_test_samples + NVN_MAP_WARN_TEST_PHASE_SAMPLES - 1) / NVN_MAP_WARN_TEST_PHASE_SAMPLES : 0;
+        uint64_t scan_elapsed = scanned ? sample->completed_ns - start : 0;
+        LOG("[map-warn-scan] start_ns=%llu duration_us=%llu rows=%llu frame_origin_ns=%llu warn=%d notice=%d test_phase=%u log=%u show=%u clear=%u scanned=%d warning_scans=%llu warning_reuses=%llu",
+            (unsigned long long)start, (unsigned long long)(scan_elapsed / 1000),
+            (unsigned long long)sample->maps, (unsigned long long)atomic_load_explicit(&g_map_warn_frame_origin, memory_order_relaxed),
+            warn_due, nvn_dirty_map_warn_notice(), phase, g_map_warn_thresholds.log_percent,
+            g_map_warn_thresholds.notice_percent, g_map_warn_thresholds.clear_percent, scanned,
+            (unsigned long long)sample->warning_scans, (unsigned long long)sample->warning_reuses);
+    }
+    if (scanned) {
+        pthread_mutex_lock(&g_vma_scan_mu);
+        g_vma_scan_stats[0]++;
+        g_vma_scan_stats[1] += !!(requests & VMA_EPOCH);
+        g_vma_scan_stats[2] += elapsed;
+        if (elapsed > g_vma_scan_stats[3]) g_vma_scan_stats[3] = elapsed;
+        pthread_mutex_unlock(&g_vma_scan_mu);
+    }
+}
 static void *vma_worker(void *creator) {
 #ifdef __linux__
     /* Preserve lag and independently requested diagnostic scheduling; normalize only warning-only creation. */
@@ -615,6 +670,7 @@ static void *vma_worker(void *creator) {
     uint64_t scan_period = (uint64_t)g_vma_period_ms * 1000000;
     uint64_t warn_period = (uint64_t)MAP_WARN_PERIOD_MS * 1000000;
     uint64_t next_scan = vma_clock_ns() + scan_period, next_warn = vma_clock_ns() + warn_period;
+    vma_worker_sample sample = {0};
     for (;;) {
         /* Independent deadlines preserve lag's configured cadence. Requests never advance either.
            No game/render/present thread scans for this feature, including its startup sample. */
@@ -629,45 +685,9 @@ static void *vma_worker(void *creator) {
         int lag_scan = scan_due && (g_lag_enabled || requests);
         if (scan_due) next_scan = now + scan_period;
         if (!lag_scan && !warn_due) continue;
-        uint64_t start = vma_clock_ns(), maps = 0, maximum = 0;
-        if (lag_scan) {
-            /* Reuse the existing traversal, including classification when explicitly requested. */
-#ifdef __linux__
-            if (requests & VMA_CLASSES) nvn_dirty_lag_vma_report();
-            else
-#endif
-                nvn_dirty_lag_vma_refresh();
-            maps = atomic_load(&g_vma_missing_maps) ? 0 : atomic_load(&g_vma_count);
-            maximum = atomic_load(&g_vma_max);
-        } else {
-            /* No g_vma_mu, g_slot_mu, pool or runtime locks in warning-only sampling. */
-            maps = vma_read("/proc/self/maps", 1);
-            maximum = vma_read("/proc/sys/vm/max_map_count", 0);
-        }
-        /* Trace duration covers traversal/sysctl (and existing lag/classification work), not
-           warning policy/logging, telemetry publication or sleep. Only diagnostic modes read it. */
-        uint64_t scan_elapsed = g_map_warn_mode >= 2 ? vma_clock_ns() - start : 0;
-        if (warn_due) {
-            map_warn_sample(maps, maximum);
-            next_warn = vma_clock_ns() + warn_period;
-        }
+        vma_worker_poll(&sample, lag_scan, requests, warn_due);
+        if (warn_due) next_warn = vma_clock_ns() + warn_period;
         if (scan_due) next_scan = vma_clock_ns() + scan_period;
-        uint64_t elapsed = vma_clock_ns() - start;
-        if (g_map_warn_mode >= 2) {
-            unsigned phase = g_map_warn_mode == 3 ?
-                (g_map_warn_test_samples + NVN_MAP_WARN_TEST_PHASE_SAMPLES - 1) / NVN_MAP_WARN_TEST_PHASE_SAMPLES : 0;
-            LOG("[map-warn-scan] start_ns=%llu duration_us=%llu rows=%llu frame_origin_ns=%llu warn=%d notice=%d test_phase=%u log=%u show=%u clear=%u",
-                (unsigned long long)start, (unsigned long long)(scan_elapsed / 1000),
-                (unsigned long long)maps, (unsigned long long)atomic_load_explicit(&g_map_warn_frame_origin, memory_order_relaxed),
-                warn_due, nvn_dirty_map_warn_notice(), phase, g_map_warn_thresholds.log_percent,
-                g_map_warn_thresholds.notice_percent, g_map_warn_thresholds.clear_percent);
-        }
-        pthread_mutex_lock(&g_vma_scan_mu);
-        g_vma_scan_stats[0]++;
-        g_vma_scan_stats[1] += !!(requests & VMA_EPOCH);
-        g_vma_scan_stats[2] += elapsed;
-        if (elapsed > g_vma_scan_stats[3]) g_vma_scan_stats[3] = elapsed;
-        pthread_mutex_unlock(&g_vma_scan_mu);
     }
     return NULL;
 }

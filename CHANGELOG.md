@@ -132,8 +132,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Host regressions cover native layer guards, native JSON → Java coordinates and deterministic cache convergence;
   surface/sky/Depths transitions, zoom appearance, memory and decoder CPU still need dual-screen device checks.
 - Enable `TOTK_MAP_WARN` mode `1` by default when unset; `=0` disables it and starts no sampler for this feature.
-  Start lazily in the game presenter, not on library load or in `:setup`; log one startup line. Count maps on the existing low-priority
-  sampler about every five seconds, independently of frame lag. Log at 80%; show `MAP LIMIT NEAR` /
+  Start lazily in the game presenter, not on library load or in `:setup`; log one startup line. Evaluate
+  every five seconds on the shared sampler, reusing its latest completed sample when at most five seconds old.
+  Only missing/stale samples request a warning traversal; lag sampling at least that often adds none.
+  Warning-only devices retain the five-second scan cadence. Mode `2` reports cumulative warning-requested
+  scans versus reused samples and distinguishes reuse-only evaluations from actual traversals.
+  Log at 80%; show `MAP LIMIT NEAR` /
   `SAVE AND RESTART GAME SOON` at 88%, even with the performance overlay off; clear below 84%.
   Hidden kernel limits use 65,530; unreadable counts clear the notice and log once. Startup-only
   percentage overrides support safe low-threshold testing. Add diagnostic `TOTK_MAP_WARN=2`

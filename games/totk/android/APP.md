@@ -1466,11 +1466,16 @@ without that run.
 Unset `TOTK_MAP_WARN` or exact `1` enables process-map counting on the existing
 `totk-vmascan` worker, independently of `TOTK_FRAME_LAG`. It starts lazily when the game's Vulkan
 overlay/presenter is first used, not when the native library is loaded or the frame origin is published.
-The separate `:setup` process does not link this sampler. The first sample is about five seconds after
-worker startup; subsequent samples are spaced by about five seconds plus scan time. The
-game/render/present threads and signal handlers do not scan for this feature. Warning-only scans take
-no pool, runtime or tracker locks. Independently requested lag budget/classification work may start
-the shared worker earlier, as before; its locks and policy are unchanged. One `[map-warn] started mode=1 period_ms=5000 log=80 notice=88 clear=84; warning only, does not prevent map-limit abort`
+The separate `:setup` process does not link this sampler. The first warning evaluation is about five
+seconds after worker startup; subsequent evaluations are spaced by five seconds plus evaluation time.
+Each evaluation reuses the worker's latest completed sample when it is at most five seconds old,
+including a freshly completed lag/classification scan. Only a missing or older sample requests a new
+traversal. When lag already samples at least that often, the warning adds no traversals; warning-only
+devices keep one traversal per five-second period plus scan/scheduling delay. The game/render/present
+threads and signal handlers do not scan for this feature. Warning-only scans take no pool, runtime or
+tracker locks. Independently requested lag budget/classification work may start the shared worker
+earlier, as before; its locks, scheduling, budget freshness and deadlines are unchanged.
+One `[map-warn] started mode=1 period_ms=5000 log=80 notice=88 clear=84; warning only, does not prevent map-limit abort`
 line records the ordinary default startup.
 
 Warning-only creation explicitly requests absolute nice **at least +10** (retaining a lower-priority
@@ -1524,20 +1529,24 @@ lag/classification work, not the warning's independent five-second deadline.
 
 ### Scan attribution (`TOTK_MAP_WARN=2`, diagnostic only)
 
-`2` keeps `1`'s warning thresholds, sampling cadence and policy, and adds one fixed-format, bounded
-`[map-warn-scan]` line per completed worker traversal, written only by `totk-vmascan`:
-`start_ns`, `duration_us`, `rows`, `frame_origin_ns`, `warn`, `notice`, `test_phase`, `log`, `show`, `clear`.
+`2` keeps `1`'s warning thresholds, evaluation cadence and policy, and adds one fixed-format, bounded
+`[map-warn-scan]` line per completed worker traversal or reuse-only warning evaluation, written only by
+`totk-vmascan`: `start_ns`, `duration_us`, `rows`, `frame_origin_ns`, `warn`, `notice`, `test_phase`,
+`log`, `show`, `clear`, `scanned`, `warning_scans`, `warning_reuses`.
 `start_ns` is absolute `CLOCK_MONOTONIC` nanoseconds, the same clock as ordinary native frame
 reports; `frame_origin_ns` is their existing process origin (`g_t0_ns`). Convert to ordinary elapsed
 seconds with `(start_ns - frame_origin_ns) / 1e9`. Zero origin means unavailable in a graphics-only
 host, not a valid conversion anchor. Duration is truncated to whole microseconds and covers traversal
-and sysctl read (plus existing lag/classification work if reused), excluding warning/logging, telemetry
-and sleep. `rows=0` denotes an unknown count.
+and sysctl read (plus existing lag/classification work), excluding warning/logging, telemetry and sleep.
+`scanned=0` denotes a reuse-only evaluation, with zero duration: it must not be counted as a traversal
+or correlated with long frames as one. `rows=0` denotes an unknown count. `warning_scans` counts
+cumulative traversals requested solely by the warning; `warning_reuses` counts warning evaluations
+using a fresh completed sample instead, including a lag scan completed in the same worker iteration.
 
 With lag/classification off this is at most one line per five-second warning scan (about 0.2 Hz).
 Existing independently requested lag/classification scans also get a line; their unchanged minimum
-period is one second. No per-row or per-frame logging is added. `warn=1` marks a warning-policy sample.
-`1` remains quiet except its once-only startup and threshold/read-failure logs; neither `1` nor off adds trace reads.
+period is one second. No per-row or per-frame logging is added. `warn=1` marks a warning-policy evaluation.
+`1` remains quiet except its once-only startup and threshold/read-failure logs; neither `1` nor off adds trace logging.
 Use `2`, not `3`, for standing performance attribution. Logging itself can perturb timing. Match real
 scan intervals, not modulo-five-second phases or log-delivery timestamps; ordinary long-frame rows
 are delayed/rounded sparse observations, and window maxima have no within-window event timestamp.
