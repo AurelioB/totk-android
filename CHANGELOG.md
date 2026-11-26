@@ -15,6 +15,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Reject stale, duplicate, malformed and conflicting records per switch before marker or pre-switch-provenance
   admission; require current evidence metadata so older resolver results cannot bypass UNKNOWN rejection.
   Preserve window metrics and immutable baseline identities.
+- Scope effective-switch evidence, including both startup-bracket ends, to the current launch in retained
+  ten-launch logs. Historical markers never authenticate a missing or incomplete current startup.
 - Make optional frame-timeline and fence-evidence ring producers single-attempt/nonblocking, with counted
   dropped updates and skipped snapshots. Reuse per-walk elapsed clocks instead of enabling recorder
   opcode/category probes, and batch recorder-worker draws/descriptors at slot assembly instead of each job.

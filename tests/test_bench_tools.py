@@ -239,6 +239,34 @@ class EffectiveSwitches(unittest.TestCase):
             self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
             self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
 
+    def test_ten_launch_history_uses_only_current_off_startup_bracket(self):
+        old = ''.join(
+            f'[totk-log] ===== Launch 2026-11-26T00:00:{n:02}Z (pid {100 + n}) =====\n'
+            + self.START + self.marker('on', 1) + self.END for n in range(9))
+        heading = '[totk-log] ===== Launch 2026-11-26T00:00:09Z (pid 109) =====\n'
+        current = self.START + self.marker()
+        plain = self.document(current)
+        history = self.document(old + heading + current)
+        self.assertEqual(self.values(history), dict.fromkeys(benchlib.SWITCH_KEYS, 'off'))
+        self.assertEqual(history['runs'], plain['runs'])
+        self.assertEqual(benchlib.device_signature(history, 'thor')['sha256'],
+                         benchlib.device_signature(plain, 'thor')['sha256'])
+        self.assertEqual(self.compare(plain, history)[0], {'match'})
+
+    def test_current_history_without_marker_or_closed_bracket_stays_unknown(self):
+        old = ''.join(
+            f'[totk-log] ===== Launch 2026-11-26T00:00:{n:02}Z (pid {100 + n}) =====\n'
+            + self.START + self.marker('on', 1) + self.END for n in range(9))
+        heading = '[totk-log] ===== Launch 2026-11-26T00:00:09Z (pid 109) =====\n'
+        for current in ('', self.START, self.START + '[totk-switches] v=1 TOTK_WB_ALIAS=off'):
+            with self.subTest(current=current):
+                states = self.parse_states(old + heading + current)
+                self.assertEqual({value['state'] for value in states.values()}, {'UNKNOWN'})
+                doc = self.document(old + heading + current)
+                self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
+                self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+                self.assertIn('NOT COMPARABLE', self.compare(doc, doc)[1])
+
     def test_marker_after_startup_end_cannot_authenticate_current_launch(self):
         doc = self.document(self.START + self.END + self.marker())
         self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))

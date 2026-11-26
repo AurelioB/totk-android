@@ -291,10 +291,13 @@ and signatures include those states (and warning mode); mismatches are **NOT COM
 `UNKNOWN` never matches, even another `UNKNOWN`. The reliable raw startup bracket starts at the sole
 `[totk-app] build ...` line and ends at the first subsequent `[nvn-vk] frame N: ... fps over the last 300`
 line. The neutral marker must lie strictly inside that bracket; it cannot close or authenticate its own bracket.
-The parser retains every positioned observation. Invalid, conflicting, duplicate single-startup, stale or
-out-of-bracket state records make the affected switch UNKNOWN, independently of the other switch. Multiple
-launches or presentation records before the build start invalidate both; a filtered/prefixed or truncated
-capture cannot borrow state from another launch.
+The parser first selects the current segment at the last `[totk-log] ===== Launch ` heading, then retains
+every positioned observation from that segment only (legacy logs without headings remain single-run).
+Both bracket ends and all switch evidence must belong to that same segment; old on/on markers cannot
+authenticate current off/off or a missing/truncated current bracket. The latter stays UNKNOWN.
+Invalid, conflicting, duplicate single-startup, stale or out-of-bracket state records make the affected
+switch UNKNOWN, independently of the other switch. Multiple build starts inside that segment or
+presentation records before its build start invalidate both; filtered/prefixed captures cannot borrow state.
 Older complete captures can prove ON through the alias enable/statistics line and map-warning start line.
 Normal repeated post-startup alias statistics may corroborate an authenticated ON state, but cannot establish
 missing startup; stale, malformed or contradictory telemetry rejects alias admission. Absence alone is not OFF.
