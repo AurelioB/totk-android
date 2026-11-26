@@ -116,10 +116,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   A pending update comes first, then the notice; both wait for the first real handoff. Keep session-token
   recording independent of that UI gate and preserve background hold and refresh-request lifecycle.
 - Report companion tile, overview, decoration and image LRU occupancy/budgets, allocation-byte high water,
-  lookup/decode counts and evictions through the native log, at most once per ten seconds while shown.
-  First fills and eviction bursts share that limit; cache budgets, decode policy and eviction order are unchanged.
-  Snapshot into preallocated storage, then format/write on a bounded background task outside cache locks;
-  slow native logging cannot occupy the draw or bitmap-decoder thread. Logcat mirroring remains opt-in.
+  lookup/decode counts and evictions through the native log. Snapshot/fill/eviction delivery shares one process-wide
+  ten-second completion-based limit across recreated stores. A second ten-second allowance batches lifecycle events;
+  at most two lines per rolling ten seconds, only while visible, with monotonic store IDs and bounded/loss-counted
+  create/close history. Counters remain per store; cache budgets, decode policy and eviction order are unchanged.
+  Snapshot into preallocated storage, then format/write on one bounded process-wide background task outside cache
+  locks; slow native logging cannot occupy the draw or bitmap-decoder thread. Logcat mirroring remains opt-in.
 - Follow Link's environment-based map layer, display in-game map coordinates without losing integer-boundary
   precision, and separate overview/detail caches to stop stationary tile eviction loops. Reject invalid, unreadable
   or replaced layer samples using the previous layer heuristic; always keep the visible detail tiles plus one, scale

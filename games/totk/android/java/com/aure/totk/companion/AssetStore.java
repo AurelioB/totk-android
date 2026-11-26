@@ -34,6 +34,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Optional, asynchronous game art generated on the device into <game>/companion/ (never shipped in the APK).
  * No bitmap decode or file reads occur in Canvas drawing. */
@@ -41,19 +43,17 @@ public final class AssetStore {
     private final File root;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService decoder = Executors.newSingleThreadExecutor();
-    // One reusable task/snapshot; a slow native sink must not occupy the decoder or the UI thread.
-    private final ExecutorService cacheLogger = Executors.newSingleThreadExecutor();
-    private final AtomicBoolean cacheLogQueued = new AtomicBoolean();
+    // Counters/snapshot stay per store; one process-wide writer and two bounded delivery channels survive recreation.
+    private final long instanceId = CacheLog.ids.incrementAndGet();
     private final long[] cacheSnapshot = new long[4 * 9];
     private final Runnable cacheLogTask = this::writeCacheLog;
-    private volatile boolean cacheVisible, cacheFilled;
-    private volatile long nextCacheLogAt;
+    private final AtomicBoolean cacheVisible = new AtomicBoolean();
+    private volatile boolean cacheFilled;
     private final BitmapCache images, tiles, overviews, decorImages;
     private final int tileFloor, tileMarginLimit;
     private final int memoryClass;
-    private long cacheLogTime, loggedEvictions;
+    private long loggedEvictions;
     private int loggedFills;
-    private boolean cacheLogged;
     private final Set<String> pending = new HashSet<>(), missing = new HashSet<>();
     private final Runnable changed;
     public volatile JSONObject index = new JSONObject(), text = new JSONObject();
@@ -132,6 +132,7 @@ public final class AssetStore {
         overviews = cache(24 * 1024 * 1024);
         // Full-screen frames must not evict one another or every redraw re-decodes the menu.
         decorImages = cache(48 * 1024 * 1024);
+        CacheLog.record(instanceId, false, "constructor");
         decoder.execute(() -> {
             index = json("index.json");
             Map<String, Decor> parts = new HashMap<>();
@@ -180,6 +181,71 @@ public final class AssetStore {
             notifyChanged();
         });
     }
+    /** Periodic/fill/eviction snapshots: one per ten seconds process-wide. Lifecycle-only delivery has one separate
+     * ten-second allowance; both channels use this one writer, including across a slow old store's native write.
+     * Only primitive lifecycle metadata is retained: 32 events maximum, with an explicit cumulative loss count. */
+    private static final class CacheLog {
+        static final AtomicLong ids = new AtomicLong();
+        static final AtomicInteger visible = new AtomicInteger();
+        static final AtomicBoolean queued = new AtomicBoolean();
+        static final ExecutorService worker = Executors.newSingleThreadExecutor();
+        static volatile long nextSnapshotAt, nextLifecycleAt;
+        static volatile boolean eventsPending;
+        static final Object events = new Object();
+        static final int LIMIT = 32;
+        static final long[] eventSeq = new long[LIMIT], eventIds = new long[LIMIT], eventTimes = new long[LIMIT];
+        static final boolean[] eventClosed = new boolean[LIMIT];
+        static final String[] eventReasons = new String[LIMIT];
+        // This copy belongs only to the single writer; no formatting or allocation under either metadata/cache lock.
+        static final long[] logIds = new long[LIMIT], logTimes = new long[LIMIT];
+        static final boolean[] logClosed = new boolean[LIMIT];
+        static final String[] logReasons = new String[LIMIT];
+        static int head, count, logCount;
+        static long sequence, dropped, logDropped, logThrough;
+        static void record(long id, boolean closed, String reason) {
+            long now = android.os.SystemClock.elapsedRealtime();
+            synchronized (events) {
+                if (count == LIMIT) { head = (head + 1) % LIMIT; count--; dropped++; }
+                int at = (head + count++) % LIMIT;
+                eventSeq[at] = ++sequence; eventIds[at] = id; eventTimes[at] = now;
+                eventClosed[at] = closed; eventReasons[at] = reason;
+                eventsPending = true;
+            }
+        }
+        static void copyEvents() {
+            synchronized (events) {
+                logCount = count; logDropped = dropped;
+                for (int n = 0; n < count; n++) {
+                    int at = (head + n) % LIMIT;
+                    logIds[n] = eventIds[at]; logTimes[n] = eventTimes[at];
+                    logClosed[n] = eventClosed[at]; logReasons[n] = eventReasons[at];
+                    logThrough = eventSeq[at];
+                }
+            }
+        }
+        static void appendEvents(StringBuilder line) {
+            line.append(" lifecycle=");
+            if (logCount == 0) line.append("none");
+            for (int n = 0; n < logCount; n++) {
+                if (n != 0) line.append(';');
+                line.append(logIds[n]).append(',').append(logClosed[n] ? "closed" : "created").append(',')
+                        .append(logTimes[n]).append(',').append(logReasons[n]);
+            }
+            line.append(" lifecycle_dropped=").append(logDropped);
+        }
+        static void acknowledge() {
+            synchronized (events) {
+                while (count > 0 && eventSeq[head] <= logThrough) {
+                    eventReasons[head] = null; head = (head + 1) % LIMIT; count--;
+                }
+                eventsPending = count != 0;
+            }
+        }
+        static void releaseCopy() {
+            for (int n = 0; n < logCount; n++) logReasons[n] = null;
+        }
+    }
+
     /** Mutations and these extra counters use the existing pending monitor. LruCache already counts lookups,
      * allocation bytes and evictions under its own monitor; do not wrap or allocate on the lookup path. */
     private static final class BitmapCache extends LruCache<String, Bitmap> {
@@ -208,24 +274,30 @@ public final class AssetStore {
     }
     private static BitmapCache cache(int bytes) { return new BitmapCache(bytes); }
 
-    /** UI-only admission: no cache monitor, formatting or native call on the draw path. */
+    /** UI-only admission: no cache/event monitor, formatting or native call on the draw path. */
     void logCaches(boolean visible, long now) {
         setCacheVisible(visible);
-        if (!visible || closed || !cacheFilled || now < nextCacheLogAt || !cacheLogQueued.compareAndSet(false, true)) return;
-        nextCacheLogAt = now + 10000;
-        try { cacheLogger.execute(cacheLogTask); }
-        catch (RejectedExecutionException stopped) { cacheLogQueued.set(false); }
+        if (!visible || closed || (!cacheFilled && !CacheLog.eventsPending) ||
+                (now < CacheLog.nextSnapshotAt && (now < CacheLog.nextLifecycleAt || !CacheLog.eventsPending)) ||
+                !CacheLog.queued.compareAndSet(false, true)) return;
+        try { CacheLog.worker.execute(cacheLogTask); }
+        catch (RejectedExecutionException stopped) { CacheLog.queued.set(false); }
     }
-    void setCacheVisible(boolean visible) { cacheVisible = visible; }
+    void setCacheVisible(boolean visible) {
+        visible &= !closed;
+        if (cacheVisible.get() != visible && cacheVisible.compareAndSet(!visible, visible))
+            CacheLog.visible.addAndGet(visible ? 1 : -1);
+    }
     private static void appendCache(StringBuilder line, String name, long[] values, int offset) {
         line.append(' ').append(name).append('=').append(values[offset]);
         for (int n = 1; n < 9; n++) line.append(',').append(values[offset + n]);
     }
     private void writeCacheLog() {
         try {
-            if (closed || !cacheVisible) return;
+            if (closed || !cacheVisible.get() || CacheLog.visible.get() == 0) return;
             long now = android.os.SystemClock.elapsedRealtime();
-            if (cacheLogged && now - cacheLogTime < 10000) return;
+            boolean snapshot = now >= CacheLog.nextSnapshotAt;
+            if (!snapshot && now < CacheLog.nextLifecycleAt) return;
             int fills;
             synchronized (pending) {
                 if (closed) return;
@@ -235,21 +307,28 @@ public final class AssetStore {
                 tiles.copy(cacheSnapshot, 0); overviews.copy(cacheSnapshot, 9);
                 decorImages.copy(cacheSnapshot, 18); images.copy(cacheSnapshot, 27);
             }
-            if (fills == 0 || closed || !cacheVisible) return;
+            if (closed || !cacheVisible.get()) return;
+            CacheLog.copyEvents();
+            if ((!snapshot && CacheLog.logCount == 0) || (fills == 0 && CacheLog.logCount == 0)) return;
             long evictions = cacheSnapshot[6] + cacheSnapshot[15] + cacheSnapshot[24] + cacheSnapshot[33];
-            String reason = fills != loggedFills ? "first_fill" :
+            String reason = !snapshot ? "lifecycle" : fills != 0 && fills != loggedFills ? "first_fill" :
                     evictions - loggedEvictions >= 8 ? "eviction_burst" : "periodic";
-            StringBuilder line = new StringBuilder(640).append("cache v=1 ms=").append(now)
+            StringBuilder line = new StringBuilder(1024).append("cache v=2 ms=").append(now)
+                    .append(" instance=").append(instanceId).append(" event=").append(snapshot ? "snapshot" : "lifecycle")
                     .append(" reason=").append(reason).append(" memory_class_mib=").append(memoryClass);
+            CacheLog.appendEvents(line);
             appendCache(line, "tiles", cacheSnapshot, 0); appendCache(line, "overview", cacheSnapshot, 9);
             appendCache(line, "decor", cacheSnapshot, 18); appendCache(line, "images", cacheSnapshot, 27);
-            if (closed || !cacheVisible) return;
+            if (closed || !cacheVisible.get() || CacheLog.visible.get() == 0) return;
             boolean delivered = CompanionNative.logCover(line.toString());
-            // Limit from completion, not enqueue time: a delayed/slow write cannot create a catch-up burst.
-            cacheLogged = true; cacheLogTime = android.os.SystemClock.elapsedRealtime();
-            nextCacheLogAt = cacheLogTime + 10000;
-            if (delivered) { loggedFills = fills; loggedEvictions = evictions; }
-        } finally { cacheLogQueued.set(false); }
+            // Completion-based process deadlines: slow writes/replacement stores cannot overlap or catch up.
+            long next = android.os.SystemClock.elapsedRealtime() + 10000;
+            if (snapshot) CacheLog.nextSnapshotAt = next; else CacheLog.nextLifecycleAt = next;
+            if (delivered) {
+                CacheLog.acknowledge();
+                if (snapshot) { loggedFills = fills; loggedEvictions = evictions; }
+            }
+        } finally { CacheLog.releaseCopy(); CacheLog.queued.set(false); }
     }
     private JSONObject json(String path) {
         try (InputStream in = open(path)) {
@@ -463,10 +542,13 @@ public final class AssetStore {
         return null;
     }
     private void notifyChanged() { main.post(() -> { if (!closed) changed.run(); }); }
-    public void close() {
-        closed = true;
-        cacheVisible = false;
-        cacheLogger.shutdownNow();
+    public void close(String reason) {
+        synchronized (pending) {
+            if (closed) return;
+            closed = true;
+        }
+        setCacheVisible(false);
+        CacheLog.record(instanceId, true, reason);
         decoder.shutdownNow();
         synchronized (pending) {
             images.evictAll(); tiles.evictAll(); overviews.evictAll(); decorImages.evictAll();

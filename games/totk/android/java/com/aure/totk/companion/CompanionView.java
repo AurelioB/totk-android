@@ -90,7 +90,7 @@ public final class CompanionView extends View implements SnapshotPoller.Listener
     }
     @Override protected void onDetachedFromWindow() {
         poller.stop();
-        if (assets != null) { assets.close(); assets = null; }
+        if (assets != null) { assets.close("view_detached"); assets = null; }
         super.onDetachedFromWindow();
     }
     @Override protected void onVisibilityChanged(View changedView, int visibility) {
