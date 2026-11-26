@@ -106,6 +106,14 @@ class EffectiveSwitches(unittest.TestCase):
     START = '[totk-app] build release test; game folder /game\n'
     ALIAS = '[nvn-vk] write-back alias: enabled (default on; TOTK_WB_ALIAS=0 disables)\n'
     WARN = '[dirty] [map-warn] started mode=1 period_ms=5000 log=80 notice=88 clear=84\n'
+    END = '[nvn-vk] frame 300: 30 fps over the last 300\n'
+
+    @staticmethod
+    def statistics():
+        buckets = ','.join(reason + ':0/0' for reason in
+            ('alias', 'registry', 'ownership', 'mixed', 'non-dmabuf', 'retired', 'other'))
+        return '[nvn-vk] memory write-back alias paths: phase=periodic cumulative=1 ' + ' '.join(
+            site + '=' + buckets for site in ('landing', 'store', 'publication')) + '\n'
 
     @staticmethod
     def marker(alias='off', mode=0):
@@ -187,7 +195,7 @@ class EffectiveSwitches(unittest.TestCase):
 
     def test_old_and_new_alias_literals_and_statistics_prove_enabled_state(self):
         for alias in (self.ALIAS, '[nvn-vk] write-back alias: enabled (TOTK_WB_ALIAS=1)\n',
-                      '[nvn-vk] memory write-back alias paths: phase=pause cumulative=1 landing=alias:0/0\n'):
+                      self.statistics()):
             states = self.parse_states(self.START + alias + self.WARN
                 + '[nvn-vk] frame 300: 30 fps over the last 300\n')
             self.assertEqual({value['state'] for value in states.values()}, {'on'})
@@ -221,6 +229,159 @@ class EffectiveSwitches(unittest.TestCase):
                 self.assertEqual(self.values(doc), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'})
                 self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
                 self.assertIn('TOTK_MAP_WARN=UNKNOWN', self.compare(doc, doc)[1])
+
+    def test_previous_launch_records_in_multilaunch_log_are_never_reused(self):
+        for text in (
+            self.START + self.marker('on', 1) + self.END + self.START + self.marker(),
+            self.marker() + self.END + self.START + self.marker(),
+        ):
+            doc = self.document(text)
+            self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
+            self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+
+    def test_marker_after_startup_end_cannot_authenticate_current_launch(self):
+        doc = self.document(self.START + self.END + self.marker())
+        self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
+        self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+        self.assertIn('out-of-bracket', self.compare(doc, doc)[1])
+
+    def test_two_disagreeing_markers_are_unknown_not_last_writer_wins(self):
+        doc = self.document(self.START + self.marker() + self.marker('on', 1))
+        self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
+        self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+
+    def test_marker_requires_both_independent_startup_bracket_ends(self):
+        for text in (self.START + self.marker(), self.marker() + self.END,
+                     self.START + self.marker() + self.END.rstrip('\n')):
+            with self.subTest(text=text):
+                self.assertEqual({value['state'] for value in self.parse_states(text).values()}, {'UNKNOWN'})
+
+    def test_duplicate_single_startup_records_invalidate_each_affected_switch(self):
+        cases = (
+            (self.ALIAS * 2 + self.marker('on'), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
+            (self.WARN * 2 + self.marker('off', 1), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}),
+            (self.marker() * 2, dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN')),
+        )
+        for records, expected in cases:
+            doc = self.document(self.START + records)
+            self.assertEqual(self.values(doc), expected)
+            self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+            self.assertIn('duplicated', self.compare(doc, doc)[1])
+
+    def test_invalid_marker_fields_are_independent_and_do_not_become_off(self):
+        alias_unknown = {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}
+        warn_unknown = {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}
+        cases = (
+            (self.marker().replace('TOTK_WB_ALIAS=off', 'TOTK_WB_ALIAS=bad'), alias_unknown),
+            (self.marker().replace('TOTK_WB_ALIAS=off', 'TOTK_WB_ALIAS=off TOTK_WB_ALIAS=off'), alias_unknown),
+            (self.marker().replace('TOTK_WB_ALIAS=off ', ''), alias_unknown),
+            (self.marker().replace('TOTK_MAP_WARN=off', 'TOTK_MAP_WARN=bad'), warn_unknown),
+            (self.marker().replace('map_warn_mode=0', 'map_warn_mode=1'), warn_unknown),
+            (self.marker().replace('map_warn_mode=0', 'map_warn_mode=bad'), warn_unknown),
+            (self.marker().replace('map_warn_mode=0', 'map_warn_mode=0 map_warn_mode=0'), warn_unknown),
+            (self.marker().replace('v=1', 'v=2'), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN')),
+            (self.marker().rstrip('\n') + ' unexpected=1\n', dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN')),
+        )
+        for marker, expected in cases:
+            with self.subTest(marker=marker):
+                doc = self.document(self.START + marker)
+                self.assertEqual(self.values(doc), expected)
+                self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+
+    def test_stale_late_and_conflicting_feature_records_are_independent(self):
+        cases = (
+            (self.ALIAS + self.START + self.marker(), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
+            (self.WARN + self.START + self.marker(), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}),
+            (self.START + self.marker() + self.END + self.ALIAS,
+             {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
+            (self.START + self.marker() + self.END + self.WARN,
+             {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}),
+            (self.START + self.ALIAS + self.marker(), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
+            (self.START + self.WARN + self.marker(), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}),
+        )
+        for text, expected in cases:
+            doc = self.document(text)
+            self.assertEqual(self.values(doc), expected)
+            self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+
+    def test_every_conflicting_warning_mode_is_preserved_in_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'log'
+            path.write_text(self.START + self.WARN + self.WARN.replace('mode=1', 'mode=2')
+                            + self.marker('off', 2) + self.END)
+            info = analyze.parse_log(path)[5]
+        records = info['switch_capture']['records']['TOTK_MAP_WARN']
+        self.assertEqual([record['mode'] for record in records], [1, 2, 2])
+        self.assertEqual([record['line'] for record in records], [2, 3, 4])
+        states = benchlib.log_switch_states(info, {})
+        self.assertEqual(states['TOTK_WB_ALIAS']['state'], 'off')
+        self.assertEqual(states['TOTK_MAP_WARN']['state'], 'UNKNOWN')
+
+    def test_pre_switch_provenance_cannot_hide_alias_or_marker_conflicts(self):
+        build = benchlib.load_result(BASELINE)['build']
+        for records, expected in (
+            (self.ALIAS, {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
+            (self.marker('on'), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
+            (self.marker('off', 1), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}),
+        ):
+            doc = self.document(self.START + records, build)
+            self.assertEqual(self.values(doc), expected)
+            self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+
+    def test_alias_only_and_warning_only_workload_changes_mismatch_separately(self):
+        off = self.document(self.START + self.marker())
+        for alias, mode, expected in (('on', 0, 'TOTK_WB_ALIAS: off -> on'),
+                                      ('off', 1, 'TOTK_MAP_WARN: off -> on')):
+            new = self.document(self.START + self.marker(alias, mode))
+            self.assertEqual(self.compare(off, new)[0], {'mismatch'})
+            self.assertIn(expected, self.compare(off, new)[1])
+
+    def test_mixed_old_and_new_resolver_metadata_never_matches(self):
+        current = self.document(self.START + self.marker('on', 1))
+        old = json.loads(json.dumps(current))
+        for record in old['devices']['thor']['effective_switches'].values():
+            record.pop('evidence_version')
+            record['reason'] = 'complete startup: frozen state marker v1'
+        for ref, new in ((old, current), (current, old), (old, old)):
+            self.assertEqual(self.compare(ref, new)[0], {'unknown'})
+            self.assertIn('obsolete effective-state metadata', self.compare(ref, new)[1])
+        self.assertEqual(old['runs'], current['runs'])
+        old_signature = benchlib.device_signature(current, 'thor')
+        old_signature['fields'].pop('switch_evidence_version')
+        self.assertEqual(benchlib.signature_relation(old_signature, old_signature), 'unknown')
+
+    def test_periodic_telemetry_corroborates_but_never_authenticates_missing_startup(self):
+        valid = self.document(self.START + self.marker('on') + self.END + self.statistics() * 2)
+        self.assertEqual(self.values(valid), {'TOTK_WB_ALIAS': 'on', 'TOTK_MAP_WARN': 'off'})
+        self.assertEqual(self.compare(valid, valid)[0], {'match'})
+        for text in (self.START + self.marker() + self.END + self.statistics(),
+                     self.statistics() + self.START + self.marker(),
+                     self.START + self.marker() + '[nvn-vk] memory write-back alias paths: malformed\n'):
+            doc = self.document(text)
+            self.assertEqual(self.values(doc), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'})
+            self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+        missing = self.document(self.START + self.END + self.statistics())
+        self.assertEqual(self.values(missing), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
+
+    def test_invalid_warning_start_records_are_unknown_independently(self):
+        for warning in (self.WARN.replace('mode=1', 'mode=0'),
+                        self.WARN.replace('mode=1', 'mode=bad'),
+                        self.WARN.replace('mode=1', 'mode=1 mode=2'),
+                        'logcat: ' + self.WARN):
+            doc = self.document(self.START + warning + self.marker())
+            self.assertEqual(self.values(doc), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'})
+            self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+        states = self.parse_states(self.START + self.marker() + self.END + self.WARN.rstrip('\n'))
+        self.assertEqual(states['TOTK_WB_ALIAS']['state'], 'off')
+        self.assertEqual(states['TOTK_MAP_WARN']['state'], 'UNKNOWN')
+
+    def test_invalid_current_metadata_mode_does_not_bypass_admission(self):
+        for mode in (True, '0', 1, None):
+            doc = self.document(self.START + self.marker())
+            doc['devices']['thor']['effective_switches']['TOTK_MAP_WARN']['mode'] = mode
+            self.assertEqual(benchlib.device_switch_states(doc, 'thor')['TOTK_WB_ALIAS']['state'], 'off')
+            self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+            self.assertIn('invalid effective-state metadata', self.compare(doc, doc)[1])
 
     def test_unknown_never_creates_or_admits_a_ledger_baseline(self):
         unknown = self.document('')

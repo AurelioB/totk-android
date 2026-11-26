@@ -283,18 +283,27 @@ aborts publication without replacing the previous batch. There is no totk.env wr
 when writing one manually, apply the same game-directory owner/mode/context procedure to `"$GAME/totk.env"`,
 not a generic `app_data_file:s0` label that discards its categories.
 
-Historical comparisons must explicitly pin **`TOTK_WB_ALIAS=0 TOTK_MAP_WARN=0`** in `totk.env` and restart;
+Historical comparisons must explicitly pin **`TOTK_WB_ALIAS=0`** and **`TOTK_MAP_WARN=0`** on separate `totk.env` lines and restart;
 an unset variable can select a different workload in a newer build. Keep the raw complete launch log.
 The once-only `[totk-switches] v=1 TOTK_WB_ALIAS=on|off TOTK_MAP_WARN=on|off map_warn_mode=N` line
 records the frozen effective states, including opt-outs, independently of menu settings. Analyzer metadata
 and signatures include those states (and warning mode); mismatches are **NOT COMPARABLE**.
-`UNKNOWN` never matches, even another `UNKNOWN`. The reliable current startup bracket is the raw
-`[totk-app] build ...` line followed by this versioned marker. Missing/truncated startup, prefixed/filtered
-logging, an absent marker with no positive enable/start evidence, or an unknown warning mode stays UNKNOWN.
-Older complete logs can prove ON through the alias enable/statistics line and map-warning start line;
-absence alone is not OFF. Only exact known pre-switch provenance (the pinned 1.0.0 build's commit and APK
-hash) establishes historical off/off without those markers. Legacy metrics and pinned hashes are unchanged;
-unknown historical controls must be recaptured, not silently reclassified or rewritten.
+`UNKNOWN` never matches, even another `UNKNOWN`. The reliable raw startup bracket starts at the sole
+`[totk-app] build ...` line and ends at the first subsequent `[nvn-vk] frame N: ... fps over the last 300`
+line. The neutral marker must lie strictly inside that bracket; it cannot close or authenticate its own bracket.
+The parser retains every positioned observation. Invalid, conflicting, duplicate single-startup, stale or
+out-of-bracket state records make the affected switch UNKNOWN, independently of the other switch. Multiple
+launches or presentation records before the build start invalidate both; a filtered/prefixed or truncated
+capture cannot borrow state from another launch.
+Older complete captures can prove ON through the alias enable/statistics line and map-warning start line.
+Normal repeated post-startup alias statistics may corroborate an authenticated ON state, but cannot establish
+missing startup; stale, malformed or contradictory telemetry rejects alias admission. Absence alone is not OFF.
+Exact known pre-switch provenance (the pinned 1.0.0 commit/APK pair) establishes marker-less off/off only after
+contradictory or invalid observations have been rejected; it never conceals positive switch evidence.
+Effective-state evidence version 2 is required by the new comparison and ledger tools. R2/unversioned state
+metadata must be regenerated from raw logs; UNKNOWN cannot match through a legacy stored signature. This is a
+tool-evidence version, not a runtime marker change (`v=1` stays unchanged). Mixed old/new resolver metadata is
+NOT COMPARABLE. Legacy metrics and pinned hashes stay unchanged; never rewrite historical evidence.
 
 Example (one device, one scene; placeholders in `<>`):
 

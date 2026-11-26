@@ -32,7 +32,7 @@ its "caveats" are appended to the generated ones. Never writes a baseline file (
 import argparse, collections, datetime, json, os, re, statistics, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchlib import SCHEMA, caps_of_limits, device_signature, guard_output, log_switch_states, parse_freq_tokens, sig_caps_text  # noqa: E402
+from benchlib import SCHEMA, SWITCH_EVIDENCE_VERSION, SWITCH_KEYS, caps_of_limits, device_signature, guard_output, log_switch_states, parse_freq_tokens, sig_caps_text  # noqa: E402
 from sampler import GPU_SNAPSHOT_FILE, gpu_residency_delta, parse_gpu_snapshots, power_of_tokens  # noqa: E402
 from provenance import compilation_of, compilation_summary, compile_record, scene_state  # noqa: E402
 
@@ -65,6 +65,63 @@ AB_METRICS = ('fps_steady', 'dip_time_fraction', 'throughput_fps', 'fps_mean', '
 PRESENT_BIN_LABELS = ('<12.5', '12.5-20.9', '20.9-29', '29-37.5', '37.5-45.8', '>=45.8')
 
 
+def capture_switch_line(capture, line, number):
+    """Keep every state observation with its position; never overwrite an earlier launch or mode."""
+    if '[totk-app] build' in line:
+        if line.startswith('[totk-app] build ') and line.endswith('\n'):
+            capture['starts'].append(number)
+        else:
+            capture['errors'].append('invalid or non-raw launch-start record')
+    if line.startswith('[nvn-vk] frame ') and re.fullmatch(
+            r'\[nvn-vk\] frame \d+: [\d.]+ fps over the last 300[^\n]*\n', line):
+        capture['presents'].append(number)
+    records = capture['records']
+    if '[totk-switches]' in line:
+        fields = collections.defaultdict(list)
+        invalid = not line.startswith('[totk-switches] ') or not line.endswith('\n')
+        for token in line.split('[totk-switches]', 1)[1].split():
+            if '=' not in token:
+                invalid = True
+                continue
+            key, value = token.split('=', 1)
+            fields[key].append(value)
+        invalid |= fields.get('v') != ['1'] or bool(set(fields) - {'v', *SWITCH_KEYS, 'map_warn_mode'})
+        for key in SWITCH_KEYS:
+            values = fields.get(key, [])
+            error = 'invalid state-marker framing, version or fields' if invalid else None
+            if len(values) != 1 or values[0] not in ('on', 'off'):
+                error = 'missing, duplicated or invalid ' + key + ' marker field'
+            state = values[0] if len(values) == 1 and values[0] in ('on', 'off') else 'UNKNOWN'
+            record = {'line': number, 'kind': 'marker', 'state': state, 'error': error}
+            if key == 'TOTK_MAP_WARN':
+                modes = fields.get('map_warn_mode', [])
+                mode = int(modes[0]) if len(modes) == 1 and modes[0] in ('0', '1', '2', '3') else None
+                if mode is None or (state == 'off') != (mode == 0):
+                    record['error'] = 'missing, duplicated, invalid or inconsistent warning mode'
+                record['mode'] = mode
+            records[key].append(record)
+    if 'write-back alias:' in line.lower():
+        valid = re.fullmatch(r'\[nvn-vk\] write-back alias: enabled(?: [^\n]*)?\n', line)
+        records['TOTK_WB_ALIAS'].append({'line': number, 'kind': 'alias-start', 'state': 'on',
+            'error': None if valid else 'invalid or non-raw alias startup record'})
+    if 'memory write-back alias' in line.lower():
+        buckets = ','.join(reason + r':\d+/\d+' for reason in
+                           ('alias', 'registry', 'ownership', 'mixed', 'non-dmabuf', 'retired', 'other'))
+        paths = (r'\[nvn-vk\] memory write-back alias paths: phase=(?:periodic|pause|exit) cumulative=1 '
+                 + ' '.join(site + '=' + buckets for site in ('landing', 'store', 'publication')) + '\n')
+        mappings = (r'\[nvn-vk\] memory write-back aliases: mappings \d+, bytes \d+ '
+                    r'\(backend-private RW dma-buf; not guest pools\)\n')
+        valid = re.fullmatch(paths, line) or re.fullmatch(mappings, line)
+        records['TOTK_WB_ALIAS'].append({'line': number, 'kind': 'telemetry', 'state': 'on',
+            'error': None if valid else 'invalid or non-raw alias statistics record'})
+    if re.search(r'\[map-warn\]\s+start', line, re.I):
+        match = re.fullmatch(r'(?:\[(?:totk-gfx|dirty)\] )?\[map-warn\] started mode=([123])(?: [^\n]*)?\n', line)
+        valid = match is not None and len(re.findall(r'\bmode=', line)) == 1
+        records['TOTK_MAP_WARN'].append({'line': number, 'kind': 'warning-start', 'state': 'on',
+            'mode': int(match[1]) if match else None,
+            'error': None if valid else 'invalid, duplicated-mode or non-raw warning startup record'})
+
+
 def parse_log(path):
     timing, gpu, fps, stut, longf, info = {}, {}, {}, {}, [], {}
     frame_ms, near33, draw_samples = {}, {}, []
@@ -72,23 +129,10 @@ def parse_log(path):
     last_window = None
     recording, present_stats, present_bins, traces = {}, {}, {}, {}
     frame_p99 = {}
-    capture = info['switch_capture'] = {'starts': 0, 'markers': 0}
-    for line in open(path, encoding='utf-8', errors='replace'):
-        if line.startswith('[totk-app] build ') and line.endswith('\n'):
-            capture['starts'] += 1
-        if capture['starts'] == 1 and re.match(r'^\[nvn-vk\] frame \d+: [\d.]+ fps over the last 300', line):
-            capture['present'] = True
-        if re.match(r'^\[nvn-vk\] (write-back alias: enabled\b|memory write-back alias(?:es| paths):)', line):
-            capture['alias'] = True
-        if m := re.search(r'\[map-warn\] started mode=([123])\b', line):
-            capture['warn_mode'] = int(m[1])
-        if line.startswith('[totk-switches]'):
-            capture['markers'] += 1
-            m = re.fullmatch(r'\[totk-switches\] v=1 TOTK_WB_ALIAS=(on|off) TOTK_MAP_WARN=(on|off) map_warn_mode=([0-3])\n', line)
-            if m and (m[2] == 'off') == (m[3] == '0'):
-                capture['marker'] = dict(zip(('TOTK_WB_ALIAS', 'TOTK_MAP_WARN', 'mode'),
-                                            (m[1], m[2], int(m[3]))))
-                capture['marker_started'] = capture['starts'] == 1
+    capture = info['switch_capture'] = {'evidence_version': SWITCH_EVIDENCE_VERSION,
+        'starts': [], 'presents': [], 'errors': [], 'records': {key: [] for key in SWITCH_KEYS}}
+    for number, line in enumerate(open(path, encoding='utf-8', errors='replace'), 1):
+        capture_switch_line(capture, line, number)
         if record := compile_record(line):
             compilations[record[0]] = record[1]
         if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):

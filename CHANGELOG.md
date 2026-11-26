@@ -11,6 +11,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 - Record effective alias/warning states from complete startup evidence, including the warning mode, in benchmark
   signatures and comparison admission. UNKNOWN never matches; missing lines are not silently off. Preserve pinned
   pre-switch baseline numbers/hashes and require explicit `TOTK_WB_ALIAS=0 TOTK_MAP_WARN=0` for historical controls.
+- Reconcile every positioned benchmark switch-state record inside an independently closed startup bracket.
+  Reject stale, duplicate, malformed and conflicting records per switch before marker or pre-switch-provenance
+  admission; require current evidence metadata so older resolver results cannot bypass UNKNOWN rejection.
+  Preserve window metrics and immutable baseline identities.
 - Make optional frame-timeline and fence-evidence ring producers single-attempt/nonblocking, with counted
   dropped updates and skipped snapshots. Reuse per-walk elapsed clocks instead of enabling recorder
   opcode/category probes, and batch recorder-worker draws/descriptors at slot assembly instead of each job.

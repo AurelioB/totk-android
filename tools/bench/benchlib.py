@@ -173,6 +173,7 @@ def settings_sha256(env):
 
 SIGNATURE_FIELDS = ('model', 'soc', 'settings_env_sha256', 'cpu_caps_khz', 'gpu_cap_hz')
 SWITCH_KEYS = ('TOTK_WB_ALIAS', 'TOTK_MAP_WARN')
+SWITCH_EVIDENCE_VERSION = 2
 # Exact provenance of the immutable 1.0.0 baseline, before either switch existed.
 PRE_SWITCH_COMMIT = 'edc526df8c95'
 PRE_SWITCH_APK = '393576ab9b01b9c2370b5dd515b941e0e0a851c763d16b5b624092aab9f68ad6'
@@ -185,52 +186,106 @@ def legacy_switch_provenance(build):
 
 
 def switch_states(state='UNKNOWN', reason='startup evidence unavailable'):
-    return {key: dict(state=state, reason=reason, **({'mode': 0} if key == 'TOTK_MAP_WARN' and state == 'off' else {}))
+    return {key: dict(state=state, reason=reason, evidence_version=SWITCH_EVIDENCE_VERSION,
+                     **({'mode': 0} if key == 'TOTK_MAP_WARN' and state == 'off' else {}))
             for key in SWITCH_KEYS}
 
 
 def log_switch_states(info, build):
-    """Resolve only logged frozen states, or exact known pre-switch provenance; never infer an env default."""
+    """Resolve each switch independently only after reconciling every positioned observation."""
     capture = info.get('switch_capture', {})
-    marker = capture.get('marker')
-    complete = capture.get('starts') == 1 and (marker and capture.get('marker_started') or capture.get('present'))
-    if capture.get('starts', 0) > 1 or capture.get('markers', 0) > 1:
-        return switch_states(reason='multiple launch/state markers in one session log')
-    if complete and marker:
-        result = {key: {'state': marker[key], 'reason': 'complete startup: frozen state marker v1'}
-                  for key in SWITCH_KEYS}
-        result['TOTK_MAP_WARN']['mode'] = marker['mode']
-        if capture.get('alias') and marker['TOTK_WB_ALIAS'] == 'off' or \
-                capture.get('warn_mode') and capture['warn_mode'] != marker['mode']:
-            return switch_states(reason='conflicting startup state evidence')
-        return result
-    if legacy_switch_provenance(build):
-        return switch_states('off', 'known pre-switch baseline build')
-    if not complete:
-        return switch_states(reason='missing or truncated complete startup section')
-    result = switch_states(reason='build has no frozen switch-state logging contract; absence is not off')
-    if capture.get('alias'):
-        result['TOTK_WB_ALIAS'] = {'state': 'on', 'reason': 'alias startup/statistics line'}
-    if capture.get('warn_mode'):
-        result['TOTK_MAP_WARN'] = {'state': 'on', 'mode': capture['warn_mode'], 'reason': 'map-warn start line'}
+    legacy = legacy_switch_provenance(build)
+    if not isinstance(capture, dict) or capture.get('evidence_version') != SWITCH_EVIDENCE_VERSION:
+        return switch_states('off', 'known pre-switch baseline build') if not capture and legacy \
+            else switch_states(reason='unvalidated or obsolete startup capture')
+    starts, presents = capture.get('starts', []), capture.get('presents', [])
+    errors = list(capture.get('errors', []))
+    start = starts[0] if len(starts) == 1 else None
+    end = next((line for line in presents if start is not None and line > start), None)
+    if len(starts) > 1:
+        errors.append('multiple launch-start records in one capture')
+    if start is not None and any(line < start for line in presents):
+        errors.append('stale presentation records precede the launch start')
+    complete = start is not None and end is not None
+    result = {}
+    for key in SWITCH_KEYS:
+        records = capture.get('records', {}).get(key, [])
+        invalid = list(errors)
+        for record in records:
+            if record.get('error'):
+                invalid.append(f'line {record["line"]}: {record["error"]}')
+            if start is None or record['line'] <= start:
+                invalid.append(f'line {record["line"]}: stale or out-of-bracket {record["kind"]}')
+            elif record['kind'] != 'telemetry' and end is not None and record['line'] >= end:
+                invalid.append(f'line {record["line"]}: out-of-bracket {record["kind"]}')
+        for kind in ('marker', 'alias-start', 'warning-start'):
+            if sum(record['kind'] == kind for record in records) > 1:
+                invalid.append('duplicated ' + kind + ' records')
+        values = {(record['state'], record.get('mode') if key == 'TOTK_MAP_WARN' else None)
+                  for record in records if not record.get('error')}
+        if len(values) > 1:
+            invalid.append('conflicting startup/telemetry states or warning modes')
+        if legacy and any(record.get('state') == 'on' for record in records):
+            invalid.append('positive switch evidence contradicts known pre-switch provenance')
+        candidates = [record for record in records if complete and start < record['line'] < end]
+        mode = None
+        if invalid:
+            state, reason = 'UNKNOWN', '; '.join(dict.fromkeys(invalid))
+        elif records and not complete:
+            state, reason = 'UNKNOWN', 'missing or truncated startup bracket (build start through first FPS record)'
+        elif legacy:
+            state, mode, reason = 'off', 0, 'known pre-switch baseline build'
+        elif not complete:
+            state, reason = 'UNKNOWN', 'missing or truncated startup bracket (build start through first FPS record)'
+        elif not candidates:
+            state, reason = 'UNKNOWN', 'no authenticated startup state; absence is not off'
+        else:
+            state = candidates[0]['state']
+            mode = candidates[0].get('mode')
+            reason = 'complete startup bracket: reconciled state evidence'
+        result[key] = {'state': state, 'reason': reason, 'evidence_version': SWITCH_EVIDENCE_VERSION,
+                       'evidence_lines': [record['line'] for record in records]}
+        if key == 'TOTK_MAP_WARN':
+            result[key]['mode'] = mode
     return result
 
 
 def device_switch_states(doc, label):
     dev = doc['devices'][label]
-    return dev.get('effective_switches') or (switch_states('off', 'known pre-switch baseline build')
-        if legacy_switch_provenance(doc.get('build', {})) else switch_states())
+    states = dev.get('effective_switches')
+    if states is None:
+        return switch_states('off', 'known pre-switch baseline build') \
+            if legacy_switch_provenance(doc.get('build', {})) else switch_states()
+    result = switch_states(reason='unvalidated or obsolete effective-state metadata; reparse the raw log')
+    for key in SWITCH_KEYS:
+        record = states.get(key) if isinstance(states, dict) else None
+        if isinstance(record, dict) and record.get('evidence_version') == SWITCH_EVIDENCE_VERSION:
+            state, mode = record.get('state'), record.get('mode')
+            valid_mode = key != 'TOTK_MAP_WARN' or state == 'UNKNOWN' or \
+                type(mode) is int and (mode == 0 if state == 'off' else mode in (1, 2, 3))
+            if state not in ('on', 'off', 'UNKNOWN') or not valid_mode:
+                result[key] = switch_states(reason='invalid effective-state metadata')[key]
+            elif legacy_switch_provenance(doc.get('build', {})) and state == 'on':
+                result[key] = switch_states(reason='positive switch evidence contradicts pre-switch provenance')[key]
+            else:
+                result[key] = record
+    return result
 
 
 def switch_fields(states):
-    values = {key: states.get(key, {}).get('state', 'UNKNOWN') for key in SWITCH_KEYS}
-    values = {key: value if value in ('on', 'off') else 'UNKNOWN' for key, value in values.items()}
-    mode = states.get('TOTK_MAP_WARN', {}).get('mode')
-    if values['TOTK_MAP_WARN'] == 'off':
-        mode = 0
-    elif mode not in (1, 2, 3):
+    values = {}
+    for key in SWITCH_KEYS:
+        record = states.get(key, {})
+        state = record.get('state') if isinstance(record, dict) else None
+        version = record.get('evidence_version') if isinstance(record, dict) else None
+        values[key] = state if state in ('on', 'off') and version == SWITCH_EVIDENCE_VERSION else 'UNKNOWN'
+    record = states.get('TOTK_MAP_WARN', {})
+    mode = record.get('mode') if isinstance(record, dict) else None
+    valid_mode = type(mode) is int and (mode == 0 if values['TOTK_MAP_WARN'] == 'off' else mode in (1, 2, 3))
+    if not valid_mode:
         values['TOTK_MAP_WARN'], mode = 'UNKNOWN', None
-    return {'effective_switches': values, 'map_warn_mode': mode}
+    return {'effective_switches': values, 'map_warn_mode': mode,
+            'switch_evidence_version': SWITCH_EVIDENCE_VERSION}
 
 
 def switch_admission(base_doc, base_label, new_doc, new_label):
@@ -256,7 +311,8 @@ def signature_of_fields(fields):
     # Keep the pinned off/off historical hash, but domain-separate any other effective workload.
     states = fields.get('effective_switches')
     if states is not None and states != dict.fromkeys(SWITCH_KEYS, 'off'):
-        payload.update(effective_switches=states, map_warn_mode=fields.get('map_warn_mode'))
+        payload.update(effective_switches=states, map_warn_mode=fields.get('map_warn_mode'),
+                       switch_evidence_version=fields.get('switch_evidence_version'))
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
@@ -302,9 +358,14 @@ def device_signature(doc, label, docs=None, path=None):
 def index_sig(b):
     """A baseline index entry as a device_signature() dict."""
     fields = {k: b[k] for k in SIGNATURE_FIELDS}
-    states = b.get('effective_switches')
-    fields.update(effective_switches=states or dict.fromkeys(SWITCH_KEYS,
-        'off' if b['file'] == 'baseline-1.0.0.json' else 'UNKNOWN'), map_warn_mode=b.get('map_warn_mode', 0))
+    if b.get('switch_evidence_version') == SWITCH_EVIDENCE_VERSION:
+        states = {key: {'state': b.get('effective_switches', {}).get(key), 'mode': b.get('map_warn_mode'),
+                        'evidence_version': SWITCH_EVIDENCE_VERSION} for key in SWITCH_KEYS}
+    elif b['file'] == 'baseline-1.0.0.json' and 'effective_switches' not in b:
+        states = switch_states('off', 'known pre-switch baseline index entry')
+    else:
+        states = switch_states(reason='unvalidated or obsolete baseline state metadata')
+    fields.update(switch_fields(states))
     return {'sha256': b['signature'], 'short': b['short'], 'fields': fields,
             'cpu_hw_max_khz': b['cpu_hw_max_khz'], 'gpu_hw_max_hz': b['gpu_hw_max_hz']}
 
@@ -315,6 +376,8 @@ def signature_relation(ref, new):
     if ref is None or new is None:
         return 'unknown'
     a, b = ref['fields'], new['fields']
+    if any(field.get('switch_evidence_version') != SWITCH_EVIDENCE_VERSION for field in (a, b)):
+        return 'unknown'
     if any(field.get('effective_switches', {}).get(key, 'UNKNOWN') == 'UNKNOWN'
            for field in (a, b) for key in SWITCH_KEYS):
         return 'unknown'
@@ -322,7 +385,6 @@ def signature_relation(ref, new):
         return 'mismatch'
     if ref['sha256'] == new['sha256']:
         return 'match'
-    a, b = ref['fields'], new['fields']
     if a['gpu_cap_hz'] is None and all(a[k] == b[k] for k in ('model', 'settings_env_sha256', 'cpu_caps_khz')):
         return 'reference-only'
     return 'mismatch'
