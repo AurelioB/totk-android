@@ -10,6 +10,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   is about 25 MiB past native text, outside an LDR-literal's reach. Use ADRP+LDR and a flag-free
   clamp for the published one/two-tick floor, retaining the same 108-byte tail allocation.
   Model the full rewritten image in host fixtures and verify all floor addresses/register semantics.
+- Make menu/thermal, FPS60 hardening/hysteresis and DRS startup guard failures refuse-and-log
+  without exiting or partially installing a group. Preflight full module bounds and generated B/ADRP
+  references; cover all switch combinations/install orders on the complete Android rewrite geometry,
+  corrupted sites/padding and invalid layouts, plus real 30/60-preset startup with player-supplied data.
 - Keep PR #44's quick-menu capture fix default off (`TOTK_MENU_CAPTURE_FIX=1` opts in), but restore
   the contributor's original armed-OR-requested admission. Our added visibility guard suppressed the fix:
   Odin requests were pending while hidden; original admission removed the black backgrounds in the finite

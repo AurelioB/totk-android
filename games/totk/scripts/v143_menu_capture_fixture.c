@@ -9,7 +9,7 @@ int mfxup_output_enabled(void){return 0;}
 void runtime_oe_push_message(uint32_t value){(void)value;}
 void dm_gfx_set_flag(const char *name,int value){(void)name;(void)value;}
 void runtime_survey_init(Module *m){(void)m;}
-enum { ALLOCATION=0x2bc0000, TEXT_END=0x2bb9c00, SITE=0x105bbcc };
+enum { ALLOCATION=0x4524000, FILE_SIZE=0x451cdd8, TEXT_END=0x2bb9c00, SITE=0x105bbcc };
 static const uint64_t hardening_sites[]={
     0x0a7ac4,0x95dd24,0x6155e4,0x615660,0x45c700,0x2b23c7c,
     0x42c3bc,0xa5a188,0x2db238,0xa5a670,
@@ -20,7 +20,7 @@ static unsigned char *before;
 static uint64_t stub(void){return ((module.text_end+15)&~15ULL)+MENU_CAPTURE_STUB;}
 static uint64_t tail(void){return ((module.text_end+15)&~15ULL)+MENU_CAPTURE_TAIL;}
 static void reset(void){
-    module.text_end=TEXT_END;module.file_size=0x2bbb000;module.size=ALLOCATION;
+    module.text_end=TEXT_END;module.file_size=FILE_SIZE;module.size=ALLOCATION;
     memset(module.base,0,ALLOCATION);
     fixture_seed_at(module.base,SITE);fixture_seed_at(module.base,SITE+4);
     for(unsigned i=0;i<sizeof hardening_sites/sizeof *hardening_sites;i++)
@@ -74,16 +74,16 @@ int main(int argc,char **argv){
     reset();setenv("TOTK_MENU_CAPTURE_FIX","1",1);module.text_end=TEXT_END+0x2b0;unchanged();
     reset();setenv("TOTK_MENU_CAPTURE_FIX","1",1);module.size=tail()+MENU_CAPTURE_TAIL_WORDS*4-1;unchanged();
     /* Range rejection happens before accessing absent sites/padding. */
-    reset();setenv("TOTK_MENU_CAPTURE_FIX","1",1);module.text_end=0x9100000;module.size=0xa000000;unchanged();
+    reset();setenv("TOTK_MENU_CAPTURE_FIX","1",1);module.text_end=0x9100000;module.size=module.file_size=0xa000000;unchanged();
     /* The site-to-head branch fits, but the tail-to-site return does not. */
     reset();setenv("TOTK_MENU_CAPTURE_FIX","1",1);
     module.text_end=(SITE+(1ull<<27)-MENU_CAPTURE_STUB-1)&~15ull;
-    module.size=0xa000000;unchanged();
+    module.size=module.file_size=0xa000000;unchanged();
     /* Actual 1.4.3 geometry: 1024 bytes before RO_OFF=0x2bba000.
        Also test the exact site-end and last fitting page alignment. */
     reset();setenv("TOTK_MENU_CAPTURE_FIX","1",1);module.text_end=SITE+8;applied();
     reset();setenv("TOTK_MENU_CAPTURE_FIX","1",1);module.text_end=TEXT_END+0x2a0;applied();
-    reset();setenv("TOTK_MENU_CAPTURE_FIX","1",1);module.size=tail()+MENU_CAPTURE_TAIL_WORDS*4;applied();
+    reset();setenv("TOTK_MENU_CAPTURE_FIX","1",1);module.size=module.file_size=tail()+MENU_CAPTURE_TAIL_WORDS*4;applied();
     for(unsigned lag=0;lag<2;lag++)for(unsigned primary=0;primary<2;primary++)for(unsigned alias=0;alias<2;alias++){
         reset();setenv("TOTK_MENU_CAPTURE_FIX","1",1);
         setenv("TOTK_FRAME_LAG",lag?"1":"0",1);
@@ -94,7 +94,7 @@ int main(int argc,char **argv){
     /* Install the real three production groups in all six orders, with both
        menu/thermal switches on and off. No owner may depend on another's order. */
     static const unsigned orders[][3]={{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
-    void (*const patches[])(Module *)={patch_menu_capture,patch_thermal_step,patch_fps60_hardening};
+    int (*const patches[])(Module *)={patch_menu_capture,patch_thermal_step,patch_fps60_hardening};
     unsigned char *coexist=malloc(ALLOCATION);assert(coexist);
     for(unsigned menu=0;menu<2;menu++)for(unsigned thermal=0;thermal<2;thermal++)
         for(unsigned order=0;order<6;order++){
@@ -102,7 +102,7 @@ int main(int argc,char **argv){
             setenv("TOTK_THERMAL_STEP",thermal?"1":"0",1);
             const unsigned indices[]={1,6,4};
             for(unsigned i=0;i<3;i++)memcpy(module.base+fps60[indices[i]].off,&fps60[indices[i]].replacement,4);
-            for(unsigned i=0;i<3;i++)patches[orders[order][i]](&module);
+            for(unsigned i=0;i<3;i++)assert(patches[orders[order][i]](&module)>=0);
             if(menu){
                 assert(branch_target(SITE)==stub());
                 assert(branch_target(stub()+8)==tail());

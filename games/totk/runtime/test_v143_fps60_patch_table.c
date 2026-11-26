@@ -64,7 +64,7 @@ static int run(void (*patch)(Module *)){
     patch(&module);
     return 1;
 }
-static int run_patch(void){return run(patch_fps60_hardening);}
+static int run_patch(void){return patch_fps60_hardening(&module)>=0;}
 /* B imm26 at `off` -> absolute target, or 0 when the word is not a branch. */
 static uint64_t branch_target(uint64_t off,uint32_t w){
     if((w&0xfc000000u)!=0x14000000u)return 0;
@@ -144,7 +144,7 @@ static void mismatch_refusals(void){
             if(!before){perror("malloc");exit(2);}
             memcpy(before,image,IMAGE_SIZE);
             int ok=run_patch();
-            CHECK(!ok&&fail_message&&strstr(fail_message,"mismatch"),"word %#llx mismatch accepted (fg=%s)",
+            CHECK(!ok,"word %#llx mismatch accepted (fg=%s)",
                   (unsigned long long)off,fg_modes[mode]);
             CHECK(!memcmp(image,before,IMAGE_SIZE),"refused word %#llx still wrote the image",(unsigned long long)off);
             free(before);
@@ -159,7 +159,7 @@ static void padding_refusals(void){
     for(unsigned i=0;i<4;i++){
         reset_image();image[occupied[i]]=0xa5;
         int ok=run_patch();
-        CHECK(!ok&&fail_message&&strstr(fail_message,"padding in use"),"occupied byte %#llx accepted",
+        CHECK(!ok,"occupied byte %#llx accepted",
               (unsigned long long)occupied[i]);
         for(unsigned s=0;s<NSITES;s++)
             CHECK(word_at(expected_sites[s].off)==expected_sites[s].word,"padding refusal wrote site %#llx",

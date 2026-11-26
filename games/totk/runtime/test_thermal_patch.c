@@ -16,7 +16,7 @@ int main(void) {
     const char *off[] = {NULL, "0", "", "invalid", "01"};
     for (unsigned i = 0; i < sizeof off / sizeof *off; i++) {
         set_env("TOTK_THERMAL_STEP", off[i]);
-        CHECK(run(patch_thermal_step), "disabled thermal gate refused");
+        CHECK(patch_thermal_step(&module)==0, "disabled thermal gate refused");
         CHECK(!memcmp(image, pristine, IMAGE_SIZE),
               "off/unset thermal gate changed controller, veneer or data bytes");
     }
@@ -27,12 +27,12 @@ int main(void) {
         thermal_stub, thermal_stub + 107, DATA + 144};
     for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) {
         reset_image(); image[bad[i]] ^= 0x40;
-        CHECK(!run(patch_thermal_step), "accepted mismatch at %#llx", (unsigned long long)bad[i]);
+        CHECK(patch_thermal_step(&module)<0, "accepted mismatch at %#llx", (unsigned long long)bad[i]);
         image[bad[i]] ^= 0x40;
         CHECK(!memcmp(image, pristine, IMAGE_SIZE), "refusal changed image");
     }
     reset_image();
-    CHECK(run(patch_thermal_step), "thermal install failed");
+    CHECK(patch_thermal_step(&module)==1, "thermal install failed");
     CHECK(word_at(DATA + 144) == 1, "default floor must be one");
     const unsigned indices[] = {1, 6, 4};
     printf("{\"stub\":%u,\"floor\":%u,\"entries\":[", (unsigned)thermal_stub, DATA + 144);

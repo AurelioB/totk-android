@@ -125,6 +125,19 @@ four instructions. No other owner moves: both the `+416..916` FPS60 hardening an
 veneers coexist in either order. Full bounds, original-word hashes, both empty slots and all branch ranges
 are checked before any write; refusal logs and leaves the menu patch untouched.
 
+Thermal-step's private mutable floor is at `0x4520090` in the pinned Android rewrite, about 25 MiB
+past the native text veneer, not in a nearby literal pool. Its three 36-byte veneers use ADRP+LDR
+and preserve flags without saving/restoring NZCV; the published floor is always one or two ticks.
+Shipping 30 retains its native controller and does not install these native60 thermal hooks.
+Menu, thermal-step, FPS60 hardening/hysteresis and both DRS installers validate complete bounds,
+padding and PC-relative references before writing. An optional guard failure logs `skipped` and leaves
+that group untouched instead of entering the process-fatal loader failure path.
+
+`tests/test_optional_patches.py` checks all five physical veneer installers in all 120 orders,
+all 16 menu/thermal/hardening/DRS switch combinations and 30/native60/locked-framegen profiles.
+It uses the complete rewritten-image geometry, checks generated references and atomic refusal,
+and, when the player's pinned Android rewrite is available, runs the real 30/60 startup installers.
+
 `tests/test_menu_capture.py` runs the production C guard/layout fixture without game data. With `TOTK_MAIN_NSO`
 pointing to the player's 1.4.3 main and Unicorn/lz4 installed it also checks actual update eligibility, draw continuation,
 register/flag preservation and completion semantics. This is not a substitute for repeated matched off/on openings
