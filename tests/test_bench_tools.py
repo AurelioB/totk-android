@@ -916,7 +916,16 @@ class InSessionAB(unittest.TestCase):
             legacy.write_text(current, encoding='utf-8')
             mixed.write_text(''.join('[totk-log] ===== Launch old =====\n' + old for _ in range(9)) +
                              '[totk-log] ===== Launch current =====\n' + current, encoding='utf-8')
-            self.assertEqual(analyze.parse_log(mixed), analyze.parse_log(legacy))
+            expected = analyze.parse_log(legacy)
+            # The retained current heading adds exactly one line to positioned startup evidence.
+            # Keep full-output equality (including all states/metrics), adjusting only that real offset.
+            capture = expected[-1]['switch_capture']
+            for key in ('starts', 'presents'):
+                capture[key] = [number + 1 for number in capture[key]]
+            for records in capture['records'].values():
+                for record in records:
+                    record['line'] += 1
+            self.assertEqual(analyze.parse_log(mixed), expected)
             self.assertEqual(analyze.parse_ctl(mixed), analyze.parse_ctl(legacy))
             info = analyze.parse_log(mixed)[-1]
             self.assertNotIn('device_lost', info)
