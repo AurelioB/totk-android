@@ -38,6 +38,7 @@ class AndroidDriverStartup(unittest.TestCase):
         driver = source[source.index('static int android_native_lib_dir('):source.index('/* ---------- the game ---------- */')]
         native = source[source.index('static void android_native_ui_mode_policy('):source.index('static int start_game(')]
         startup = source[source.index('static int start_game('):source.index('/* ---------- input ----------')]
+        hold_marker = source[source.index('static char g_game_hold_marker['):source.index('/* The logcat copy')]
         constructor_guard = '#if !defined(__ANDROID__) || !defined(TOTK_ANDROID_APP)'
         constructors = ''
         for path in ('input.c', 'threads.c'):
@@ -62,6 +63,10 @@ class AndroidDriverStartup(unittest.TestCase):
 #include <sys/stat.h>
 #include <unistd.h>
 #include "adreno_gmem.h"
+#include "android_game_hold.h"
+static AndroidGameHold game_hold;
+static int g_log_fd = -1;
+static char g_log_path[1100];
 typedef struct {
     const char *externalDataPath, *internalDataPath;
     int sdkVersion;
@@ -69,7 +74,7 @@ typedef struct {
 } ANativeActivity;
 typedef FILE AAsset; /* Host fixture reads the test APK asset from an ordinary, bounded file. */
 enum { AASSET_MODE_STREAMING = 2, AASSET_MODE_BUFFER = 3 };
-enum { ANDROID_LOG_INFO = 4, ANDROID_LOG_WARN = 5 };
+enum { ANDROID_LOG_INFO = 4, ANDROID_LOG_WARN = 5, ANDROID_LOG_ERROR = 6 };
 static int __android_log_print(int level, const char *tag, const char *format, ...) {
     (void)level; (void)tag; (void)format; return 0;
 }
@@ -123,7 +128,7 @@ static int create_hook(pthread_t *thread, const pthread_attr_t *attr,
     assert(entry == game_thread); *thread = 0; phase = 7; return 0;
 }
 static int detach_hook(pthread_t thread) { (void)thread; assert(phase == 7); return 0; }
-''' + options + version + '''
+''' + hold_marker + options + version + '''
 #define driver_setup production_driver_setup
 ''' + driver + '''
 #undef driver_setup
@@ -132,6 +137,9 @@ static void driver_setup(const char *private_dir) {
 }
 ''' + native + '''
 static int android_all_files_access(const ANativeActivity *a) { (void)a; return 0; }
+static void android_exit_notice_start(const ANativeActivity *activity, const char *log, const char *data) {
+    (void)activity; (void)log; (void)data; assert(phase == 7); /* JNI posting exercised by the exit-notice fixture. */
+}
 static void android_close_requests_start(const char *private_dir) { (void)private_dir; }
 #define pthread_create create_hook
 #define pthread_detach detach_hook

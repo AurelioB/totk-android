@@ -26,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchlib import (BENCH_DOCS, METRICS, REPO, comparability, compare_docs, device_signature, index_entry,  # noqa: E402
                       index_sig, load_index, load_result, scene_verdicts, sig_caps_text, signature_relation,
-                      write_baseline)
+                      switch_admission, write_baseline)
 
 LEDGER = BENCH_DOCS / 'ledger.jsonl'
 LEDGER_MD = BENCH_DOCS / 'LEDGER.md'
@@ -54,11 +54,13 @@ def device_doc(doc, label):
 
 def verdict_block(ref_doc, ref_label, doc, label):
     refruns = {r['scene']: r for r in ref_doc['runs'] if r['device'] == ref_label}
+    switch_reasons = switch_admission(ref_doc, ref_label, doc, label)
     scenes = {}
     for r in doc['runs']:
         if r['device'] == label and r['scene'] in refruns:
             per, overall = scene_verdicts(refruns[r['scene']]['summary'], r['summary'])
-            scenes[r['scene']] = {'overall': overall, 'metrics': {k: v for k, (_, v) in per.items()}}
+            scenes[r['scene']] = {'overall': 'NOT COMPARABLE' if switch_reasons else overall,
+                                  'metrics': {k: v for k, (_, v) in per.items()}}
     return {'device': ref_label, 'scenes': scenes, 'warnings': comparability(ref_doc, ref_label, doc, label)}
 
 
@@ -80,7 +82,11 @@ def resolve_baseline(ddoc, label, run_id, commit, docs=None):
     sig = device_signature(ddoc, label)
     stables = [r.get('freq_stable') for r in ddoc['runs']]
     freq_stable = False if False in stables else True if stables and all(s is True for s in stables) else None
+    if sig and signature_relation(sig, sig) == 'unknown':
+        return sig, freq_stable, None, False
     base = index_entry(sig['sha256'], docs) if sig else None
+    if base and signature_relation(index_sig(base), sig) != 'match':
+        return sig, freq_stable, None, False
     if sig and freq_stable and not base:
         return sig, freq_stable, write_baseline(ddoc, label, run_id, commit, docs), True
     return sig, freq_stable, base, False

@@ -127,6 +127,18 @@ class ManifestTests(unittest.TestCase):
     def manifest(self, **kw):
         return manifest_elements(build_apk.binary_xml(build_apk.manifest_tree(build_apk.PACKAGE, build_apk.LABEL, 1, '1', 33, 33, **kw)))
 
+    def test_game_hold_switch_does_not_change_manifest_bytes(self):
+        for release in (False, True):
+            def compiled():
+                return build_apk.binary_xml(build_apk.manifest_tree(
+                    build_apk.PACKAGE, build_apk.LABEL, 1, '1', 33, 33, release=release))
+            with patch.dict(os.environ):
+                os.environ.pop('TOTK_GAME_HOLD', None)
+                baseline = compiled()
+                for value in ('0', '1', 'true', '01'):
+                    os.environ['TOTK_GAME_HOLD'] = value
+                    self.assertEqual(compiled(), baseline, (release, value))
+
     def test_generic_app_manifest(self):
         m = self.manifest(icon=build_apk.LAUNCHER_ICON, round_icon=build_apk.LAUNCHER_ROUND, release=True)
         self.assertEqual(m['manifest'][(None, 'package')], (3, 'com.aure.totk'))

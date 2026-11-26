@@ -11,6 +11,15 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   validate bounds/branches before writes, and test production guards plus player-supplied ARM64 admission,
   continuation and completion. Update/draw publication and device capture safety remain unqualified;
   there is no unconditional per-frame copy or default behavior change.
+- Log the frozen effective write-back-alias state and map-warning mode once at first presenter startup,
+  including explicit opt-outs, so benchmark tools need not infer build-dependent defaults from menu settings.
+- Record effective alias/warning states from complete startup evidence, including the warning mode, in benchmark
+  signatures and comparison admission. UNKNOWN never matches; missing lines are not silently off. Preserve pinned
+  pre-switch baseline numbers/hashes and require explicit `TOTK_WB_ALIAS=0 TOTK_MAP_WARN=0` for historical controls.
+- Reconcile every positioned benchmark switch-state record inside an independently closed startup bracket.
+  Reject stale, duplicate, malformed and conflicting records per switch before marker or pre-switch-provenance
+  admission; require current evidence metadata so older resolver results cannot bypass UNKNOWN rejection.
+  Preserve window metrics and immutable baseline identities.
 - Make optional frame-timeline and fence-evidence ring producers single-attempt/nonblocking, with counted
   dropped updates and skipped snapshots. Reuse per-walk elapsed clocks instead of enabling recorder
   opcode/category probes, and batch recorder-worker draws/descriptors at slot assembly instead of each job.
@@ -122,6 +131,17 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 - Correct the experimental private writer's virtual-mapping authority across production MapVirtual replacements,
   including anonymous unmaps and fallback remaps; serialize replacement and invalidation with borrowed writers.
   Watch-slot-exhausted synchronous records keep the original no-token guest-store path rather than bypass ownership.
+- Diagnose interrupted Android game sessions on launcher/title return using matched platform exit history,
+  with a once-only, controller-dismissable recovery notice. Low-memory exits explain possible unsaved
+  progress loss; unknown endings remain unclassified. Updates, normal closes and setup-only exits do not
+  show a game-loss warning. Default on; exact `TOTK_EXIT_NOTICE=0` silences it. No survival guarantee.
+  Receipt/diagnostic IO and cross-process delivery claiming run off the UI thread; native lifecycle only enqueues.
+  Platform summary tokens and exact exit-record identities replace wall-clock ordering. Missing/rotated history
+  or cleared state stays silent; unshown delivery survives activity recreation without duplicate dialogs.
+- Add experimental `TOTK_GAME_HOLD=1`, off by default: our visible Settings menu binds the live game at foreground-client
+  importance and defers its pause-forced pipeline-cache snapshot. Real background and save-safe Close still flush;
+  a kill during deferral can lose new cache entries. The save protocol is unchanged, not kill-proof. Binding lifecycle
+  and the game's pause/1 s/5 s `oom_score_adj` are logged. Host coverage is not Duo survival evidence.
 - Fix shader translation for compute texture gathers with runtime offsets.
   The translator now lowers those offsets before emitting SPIR-V instead of putting runtime values in constants.
   Existing generated shader seeds need replacement to receive the corrected modules.

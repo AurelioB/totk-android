@@ -1,4 +1,12 @@
-/* libtotk.so exports only the NativeActivity entry point and the companion's JNI_OnLoad (runtime/companion_jni.c);
-   everything else binds inside the library (the runtime's assembly addresses its own symbols PC-relative, which a shared
-   library allows only for symbols that cannot be preempted). */
-{ global: ANativeActivity_onCreate; JNI_OnLoad; local: *; };
+/* Only Android entry points are exported; other runtime symbols bind internally
+   (the assembly addresses its own non-preemptible symbols PC-relative). */
+{
+  global:
+    ANativeActivity_onCreate;
+    JNI_OnLoad;
+    Java_com_aure_totk_GameHold_nativeEnabled;
+    Java_com_aure_totk_GameHold_nativeSettingsActive;
+    Java_com_aure_totk_GameHold_nativePendingPause;
+    Java_com_aure_totk_GameHold_nativeFlushPause;
+  local: *;
+};

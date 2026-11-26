@@ -188,8 +188,8 @@ $(OUT)/totk-native: $(RUNTIME_O) $(GFX_O)
 	$(CC) -pie -rdynamic $(PGO_LDFLAGS) -o $@ $^ $(OPUS_LIB) $(VPX_LIB) $(PLATFORM_LIBS)
 	@echo "built $@ ($(TARGET), $(VERSION), GPU $(GPU)$(if $(PGO_ID), PGO $(PGO_ID)))"
 
-# libtotk.map: only ANativeActivity_onCreate and the companion's JNI_OnLoad are exported, so the runtime's symbols bind
-# inside the library.
+# libtotk.map exports the NativeActivity/JNI entrypoints and GameHold's exact JNI methods only;
+# the remaining runtime symbols bind inside the library.
 $(OUT)/libtotk.so: $(RUNTIME_O) $(GFX_O) $(TOTK)/android/libtotk.map $(TOTK)/android/Makefile
 	@rm -f $(OBJ)/rt/frontend_android.c.o; $(CC) $(WARN) $(COMMON) -c $(TOTK)/runtime/frontend_android.c -o $(OBJ)/rt/frontend_android.c.o   # the build time in the log is this link's
 	$(CC) -shared $(PGO_LDFLAGS) -Wl,--build-id=sha1 -Wl,--version-script=$(TOTK)/android/libtotk.map -Wl,--no-undefined -Wl,-soname,libtotk.so -o $@ $(RUNTIME_O) $(GFX_O) $(OPUS_LIB) $(VPX_LIB) $(PLATFORM_LIBS) -landroid
