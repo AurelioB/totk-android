@@ -343,6 +343,10 @@ int nvn_dirty_map_warn_init(void) {
     if (g_map_warn_enabled) pthread_once(&g_vma_once, vma_start);
     return g_map_warn_enabled;
 }
+unsigned nvn_dirty_map_warn_mode(void) {
+    pthread_once(&g_map_warn_once, map_warn_configure);
+    return g_map_warn_mode;
+}
 int nvn_dirty_map_warn_notice(void) {
     return atomic_load_explicit(&g_map_warn_notice, memory_order_relaxed);
 }
