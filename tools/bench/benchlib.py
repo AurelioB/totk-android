@@ -90,6 +90,8 @@ def write_baseline(ddoc, label, run_id, commit, docs=None):
     sig = device_signature(ddoc, label)
     if sig is None:
         sys.exit(f'{label}: no frequency signature (no frequency limits recorded): cannot become a baseline')
+    if signature_relation(sig, sig) == 'unknown':
+        sys.exit(f'{label}: effective switches UNKNOWN: cannot become a comparable baseline')
     if index_entry(sig['sha256'], docs):
         sys.exit(f'signature {sig["short"]} already has a baseline; baselines are never replaced')
     rel_name = f'baselines/{slug(sig["fields"]["model"])}/{sig["short"]}.json'
@@ -170,18 +172,100 @@ def settings_sha256(env):
 
 
 SIGNATURE_FIELDS = ('model', 'soc', 'settings_env_sha256', 'cpu_caps_khz', 'gpu_cap_hz')
+SWITCH_KEYS = ('TOTK_WB_ALIAS', 'TOTK_MAP_WARN')
+# Exact provenance of the immutable 1.0.0 baseline, before either switch existed.
+PRE_SWITCH_COMMIT = 'edc526df8c95'
+PRE_SWITCH_APK = '393576ab9b01b9c2370b5dd515b941e0e0a851c763d16b5b624092aab9f68ad6'
+
+
+def legacy_switch_provenance(build):
+    commit = build.get('commit') or ''
+    return (commit == PRE_SWITCH_COMMIT or len(commit) == 40 and commit.startswith(PRE_SWITCH_COMMIT)) \
+        and build.get('apk_sha256') == PRE_SWITCH_APK
+
+
+def switch_states(state='UNKNOWN', reason='startup evidence unavailable'):
+    return {key: dict(state=state, reason=reason, **({'mode': 0} if key == 'TOTK_MAP_WARN' and state == 'off' else {}))
+            for key in SWITCH_KEYS}
+
+
+def log_switch_states(info, build):
+    """Resolve only logged frozen states, or exact known pre-switch provenance; never infer an env default."""
+    capture = info.get('switch_capture', {})
+    marker = capture.get('marker')
+    complete = capture.get('starts') == 1 and (marker and capture.get('marker_started') or capture.get('present'))
+    if capture.get('starts', 0) > 1 or capture.get('markers', 0) > 1:
+        return switch_states(reason='multiple launch/state markers in one session log')
+    if complete and marker:
+        result = {key: {'state': marker[key], 'reason': 'complete startup: frozen state marker v1'}
+                  for key in SWITCH_KEYS}
+        result['TOTK_MAP_WARN']['mode'] = marker['mode']
+        if capture.get('alias') and marker['TOTK_WB_ALIAS'] == 'off' or \
+                capture.get('warn_mode') and capture['warn_mode'] != marker['mode']:
+            return switch_states(reason='conflicting startup state evidence')
+        return result
+    if legacy_switch_provenance(build):
+        return switch_states('off', 'known pre-switch baseline build')
+    if not complete:
+        return switch_states(reason='missing or truncated complete startup section')
+    result = switch_states(reason='build has no frozen switch-state logging contract; absence is not off')
+    if capture.get('alias'):
+        result['TOTK_WB_ALIAS'] = {'state': 'on', 'reason': 'alias startup/statistics line'}
+    if capture.get('warn_mode'):
+        result['TOTK_MAP_WARN'] = {'state': 'on', 'mode': capture['warn_mode'], 'reason': 'map-warn start line'}
+    return result
+
+
+def device_switch_states(doc, label):
+    dev = doc['devices'][label]
+    return dev.get('effective_switches') or (switch_states('off', 'known pre-switch baseline build')
+        if legacy_switch_provenance(doc.get('build', {})) else switch_states())
+
+
+def switch_fields(states):
+    values = {key: states.get(key, {}).get('state', 'UNKNOWN') for key in SWITCH_KEYS}
+    values = {key: value if value in ('on', 'off') else 'UNKNOWN' for key, value in values.items()}
+    mode = states.get('TOTK_MAP_WARN', {}).get('mode')
+    if values['TOTK_MAP_WARN'] == 'off':
+        mode = 0
+    elif mode not in (1, 2, 3):
+        values['TOTK_MAP_WARN'], mode = 'UNKNOWN', None
+    return {'effective_switches': values, 'map_warn_mode': mode}
+
+
+def switch_admission(base_doc, base_label, new_doc, new_label):
+    states = [device_switch_states(doc, label) for doc, label in
+              ((base_doc, base_label), (new_doc, new_label))]
+    fields = [switch_fields(state) for state in states]
+    reasons = []
+    for key in SWITCH_KEYS:
+        values = [field['effective_switches'][key] for field in fields]
+        for side, value, state in zip(('reference', 'new'), values, states):
+            if value == 'UNKNOWN':
+                reasons.append(f'{side} {key}=UNKNOWN ({state.get(key, {}).get("reason", "effective mode unavailable")})')
+        if 'UNKNOWN' not in values and values[0] != values[1]:
+            reasons.append(f'{key}: {values[0]} -> {values[1]}')
+    if all(field['effective_switches']['TOTK_MAP_WARN'] == 'on' for field in fields) \
+            and fields[0]['map_warn_mode'] != fields[1]['map_warn_mode']:
+        reasons.append(f'TOTK_MAP_WARN mode: {fields[0]["map_warn_mode"]} -> {fields[1]["map_warn_mode"]}')
+    return reasons
 
 
 def signature_of_fields(fields):
-    return hashlib.sha256(json.dumps({k: fields[k] for k in SIGNATURE_FIELDS}, sort_keys=True,
-                                     separators=(',', ':')).encode()).hexdigest()
+    payload = {k: fields[k] for k in SIGNATURE_FIELDS}
+    # Keep the pinned off/off historical hash, but domain-separate any other effective workload.
+    states = fields.get('effective_switches')
+    if states is not None and states != dict.fromkeys(SWITCH_KEYS, 'off'):
+        payload.update(effective_switches=states, map_warn_mode=fields.get('map_warn_mode'))
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
-def signature_of(model, soc, env, cpu_caps, gpu_cap):
+def signature_of(model, soc, env, cpu_caps, gpu_cap, effective_switches=None):
     """(sha256, fields) of a frequency signature: device model + SoC, the settings_env hash, the per-cluster effective
     CPU caps (kHz, policy order) and the effective GPU cap (Hz, None when unknown)."""
     fields = {'model': model, 'soc': soc, 'settings_env_sha256': settings_sha256(env or {}),
-              'cpu_caps_khz': list(cpu_caps), 'gpu_cap_hz': gpu_cap}
+              'cpu_caps_khz': list(cpu_caps), 'gpu_cap_hz': gpu_cap,
+              **switch_fields(effective_switches or switch_states())}
     return signature_of_fields(fields), fields
 
 
@@ -193,7 +277,11 @@ def device_signature(doc, label, docs=None, path=None):
     fl = dev.get('freq_limits')
     if fl:
         cpu, gpu = caps_of_limits(fl)
-        sha, fields = signature_of(dev.get('name'), dev.get('soc'), dev.get('settings_env'), cpu, gpu)
+        sha, fields = signature_of(dev.get('name'), dev.get('soc'), dev.get('settings_env'), cpu, gpu,
+                                   device_switch_states(doc, label))
+        if 'effective_switches' not in dev and not legacy_switch_provenance(doc.get('build', {})):
+            # Preserve immutable legacy identifiers, not admission: their UNKNOWN states still never match.
+            sha = signature_of_fields({key: fields[key] for key in SIGNATURE_FIELDS})
         return {'sha256': sha, 'short': sha[:12], 'fields': fields,
                 'cpu_hw_max_khz': [c['cpuinfo_max_khz'] for c in fl['cpu']],
                 'gpu_hw_max_hz': (fl.get('gpu') or {}).get('hw_max_hz')}
@@ -205,13 +293,19 @@ def device_signature(doc, label, docs=None, path=None):
             return None
         for b in load_index(docs)['baselines']:
             if b['file'] == rel_name and b['device'] == label:
-                return index_sig(b)
+                sig = index_sig(b)
+                sig['fields'].update(switch_fields(device_switch_states(doc, label)))
+                return sig
     return None
 
 
 def index_sig(b):
     """A baseline index entry as a device_signature() dict."""
-    return {'sha256': b['signature'], 'short': b['short'], 'fields': {k: b[k] for k in SIGNATURE_FIELDS},
+    fields = {k: b[k] for k in SIGNATURE_FIELDS}
+    states = b.get('effective_switches')
+    fields.update(effective_switches=states or dict.fromkeys(SWITCH_KEYS,
+        'off' if b['file'] == 'baseline-1.0.0.json' else 'UNKNOWN'), map_warn_mode=b.get('map_warn_mode', 0))
+    return {'sha256': b['signature'], 'short': b['short'], 'fields': fields,
             'cpu_hw_max_khz': b['cpu_hw_max_khz'], 'gpu_hw_max_hz': b['gpu_hw_max_hz']}
 
 
@@ -220,6 +314,12 @@ def signature_relation(ref, new):
     'unknown' (either side has no signature)."""
     if ref is None or new is None:
         return 'unknown'
+    a, b = ref['fields'], new['fields']
+    if any(field.get('effective_switches', {}).get(key, 'UNKNOWN') == 'UNKNOWN'
+           for field in (a, b) for key in SWITCH_KEYS):
+        return 'unknown'
+    if a['effective_switches'] != b['effective_switches'] or a['map_warn_mode'] != b['map_warn_mode']:
+        return 'mismatch'
     if ref['sha256'] == new['sha256']:
         return 'match'
     a, b = ref['fields'], new['fields']
@@ -230,7 +330,7 @@ def signature_relation(ref, new):
 
 def signature_diff(ref, new):
     a, b = ref['fields'], new['fields']
-    return ', '.join(f'{k}: {a[k]} -> {b[k]}' for k in a if a[k] != b[k])
+    return ', '.join(f'{k}: {a.get(k)} -> {b.get(k)}' for k in sorted(a.keys() | b.keys()) if a.get(k) != b.get(k))
 
 
 def caps_text(cpu_caps, cpu_hw, gpu_cap, gpu_hw):
@@ -382,6 +482,7 @@ def comparability(base_doc, base_label, new_doc, new_label):
     """Warnings that make two runs of one device not comparable: settings.env and cpufreq caps differences, and runs
     whose frequency limits changed during a pan (freq_stable false)."""
     warns = []
+    warns.extend(switch_admission(base_doc, base_label, new_doc, new_label))
     be = base_doc['devices'].get(base_label, {}).get('settings_env')
     ne = new_doc['devices'].get(new_label, {}).get('settings_env')
     if be is not None and ne is not None and be != ne:
@@ -431,8 +532,13 @@ def compare_docs(base_doc, new_doc, out=sys.stdout, base_path=None, new_path=Non
         bsig = device_signature(base_doc, base_label, path=base_path)
         nsig = device_signature(new_doc, new_label, path=new_path)
         relation = signature_relation(bsig, nsig)
+        switch_reasons = switch_admission(base_doc, base_label, new_doc, new_label)
+        if switch_reasons:
+            relation = 'unknown' if any('UNKNOWN' in reason for reason in switch_reasons) else 'mismatch'
         line = RELATION_TEXT[relation]
-        if relation == 'mismatch':
+        if switch_reasons:
+            line = 'WARNING: NOT COMPARABLE: effective switches: ' + '; '.join(switch_reasons)
+        if relation == 'mismatch' and not switch_reasons:
             line += f' ({signature_diff(bsig, nsig)})'
         print(f'\n# {new_label}: {line}', file=out)
         for side, sig in (('reference', bsig), ('new', nsig)):

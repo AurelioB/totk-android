@@ -13,7 +13,7 @@ cpuinfo_max kHz; GPU max_gpuclk, available frequencies, devfreq max, power level
 A run is freq_stable false when any effective cap (CPU scaling_max per cluster, GPU cap) differs between those
 snapshots, between the sampler's records over the pans, or from the device's first scene: such a run is not usable
 for comparison and never becomes a baseline. Each device gets freq_limits (its first pan's start) and freq_signature
-(benchlib.device_signature: model + SoC, settings_env hash, CPU caps, GPU cap).
+(benchlib.device_signature: model + SoC, settings_env hash, effective alias/warning states/mode, CPU caps, GPU cap).
 
 --arms (in-session A/B, tools/bench/ab.sh): the log's live-switch lines ([totk-ctl] gen=N frame=F applied ... / mark
 ...) split the session into generations; generation N covers the frames after F up to the next generation's frame.
@@ -32,7 +32,7 @@ its "caveats" are appended to the generated ones. Never writes a baseline file (
 import argparse, collections, datetime, json, os, re, statistics, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchlib import SCHEMA, caps_of_limits, device_signature, guard_output, parse_freq_tokens, sig_caps_text  # noqa: E402
+from benchlib import SCHEMA, caps_of_limits, device_signature, guard_output, log_switch_states, parse_freq_tokens, sig_caps_text  # noqa: E402
 from sampler import GPU_SNAPSHOT_FILE, gpu_residency_delta, parse_gpu_snapshots, power_of_tokens  # noqa: E402
 from provenance import compilation_of, compilation_summary, compile_record, scene_state  # noqa: E402
 
@@ -72,7 +72,23 @@ def parse_log(path):
     last_window = None
     recording, present_stats, present_bins, traces = {}, {}, {}, {}
     frame_p99 = {}
+    capture = info['switch_capture'] = {'starts': 0, 'markers': 0}
     for line in open(path, encoding='utf-8', errors='replace'):
+        if line.startswith('[totk-app] build ') and line.endswith('\n'):
+            capture['starts'] += 1
+        if capture['starts'] == 1 and re.match(r'^\[nvn-vk\] frame \d+: [\d.]+ fps over the last 300', line):
+            capture['present'] = True
+        if re.match(r'^\[nvn-vk\] (write-back alias: enabled\b|memory write-back alias(?:es| paths):)', line):
+            capture['alias'] = True
+        if m := re.search(r'\[map-warn\] started mode=([123])\b', line):
+            capture['warn_mode'] = int(m[1])
+        if line.startswith('[totk-switches]'):
+            capture['markers'] += 1
+            m = re.fullmatch(r'\[totk-switches\] v=1 TOTK_WB_ALIAS=(on|off) TOTK_MAP_WARN=(on|off) map_warn_mode=([0-3])\n', line)
+            if m and (m[2] == 'off') == (m[3] == '0'):
+                capture['marker'] = dict(zip(('TOTK_WB_ALIAS', 'TOTK_MAP_WARN', 'mode'),
+                                            (m[1], m[2], int(m[3]))))
+                capture['marker_started'] = capture['starts'] == 1
         if record := compile_record(line):
             compilations[record[0]] = record[1]
         if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):
@@ -837,6 +853,7 @@ def main():
     }
     deep_merge(doc, meta)
     for dev in order:
+        doc['devices'][dev]['effective_switches'] = log_switch_states(logs[dev][5], doc['build'])
         sig = device_signature(doc, dev)
         if sig:
             doc['devices'][dev]['freq_signature'] = {'sha256': sig['sha256'], 'short': sig['short'],

@@ -102,6 +102,121 @@ class Signatures(unittest.TestCase):
                          'CPU 2.23/2.25 GHz (hw 3.53/4.32), GPU cap unknown')
 
 
+class EffectiveSwitches(unittest.TestCase):
+    START = '[totk-app] build release test; game folder /game\n'
+    ALIAS = '[nvn-vk] write-back alias: enabled (default on; TOTK_WB_ALIAS=0 disables)\n'
+    WARN = '[dirty] [map-warn] started mode=1 period_ms=5000 log=80 notice=88 clear=84\n'
+
+    @staticmethod
+    def marker(alias='off', mode=0):
+        return (f'[totk-switches] v=1 TOTK_WB_ALIAS={alias} '
+                f'TOTK_MAP_WARN={"on" if mode else "off"} map_warn_mode={mode}\n')
+
+    def parse_states(self, text, build=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'log'
+            path.write_text(text)
+            return benchlib.log_switch_states(analyze.parse_log(path)[5], build or {})
+
+    def document(self, text, build=None, env=''):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            (path / 'logs').mkdir()
+            (path / 'logs/thor.log').write_text(text + ab_log(
+                {300: (30, 36, 20, 0), 600: (30, 36, 20, 0), 900: (30, 36, 20, 0)}, []))
+            (path / 'pans.txt').write_text('thor hateno F0=0 F1=900 T0=100 T1=130 V=16000\n')
+            (path / 'settings-thor.env').write_text('TOTK_FPS60=0\n')
+            if env:
+                (path / 'totk-env-thor.txt').write_text(env)
+            (path / 'meta.json').write_text(json.dumps({'build': build or {'commit': 'a' * 40}}))
+            result = run(BENCH / 'analyze.py', path, '--meta', path / 'meta.json', '--json', path / 'result.json')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            doc = json.loads((path / 'result.json').read_text())
+        doc['devices']['thor'].update(name='AYN Thor', soc='QCS8550', freq_limits=snapshot())
+        return doc
+
+    @staticmethod
+    def values(doc):
+        return {key: value['state'] for key, value in doc['devices']['thor']['effective_switches'].items()}
+
+    def compare(self, ref, new):
+        out = io.StringIO()
+        verdicts = benchlib.compare_docs(ref, new, out)
+        return {relation for _, relation in verdicts.values()}, out.getvalue()
+
+    def test_historical_off_and_explicit_optouts_keep_numbers_and_signature(self):
+        old_build = benchlib.load_result(BASELINE)['build']
+        old = self.document(self.START, old_build)
+        off = self.document(self.START + self.marker(), env='TOTK_WB_ALIAS=0\nTOTK_MAP_WARN=0\n')
+        self.assertEqual(self.values(old), dict.fromkeys(benchlib.SWITCH_KEYS, 'off'))
+        self.assertEqual(self.values(off), self.values(old))
+        self.assertEqual(old['runs'], off['runs'])
+        self.assertEqual(benchlib.device_signature(old, 'thor')['sha256'],
+                         benchlib.device_signature(off, 'thor')['sha256'])
+        self.assertEqual(self.compare(old, off)[0], {'match'})
+
+    def test_new_defaults_are_not_comparable_to_historical_off(self):
+        old = self.document(self.START, benchlib.load_result(BASELINE)['build'])
+        new = self.document(self.START + self.ALIAS + self.WARN + self.marker('on', 1))
+        self.assertEqual(self.values(new), dict.fromkeys(benchlib.SWITCH_KEYS, 'on'))
+        self.assertEqual(old['runs'], new['runs'])
+        self.assertNotEqual(benchlib.device_signature(old, 'thor')['sha256'],
+                            benchlib.device_signature(new, 'thor')['sha256'])
+        relations, text = self.compare(old, new)
+        self.assertEqual(relations, {'mismatch'})
+        self.assertIn('NOT COMPARABLE', text)
+        self.assertIn('TOTK_WB_ALIAS: off -> on', text)
+        self.assertIn('TOTK_MAP_WARN: off -> on', text)
+
+    def test_truncated_and_missing_startup_are_unknown_even_against_themselves(self):
+        for text in ('', self.marker('on', 1), self.START + '[totk-switches] v=1 TOTK_WB_ALIAS=off'):
+            with self.subTest(text=text):
+                states = self.parse_states(text)
+                self.assertEqual({value['state'] for value in states.values()}, {'UNKNOWN'})
+        missing = self.document('')
+        self.assertEqual(self.compare(missing, missing)[0], {'unknown'})
+        self.assertIn('UNKNOWN', self.compare(missing, missing)[1])
+        self.assertIn('NOT COMPARABLE', self.compare(missing, missing)[1])
+
+    def test_prefixed_logging_and_absence_without_a_contract_are_unknown(self):
+        for text in (self.START, 'logcat: ' + self.START + 'logcat: ' + self.marker()):
+            states = self.parse_states(text + '[nvn-vk] frame 300: 30 fps over the last 300\n')
+            self.assertEqual({value['state'] for value in states.values()}, {'UNKNOWN'})
+        wrong_build = dict(benchlib.load_result(BASELINE)['build'], apk_sha256='b' * 64)
+        self.assertEqual({value['state'] for value in self.parse_states('', wrong_build).values()}, {'UNKNOWN'})
+
+    def test_old_and_new_alias_literals_and_statistics_prove_enabled_state(self):
+        for alias in (self.ALIAS, '[nvn-vk] write-back alias: enabled (TOTK_WB_ALIAS=1)\n',
+                      '[nvn-vk] memory write-back alias paths: phase=pause cumulative=1 landing=alias:0/0\n'):
+            states = self.parse_states(self.START + alias + self.WARN
+                + '[nvn-vk] frame 300: 30 fps over the last 300\n')
+            self.assertEqual({value['state'] for value in states.values()}, {'on'})
+            self.assertEqual(states['TOTK_MAP_WARN']['mode'], 1)
+
+    def test_marker_overrides_env_intent_and_modes_do_not_match(self):
+        off = self.document(self.START + self.marker(), env='TOTK_WB_ALIAS=1\nTOTK_MAP_WARN=3\n')
+        self.assertEqual(self.values(off), dict.fromkeys(benchlib.SWITCH_KEYS, 'off'))
+        one = self.document(self.START + self.marker('on', 1))
+        two = self.document(self.START + self.marker('on', 2))
+        self.assertEqual(self.compare(one, two)[0], {'mismatch'})
+        self.assertIn('TOTK_MAP_WARN mode: 1 -> 2', self.compare(one, two)[1])
+
+    def test_unknown_never_creates_or_admits_a_ledger_baseline(self):
+        unknown = self.document('')
+        for record in unknown['runs']:
+            record['freq_stable'] = True
+        with tempfile.TemporaryDirectory() as tmp:
+            sig, stable, base, became = ledger.resolve_baseline(unknown, 'thor', 'unknown', 'a' * 40, Path(tmp))
+            self.assertIsNotNone(sig)
+            self.assertTrue(stable)
+            self.assertIsNone(base)
+            self.assertFalse(became)
+            self.assertFalse((Path(tmp) / 'baselines').exists())
+        verdict = ledger.verdict_block(unknown, 'thor', unknown, 'thor')
+        self.assertEqual({scene['overall'] for scene in verdict['scenes'].values()}, {'NOT COMPARABLE'})
+        self.assertTrue(any('UNKNOWN' in warning for warning in verdict['warnings']))
+
+
 class Compare(unittest.TestCase):
     def setUp(self):
         self.doc = benchlib.load_result(BASELINE)

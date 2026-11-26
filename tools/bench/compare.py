@@ -6,14 +6,16 @@ from docs/benchmarks/baselines/index.json, a ledger run file or an analyze.py --
 per metric and per scene. Devices are paired by label, else by model / name. Exits 1 when any scene whose frequency
 signatures match is worse.
 
-Frequency signature (benchlib.signature_of): device model + SoC, the settings_env hash, the per-cluster effective CPU
-caps (cpufreq scaling_max_freq, kHz) and the effective GPU cap (Hz). Each device pair is labelled:
+Frequency signature (benchlib.signature_of): device model + SoC, the settings_env hash, frozen effective
+TOTK_WB_ALIAS/TOTK_MAP_WARN states and warning mode, per-cluster CPU caps and effective GPU cap. Each pair is labelled:
   match           same signature: the verdicts are a regression check (they decide the exit status)
   reference only  the reference has no GPU cap recorded (the 1.0.0 baseline) but model, settings and CPU caps match:
                   shown for information, never decides the exit status
   NOT COMPARABLE  the signatures differ, or one side has none: printed with a loud WARNING, never decides the exit
                   status. Compare against the baseline of the new run's own signature instead.
 The signature of baseline-1.0.0.json comes from the baseline index (CPU caps from its sampler records, GPU cap null).
+Effective-state mismatches or UNKNOWN on either side are NOT COMPARABLE, even with identical hardware/menu
+signatures. UNKNOWN never matches itself. Old pre-switch baseline metrics and their pinned hashes remain unchanged.
 
 Verdict thresholds (a difference within the tolerance is 'same'; beyond it 'better' or 'worse'):
   fps steady      max(0.5 fps, 2 %)        higher is better

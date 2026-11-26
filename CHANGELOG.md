@@ -8,6 +8,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ### Developer tools
 - Log the frozen effective write-back-alias state and map-warning mode once at first presenter startup,
   including explicit opt-outs, so benchmark tools need not infer build-dependent defaults from menu settings.
+- Record effective alias/warning states from complete startup evidence, including the warning mode, in benchmark
+  signatures and comparison admission. UNKNOWN never matches; missing lines are not silently off. Preserve pinned
+  pre-switch baseline numbers/hashes and require explicit `TOTK_WB_ALIAS=0 TOTK_MAP_WARN=0` for historical controls.
 - Make optional frame-timeline and fence-evidence ring producers single-attempt/nonblocking, with counted
   dropped updates and skipped snapshots. Reuse per-walk elapsed clocks instead of enabling recorder
   opcode/category probes, and batch recorder-worker draws/descriptors at slot assembly instead of each job.
