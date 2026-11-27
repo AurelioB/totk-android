@@ -5,7 +5,7 @@ The on-device setup writes the same files (android/setup/romfs_index.c)."""
 import argparse,hashlib,json,struct
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
-parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--version', choices=('v0','v112','v121','v143'), default='v0')
+parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--version', choices=('v0','v112','v121','v143','botw160'), default='v0')
 parser.add_argument('--out', type=Path, help='game data folder (default build/game-data/<version>)')
 args=parser.parse_args();version=args.version
 out=args.out or root/f'build/game-data/{version}';out.mkdir(parents=True,exist_ok=True)

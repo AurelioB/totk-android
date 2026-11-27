@@ -36,7 +36,7 @@ def find_sdk(explicit=None):
     return None
 
 
-def build(out, sdk=None, extra_sources=()):
+def build(out, sdk=None, extra_sources=(), game=None):
     selected = find_sdk(sdk)
     if selected is None:
         raise RuntimeError('Android SDK with platform API >=33 and build-tools/d8 not found; use --android-sdk, ANDROID_HOME, or ANDROID_SDK_ROOT')
@@ -46,6 +46,12 @@ def build(out, sdk=None, extra_sources=()):
         raise RuntimeError('javac 17 or later not found on PATH')
     roots = [HERE.parent / 'java', *(Path(p).resolve() for p in extra_sources)]
     sources = sorted(p for root in roots for p in root.rglob('*.java'))
+    if game and game != 'v143':   # another game's identity (java-<game>/.../GameBuild.java) replaces the default one
+        override = HERE.parent / f"java-{game.rstrip('0123456789')}"
+        names = {p.relative_to(override) for p in override.rglob('*.java')}
+        if not names:
+            raise RuntimeError(f'no Java sources for {game} in {override}')
+        sources = sorted([p for p in sources if p.relative_to(HERE.parent / 'java') not in names] + [override / n for n in names])
     if not sources:
         raise RuntimeError('no Java sources found')
     out = Path(out).expanduser().resolve()
@@ -75,9 +81,10 @@ def main(argv=None):
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--android-sdk', type=Path)
     parser.add_argument('--sources', type=Path, action='append', default=[], help='additional Java source root (preview only)')
+    parser.add_argument('--game', default='v143', help='game build: v143 (Tears of the Kingdom 1.4.3) or botw160')
     args = parser.parse_args(argv)
     try:
-        build(args.out, args.android_sdk, args.sources)
+        build(args.out, args.android_sdk, args.sources, args.game)
     except (RuntimeError, subprocess.CalledProcessError) as error:
         parser.exit(1, f'build_dex: {error}\n')
 

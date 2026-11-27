@@ -37,6 +37,7 @@ from build_app import BuildError, say, run, sha256   # noqa: E402
 import audit_apk                                    # noqa: E402
 
 VERSION = 'v143'
+IDENTITY = []   # extra build_apk.py arguments (--package, --label) from the command line
 API = 33
 TURNIP_SHA256 = audit_apk.TURNIP_SHA256
 LICENSES = HERE / 'apk/licenses'   # licence texts of the prebuilt inputs (their sources are not fetched by this build)
@@ -68,6 +69,10 @@ def parse_args(argv):
     ap.add_argument('--version-code', type=int, help='default: from the version name, MAJOR*10000 + MINOR*100 + PATCH')
     ap.add_argument('--version-name', help=f'default: {APP_VERSION}')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
+    ap.add_argument('--game', choices=('v143', 'botw160'), default='v143', help='game build (default v143: Tears of the Kingdom 1.4.3)')
+    ap.add_argument('--package', help='application id (default: build_apk.py\'s)')
+    ap.add_argument('--label', help='launcher name (default: build_apk.py\'s)')
+    ap.add_argument('--dev-key', action='store_true', help='debuggable build; --key is created when missing (never for a public release)')
     args = ap.parse_args(argv)
     if not args.audit:
         missing = [n for n in ('ndk', 'turnip', 'key') if not getattr(args, n)]
@@ -189,7 +194,7 @@ def build_classes(sdk, out, logs):
     selected = build_dex.find_sdk(sdk)
     if selected is None:
         raise BuildError('no Android SDK with platform 33+ and build-tools (d8); pass --android-sdk')
-    run([sys.executable, HERE / 'apk/build_dex.py', '--android-sdk', selected[0], '--out', out], logs / 'build_dex.log')
+    run([sys.executable, HERE / 'apk/build_dex.py', '--android-sdk', selected[0], '--out', out, '--game', VERSION], logs / 'build_dex.log')
     return out
 
 
@@ -331,15 +336,19 @@ def package(*, out, dex, libs, translator, turnip, assets, key, key_pass_env=Non
         libs[-1] = staged
     # The launcher images are rendered once from the app's artwork and committed (apk/render_launcher.py), so this build
     # needs no Pillow; a stale render (artwork changed since) is refused.
-    icons = HERE / 'apk/launcher'
+    # Another game's build has its own recolour of the artwork (app-assets/icon/recolour_icon.py), named as its java-<game>.
+    game = '' if VERSION == 'v143' else VERSION.rstrip('0123456789')
+    icons = HERE / (f'apk/launcher-{game}' if game else 'apk/launcher')
     stamp = icons / 'source.sha256'
-    art = HERE / 'app-assets/icon/totk-native-1024.png'
+    art = HERE / f"app-assets/icon/{game or 'totk'}-native-1024.png"
     if not stamp.is_file() or not art.is_file() or stamp.read_text().split()[0] != sha256(art):
-        raise BuildError(f'{icons} is missing or older than {art}: rerun python3 games/totk/android/apk/render_launcher.py (needs Pillow)')
+        raise BuildError(f'{icons} is missing or older than {art}: rerun python3 games/totk/android/apk/render_launcher.py'
+                         + (f' --icon {art} --out {icons}' if game else '') + ' (needs Pillow)')
     cmd = [sys.executable, HERE / 'apk/build_apk.py', '--dex', dex, *sum((['--lib', str(p)] for p in libs), []),
            '--ondevice-xlate', translator, '--assets', assets, '--launcher-mipmaps', icons, '--out', out, '--key', key,
            '--version-code', str(version_code), '--version-name', version_name, '--min-sdk', str(API), '--target-sdk', str(API)]
     cmd += (['--key-pass-env', key_pass_env] if key_pass_env else []) + (['--make-key'] if make_key else [])
+    cmd += IDENTITY
     cmd += (['--release'] if release else []) + (['--timestamp', str(timestamp)] if timestamp is not None else [])
     run(cmd, logs / 'build_apk.log')
     try:
@@ -405,8 +414,11 @@ def main(argv):
     ndk = Path(args.ndk).expanduser().resolve()
     if not (ndk / 'build/cmake/android.toolchain.cmake').is_file():
         raise BuildError('--ndk must point at an Android NDK (r28)')
+    global VERSION
+    VERSION = args.game
+    IDENTITY[:] = (['--package', args.package] if args.package else []) + (['--label', args.label] if args.label else [])
     key = args.key.expanduser().resolve()
-    if not key.is_file():
+    if not key.is_file() and not args.dev_key:
         raise BuildError(f'no signing key at {key} (this build never makes one)')
     turnip = check_turnip(args.turnip)
     work = args.work.expanduser().resolve()
@@ -414,7 +426,7 @@ def main(argv):
     logs.mkdir(parents=True, exist_ok=True)
     out = (args.out.expanduser().resolve() if args.out else work / 'totk-native.apk')
     t0 = time.time()
-    app(work=work, ndk=ndk, logs=logs, out=out, key=key, key_pass_env=args.key_pass_env, release=True, turnip=turnip,
+    app(work=work, ndk=ndk, logs=logs, out=out, key=key, key_pass_env=args.key_pass_env, release=not args.dev_key, make_key=args.dev_key, turnip=turnip,
         translator=args.translator, android_sdk=args.android_sdk, version_code=args.version_code, version_name=args.version_name,
         jobs=args.jobs)
     say(f'done in {(time.time() - t0) / 60:.0f} min: {out} (sha256 {sha256(out)})')
