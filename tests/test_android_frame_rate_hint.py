@@ -40,6 +40,13 @@ class AndroidFrameRateHint(unittest.TestCase):
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#define PROP_VALUE_MAX 92
+static const char *manufacturer = "Samsung";
+static int __system_property_get(const char *key, char *value) {
+    assert(!strcmp(key, "ro.product.manufacturer"));
+    return strcpy(value, manufacturer), (int)strlen(value);
+}
 static pthread_once_t config_once = PTHREAD_ONCE_INIT;
 static int rate_on, fps60, framegen, lattice, auto40, hold_launch, hold_logged = -1;
 static unsigned rate_request;
@@ -71,7 +78,7 @@ static void (*surface_rate)(ASurfaceTransaction *, ASurfaceControl *, float, int
 '''
         source += section(perf, 'static int is_one(', 'static uint64_t mono_ns(')
         source += 'static void configure(void) {\n' + section(
-            perf, '    rate_on = is_one("TOTK_FRAME_RATE_HINT")', '    span_applied = span_launch') + '}\n'
+            perf, '    const char *fg = getenv("TOTK_FRAMEGEN")', '    span_applied = span_launch') + '}\n'
         source += section(perf, 'static void rate_frame(', 'void totk_perf_frame(')
         source += section(perf, 'unsigned totk_perf_rate_request(void)', '#endif')
         source += r'''
@@ -106,9 +113,9 @@ static jboolean exception_check(JNIEnv *env) { (void)env; return jni_exception; 
 static void exception_clear(JNIEnv *env) { (void)env; jni_exception = 0; jni_clears++; }
 static float advertised_rate = 120;
 static jfloat call_float(JNIEnv *env, jobject obj, jmethodID method, jint hz) {
-    (void)env; assert(obj && method && (hz == 120 || hz == -1));
+    (void)env; assert(obj && method && (hz == 60 || hz == 120 || hz == -1));
     if (jni_failure == 3) jni_exception = 1;
-    return jni_failure == 4 ? 0 : advertised_rate;
+    return jni_failure == 4 ? 0 : hz == 60 ? 60 : advertised_rate;
 }
 static const struct fake_jni jni = {
     object_class, method_id, delete_ref, exception_check, exception_clear, call_float
@@ -137,12 +144,41 @@ int main(void) {
         settings("1", bad[i]); assert(!totk_perf_rate_request());
     }
     ANativeWindow window = {0}; ASurfaceTransaction tx = {0}; ASurfaceControl surface = {0};
-    settings(NULL, "120");
     JNIEnv env = &jni; ANativeActivity activity = {&env, &window};
+    /* Ordinary 30/60 fps gameplay needs a persistent vote without developer settings or touch input. */
+    settings(NULL, NULL);
+    assert(totk_perf_rate_request() == UINT32_MAX);
+    frame_rate_hint_update(&activity);
+    for (int i = 0; i < 1000; i++) {
+        rate_frame(i % 2 + 1, i % 2 ? 33333333 : 16666667);
+        assert(totk_perf_rate() == 120);
+    }
+    totk_perf_window(&window); totk_perf_surface(&tx, &surface);
+    assert(window_hz == 120 && surface_hz == 120);
+    advertised_rate = 60; frame_rate_hint_update(&activity);
+    assert(totk_perf_rate() == 60); /* A 60-Hz-only display never gets a fabricated 120. */
+    advertised_rate = 120;
+    settings(NULL, "60"); frame_rate_hint_update(&activity);
+    assert(totk_perf_rate() == 60); /* Explicit preference also works with hints enabled by default. */
+    settings(NULL, "0"); assert(!totk_perf_rate_request());
+    settings("1", ""); assert(!totk_perf_rate_request());
+    manufacturer = "AYN";
+    settings(NULL, NULL); assert(!totk_perf_rate_request() && !totk_perf_rate());
+    settings(NULL, "120");
+    window_calls = surface_calls = jni_queries = 0;
     frame_rate_hint_update(&activity); assert(!jni_queries); /* disabled means no JNI */
     assert(!totk_perf_rate_request()); totk_perf_rate_override(120); assert(!totk_perf_rate());
     totk_perf_window(&window); totk_perf_surface(&tx, &surface);
     assert(!window_calls && !surface_calls);
+    manufacturer = "samsung";
+    const char *special[] = {"TOTK_FRAMEGEN", "TOTK_FPS_AUTO", "DM_PRESENT_HZ", "TOTK_ACQUIRE_CLOCK", "TOTK_PACE"};
+    const char *values[] = {"locked", "1", "60", "vsync", "display"};
+    for (unsigned i = 0; i < sizeof special / sizeof *special; i++) {
+        assert(!setenv(special[i], values[i], 1));
+        settings(NULL, NULL); assert(!totk_perf_rate_request() && !totk_perf_rate());
+        settings("1", "120"); assert(totk_perf_rate_request() == 120);
+        assert(!unsetenv(special[i]));
+    }
     settings("0", "120"); assert(!totk_perf_rate_request() && !totk_perf_rate());
     settings("true", "120"); assert(!totk_perf_rate_request() && !totk_perf_rate());
     const char *off[] = {NULL, "", "0"};
@@ -236,8 +272,13 @@ int main(void) {
         javac, java = shutil.which('javac'), shutil.which('java')
         if not javac or not java:
             self.skipTest('A JDK 17+ is required')
-        method = section(ACTIVITY.read_text(), '    public float selectFrameRateHint(',
+        activity = ACTIVITY.read_text()
+        method = section(activity, '    public float selectFrameRateHint(',
                          '    /** Native UI thread only, after its explicit parent transaction succeeded.')
+        lifecycle = section(activity, '    @Override protected void onResume()',
+                            '    @Override public void onTopResumedActivityChanged(')
+        lifecycle += section(activity, '    @Override protected void onPause()',
+                             '    @Override protected void onStop()')
         source = r'''
 class Log { static int warnings; static void w(String tag, String text) { warnings++; } }
 class Display {
@@ -251,22 +292,61 @@ class Display {
     static class Mode { final float hz; Mode(float hz) { this.hz = hz; } float getRefreshRate() { return hz; } }
 }
 class View { Display display; Display getDisplay() { return display; } }
-class Window { final View decor = new View(); View getDecorView() { return decor; } }
-public class HintProbe {
+class WindowManager {
+    static class LayoutParams { float preferredRefreshRate; }
+}
+class Window {
+    final View decor = new View(); View getDecorView() { return decor; }
+    final WindowManager.LayoutParams attrs = new WindowManager.LayoutParams();
+    int writes;
+    WindowManager.LayoutParams getAttributes() { return attrs; }
+    void setAttributes(WindowManager.LayoutParams value) { writes++; }
+}
+class NativeActivity { protected void onResume() {} protected void onPause() {} }
+class GameFeedback { void resume() {} void pause() {} }
+class BootProgress { void resume() {} void pause() {} }
+class GameHold { static void resumed() {} static void paused(Object a) {} static void updatePause() {} }
+class ExitNotice {
+    void pause() {}
+    void resume(Object a, java.util.function.BooleanSupplier ready, java.util.function.Consumer<Boolean> visible) {}
+}
+class PresentationController { static int secondScreen(Object a, Display d) { return 0; } }
+class DisplayClass { static final int NONE = 0; }
+public class HintProbe extends NativeActivity {
     final Window window = new Window(); Window getWindow() { return window; }
-''' + method + r'''
+    boolean resumed, bootReady, updateOpen, exitNoticeOpen; float frameRateHint;
+    GameFeedback feedback;
+    final BootProgress bootProgress = new BootProgress();
+    final ExitNotice exitNotice = new ExitNotice();
+    boolean hasWindowFocus() { return true; }
+    Display getDisplay() { return window.decor.display; }
+    static void nativeGameFocus(boolean focused, boolean single) {}
+    void ensureMainDisplay() {} void showUpdate() {}
+''' + method + lifecycle + r'''
     static void require(boolean value) { if (!value) throw new AssertionError(); }
     public static void main(String[] args) {
         HintProbe activity = new HintProbe();
         require(activity.selectFrameRateHint(120) == 0); // no default-display fallback
         activity.window.decor.display = new Display(4, 60, 120.00001f);
         require(activity.selectFrameRateHint(120) == 120);
+        require(activity.window.attrs.preferredRefreshRate == 0); // background/pre-resume
+        activity.onResume();
+        require(activity.window.attrs.preferredRefreshRate == 120);
+        int writes = activity.window.writes;
+        for (int i = 0; i < 100; i++) activity.selectFrameRateHint(120);
+        require(activity.window.writes == writes); // lifecycle rechecks do not spam window updates
+        activity.onPause();
+        require(activity.window.attrs.preferredRefreshRate == 0); // pause clears the vote
+        activity.onResume();
+        require(activity.window.attrs.preferredRefreshRate == 120); // resume restores without touch
         require(activity.selectFrameRateHint(90) == 0);
+        require(activity.window.attrs.preferredRefreshRate == 0); // invalid rate clears stale preference
         require(activity.selectFrameRateHint(0) == 0);
         require(activity.selectFrameRateHint(-1) == 120.00001f);
         activity.window.decor.display = new Display(7, 60); // moved/recreated on another display
         require(activity.selectFrameRateHint(120) == 0);
         require(activity.selectFrameRateHint(60) == 60);
+        require(activity.window.attrs.preferredRefreshRate == 60);
         require(activity.selectFrameRateHint(-1) == 60);
         activity.window.decor.display = new Display(7, 119.88f, 120.02f, Float.NaN, Float.POSITIVE_INFINITY);
         require(activity.selectFrameRateHint(120) == 0);
@@ -278,9 +358,12 @@ public class HintProbe {
         require(activity.selectFrameRateHint(-1) == 0);
         activity.window.decor.display = new Display(7, -1, 0, Float.NaN, Float.POSITIVE_INFINITY);
         require(activity.selectFrameRateHint(-1) == 0);
+        activity.window.decor.display = new Display(7, 60, 120);
+        require(activity.selectFrameRateHint(120) == 120 && activity.window.attrs.preferredRefreshRate == 120);
         activity.window.decor.display.failed = true;
         try { activity.selectFrameRateHint(120); throw new AssertionError("exception must reach JNI refusal"); }
         catch (IllegalStateException expected) {}
+        require(activity.window.attrs.preferredRefreshRate == 0);
         require(Log.warnings == 8);
     }
 }

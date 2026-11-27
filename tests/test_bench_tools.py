@@ -239,6 +239,34 @@ class EffectiveSwitches(unittest.TestCase):
             self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
             self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
 
+    def test_ten_launch_history_uses_only_current_off_startup_bracket(self):
+        old = ''.join(
+            f'[totk-log] ===== Launch 2026-11-26T00:00:{n:02}Z (pid {100 + n}) =====\n'
+            + self.START + self.marker('on', 1) + self.END for n in range(9))
+        heading = '[totk-log] ===== Launch 2026-11-26T00:00:09Z (pid 109) =====\n'
+        current = self.START + self.marker()
+        plain = self.document(current)
+        history = self.document(old + heading + current)
+        self.assertEqual(self.values(history), dict.fromkeys(benchlib.SWITCH_KEYS, 'off'))
+        self.assertEqual(history['runs'], plain['runs'])
+        self.assertEqual(benchlib.device_signature(history, 'thor')['sha256'],
+                         benchlib.device_signature(plain, 'thor')['sha256'])
+        self.assertEqual(self.compare(plain, history)[0], {'match'})
+
+    def test_current_history_without_marker_or_closed_bracket_stays_unknown(self):
+        old = ''.join(
+            f'[totk-log] ===== Launch 2026-11-26T00:00:{n:02}Z (pid {100 + n}) =====\n'
+            + self.START + self.marker('on', 1) + self.END for n in range(9))
+        heading = '[totk-log] ===== Launch 2026-11-26T00:00:09Z (pid 109) =====\n'
+        for current in ('', self.START, self.START + '[totk-switches] v=1 TOTK_WB_ALIAS=off'):
+            with self.subTest(current=current):
+                states = self.parse_states(old + heading + current)
+                self.assertEqual({value['state'] for value in states.values()}, {'UNKNOWN'})
+                doc = self.document(old + heading + current)
+                self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
+                self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+                self.assertIn('NOT COMPARABLE', self.compare(doc, doc)[1])
+
     def test_marker_after_startup_end_cannot_authenticate_current_launch(self):
         doc = self.document(self.START + self.END + self.marker())
         self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
@@ -859,6 +887,51 @@ class InSessionAB(unittest.TestCase):
         self.assertEqual(gens[1]['applied'], ['TOTK_VK_DESC_STOCK=1'])
         self.assertEqual([g['direction'] for g in gens], ['right', 'left', 'right', 'left', None])
 
+    def test_measures_only_the_latest_launch_in_an_android_history(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'totk.log'
+            path.write_text(
+                '[totk-log] ===== Launch old =====\n'
+                '[nvn-vk] frame 600: 60.0 fps over the last 300\n'
+                '[totk-ctl] gen=2 frame=600 mark ab arm=B block=2\n'
+                '[totk-log] ===== Launch current =====\n'
+                '[nvn-vk] frame 300: 27.0 fps over the last 300\n'
+                '[totk-ctl] gen=1 frame=300 mark ab arm=A block=1\n', encoding='utf-8')
+            _, _, fps, *_ = analyze.parse_log(path)
+            self.assertEqual(fps, {300: 27.0})
+            self.assertEqual([g['arm'] for g in analyze.parse_ctl(path)], ['A'])
+
+    def test_history_excludes_old_faults_provenance_and_compile_counts(self):
+        old = ('[totk] game version stale\n[totk-app] settings.env (menu): TOTK_FPS60=0\n'
+               'driver sha256=' + 'a' * 64 + '\n[vk] device lost\n' +
+               ab_log({300: (60, 99, 50, 9)}, []) +
+               '[nvn-vk] frame 300, stutter: 91 new pipelines took 1.2 ms; '
+               '92 compiled on worker threads in 3.4 ms; sync compiles 93 in 5.6 ms\n')
+        current = ('[totk] game version 1.4.3\n[totk-app] settings.env (menu): TOTK_FPS60=1\n'
+                   'driver sha256=' + 'b' * 64 + '\n' +
+                   ab_log({300: (30, 34, 10, 0)}, [
+                       (1, '[totk-ctl] gen=1 frame=1 mark ab arm=A block=1')]))
+        with tempfile.TemporaryDirectory() as d:
+            legacy, mixed = Path(d) / 'legacy.log', Path(d) / 'mixed.log'
+            legacy.write_text(current, encoding='utf-8')
+            mixed.write_text(''.join('[totk-log] ===== Launch old =====\n' + old for _ in range(9)) +
+                             '[totk-log] ===== Launch current =====\n' + current, encoding='utf-8')
+            expected = analyze.parse_log(legacy)
+            # The retained current heading adds exactly one line to positioned startup evidence.
+            # Keep full-output equality (including all states/metrics), adjusting only that real offset.
+            capture = expected[-1]['switch_capture']
+            for key in ('starts', 'presents'):
+                capture[key] = [number + 1 for number in capture[key]]
+            for records in capture['records'].values():
+                for record in records:
+                    record['line'] += 1
+            self.assertEqual(analyze.parse_log(mixed), expected)
+            self.assertEqual(analyze.parse_ctl(mixed), analyze.parse_ctl(legacy))
+            info = analyze.parse_log(mixed)[-1]
+            self.assertNotIn('device_lost', info)
+            self.assertEqual(info['game_version'], '1.4.3')
+            self.assertEqual(info['turnip'], 'b' * 64)
+
     def test_explicit_pan_direction(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / 'x.log'
@@ -1326,7 +1399,7 @@ class PanMeasurement(unittest.TestCase):
             self.assertEqual(calls.count('pan 16000 24\n'), 3)
             self.assertNotIn('sleep 24\n', calls)  # sleeps are inside one device command now
             pan_index = calls.index('pan 16000 24\n')
-            final_read = calls.index("grep -ao", pan_index)
+            final_read = calls.index("awk '", pan_index)
             final_gpu = calls.index('--boundary end', pan_index)
             self.assertLess(pan_index, final_read)
             self.assertLess(final_read, final_gpu)

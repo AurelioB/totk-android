@@ -402,6 +402,7 @@ enum { MFX_OFF,MFX_HALF,MFX_30,MFX_MAX };
 #define UNCAPPED_HZ 120
 typedef struct { int interval; } win_t;
 static int g_uncapped,g_paced_hz,g_hz=-1,g_display_mode;
+static int g_use_guest_ticks;
 static unsigned g_fps_auto_ticks;
 static int display_pace_on,present_slots_on=1,acquire_clock_on_flag,display_pace_ready=1;
 static pthread_mutex_t display_mu=PTHREAD_MUTEX_INITIALIZER;
@@ -543,8 +544,6 @@ class MainDefectReproductions(unittest.TestCase):
     def test_d_new_serial_control_can_allocate_after_failure(self):
         self.assertEqual(self.observed['retry-recreated'], {'available': 1, 'allocations': 2})
 
-    # E awaits a maintainer decision; this split does not change pacing.
-    @unittest.expectedFailure
     def test_e_default_shipping30_retains_guest60_units_on_120hz(self):
         self.assertEqual(self.observed['default']['slots'], 4)
         self.assertAlmostEqual(self.observed['default']['period_ns'], 1000000000 / 30, delta=4)

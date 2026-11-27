@@ -71,17 +71,22 @@ typedef struct {
     const char *path;
     log_mirror_emit emit;
     void *context;
+    off_t offset;             /* initial file offset, so only this launch reaches logcat */
     int fd, watch;            /* the log (read only) and the inotify descriptor (-1: 20 ms polling) */
     long tid;                 /* the thread that runs log_mirror_run (for /proc/self/task/<tid>/status) */
     unsigned long wakeups;    /* times the loop woke (event or poll); only that thread writes it */
     log_mirror lines;
 } log_mirror_tail;
-/* 0, or errno when the log cannot be opened. Reading starts at the beginning: lines written before the thread
-   started are mirrored too. */
+/* 0, or errno when the log cannot be opened or seeked to the initial offset. */
 static inline int log_mirror_open(log_mirror_tail *t) {
     memset(&t->lines, 0, sizeof t->lines); t->wakeups = 0; t->watch = -1;
     t->fd = open(t->path, O_RDONLY | O_CLOEXEC);
     if (t->fd < 0) return errno;
+    if (t->offset && lseek(t->fd, t->offset, SEEK_SET) < 0) {
+        int error = errno;
+        close(t->fd);
+        return error;
+    }
     int in = inotify_init1(IN_CLOEXEC);
     if (in >= 0 && inotify_add_watch(in, t->path, IN_MODIFY) < 0) { close(in); in = -1; }
     t->watch = in;

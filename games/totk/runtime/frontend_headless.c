@@ -25,14 +25,26 @@ static unsigned vsync_count;
 static int vi_ready;
 static int display_identity, layer_identity, native_window;   /* addresses only */
 
+#ifdef TOTK_ANDROID_APP
+static void android_boot_update(const char *stage, uint64_t done, uint64_t total);
+#endif
+
 static double since_boot(void) { return (runtime_now_ns() - boot_start_ns) / 1e9; }
 void runtime_boot_progress(const char *stage, uint64_t done, uint64_t total) {
+#ifdef TOTK_ANDROID_APP
+    android_boot_update(stage, done, total);
+#endif
     static uint64_t last; uint64_t now = runtime_now_ns();
     if (done != total && now - last < 1000000000ull) return;   /* at most once a second, and the last step */
     last = now; fprintf(stderr, "[totk-boot] %.3f %s %llu/%llu\n", since_boot(), stage, (unsigned long long)done, (unsigned long long)total);
 }
 void runtime_boot_count(const char *stage, uint64_t done, uint64_t total) { runtime_boot_progress(stage, done, total); }
-void runtime_boot_status(const char *stage, const char *detail) { fprintf(stderr, "[totk-boot] %.3f %s: %s\n", since_boot(), stage, detail ? detail : ""); }
+void runtime_boot_status(const char *stage, const char *detail) {
+#ifdef TOTK_ANDROID_APP
+    android_boot_update(stage, 0, 0);
+#endif
+    fprintf(stderr, "[totk-boot] %.3f %s: %s\n", since_boot(), stage, detail ? detail : "");
+}
 void runtime_warm_progress(uint64_t done, uint64_t total, uint64_t shaders, uint64_t shader_total, uint64_t pipelines, uint64_t pipeline_total) {
     (void)shaders; (void)shader_total; (void)pipelines; (void)pipeline_total; runtime_boot_progress("shader warm-up", done, total);
 }

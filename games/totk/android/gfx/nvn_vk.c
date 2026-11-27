@@ -703,6 +703,8 @@ static void vk_init_once(void) {
     VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &drvp};
     vkGetPhysicalDeviceProperties2(V.pd, &p2);
     V.props = p2.properties;
+    LOGV("subgroup capabilities: supportedStages=0x%x, supportedOperations=0x%x",
+        V.subgroup.supportedStages, V.subgroup.supportedOperations);
     if (V.props.apiVersion < VK_API_VERSION_1_3) DIE("%s offers Vulkan %u.%u; 1.3 is needed", V.props.deviceName, VK_API_VERSION_MAJOR(V.props.apiVersion), VK_API_VERSION_MINOR(V.props.apiVersion));
     LOGV("device %s, driver %s %s (%s%s%s)", V.props.deviceName, drvp.driverName, drvp.driverInfo, kind, drv ? " " : "", drv ? drv : "");
     vkGetPhysicalDeviceMemoryProperties(V.pd, &V.mp);

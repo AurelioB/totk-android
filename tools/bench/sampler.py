@@ -49,7 +49,10 @@ done
 online() { [ -z "$1" ] || cat $1 2>/dev/null </dev/null | sort -n | tail -n1; }
 PSI() { sed -n "s/^$1 avg10=\([0-9.]*\).*/\1/p" $2 2>/dev/null </dev/null; }
 while true; do
-  f=$(tail -c 30000 $L 2>/dev/null | grep -ao '至帧 [0-9]*' | tail -n1 | grep -o '[0-9]*')
+  f=$(tail -c 30000 $L 2>/dev/null | awk '
+    /^\[totk-log\] ===== Launch / { frame="" }
+    match($0, /至帧 [0-9]+/) { frame=substr($0, RSTART, RLENGTH); sub(/^.* /, "", frame) }
+    END { print frame }')
   # </dev/null: with an empty zone list `cat` would otherwise read this script's stdin and block.
   ct=$(cat $CZ 2>/dev/null </dev/null | sort -n | tail -n1); gt=$(cat $GZ 2>/dev/null </dev/null | sort -n | tail -n1)
   cs=""; [ -z "$CD" ] || { cs=0; for s in $(cat $CD 2>/dev/null </dev/null); do cs=$((cs+s)); done; }

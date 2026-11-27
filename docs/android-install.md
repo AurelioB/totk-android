@@ -96,6 +96,14 @@ directly next time*; long-press the app icon and choose *Settings* to reach the 
 **−** and then **R** quickly to cycle the performance overlay (off → FPS → full) for that session. An install without a
 usable shader seed (an earlier version's *Play now* could skip it, or its files were removed) shows *Shaders not built*
 and offers *Build shaders* in place of *Start game*; the game is not started without the seed.
+During launch, the game shows the current startup stage and the percentage of any data verification
+in progress. The indicator clears after the first real frame's compositor handoff; this is not
+a measurement of physical scanout.
+
+Android can reuse a verified RomFS overlay at the next launch if the manifest, replacement-file
+identity/stat metadata, base-part proofs and index digest still match. This cached proof is not
+a fresh content hash at each launch and depends on the filesystem reporting identity changes.
+Set `TOTK_ROMFS_VERIFY=full` in `totk.env` to rehash the image and overlays.
 
 ## Versions and updates
 

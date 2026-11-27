@@ -1,12 +1,30 @@
 """Shared helpers of the benchmark tools: repository paths, the baseline write guard and store (per frequency signature),
 frequency limits and signatures, and the comparison metrics."""
 import datetime, hashlib, json, math, re, sys
+from io import TextIOWrapper
 from pathlib import Path
 
 SCHEMA = 'totk-android-benchmark/1'
 INDEX_SCHEMA = 'totk-android-baselines/1'
 REPO = Path(__file__).resolve().parents[2]
 BENCH_DOCS = REPO / 'docs/benchmarks'
+
+LOG_LAUNCH = b'[totk-log] ===== Launch '
+
+def open_current_log(path):
+    """Open the latest launch in an Android history, or a legacy single-run log."""
+    log = open(path, 'rb')
+    try:
+        start, offset = 0, 0
+        for line in log:
+            if line.startswith(LOG_LAUNCH):
+                start = offset
+            offset += len(line)
+        log.seek(start)
+        return TextIOWrapper(log, encoding='utf-8', errors='replace')
+    except BaseException:
+        log.close()
+        raise
 
 
 # ---- baselines: immutable files, one per frequency signature -------------------------------------------------------

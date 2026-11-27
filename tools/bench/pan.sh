@@ -81,7 +81,10 @@ if [ -z "$EV" ] || [ -z "$DISP" ]; then
 fi
 input() { "$HERE/bench_input.sh" -s "$SER" --event "$EV" --display "$DISP" "$@"; }
 lastf() {
-  python3 "$HERE/rootsh.py" -s "$SER" run -c "grep -ao '至帧 [0-9]*' $LOG | tail -n1" | tr -d '\r' | grep -o '[0-9][0-9]*'
+  python3 "$HERE/rootsh.py" -s "$SER" run -c "awk '
+    /^\[totk-log\] ===== Launch / { frame=\"\" }
+    match(\$0, /至帧 [0-9]+/) { frame=substr(\$0, RSTART, RLENGTH) }
+    END { print frame }' $LOG" | tr -d '\r' | grep -o '[0-9][0-9]*'
 }
 gpu_snapshot() {
   python3 "$HERE/sampler.py" -s "$SER" --device "$DEV" --out "$OUT" \

@@ -35,6 +35,7 @@ static void JNICALL native_present_transform_hint(JNIEnv *env, jclass cls, jlong
     runtime_android_present_transform_hint((uint64_t)epoch,hint);
 }
 void runtime_android_text_done(JNIEnv *env, jclass cls, jlong serial, jbyteArray utf8);   /* frontend_android.c: swkbd */
+jstring runtime_android_boot_progress(JNIEnv *env, jclass cls, jlongArray counts);
 void runtime_android_game_focus(JNIEnv *env, jclass cls, jboolean focused, jboolean single_display);
 void runtime_android_game_input_focus(JNIEnv *env, jclass cls, jboolean top);
 /* feedback_android.c: the game's rumble and six-axis sensor */
@@ -211,6 +212,7 @@ __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserve
         static const JNINativeMethod present_methods[] = {
             {"nativePresentTransformHint", "(JI)V", (void *)native_present_transform_hint},
             {"nativeTextInputDone", "(J[B)V", (void *)runtime_android_text_done},
+            {"nativeBootProgress", "([J)Ljava/lang/String;", (void *)runtime_android_boot_progress},
             {"nativeGameFocus", "(ZZ)V", (void *)runtime_android_game_focus},
             {"nativeGameInputFocus", "(Z)V", (void *)runtime_android_game_input_focus},
             {"nativeMotion", "(FFFFFF)V", (void *)runtime_android_motion},
