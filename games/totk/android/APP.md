@@ -1492,7 +1492,20 @@ runtime or tracker locks. Lag/classification scheduling, budget freshness and de
 With quiet pool lifetimes below 40%, expect about one warning traversal per minute after startup/holds.
 At roughly 45% (the Thor standing case), the conservative medium band instead means about three per
 minute; near 60% it is about twelve. Activity and jumps can increase these counts.
-One `[map-warn] started mode=1 period_ms=5000 log=80 notice=88 clear=84; warning only, does not prevent map-limit abort`
+A recent count is not sufficient: the warning compares the sample's **pre-traversal** pool epoch
+with the live epoch at every evaluation, independently of the five-second activity probe.
+Accepted dirty-range registration (including reuse of a dead tracker slot) and removal advance
+this epoch even while standing; a balanced destroy/create can leave live-pool totals unchanged.
+Thus `activity=0` means no probe event in this worker iteration, not no pool change. A change
+during a lag traversal can require a warning traversal even in that same iteration. This conservative
+invalidation is intentional; ordinary page writes/protection generations do not invalidate the count.
+With no completed worker sample (including before the first scheduled lag scan), a sample older
+than five seconds, or a clock earlier than its completion, the warning also scans. The synchronous
+lag startup/budget refresh does not populate this worker-owned cache. A completed zero/unreadable
+count is unknown, not a separate invalid-sample flag: it can still be reused when age and epoch match.
+Jump/reserve/notice holds, activity hints and forced-band/mode-3 controls can advance evaluation or
+select its cadence, but do not independently reject an age- and epoch-current sample.
+One `[map-warn] started mode=1 period_ms=5000 log=80 notice=88 clear=84; warning only, does not prevent the system from closing the game at the map limit`
 line records the ordinary default startup.
 Here startup `period_ms=5000` is the initial evaluation/freshness/probe period, not the standing
 adaptive cadence; diagnostic `cadence_ms` records the interval currently selected.
@@ -1578,7 +1591,8 @@ lag/classification work, not the warning's adaptive deadline.
 `[map-warn-scan]` line per completed worker traversal or reuse-only warning evaluation, written only by
 `totk-vmascan`: `start_ns`, `duration_us`, `rows`, `frame_origin_ns`, `warn`, `notice`, `test_phase`,
 `log`, `show`, `clear`, `scanned`, `warning_scans`, `warning_reuses`, `cadence_ms`, `jump_rows`,
-`activity`, `activity_events`, `forced_band`.
+`activity`, `activity_events`, `forced_band`, `lag_scan`, `reason`, `cached_epoch`, `check_epoch`,
+`probe_epoch`, `sample_age_ns`.
 `start_ns` is absolute `CLOCK_MONOTONIC` nanoseconds, the same clock as ordinary native frame
 reports; `frame_origin_ns` is their existing process origin (`g_t0_ns`). Convert to ordinary elapsed
 seconds with `(start_ns - frame_origin_ns) / 1e9`. Zero origin means unavailable in a graphics-only
@@ -1591,6 +1605,18 @@ using a fresh completed sample instead, including a lag scan completed in the sa
 `cadence_ms` is the currently selected next interval (60,000 / 20,000 / 5,000); `jump_rows` is the
 new-sample increase when over 2,048, otherwise zero. `activity=1` identifies a coalesced pool-epoch
 probe event, with cumulative `activity_events`; it is not a decoded area-arrival count.
+`reason` records the exact cache decision: `lag` means no warning evaluation, `reuse` means all
+reuse checks passed, and `no_sample`, `clock`, `stale`, `epoch` identify the first failed check,
+in that order. `lag_scan=1` marks a lag/classification traversal in this iteration; if `reason=epoch`
+also advances `warning_scans`, two traversals occurred (the existing scan statistics count worker
+iterations, not this rare second traversal). `cached_epoch` belongs to the sample considered for
+reuse, **before** any replacement warning traversal (after lag traversal if present).
+`check_epoch` is the exact live epoch read by the reuse predicate, not a later logging-time read;
+it is zero/not checked for `lag`, `no_sample`, `clock`, `stale`. `probe_epoch` is the last epoch
+seen by the separate activity probe. `sample_age_ns` is the considered sample's age at evaluation,
+or `18446744073709551615` when no sample exists, time is reversed, or no warning was evaluated.
+An epoch can change after the comparison and before/while the replacement scan completes; the
+next evaluation checks again. These fields add no producer work or extra epoch reads.
 
 With lag/classification off and no activity, this is one line per adaptive warning scan.
 Existing independently requested lag/classification scans also get a line; their unchanged minimum

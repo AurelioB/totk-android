@@ -142,6 +142,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   at limit 17,647/count 500; keep the documented unreadable-limit 65,530 fallback and its uncertainty.
   No new game/render/fault-path work is added. Mode `2` logs cadence, activity, jump and requested/reused
   scan counts; TEST-ONLY forced-band controls support safe checks. Mode `3` retains its five-second test.
+  Attribute each diagnostic cache decision with its reason, cached/check/probe epochs and sample age;
+  mark same-iteration lag scans. Fresh counts remain intentionally invalidated by a later pool-lifetime
+  change even before the next activity probe (`activity=0` is not proof of validity). Cover both that
+  case and an epoch change during a lag traversal on the host without changing sampling policy.
+  Reword the startup warning without the health-scanner trigger word: it does not prevent the system
+  from closing the game at the map limit.
   This reduces warning overhead, **not mapping growth**. The warning remains **best-effort**: a jump is
   only detected when sampled, hints miss pool reuse/driver growth, 15,000 rows is not an upper bound,
   and repeated loads can cross 88% inside a nominal 60/20/5 s unsampled interval plus scan/scheduling delay.

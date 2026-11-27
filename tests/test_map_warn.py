@@ -21,7 +21,11 @@ PROBE = r'''
 #include <time.h>
 /* Deterministic elapsed time for production worker-poll tests; procfs traversals stay real. */
 static uint64_t poll_now;
+static _Atomic uint64_t *poll_epoch;
+static unsigned poll_epoch_countdown;
 static int poll_clock_gettime(clockid_t clock, struct timespec *now) {
+    if (poll_epoch_countdown && !--poll_epoch_countdown)
+        atomic_fetch_add_explicit(poll_epoch,1,memory_order_release);
     if (poll_now && clock==CLOCK_MONOTONIC) {
         now->tv_sec=poll_now/1000000000; now->tv_nsec=poll_now%1000000000; return 0;
     }
@@ -259,6 +263,17 @@ int main(int argc,char **argv) {
         assert(sample.activity_events==2 && g_vma_scan_stats[0]==3);
         puts("activity coalesced fresh-invalidated lag-reused no-producer-work PASS"); return 0;
     }
+    if (!strcmp(argv[1],"epoch-during-lag")) {
+        map_warn_configure();
+        vma_worker_sample sample={.observed_epoch=nvn_dirty_lag_epoch()};
+        poll_now=1000000000;
+        poll_epoch=&g_range_epoch; poll_epoch_countdown=2; /* after lag's epoch capture, at completion */
+        vma_worker_poll(&sample,1,0,1);
+        assert(!poll_epoch_countdown && g_vma_test_reads==4);
+        assert(sample.warning_scans==1 && !sample.warning_reuses && !sample.activity_events);
+        assert(sample.sample_epoch==nvn_dirty_lag_epoch());
+        puts("epoch changed during lag traversal: warning refresh, activity=0 PASS"); return 0;
+    }
     if (!strncmp(argv[1],"reuse-",6)) {
         map_warn_configure();
         assert(g_map_warn_mode==2 && !atomic_load(&created));
@@ -299,6 +314,35 @@ int main(int argc,char **argv) {
             poll_now++;
             vma_worker_poll(&sample,0,0,1); warnings++;
             assert(sample.warning_scans==1 && sample.warning_reuses==2 && !nvn_dirty_map_warn_notice());
+        } else if (!strcmp(argv[1],"reuse-unprobed-epoch")) {
+            poll_now=second;
+            sample.observed_epoch=nvn_dirty_lag_epoch();
+            vma_worker_poll(&sample,1,0,0); scans++;
+            poll_now+=872995270; /* Odin's observed fresh-age case, before the next activity probe */
+            atomic_fetch_add_explicit(&g_range_epoch,1,memory_order_release);
+            vma_worker_poll(&sample,0,0,1); scans++; warnings++;
+            assert(sample.warning_scans==1 && !sample.warning_reuses && !sample.activity_events);
+            poll_now+=920916718;
+            assert(vma_worker_activity(&sample,poll_now));
+            vma_worker_poll(&sample,1,0,0); scans++;
+            vma_worker_poll(&sample,0,0,1); warnings++;
+            assert(sample.warning_scans==1 && sample.warning_reuses==1 && sample.activity_events==1);
+        } else if (!strcmp(argv[1],"reuse-clock")) {
+            poll_now=second;
+            vma_worker_poll(&sample,1,0,0); scans++;
+            poll_now--;
+            vma_worker_poll(&sample,0,0,1); scans++; warnings++;
+            assert(sample.warning_scans==1 && !sample.warning_reuses);
+        } else if (!strcmp(argv[1],"reuse-holds")) {
+            poll_now=second;
+            vma_worker_poll(&sample,1,0,0); scans++;
+            atomic_store(&g_map_warn_notice,1);
+            sample.cadence.reserve_fast=1;
+            nvn_map_warn_cadence_boost(&sample.cadence,poll_now);
+            sample.activity_pending=1; /* hints/holds alone do not reject an epoch-current sample */
+            poll_now+=second;
+            vma_worker_poll(&sample,0,0,1); warnings++;
+            assert(!sample.warning_scans && sample.warning_reuses==1);
         } else return 2;
         assert(g_vma_test_reads==2*scans && g_vma_scan_stats[0]==scans);
         assert(g_map_warn_thresholds.log_percent==80 && g_map_warn_thresholds.notice_percent==88 &&
@@ -477,7 +521,9 @@ class MapWarning(unittest.TestCase):
             self.assertEqual(result.stdout.strip(), '1 1 80 88 84 0')
             self.assertEqual(result.stderr.count('[map-warn] started mode=1 '), 1)
             self.assertIn('period_ms=5000 log=80 notice=88 clear=84', result.stderr)
-            self.assertIn('does not prevent map-limit abort', result.stderr)
+            self.assertIn('warning only, does not prevent the system from closing the game at the map limit',
+                          result.stderr)
+            self.assertNotIn('abort', result.stderr)
             self.assertNotIn('[map-warn-scan]', result.stderr)
 
     def test_loading_and_frame_origin_do_not_start_sampling(self):
@@ -579,6 +625,38 @@ class MapWarning(unittest.TestCase):
         self.assertIn('reuse scans=2 reads=4 warnings=3 warning_scans=1 warning_reuses=2',
                       result.stdout)
         self.assertEqual(result.stderr.count('maps count unavailable'), 1)
+        reasons = re.findall(r' reason=(\S+)', result.stderr)
+        self.assertEqual(reasons, ['lag', 'reuse', 'stale', 'reuse'])
+
+    def test_epoch_change_between_probes_rejects_a_recent_sample_without_activity(self):
+        result = self.run_probe('reuse-unprobed-epoch', TOTK_MAP_WARN='2',
+                                TOTK_MAP_WARN_TEST_BAND='fast')
+        records = [dict(re.findall(r'([a-z_]+)=(\S+)', line))
+                   for line in result.stderr.splitlines() if '[map-warn-scan]' in line]
+        self.assertEqual([r['reason'] for r in records], ['lag', 'epoch', 'lag', 'reuse'])
+        rejected = records[1]
+        self.assertEqual(rejected['sample_age_ns'], '872995270')
+        self.assertEqual(rejected['activity'], '0')
+        self.assertEqual(rejected['cached_epoch'], rejected['probe_epoch'])
+        self.assertNotEqual(rejected['cached_epoch'], rejected['check_epoch'])
+        self.assertEqual(records[-1]['cached_epoch'], records[-1]['check_epoch'])
+
+    def test_epoch_change_during_lag_traversal_requires_a_second_traversal(self):
+        result = self.run_probe('epoch-during-lag', TOTK_MAP_WARN='2')
+        self.assertIn('warning refresh, activity=0 PASS', result.stdout)
+        record = dict(re.findall(r'([a-z_]+)=(\S+)', next(
+            line for line in result.stderr.splitlines() if '[map-warn-scan]' in line)))
+        self.assertEqual(record['reason'], 'epoch')
+        self.assertEqual(record['lag_scan'], '1')
+        self.assertEqual(record['sample_age_ns'], '0')
+        self.assertNotEqual(record['cached_epoch'], record['check_epoch'])
+        self.assertEqual(record['activity'], '0')
+
+    def test_clock_guard_is_attributed_and_holds_do_not_invalidate_reuse(self):
+        result = self.run_probe('reuse-clock', TOTK_MAP_WARN='2')
+        self.assertEqual(re.findall(r' reason=(\S+)', result.stderr), ['lag', 'clock'])
+        result = self.run_probe('reuse-holds', TOTK_MAP_WARN='2', TOTK_MAP_WARN_TEST_BAND='fast')
+        self.assertEqual(re.findall(r' reason=(\S+)', result.stderr), ['lag', 'reuse'])
 
     def test_back_to_back_hint_free_loads_can_leave_warning_late_in_each_band(self):
         for band, seconds in (('slow', 60), ('medium', 20), ('fast', 5)):
@@ -654,6 +732,12 @@ class MapWarning(unittest.TestCase):
         self.assertEqual(fields['activity'], '0')
         self.assertEqual(fields['activity_events'], '0')
         self.assertEqual(fields['forced_band'], '0')
+        self.assertEqual(fields['lag_scan'], '0')
+        self.assertEqual(fields['cached_epoch'], '0')
+        self.assertEqual(fields['check_epoch'], '0')
+        self.assertEqual(fields['probe_epoch'], '0')
+        self.assertEqual(fields['sample_age_ns'], str(2**64 - 1))
+        self.assertIn(' reason=no_sample ', lines[0])
         dirty = (NVN / 'nvn_dirty.c').read_text()
         worker = dirty.split('static void vma_worker_poll(', 1)[1].split('static void *vma_worker(', 1)[0]
         self.assertEqual(dirty.count('LOG("[map-warn-scan]'), 1)

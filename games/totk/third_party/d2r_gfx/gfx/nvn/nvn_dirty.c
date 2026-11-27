@@ -667,13 +667,20 @@ static void vma_worker_poll(vma_worker_sample *sample, int lag_scan, unsigned re
         sample->maximum = atomic_load(&g_vma_max);
         sample->completed_ns = vma_clock_ns();
     }
+    uint64_t cached_epoch = sample->sample_epoch, check_epoch = 0, sample_age_ns = UINT64_MAX;
+    const char *reason = "lag";
     if (warn_due) {
         uint64_t now = vma_clock_ns();
+        if (sample->completed_ns && now >= sample->completed_ns)
+            sample_age_ns = now - sample->completed_ns;
         if (sample->completed_ns && now >= sample->completed_ns &&
             now - sample->completed_ns <= (uint64_t)MAP_WARN_PERIOD_MS * 1000000 &&
-            sample->sample_epoch == nvn_dirty_lag_epoch()) {
+            sample->sample_epoch == (check_epoch = nvn_dirty_lag_epoch())) {
+            reason = "reuse";
             sample->warning_reuses++;
         } else {
+            reason = !sample->completed_ns ? "no_sample" : now < sample->completed_ns ? "clock" :
+                     sample_age_ns > (uint64_t)MAP_WARN_PERIOD_MS * 1000000 ? "stale" : "epoch";
             /* No g_vma_mu, g_slot_mu, pool or runtime locks in warning-only sampling. */
             sample->warning_scans++;
             scanned = 1; start = now;
@@ -702,14 +709,16 @@ static void vma_worker_poll(vma_worker_sample *sample, int lag_scan, unsigned re
         unsigned phase = g_map_warn_mode == 3 ?
             (g_map_warn_test_samples + NVN_MAP_WARN_TEST_PHASE_SAMPLES - 1) / NVN_MAP_WARN_TEST_PHASE_SAMPLES : 0;
         uint64_t scan_elapsed = scanned ? sample->completed_ns - start : 0;
-        LOG("[map-warn-scan] start_ns=%llu duration_us=%llu rows=%llu frame_origin_ns=%llu warn=%d notice=%d test_phase=%u log=%u show=%u clear=%u scanned=%d warning_scans=%llu warning_reuses=%llu cadence_ms=%u jump_rows=%llu activity=%d activity_events=%llu forced_band=%u",
+        LOG("[map-warn-scan] start_ns=%llu duration_us=%llu rows=%llu frame_origin_ns=%llu warn=%d notice=%d test_phase=%u log=%u show=%u clear=%u scanned=%d warning_scans=%llu warning_reuses=%llu cadence_ms=%u jump_rows=%llu activity=%d activity_events=%llu forced_band=%u lag_scan=%d reason=%s cached_epoch=%llu check_epoch=%llu probe_epoch=%llu sample_age_ns=%llu",
             (unsigned long long)start, (unsigned long long)(scan_elapsed / 1000),
             (unsigned long long)sample->maps, (unsigned long long)atomic_load_explicit(&g_map_warn_frame_origin, memory_order_relaxed),
             warn_due, nvn_dirty_map_warn_notice(), phase, g_map_warn_thresholds.log_percent,
             g_map_warn_thresholds.notice_percent, g_map_warn_thresholds.clear_percent, scanned,
             (unsigned long long)sample->warning_scans, (unsigned long long)sample->warning_reuses,
             vma_warn_period(sample, vma_clock_ns()), (unsigned long long)jump_rows,
-            sample->activity_pending, (unsigned long long)sample->activity_events, g_map_warn_test_band);
+            sample->activity_pending, (unsigned long long)sample->activity_events, g_map_warn_test_band,
+            lag_scan, reason, (unsigned long long)cached_epoch, (unsigned long long)check_epoch,
+            (unsigned long long)sample->observed_epoch, (unsigned long long)sample_age_ns);
     }
     sample->activity_pending = 0;
     if (scanned) {
@@ -790,7 +799,7 @@ static void vma_start(void) {
     pthread_attr_destroy(&attr);
     if (result) die("VMA sampler thread: %d", result);
     if (g_map_warn_enabled)
-        LOG("[map-warn] started mode=%u period_ms=%u log=%u notice=%u clear=%u; warning only, does not prevent map-limit abort",
+        LOG("[map-warn] started mode=%u period_ms=%u log=%u notice=%u clear=%u; warning only, does not prevent the system from closing the game at the map limit",
             g_map_warn_mode, (unsigned)MAP_WARN_PERIOD_MS, startup_thresholds.log_percent,
             startup_thresholds.notice_percent, startup_thresholds.clear_percent);
 }
