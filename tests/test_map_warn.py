@@ -132,6 +132,42 @@ int main(int argc,char **argv) {
     if (!strcmp(argv[1],"policy")) { policy(); panel(); return 0; }
     if (!strcmp(argv[1],"marker")) { vk_overlay_mode(); vk_overlay_mode(); return 0; }
     if (!strcmp(argv[1],"cadence-policy")) { cadence_policy(); return 0; }
+    if (!strcmp(argv[1],"cadence-exhausted")) {
+        const struct { uint64_t limit, count; unsigned period; } limits[] = {
+            {17045,1,5000},{17046,1,5000},{17646,500,5000},
+            {17647,500,5000},{17648,500,5000},{17649,500,60000}
+        };
+        uint64_t now=1000000000;
+        assert(nvn_map_warn_boundary(17045,88)==15000 && nvn_map_warn_boundary(17046,88)==15001);
+        assert(nvn_map_warn_boundary(17647,88)-15000==nvn_map_warn_boundary(17647,3));
+        assert(nvn_map_warn_boundary(17648,88)-15000==nvn_map_warn_boundary(17648,3)+1);
+        assert(nvn_map_warn_boundary(17649,88)-15000==nvn_map_warn_boundary(17649,3)+2);
+        for (unsigned i=0;i<sizeof limits/sizeof *limits;i++) {
+            nvn_map_warn_cadence s={0}; /* exhaustion must be fast without prior guard activation */
+            nvn_map_warn_cadence_sample(&s,limits[i].count,limits[i].limit,now);
+            assert(nvn_map_warn_cadence_period(&s,now)==limits[i].period && !s.fast_until_ns);
+        }
+        const struct { uint64_t count; unsigned period; } normal[] = {
+            {26211,60000},{26212,20000},{26211,20000},{24247,20000},
+            {24246,60000},{39318,5000},{36042,5000},{36041,20000}
+        };
+        nvn_map_warn_cadence s={0};
+        for (unsigned i=0;i<sizeof normal/sizeof *normal;i++) {
+            nvn_map_warn_cadence_sample(&s,normal[i].count,65530,now);
+            assert(!s.reserve_fast && nvn_map_warn_cadence_period(&s,now+11000000000ull)==normal[i].period);
+            now+=20000000000ull;
+        }
+        s=(nvn_map_warn_cadence){0};
+        nvn_map_warn_cadence_sample(&s,500,0,now);
+        assert(!s.known && nvn_map_warn_cadence_period(&s,now)==5000);
+        map_warn_configure();
+        g_map_warn_test_sample.set=1;
+        g_map_warn_test_sample.maps=500; g_map_warn_test_sample.maximum=0;
+        vma_worker_sample sample={0}; poll_now=now;
+        vma_worker_poll(&sample,0,0,1); /* documented production path substitutes 65530 */
+        assert(sample.maximum==0 && sample.cadence.known && vma_warn_period(&sample,now)==60000);
+        puts("exhausted fresh guard FAST; zero-helper FAST; fallback 60000; normal bands PASS"); return 0;
+    }
     if (!strcmp(argv[1],"cadence-guard")) {
         nvn_map_warn_cadence s={0};
         uint64_t now=1000000000;
@@ -565,6 +601,11 @@ class MapWarning(unittest.TestCase):
     def test_smaller_limit_headroom_guard_has_separate_hysteresis(self):
         result = self.run_probe('cadence-guard')
         self.assertIn('guard actual-limit hysteresis no-flapping PASS', result.stdout)
+
+    def test_exhausted_entry_and_release_boundaries_start_fast_without_history(self):
+        result = self.run_probe('cadence-exhausted', TOTK_MAP_WARN='2')
+        self.assertIn('exhausted fresh guard FAST; zero-helper FAST; fallback 60000; normal bands PASS',
+                      result.stdout)
 
     def test_pool_activity_invalidates_older_samples_and_reuses_new_lag_sample(self):
         result = self.run_probe('cadence-activity', TOTK_MAP_WARN='2')

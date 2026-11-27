@@ -54,7 +54,7 @@ static inline uint64_t nvn_map_warn_cadence_sample(nvn_map_warn_cadence *s, uint
         uint64_t enter = notice - NVN_MAP_WARN_LOAD_RESERVE_ROWS;
         uint64_t margin = nvn_map_warn_boundary(limit, 3);
         uint64_t clear = enter > margin ? enter - margin : 0;
-        if (count >= enter) s->reserve_fast = 1;
+        if (clear <= 1 || count >= enter) s->reserve_fast = 1; /* zero is unknown, not a valid release count */
         else if (count < clear) s->reserve_fast = 0;
     }
     if (s->reserve_fast) s->band = 2;

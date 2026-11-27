@@ -1474,9 +1474,12 @@ limits. This is the largest load increase observed, **not** an upper bound on fu
 The guard has its own hysteresis: once active, release requires a count strictly below its entry
 boundary minus `ceil(3% of the current limit)`, then ordinary band hysteresis still applies.
 At limit 32,768 it enters at 13,836 rows and holds across 13,835/13,836 oscillation, releasing
-below 12,852. Limits whose reserve/release boundary is exhausted remain conservatively fast.
-The caller uses each completed scan's observed limit, or the existing fallback if it is unreadable;
-no extra startup read or producer-path work is added.
+below 12,852. If entry is nonpositive, or the strict release has no valid positive count (release
+boundary <=1), select fast **even from a fresh inactive guard**, not only after prior activation.
+Thus limit 17,647/count 500 is always fast; the ordinary 65,530 bands are unchanged.
+The helper selects fast for an unknown/zero limit. Production preserves its existing unreadable-limit
+fallback of 65,530, so a readable low count can still select slow against that assumption; it is not
+proof of the real limit. No extra startup read or producer-path work is added.
 Unknown counts and an active notice use 5 s. A newly sampled increase **over 2,048 rows** holds 5 s
 for at least 10 s; reused samples do not renew that hold.
 

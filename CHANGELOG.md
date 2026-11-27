@@ -138,6 +138,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   probes of the existing pool-lifetime epoch. Reuse fresh samples unless a later pool change invalidated them.
   Give the smaller-limit headroom guard separate hysteresis (release strictly below entry minus 3%
   of the current sampled limit), avoiding 20/5 s toggling at 13,835/13,836 rows on a 32,768 limit.
+  Select fast unconditionally for exhausted entry/release headroom, including a fresh inactive guard
+  at limit 17,647/count 500; keep the documented unreadable-limit 65,530 fallback and its uncertainty.
   No new game/render/fault-path work is added. Mode `2` logs cadence, activity, jump and requested/reused
   scan counts; TEST-ONLY forced-band controls support safe checks. Mode `3` retains its five-second test.
   This reduces warning overhead, **not mapping growth**. The warning remains **best-effort**: a jump is
