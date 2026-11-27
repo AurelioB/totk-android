@@ -36,7 +36,8 @@ static void reset(void){
     unsetenv("TOTK_FPS60_HARDENING");unsetenv("TOTK_FPS60_FADE_CLAMP");
 }
 static void unchanged(void){
-    memcpy(before,module.base,ALLOCATION);patch_menu_capture(&module);
+    memcpy(before,module.base,ALLOCATION);int outcome=patch_menu_capture(&module);
+    assert(runtime_menu_capture_state()==(outcome<0?-1:outcome));
     assert(!memcmp(before,module.base,ALLOCATION));
 }
 static uint32_t word(uint64_t off){uint32_t w;memcpy(&w,module.base+off,4);return w;}
@@ -45,7 +46,8 @@ static uint64_t branch_target(uint64_t off){
     int32_t delta=(int32_t)(w<<6)>>4;return off+delta;
 }
 static void applied(void){
-    memcpy(before,module.base,ALLOCATION);patch_menu_capture(&module);
+    memcpy(before,module.base,ALLOCATION);assert(patch_menu_capture(&module)==1);
+    assert(runtime_menu_capture_state()==1);
     assert(branch_target(SITE)==stub());
     assert(branch_target(stub()+8)==tail());
     assert(branch_target(tail()+4)==SITE+4);
@@ -60,13 +62,15 @@ static void applied(void){
 int main(int argc,char **argv){
     module=(Module){.name="main",.base=aligned_alloc(0x4000,ALLOCATION)};
     before=malloc(ALLOCATION);assert(module.base&&before);
-    if(argc==2&&!strcmp(argv[1],"unsupported")){
+    if(argc==2&&(!strcmp(argv[1],"unsupported")||!strcmp(argv[1],"host-default"))){
         const char *values[]={NULL,"0","1"};
-        for(unsigned i=0;i<sizeof values/sizeof *values;i++){
+        unsigned count=!strcmp(argv[1],"host-default")?1:sizeof values/sizeof *values;
+        for(unsigned i=0;i<count;i++){
             reset();
             if(values[i])setenv("TOTK_MENU_CAPTURE_FIX",values[i],1);
             memcpy(before,module.base,ALLOCATION);
             assert(patch_menu_capture(&module)==0);
+            assert(runtime_menu_capture_state()==0);
             assert(!memcmp(before,module.base,ALLOCATION));
         }
         free(before);free(module.base);

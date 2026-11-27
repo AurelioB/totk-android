@@ -283,27 +283,34 @@ aborts publication without replacing the previous batch. There is no totk.env wr
 when writing one manually, apply the same game-directory owner/mode/context procedure to `"$GAME/totk.env"`,
 not a generic `app_data_file:s0` label that discards its categories.
 
-Historical comparisons must explicitly pin **`TOTK_WB_ALIAS=0`** and **`TOTK_MAP_WARN=0`** on separate `totk.env` lines and restart;
-an unset variable can select a different workload in a newer build. Keep the raw complete launch log.
-The once-only `[totk-switches] v=1 TOTK_WB_ALIAS=on|off TOTK_MAP_WARN=on|off map_warn_mode=N` line
-records the frozen effective states, including opt-outs, independently of menu settings. Analyzer metadata
-and signatures include those states (and warning mode); mismatches are **NOT COMPARABLE**.
+Historical comparisons must explicitly pin **`TOTK_WB_ALIAS=0`**, **`TOTK_MAP_WARN=0`** and
+**`TOTK_MENU_CAPTURE_FIX=0`** on separate `totk.env` lines and restart; an unset variable can select a
+different workload in a newer build. Keep the raw complete launch log.
+The once-only `[totk-switches] v=2 TOTK_WB_ALIAS=on|off TOTK_MAP_WARN=on|off map_warn_mode=N TOTK_MENU_CAPTURE_FIX=on|off|UNKNOWN`
+line records frozen effective states, including opt-outs, independently of menu settings. Menu state comes
+from the actual startup install outcome, not its requested environment: applied is ON, inactive is OFF,
+and guard/padding refusal or an unavailable outcome is UNKNOWN. Legacy versions without the installer are OFF.
+Analyzer metadata and signatures include all three states (and warning mode); mismatches are **NOT COMPARABLE**.
 `UNKNOWN` never matches, even another `UNKNOWN`. The reliable raw startup bracket starts at the sole
 `[totk-app] build ...` line and ends at the first subsequent `[nvn-vk] frame N: ... fps over the last 300`
 line. The neutral marker must lie strictly inside that bracket; it cannot close or authenticate its own bracket.
 The parser retains every positioned observation. Invalid, conflicting, duplicate single-startup, stale or
-out-of-bracket state records make the affected switch UNKNOWN, independently of the other switch. Multiple
-launches or presentation records before the build start invalidate both; a filtered/prefixed or truncated
+out-of-bracket state records make the affected switch UNKNOWN, independently of the others. Multiple
+launches or presentation records before the build start invalidate all three; a filtered/prefixed or truncated
 capture cannot borrow state from another launch.
-Older complete captures can prove ON through the alias enable/statistics line and map-warning start line.
-Normal repeated post-startup alias statistics may corroborate an authenticated ON state, but cannot establish
-missing startup; stale, malformed or contradictory telemetry rejects alias admission. Absence alone is not OFF.
-Exact known pre-switch provenance (the pinned 1.0.0 commit/APK pair) establishes marker-less off/off only after
-contradictory or invalid observations have been rejected; it never conceals positive switch evidence.
-Effective-state evidence version 2 is required by the new comparison and ledger tools. R2/unversioned state
-metadata must be regenerated from raw logs; UNKNOWN cannot match through a legacy stored signature. This is a
-tool-evidence version, not a runtime marker change (`v=1` stays unchanged). Mixed old/new resolver metadata is
-NOT COMPARABLE. Legacy metrics and pinned hashes stay unchanged; never rewrite historical evidence.
+Older complete captures can prove ON through alias enable/statistics, map-warning start and original-admission
+menu applied records; a raw menu-off startup record can prove OFF. A v1 marker reports only alias/warning:
+it does not imply menu OFF. Normal repeated post-startup alias statistics may corroborate an authenticated
+ON state, but cannot establish missing startup; stale, malformed or contradictory telemetry rejects admission.
+Absence alone is not OFF. Exact known pre-switch provenance (the pinned 1.0.0 commit/APK pair) establishes
+marker-less all-OFF only in a complete raw startup bracket after rejecting contradictory/invalid observations.
+The immutable registered baseline/index retain their authenticated pre-switch identity and metrics.
+Effective-state evidence version **3** is required by comparison and ledger tools. Older stored metadata must
+be regenerated from raw logs; UNKNOWN cannot match through a legacy stored signature. Runtime marker v2
+adds menu state; the parser still reconciles v1 markers with independent raw startup evidence. Mixed old/new
+resolver metadata is NOT COMPARABLE. Legacy metrics and pinned hashes stay unchanged; never rewrite history.
+An intentional menu-policy A/B is a workload-changing experiment: record that attribution separately, not as
+an ordinary matching baseline or an automatic SAME performance verdict.
 
 Example (one device, one scene; placeholders in `<>`):
 

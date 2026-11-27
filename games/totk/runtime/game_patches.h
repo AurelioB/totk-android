@@ -5,6 +5,11 @@
    Every site is checked against the original instruction word first; a mismatch stops the boot. */
 void runtime_game_patches(Module *main_module);
 
+/* v143 startup outcome: 1/applied, 0/inactive, -1/refused or not yet attempted.
+   Shared Vulkan code imports this optional getter weakly; older versions have
+   no menu installer and omit the symbol. No environment inference at present. */
+int runtime_menu_capture_state(void);
+
 /* v143 native60 only: floor physical-display pacing while a demonstrated active
  * scripted-camera action has refreshed the shared guest/presenter stamp within
  * 200 ms. Generic entry markers are diagnostic only; completion clears the

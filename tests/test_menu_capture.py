@@ -48,15 +48,21 @@ class MenuCapture(unittest.TestCase):
     def test_ios_runtime_and_writable_export_leave_complete_image_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            for phone in (False, True):
+            for platform in ('export', 'phone', 'desktop'):
                 source = directory / 'platform.c'
-                source.write_text(('#define TARGET_OS_IPHONE 1\n#define MENU_CAPTURE_NATIVE_HOST 1\n' if phone else '')
+                source.write_text('#define MENU_CAPTURE_NATIVE_HOST 1\n'
+                                  + ('#define TARGET_OS_IPHONE 1\n' if platform == 'phone' else '')
                                   + f'#include "{SCRIPTS / "v143_menu_capture_fixture.c"}"\n')
                 executable = self.seeds.build(source, directory / 'platform', standin=True)
-                with mock.patch.dict(os.environ, {'TOTK_EXPORT_IOS': str(directory / 'export')}):
-                    result = self.run_fixture(executable, ['unsupported'])
+                with mock.patch.dict(os.environ):
+                    if platform == 'export':
+                        os.environ['TOTK_EXPORT_IOS'] = str(directory / 'export')
+                    else:
+                        os.environ.pop('TOTK_EXPORT_IOS', None)
+                    result = self.run_fixture(executable, ['host-default' if platform == 'desktop' else 'unsupported'])
                 self.assertIn('complete image unchanged', result.stdout)
-                self.assertIn('inactive: iOS runtime' if phone else 'inactive: iOS export', result.stderr)
+                self.assertIn({'phone': 'inactive: iOS runtime', 'export': 'inactive: iOS export',
+                               'desktop': 'inactive: non-Android default'}[platform], result.stderr)
 
     def test_non_v143_startup_does_not_read_menu_switch_or_change_image(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -85,13 +85,18 @@ def capture_switch_line(capture, line, number):
                 continue
             key, value = token.split('=', 1)
             fields[key].append(value)
-        invalid |= fields.get('v') != ['1'] or bool(set(fields) - {'v', *SWITCH_KEYS, 'map_warn_mode'})
+        version = fields.get('v')
+        marker_keys = SWITCH_KEYS if version == ['2'] else SWITCH_KEYS[:2]
+        invalid |= version not in (['1'], ['2']) or bool(set(fields) - {'v', *marker_keys, 'map_warn_mode'})
         for key in SWITCH_KEYS:
+            if key == 'TOTK_MENU_CAPTURE_FIX' and version == ['1'] and key not in fields:
+                continue  # v1 did not report menu outcome; independent raw evidence must establish it.
             values = fields.get(key, [])
+            allowed = ('on', 'off', 'UNKNOWN') if key == 'TOTK_MENU_CAPTURE_FIX' else ('on', 'off')
             error = 'invalid state-marker framing, version or fields' if invalid else None
-            if len(values) != 1 or values[0] not in ('on', 'off'):
+            if len(values) != 1 or values[0] not in allowed:
                 error = 'missing, duplicated or invalid ' + key + ' marker field'
-            state = values[0] if len(values) == 1 and values[0] in ('on', 'off') else 'UNKNOWN'
+            state = values[0] if len(values) == 1 and values[0] in allowed else 'UNKNOWN'
             record = {'line': number, 'kind': 'marker', 'state': state, 'error': error}
             if key == 'TOTK_MAP_WARN':
                 modes = fields.get('map_warn_mode', [])
@@ -120,6 +125,18 @@ def capture_switch_line(capture, line, number):
         records['TOTK_MAP_WARN'].append({'line': number, 'kind': 'warning-start', 'state': 'on',
             'mode': int(match[1]) if match else None,
             'error': None if valid else 'invalid, duplicated-mode or non-raw warning startup record'})
+    if re.search(r'\[totk\] 1\.4\.3 menu capture (?:experiment|fix)', line):
+        prefix = r'\[totk\] 1\.4\.3 menu capture '
+        if re.fullmatch(prefix + r'experiment: armed or requested pane \(original admission\), veneers \+0x[0-9a-f]+/\+0x[0-9a-f]+\n', line):
+            state, error = 'on', None
+        elif re.fullmatch(prefix + r'(?:experiment off \([^\n]*\)|fix inactive: (?:iOS (?:runtime|export)|non-Android default))\n', line):
+            state, error = 'off', None
+        elif re.fullmatch(prefix + r'fix skipped: [^\n]+\n', line):
+            state, error = 'UNKNOWN', None
+        else:
+            state, error = 'UNKNOWN', 'invalid or non-raw menu startup record'
+        records['TOTK_MENU_CAPTURE_FIX'].append({'line': number, 'kind': 'menu-start', 'state': state,
+                                               'error': error})
 
 
 def parse_log(path):

@@ -1110,19 +1110,28 @@ void runtime_diag_xpoke(unsigned off,float value){
    and the phone runtime must never bake/install this optional patch. */
 enum { MENU_CAPTURE_STUB = 276, MENU_CAPTURE_TAIL = 340,
        MENU_CAPTURE_HEAD_WORDS = 3, MENU_CAPTURE_TAIL_WORDS = 2 };
+static _Atomic int menu_capture_state=-1;
+int runtime_menu_capture_state(void){
+    return atomic_load_explicit(&menu_capture_state,memory_order_acquire);
+}
 static int patch_menu_capture(Module *m){
+    atomic_store_explicit(&menu_capture_state,-1,memory_order_release);
 #if TARGET_OS_IPHONE
     (void)m;
+    atomic_store_explicit(&menu_capture_state,0,memory_order_release);
     fprintf(stderr,"[totk] 1.4.3 menu capture fix inactive: iOS runtime\n");
     return 0;
 #else
     const char *e=getenv("TOTK_MENU_CAPTURE_FIX");
     if(getenv("TOTK_EXPORT_IOS")){
+        atomic_store_explicit(&menu_capture_state,0,memory_order_release);
         fprintf(stderr,"[totk] 1.4.3 menu capture fix inactive: iOS export\n");
         return 0;
     }
     if((!e&&!TOTK_ANDROID)||(e&&strcmp(e,"1"))){
-        fprintf(stderr,"[totk] 1.4.3 menu capture experiment off (Android default on; TOTK_MENU_CAPTURE_FIX=1 enables, =0 disables)\n");
+        atomic_store_explicit(&menu_capture_state,0,memory_order_release);
+        if(!e)fprintf(stderr,"[totk] 1.4.3 menu capture fix inactive: non-Android default\n");
+        else fprintf(stderr,"[totk] 1.4.3 menu capture experiment off (unset or TOTK_MENU_CAPTURE_FIX=1 enables)\n");
         return 0;
     }
     const uint64_t site=0x105bbcc;
@@ -1159,6 +1168,7 @@ static int patch_menu_capture(Module *m){
     memcpy(m->base+stub,head,sizeof head);
     memcpy(m->base+tail,end,sizeof end);
     memcpy(m->base+site,&word,4);
+    atomic_store_explicit(&menu_capture_state,1,memory_order_release);
     fprintf(stderr,"[totk] 1.4.3 menu capture experiment: armed or requested pane (original admission), veneers +%#llx/+%#llx\n",
             (unsigned long long)stub,(unsigned long long)tail);
 #endif

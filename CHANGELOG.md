@@ -26,6 +26,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Test real ARM admission/continuation/completion, unset/explicit-on byte equality, explicit-off
   no-write behavior and all six install orders. This does not prove preparation/publication safety
   or a once-per-opening capture bound.
+- Include actual menu admission (applied/on, inactive/off, refused/UNKNOWN) in the one-time startup
+  switch marker and benchmark comparison/ledger workload signatures. Reconcile raw current-launch
+  startup evidence, retain legacy marker parsing without inventing menu OFF, and require resolver
+  evidence version 3. Pin all three historical opt-outs; keep immutable baseline metrics/hashes unchanged.
 - Log the frozen effective write-back-alias state and map-warning mode once at first presenter startup,
   including explicit opt-outs, so benchmark tools need not infer build-dependent defaults from menu settings.
 - Record effective alias/warning states from complete startup evidence, including the warning mode, in benchmark

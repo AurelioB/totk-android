@@ -121,6 +121,10 @@ and writes nothing, even if the original words or padding are invalid. Exact `1`
 patch; empty/malformed values remain off. Other writable hosts retain opt-in. Restart after editing.
 No menu setting or `settings.env` migration is needed. The phone runtime and writable-host `TOTK_EXPORT_IOS`
 path both log inactive and return without writes, even with `=1`; other versions use the unchanged legacy patch file.
+The startup `[totk-switches] v=2` marker reports the actual menu outcome alongside alias/warning state:
+applied is `on`, inactive is `off`, and refusal/unavailable is `UNKNOWN`. Benchmark signatures include it;
+menu-policy mismatches or UNKNOWN are NOT COMPARABLE. Historical native-admission controls must explicitly
+pin `TOTK_MENU_CAPTURE_FIX=0` alongside `TOTK_WB_ALIAS=0` and `TOTK_MAP_WARN=0`, then restart.
 Finite device qualification is not proof of global preparation/publication safety or a once-per-opening cost bound.
 
 There is no unconditional per-frame framebuffer copy, allocation, GPU wait or readback added by the patch.
