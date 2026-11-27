@@ -108,7 +108,7 @@ class WritebackAlias(unittest.TestCase):
     def test_real_dirty_switch_off_on(self):
         for lag in ('0', '1'):
             digests = []
-            for switch in ('0', '1'):
+            for switch in ('0', '1', None):
                 with self.subTest(lag=lag, alias=switch):
                     result = self.run_fixture('dirty', switch, lag=lag)
                     self.assertIn('WB_ALIAS PASS', result.stdout)
@@ -117,13 +117,13 @@ class WritebackAlias(unittest.TestCase):
                     self.assertIn('SA_ONSTACK', result.stdout)
                     if lag == '1':
                         self.assertIn('TICKETS PASS', result.stdout)
-                    if switch == '1':
+                    if switch in (None, '1'):
                         self.assertIn('COMPLETION PASS', result.stdout)
                     digest = re.search(r'digest=([0-9a-f]+)', result.stdout)
                     if digest is None:
                         self.fail('missing exact landing digest: ' + result.stdout)
                     digests.append(digest.group(1))
-            self.assertEqual(digests[0], digests[1], 'off/on exact landing contents differ')
+            self.assertEqual(len(set(digests)), 1, 'off/on/unset exact landing contents differ')
 
     def test_backend_switch_offsets_lifetime_and_site2(self):
         for switch in (None, '', '0', '01', 'true', '1 ', '1'):
@@ -133,7 +133,7 @@ class WritebackAlias(unittest.TestCase):
                 self.assertIn('BACKEND_OFFSETS PASS KOWN KVIEW KVIRT', result.stdout)
                 self.assertIn('SITE2 PASS uncontended same-thread-trylock second-thread-trylock', result.stdout)
                 self.assertIn('LIFETIME PASS pinned-token removal-excluded', result.stdout)
-                self.assertEqual('write-back alias: enabled' in result.stderr, switch == '1')
+                self.assertEqual('write-back alias: enabled' in result.stderr, switch in (None, '1'))
 
     def test_production_mapvirtual_replacement_contents(self):
         for lag in ('0', '1'):
@@ -164,7 +164,7 @@ class WritebackAlias(unittest.TestCase):
                 marker = re.search(r'WB_ALIAS_COUNTERS PASS alias=(\d) unit=(\d+)', result.stdout)
                 if marker is None:
                     self.fail('missing counter selector summary: ' + result.stdout)
-                enabled = switch == '1'
+                enabled = switch in (None, '1')
                 self.assertEqual(int(marker.group(1)), enabled)
                 unit = int(marker.group(2))
                 rows = re.findall(
@@ -212,7 +212,7 @@ class WritebackAlias(unittest.TestCase):
         for switch in (None, '0', '1'):
             with self.subTest(switch=switch):
                 result = self.run_fixture('backend', switch, args=('pause-init',))
-                enabled = switch == '1'
+                enabled = switch in (None, '1')
                 self.assertIn(f'WB_ALIAS_PAUSE_INIT PASS alias={int(enabled)} '
                               'real-reporter concurrent-real-init', result.stdout)
                 lines = [line for line in result.stderr.splitlines()

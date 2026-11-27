@@ -567,7 +567,7 @@ void vk_wb_alias_report(const char *phase) {
 static void wb_alias_exit(void) { vk_wb_alias_report("exit"); }
 int vk_wb_alias_enabled(void) { return g_wb_alias_enabled; }
 static void wb_alias_init(void) {
-    const char *e = getenv("TOTK_WB_ALIAS"); g_wb_alias_enabled = e && !strcmp(e, "1");
+    const char *e = getenv("TOTK_WB_ALIAS"); g_wb_alias_enabled = !e || !strcmp(e, "1");
     /* Only the atomic counters/static labels are read by the reporter: no other state is published. */
     atomic_store_explicit(&g_wb_alias_report_enabled, g_wb_alias_enabled, memory_order_relaxed);
     if (g_wb_alias_enabled) {
@@ -576,7 +576,7 @@ static void wb_alias_init(void) {
             if (atexit(wb_alias_exit)) LOGV("write-back alias: exit summary registration failed");
             else exit_registered = 1;
         }
-        LOGV("write-back alias: enabled (TOTK_WB_ALIAS=1); backend-private RW dma-buf mapping per owned pool; host-import/CPU ranges use existing path");
+        LOGV("write-back alias: enabled (default on; TOTK_WB_ALIAS=0 disables); backend-private RW dma-buf mapping per owned pool; host-import/CPU ranges use existing path");
     }
 }
 static VkDeviceSize g_host_align = 4096;
