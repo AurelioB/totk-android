@@ -1289,7 +1289,7 @@ Host-only does not certify gralloc, SurfaceFlinger, game-image quality or perfor
 | `TOTK_POST_SCALE=sgsr` / `fsr`, `TOTK_POST_SHARPNESS=0.2`, `TOTK_POST_SGSR_SHARPNESS=2` | Existing whole-canvas alternatives, Duo device-tested; bypassed for effective native UI. Scene SGSR shares the SGSR controls without filtering UI. |
 | `TOTK_POST_SGSR_EDGE_THRESHOLD`, `TOTK_POST_SGSR_EDGE_DIRECTION=1`, `TOTK_POST_AA=smaa` / `off` | Existing opt-in filter/control variants; host pixel coverage, no separate integrated device qualification. |
 | `TOTK_OVERLAY=off` / `fps` / `full`, `TOTK_OVERLAY_POS=tl` / `tr` / `bl` / `br`, `TOTK_OVERLAY_POWER=1` | Compact fixed-layout FPS/resolution/mode and active-FG telemetry; power/temperature opt-in, default off. Release off, development full; host pixels/timings, no inferred device benefit. |
-| `TOTK_MAP_WARN=0` | Default on when unset (mode `1`): five-second background game-process map warning, including with the performance overlay off. Logs at 80%, notice at 88%, clears below 84%; warns but does not prevent the map-limit abort. `0` disables this feature and starts no sampler for it; diagnostic `2` / TEST-ONLY `3` remain opt-in. See [Process map-limit warning](#process-map-limit-warning-default-on). |
+| `TOTK_MAP_WARN=0` | Default on when unset (mode `1`): best-effort adaptive background map warning (60/20/5-second bands). Reduces this warning's own scan overhead, not mapping growth. Logs at 80%, notice at 88%, clears below 84%; can be late and does not prevent the map-limit abort. `0` starts no sampler for this feature; diagnostic `2` / TEST-ONLY `3` remain opt-in. See [Process map-limit warning](#process-map-limit-warning-default-on). |
 | `TOTK_FRAMEGEN_DIAG=1`, `TOTK_PRESENT_CADENCE_TRACE=1`, `TOTK_FRAME_TIMELINE=1` | Qualification-only diagnostics; Thor/Odin evidence, trace measurably perturbs Thor. Slot-exhaustion snapshots require DIAG. Never use a traced arm as ordinary-play timing. |
 | `TOTK_FRAMEGEN_WRITER_DIAG=1`, `TOTK_FRAMEGEN_UNCERTIFIED_PLANE=1`, `TOTK_FRAMEGEN_UNKNOWN_PERCENT`, `TOTK_FRAMEGEN_DUMP=<frame>`, `TOTK_VK_PASS_PROFILE`, `TOTK_VK_PASS_DUMP`, `TOTK_INPUT_FILE` | Diagnostic or experimental proof controls, off by default except the unchanged35% unknown-depth ceiling; host coverage, no new device-safe/performance qualification. Uncertified plane is explicitly not a geometric proof; changing the coverage ceiling is not a quality guarantee. |
 | `TOTK_FRAMEGEN_BACKPRESSURE=0` | Diagnostic-only unsafe async control; not a play recommendation. |
@@ -1467,16 +1467,52 @@ Unset `TOTK_MAP_WARN` or exact `1` enables process-map counting on the existing
 `totk-vmascan` worker, independently of `TOTK_FRAME_LAG`. It starts lazily when the game's Vulkan
 overlay/presenter is first used, not when the native library is loaded or the frame origin is published.
 The separate `:setup` process does not link this sampler. The first warning evaluation is about five
-seconds after worker startup; subsequent evaluations are spaced by five seconds plus evaluation time.
-Each evaluation reuses the worker's latest completed sample when it is at most five seconds old,
-including a freshly completed lag/classification scan. Only a missing or older sample requests a new
-traversal. When lag already samples at least that often, the warning adds no traversals; warning-only
-devices keep one traversal per five-second period plus scan/scheduling delay. The game/render/present
-threads and signal handlers do not scan for this feature. Warning-only scans take no pool, runtime or
-tracker locks. Independently requested lag budget/classification work may start the shared worker
-earlier, as before; its locks, scheduling, budget freshness and deadlines are unchanged.
+seconds after worker startup. Subsequent warning-only scans are adaptive: **60 s below 40%**, **20 s
+from 40% to 60%**, **5 s at/above 60%**, plus traversal/scheduling time. De-escalation requires below
+37% / 55%, respectively. A **15,000-row headroom guard** can also select 5 s earlier on smaller map
+limits. This is the largest load increase observed, **not** an upper bound on future growth.
+Unknown counts and an active notice use 5 s. A newly sampled increase **over 2,048 rows** holds 5 s
+for at least 10 s; reused samples do not renew that hold.
+
+Each evaluation reuses the worker's completed sample when at most five seconds old and not invalidated
+by a later pool-lifetime change, including a just-completed lag/classification scan. Otherwise it requests
+a new traversal. The worker also polls the existing dirty-pool lifetime epoch every 5 s; a change brings
+the warning evaluation forward and holds fast cadence for 10 s. No new producer callback, counter,
+syscall, lock or scan is added to game/render/present/fault paths. Warning-only traversals take no pool,
+runtime or tracker locks. Lag/classification scheduling, budget freshness and deadlines are unchanged.
+With quiet pool lifetimes below 40%, expect about one warning traversal per minute after startup/holds.
+At roughly 45% (the Thor standing case), the conservative medium band instead means about three per
+minute; near 60% it is about twelve. Activity and jumps can increase these counts.
 One `[map-warn] started mode=1 period_ms=5000 log=80 notice=88 clear=84; warning only, does not prevent map-limit abort`
 line records the ordinary default startup.
+Here startup `period_ms=5000` is the initial evaluation/freshness/probe period, not the standing
+adaptive cadence; diagnostic `cadence_ms` records the interval currently selected.
+
+This **reduces the warning's own overhead**; it is **not a mapping-growth fix**. The warning remains
+best-effort and can be late. The native host does not register the existing load-screen callback;
+the epoch hint misses pool reuse and driver/allocator-side growth. A >2,048-row jump is known only
+after sampling, not when it happens. Without a usable hint, the nominal unobserved intervals are
+**60 / 20 / 5 s** for the three bands, **plus scan duration and OS scheduling delay**. Ordinary
+scheduling supplies no hard wall-clock maximum. An epoch hint is checked on the next five-second probe.
+
+For limit **65,530** and notice boundary **57,667**, starting at each band's highest last-observed
+pre-notice count, the following net growth can reach 88% before the next timed observation:
+
+| Band | Last count | Rows to 88% | Nominal interval | Rows / interval-second |
+| --- | --- | --- | --- | --- |
+| Slow (<40%) | 26,211 | 31,456 | 60 s | 524.27 |
+| Medium (<60%) | 39,317 | 18,350 | 20 s | 917.50 |
+| Fast (just below 88%) | 57,666 | 1 | 5 s | 0.20 |
+
+These are **assumptions needed to avoid crossing unseen**, not measured growth-rate ceilings; a burst
+can arrive immediately after a sample. The observed one-load increases were about 15,000 rows on Odin
+and 6,000–10,000 on Thor. Two 15,000-row loads fit below 88% from the slow upper edge at this limit;
+a third partial load can cross within one slow interval. Multiple loads can also cross the medium
+interval, and the fast band can already be only one row below the notice. The 15,000-row guard keeps
+one observed-size load of headroom for non-fast sampling on smaller limits, not arbitrary/repeated
+growth. Hidden limits use the existing 65,530 assumption, which is itself uncertain. If rows grow
+faster than these assumptions, the warning can be late or the process can abort first. No abort
+prevention, timely-save guarantee or new scheduler bound is promised.
 
 Warning-only creation explicitly requests absolute nice **at least +10** (retaining a lower-priority
 inherited value), not relative `nice(10)`. It restores the launch cpuset captured before guest pinning,
@@ -1525,14 +1561,15 @@ Startup-only test controls (integer percentages **1..100**):
 
 Require `LOG <= CLEAR < NOTICE`; invalid ordering restores all defaults, and invalid individual
 values restore that value's default with a diagnostic. `TOTK_VMA_SCAN_MS` still governs the existing
-lag/classification work, not the warning's independent five-second deadline.
+lag/classification work, not the warning's adaptive deadline.
 
 ### Scan attribution (`TOTK_MAP_WARN=2`, diagnostic only)
 
 `2` keeps `1`'s warning thresholds, evaluation cadence and policy, and adds one fixed-format, bounded
 `[map-warn-scan]` line per completed worker traversal or reuse-only warning evaluation, written only by
 `totk-vmascan`: `start_ns`, `duration_us`, `rows`, `frame_origin_ns`, `warn`, `notice`, `test_phase`,
-`log`, `show`, `clear`, `scanned`, `warning_scans`, `warning_reuses`.
+`log`, `show`, `clear`, `scanned`, `warning_scans`, `warning_reuses`, `cadence_ms`, `jump_rows`,
+`activity`, `activity_events`, `forced_band`.
 `start_ns` is absolute `CLOCK_MONOTONIC` nanoseconds, the same clock as ordinary native frame
 reports; `frame_origin_ns` is their existing process origin (`g_t0_ns`). Convert to ordinary elapsed
 seconds with `(start_ns - frame_origin_ns) / 1e9`. Zero origin means unavailable in a graphics-only
@@ -1542,8 +1579,11 @@ and sysctl read (plus existing lag/classification work), excluding warning/loggi
 or correlated with long frames as one. `rows=0` denotes an unknown count. `warning_scans` counts
 cumulative traversals requested solely by the warning; `warning_reuses` counts warning evaluations
 using a fresh completed sample instead, including a lag scan completed in the same worker iteration.
+`cadence_ms` is the currently selected next interval (60,000 / 20,000 / 5,000); `jump_rows` is the
+new-sample increase when over 2,048, otherwise zero. `activity=1` identifies a coalesced pool-epoch
+probe event, with cumulative `activity_events`; it is not a decoded area-arrival count.
 
-With lag/classification off this is at most one line per five-second warning scan (about 0.2 Hz).
+With lag/classification off and no activity, this is one line per adaptive warning scan.
 Existing independently requested lag/classification scans also get a line; their unchanged minimum
 period is one second. No per-row or per-frame logging is added. `warn=1` marks a warning-policy evaluation.
 `1` remains quiet except its once-only startup and threshold/read-failure logs; neither `1` nor off adds trace logging.
@@ -1551,10 +1591,17 @@ Use `2`, not `3`, for standing performance attribution. Logging itself can pertu
 scan intervals, not modulo-five-second phases or log-delivery timestamps; ordinary long-frame rows
 are delayed/rounded sparse observations, and window maxima have no within-window event timestamp.
 
+**TEST ONLY**, with exact `TOTK_MAP_WARN=2`, set `TOTK_MAP_WARN_TEST_BAND=slow`, `medium` or `fast`
+to select 60/20/5 s for safe low-occupancy band checks without changing counts or warning thresholds.
+Invalid values log once and retain adaptation; modes 1/3 ignore this control. An active notice still
+requires fast cadence, and a pool-activity probe can still bring an evaluation forward. `forced_band`
+is 1/2/3 for these controls, zero for ordinary adaptation. Do not force slow sampling near the real
+limit or use forced-band runs for ordinary acceptance. Remove this override and restart after testing.
+
 ### Same-process clear check (`TOTK_MAP_WARN=3`, TEST ONLY)
 
 `3` includes per-scan tracing and deliberately replaces **all three percentage overrides** with this
-fixed sequence on the ordinary five-second warning samples, preserving actual counts and policy state:
+fixed sequence at a fixed five-second cadence (not the adaptive bands), preserving actual counts and policy state:
 
 | Warning sample | Log / notice / clear percentages | Expected notice with a stable count between 3% and 99% |
 | --- | --- | --- |

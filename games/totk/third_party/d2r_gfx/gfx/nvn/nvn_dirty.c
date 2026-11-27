@@ -272,6 +272,8 @@ static _Atomic uint64_t g_vma_test_limit = UINT64_MAX;
 static uint64_t g_vma_test_maps, g_vma_test_max;
 static int g_vma_test_sample;
 static _Thread_local uint64_t g_vma_test_reads;
+/* Same-thread row fixture for deterministic warning-only arrival/growth tests; absent in production. */
+static _Thread_local struct { int set; uint64_t maps, maximum; } g_map_warn_test_sample;
 #endif
 static pthread_mutex_t g_vma_mu = PTHREAD_MUTEX_INITIALIZER;
 /* Requests never take g_vma_mu: a scan (or classification) may hold it for hundreds of milliseconds.
@@ -295,7 +297,7 @@ static void vma_start(void);
    the only publication consumed by presentation. Warning-only scans take no tracker locks. */
 static pthread_once_t g_map_warn_once = PTHREAD_ONCE_INIT;
 static int g_map_warn_enabled;
-static unsigned g_map_warn_mode, g_map_warn_test_samples;
+static unsigned g_map_warn_mode, g_map_warn_test_samples, g_map_warn_test_band;
 /* Startup publication from the runtime's immutable ordinary-frame CLOCK_MONOTONIC origin.
    Zero means no runtime origin was supplied (graphics-only hosts); traces never invent one. */
 static _Atomic uint64_t g_map_warn_frame_origin;
@@ -319,6 +321,14 @@ static void map_warn_configure(void) {
                       value && !strcmp(value, "2") ? 2 : value && !strcmp(value, "3") ? 3 : 0;
     g_map_warn_enabled = g_map_warn_mode != 0;
     if (!g_map_warn_enabled) return;
+    if (g_map_warn_mode == 2) {
+        const char *band = getenv("TOTK_MAP_WARN_TEST_BAND");
+        if (band) {
+            static const char *const names[] = {"slow", "medium", "fast"};
+            for (unsigned i = 0; i < 3; i++) if (!strcmp(band, names[i])) g_map_warn_test_band = i + 1;
+            if (!g_map_warn_test_band) LOG("[map-warn] invalid TOTK_MAP_WARN_TEST_BAND; using adaptive cadence");
+        }
+    }
     if (g_map_warn_mode == 3) {
         g_map_warn_thresholds = nvn_map_warn_test_thresholds(1);
         return; /* Fixed test sequence deliberately ignores startup percentage overrides. */
@@ -608,11 +618,45 @@ static void vma_place(int creator) {
 /* Worker-owned completed sample: warning evaluation never changes lag's budget or deadline. */
 typedef struct {
     uint64_t maps, maximum, completed_ns, warning_scans, warning_reuses;
+    uint64_t sample_epoch, observed_epoch, activity_events;
+    int activity_pending;
+    nvn_map_warn_cadence cadence;
 } vma_worker_sample;
+static unsigned vma_warn_period(const vma_worker_sample *sample, uint64_t now) {
+    if (g_map_warn_mode == 3 || nvn_dirty_map_warn_notice()) return MAP_WARN_PERIOD_MS;
+    if (g_map_warn_test_band) {
+        static const unsigned periods[] = {NVN_MAP_WARN_SLOW_MS, NVN_MAP_WARN_MEDIUM_MS, NVN_MAP_WARN_FAST_MS};
+        return periods[g_map_warn_test_band - 1];
+    }
+    return nvn_map_warn_cadence_period(&sample->cadence, now);
+}
+static uint64_t vma_warn_deadline(const vma_worker_sample *sample, uint64_t now,
+                                  uint64_t previous, int warn_due) {
+    /* Anchor to the completed observation, strictly after its interval. At exactly five
+       seconds the old sample is still fresh; do not reuse it and defer another full period. */
+    uint64_t completed = sample->completed_ns ? sample->completed_ns : now;
+    uint64_t candidate = completed + (uint64_t)vma_warn_period(sample, now) * 1000000;
+    if (candidate < now) candidate = now;
+    candidate++;
+    return warn_due || candidate < previous ? candidate : previous;
+}
+/* Worker-only five-second probe of the existing pool-lifetime publication. No new producer
+   work, render/fault callback, tracker lock, wake syscall or procfs traversal. It is a hint,
+   not an authoritative loading-state decoder; pool reuse/foreign mappings can be invisible. */
+static int vma_worker_activity(vma_worker_sample *sample, uint64_t now) {
+    uint64_t epoch = nvn_dirty_lag_epoch();
+    if (epoch == sample->observed_epoch) return 0;
+    sample->observed_epoch = epoch;
+    sample->activity_events++;
+    sample->activity_pending = 1;
+    nvn_map_warn_cadence_boost(&sample->cadence, now);
+    return 1;
+}
 static void vma_worker_poll(vma_worker_sample *sample, int lag_scan, unsigned requests, int warn_due) {
     uint64_t start = vma_clock_ns();
     int scanned = lag_scan;
     if (lag_scan) {
+        if (g_map_warn_enabled) sample->sample_epoch = nvn_dirty_lag_epoch();
         /* Reuse the existing traversal, including classification when explicitly requested. */
 #ifdef __linux__
         if (requests & VMA_CLASSES) nvn_dirty_lag_vma_report();
@@ -626,16 +670,30 @@ static void vma_worker_poll(vma_worker_sample *sample, int lag_scan, unsigned re
     if (warn_due) {
         uint64_t now = vma_clock_ns();
         if (sample->completed_ns && now >= sample->completed_ns &&
-            now - sample->completed_ns <= (uint64_t)MAP_WARN_PERIOD_MS * 1000000) {
+            now - sample->completed_ns <= (uint64_t)MAP_WARN_PERIOD_MS * 1000000 &&
+            sample->sample_epoch == nvn_dirty_lag_epoch()) {
             sample->warning_reuses++;
         } else {
             /* No g_vma_mu, g_slot_mu, pool or runtime locks in warning-only sampling. */
             sample->warning_scans++;
             scanned = 1; start = now;
+            sample->sample_epoch = nvn_dirty_lag_epoch(); /* before traversal: a concurrent change invalidates reuse */
             sample->maps = vma_read("/proc/self/maps", 1);
             sample->maximum = vma_read("/proc/sys/vm/max_map_count", 0);
+#ifdef TOTK_VK_TESTS
+            if (g_map_warn_test_sample.set) {
+                sample->maps = g_map_warn_test_sample.maps;
+                sample->maximum = g_map_warn_test_sample.maximum;
+            }
+#endif
             sample->completed_ns = vma_clock_ns();
         }
+    }
+    uint64_t jump_rows = 0;
+    if (scanned && g_map_warn_enabled)
+        jump_rows = nvn_map_warn_cadence_sample(&sample->cadence, sample->maps,
+            sample->maximum ? sample->maximum : 65530, sample->completed_ns);
+    if (warn_due) {
         map_warn_sample(sample->maps, sample->maximum);
     }
     /* Reuse-only evaluations are not traversals: keep scan telemetry and duration truthful. */
@@ -644,13 +702,16 @@ static void vma_worker_poll(vma_worker_sample *sample, int lag_scan, unsigned re
         unsigned phase = g_map_warn_mode == 3 ?
             (g_map_warn_test_samples + NVN_MAP_WARN_TEST_PHASE_SAMPLES - 1) / NVN_MAP_WARN_TEST_PHASE_SAMPLES : 0;
         uint64_t scan_elapsed = scanned ? sample->completed_ns - start : 0;
-        LOG("[map-warn-scan] start_ns=%llu duration_us=%llu rows=%llu frame_origin_ns=%llu warn=%d notice=%d test_phase=%u log=%u show=%u clear=%u scanned=%d warning_scans=%llu warning_reuses=%llu",
+        LOG("[map-warn-scan] start_ns=%llu duration_us=%llu rows=%llu frame_origin_ns=%llu warn=%d notice=%d test_phase=%u log=%u show=%u clear=%u scanned=%d warning_scans=%llu warning_reuses=%llu cadence_ms=%u jump_rows=%llu activity=%d activity_events=%llu forced_band=%u",
             (unsigned long long)start, (unsigned long long)(scan_elapsed / 1000),
             (unsigned long long)sample->maps, (unsigned long long)atomic_load_explicit(&g_map_warn_frame_origin, memory_order_relaxed),
             warn_due, nvn_dirty_map_warn_notice(), phase, g_map_warn_thresholds.log_percent,
             g_map_warn_thresholds.notice_percent, g_map_warn_thresholds.clear_percent, scanned,
-            (unsigned long long)sample->warning_scans, (unsigned long long)sample->warning_reuses);
+            (unsigned long long)sample->warning_scans, (unsigned long long)sample->warning_reuses,
+            vma_warn_period(sample, vma_clock_ns()), (unsigned long long)jump_rows,
+            sample->activity_pending, (unsigned long long)sample->activity_events, g_map_warn_test_band);
     }
+    sample->activity_pending = 0;
     if (scanned) {
         pthread_mutex_lock(&g_vma_scan_mu);
         g_vma_scan_stats[0]++;
@@ -668,25 +729,36 @@ static void *vma_worker(void *creator) {
     (void)creator;
 #endif
     uint64_t scan_period = (uint64_t)g_vma_period_ms * 1000000;
-    uint64_t warn_period = (uint64_t)MAP_WARN_PERIOD_MS * 1000000;
-    uint64_t next_scan = vma_clock_ns() + scan_period, next_warn = vma_clock_ns() + warn_period;
-    vma_worker_sample sample = {0};
+    const uint64_t probe_period = (uint64_t)MAP_WARN_PERIOD_MS * 1000000;
+    uint64_t now = vma_clock_ns(), next_scan = now + scan_period;
+    uint64_t next_warn = now + probe_period, next_probe = next_warn;
+    vma_worker_sample sample = {.observed_epoch = nvn_dirty_lag_epoch()};
     for (;;) {
-        /* Independent deadlines preserve lag's configured cadence. Requests never advance either.
-           No game/render/present thread scans for this feature, including its startup sample. */
-        uint64_t now = vma_clock_ns(), due = next_scan;
-        if (g_map_warn_enabled && next_warn < due) due = next_warn;
+        /* Lag deadlines remain independent. A lightweight epoch probe may bring only the
+           warning deadline forward; all procfs reads remain on this worker. */
+        now = vma_clock_ns(); uint64_t due = next_scan;
+        if (g_map_warn_enabled) {
+            if (next_warn < due) due = next_warn;
+            if (next_probe < due) due = next_probe;
+        }
         uint64_t wait = due > now ? due - now : 0;
         struct timespec delay = {wait / 1000000000, wait % 1000000000};
         while (nanosleep(&delay, &delay)) if (errno != EINTR) die("VMA sampler sleep: %d", errno);
         now = vma_clock_ns();
+        if (g_map_warn_enabled && now >= next_probe) {
+            next_probe = now + probe_period;
+            if (vma_worker_activity(&sample, now)) next_warn = now;
+        }
         int scan_due = now >= next_scan, warn_due = g_map_warn_enabled && now >= next_warn;
         unsigned requests = scan_due ? atomic_exchange_explicit(&g_vma_requests, 0, memory_order_acquire) : 0;
         int lag_scan = scan_due && (g_lag_enabled || requests);
         if (scan_due) next_scan = now + scan_period;
         if (!lag_scan && !warn_due) continue;
         vma_worker_poll(&sample, lag_scan, requests, warn_due);
-        if (warn_due) next_warn = vma_clock_ns() + warn_period;
+        if (g_map_warn_enabled) {
+            now = vma_clock_ns();
+            next_warn = vma_warn_deadline(&sample, now, next_warn, warn_due);
+        }
         if (scan_due) next_scan = vma_clock_ns() + scan_period;
     }
     return NULL;

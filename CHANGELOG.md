@@ -132,11 +132,16 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Host regressions cover native layer guards, native JSON → Java coordinates and deterministic cache convergence;
   surface/sky/Depths transitions, zoom appearance, memory and decoder CPU still need dual-screen device checks.
 - Enable `TOTK_MAP_WARN` mode `1` by default when unset; `=0` disables it and starts no sampler for this feature.
-  Start lazily in the game presenter, not on library load or in `:setup`; log one startup line. Evaluate
-  every five seconds on the shared sampler, reusing its latest completed sample when at most five seconds old.
-  Only missing/stale samples request a warning traversal; lag sampling at least that often adds none.
-  Warning-only devices retain the five-second scan cadence. Mode `2` reports cumulative warning-requested
-  scans versus reused samples and distinguishes reuse-only evaluations from actual traversals.
+  Start lazily in the game presenter, not on library load or in `:setup`; log one startup line.
+  Adapt this warning's own scans to 60/20/5 s below 40% / 60% / above, with 37% / 55% de-escalation
+  hysteresis, a 15,000-row observed-load headroom reserve, >2,048-row jump hold and worker-only five-second
+  probes of the existing pool-lifetime epoch. Reuse fresh samples unless a later pool change invalidated them.
+  No new game/render/fault-path work is added. Mode `2` logs cadence, activity, jump and requested/reused
+  scan counts; TEST-ONLY forced-band controls support safe checks. Mode `3` retains its five-second test.
+  This reduces warning overhead, **not mapping growth**. The warning remains **best-effort**: a jump is
+  only detected when sampled, hints miss pool reuse/driver growth, 15,000 rows is not an upper bound,
+  and repeated loads can cross 88% inside a nominal 60/20/5 s unsampled interval plus scan/scheduling delay.
+  It can be late when growth exceeds the stated headroom assumptions; no admitted tail improvement is claimed.
   Log at 80%; show `MAP LIMIT NEAR` /
   `SAVE AND RESTART GAME SOON` at 88%, even with the performance overlay off; clear below 84%.
   Hidden kernel limits use 65,530; unreadable counts clear the notice and log once. Startup-only

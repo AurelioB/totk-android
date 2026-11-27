@@ -88,10 +88,113 @@ static void panel(void) {
         assert(!p.layout.map_notice);
     }
 }
+static void cadence_policy(void) {
+    nvn_map_warn_cadence s={0};
+    const struct { uint64_t count; unsigned band, period; } cases[] = {
+        {399999,0,60000},{400000,1,20000},{399999,1,20000},
+        {370000,1,20000},{369999,0,60000},{600000,2,5000},
+        {550000,2,5000},{549999,1,20000},{369999,0,60000},
+        {600000,2,5000},{100000,0,60000}
+    };
+    uint64_t now=1000000000;
+    for (unsigned i=0;i<sizeof cases/sizeof *cases;i++) {
+        nvn_map_warn_cadence_sample(&s,cases[i].count,1000000,now);
+        assert(s.band==cases[i].band);
+        assert(nvn_map_warn_cadence_period(&s,now+11000000000ull)==cases[i].period);
+        now+=20000000000ull;
+    }
+    s=(nvn_map_warn_cadence){0};
+    assert(!nvn_map_warn_cadence_sample(&s,20000,65530,now));
+    assert(!nvn_map_warn_cadence_sample(&s,22048,65530,now));
+    assert(nvn_map_warn_cadence_period(&s,now)==60000);
+    assert(nvn_map_warn_cadence_sample(&s,24097,65530,now)==2049);
+    assert(nvn_map_warn_cadence_period(&s,now+9999999999ull)==5000);
+    assert(!nvn_map_warn_cadence_sample(&s,24097,65530,now+5000000000ull));
+    assert(nvn_map_warn_cadence_period(&s,now+10000000000ull)==60000);
+    nvn_map_warn_cadence_sample(&s,0,65530,now);
+    assert(nvn_map_warn_cadence_period(&s,now)==5000);
+    nvn_map_warn_cadence_sample(&s,20000,0,now);
+    assert(nvn_map_warn_cadence_period(&s,now)==5000);
+    s=(nvn_map_warn_cadence){0};
+    nvn_map_warn_cadence_sample(&s,13835,32768,now); assert(s.band==1);
+    nvn_map_warn_cadence_sample(&s,13836,32768,now); assert(s.band==2); /* 88% minus 15000 */
+    nvn_map_warn_cadence_sample(&s,13835,32768,now); assert(s.band==1);
+    nvn_map_warn_cadence_sample(&s,1,16000,now); assert(s.band==2); /* reserve consumes small limit */
+    uint64_t below40=nvn_map_warn_boundary(65530,40)-1;
+    assert(below40+2*NVN_MAP_WARN_LOAD_RESERVE_ROWS<nvn_map_warn_boundary(65530,88));
+    s=(nvn_map_warn_cadence){0};
+    nvn_map_warn_cadence_boost(&s,UINT64_MAX-1);
+    assert(s.fast_until_ns==UINT64_MAX);
+    puts("cadence bands hysteresis jump reserve unknown PASS");
+}
 int main(int argc,char **argv) {
     assert(argc==2);
     if (!strcmp(argv[1],"policy")) { policy(); panel(); return 0; }
     if (!strcmp(argv[1],"marker")) { vk_overlay_mode(); vk_overlay_mode(); return 0; }
+    if (!strcmp(argv[1],"cadence-policy")) { cadence_policy(); return 0; }
+    if (!strncmp(argv[1],"cadence-unobserved-",19)) {
+        map_warn_configure();
+        const int two=!strcmp(argv[1],"cadence-unobserved-two");
+        const int slow=two || !strcmp(argv[1],"cadence-unobserved-slow");
+        const int medium=!strcmp(argv[1],"cadence-unobserved-medium");
+        uint64_t initial=slow ? 26211 : medium ? 39317 : 57666;
+        unsigned seconds=slow ? 60 : medium ? 20 : 5;
+        g_map_warn_test_sample.set=1;
+        g_map_warn_test_sample.maps=initial; g_map_warn_test_sample.maximum=65530;
+        vma_worker_sample sample={.observed_epoch=nvn_dirty_lag_epoch()};
+        const uint64_t second=1000000000, origin=second;
+        poll_now=origin;
+        vma_worker_poll(&sample,0,0,1);
+        uint64_t deadline=vma_warn_deadline(&sample,poll_now,0,1);
+        assert(deadline==origin+(uint64_t)seconds*second+1 && g_vma_test_reads==2);
+        for (unsigned elapsed=1;elapsed<seconds;elapsed++) {
+            poll_now=origin+(uint64_t)elapsed*second;
+            if (elapsed==1) g_map_warn_test_sample.maps+=(slow || medium) ? 15000 : 1;
+            if (elapsed==2 && (slow || medium)) g_map_warn_test_sample.maps+=slow ? 15000 : 4000;
+            if (elapsed==3 && slow && !two) g_map_warn_test_sample.maps+=2000;
+            assert(!vma_worker_activity(&sample,poll_now)); /* no epoch hint, including driver/pool reuse */
+            assert(vma_warn_deadline(&sample,poll_now,deadline,0)==deadline);
+            assert(sample.maps==initial && g_vma_test_reads==2 && !nvn_dirty_map_warn_notice());
+        }
+        assert((g_map_warn_test_sample.maps>=nvn_map_warn_boundary(65530,88))==!two);
+        poll_now=deadline;
+        vma_worker_poll(&sample,0,0,1);
+        assert(g_vma_test_reads==4 && sample.warning_scans==2 && !sample.activity_events);
+        assert(nvn_dirty_map_warn_notice()==!two && vma_warn_period(&sample,poll_now)==5000);
+        printf("hint-free interval_s=%u scans=2 late_notice=%d two_observed_loads_safe=%d\n",
+            seconds,!two,two); return 0;
+    }
+    if (!strcmp(argv[1],"cadence-forced")) {
+        map_warn_configure();
+        vma_worker_sample sample={0};
+        poll_now=1000000000;
+        vma_worker_poll(&sample,0,0,1);
+        printf("forced mode=%u band=%u cadence_ms=%u\n",g_map_warn_mode,g_map_warn_test_band,
+            vma_warn_period(&sample,poll_now)); return 0;
+    }
+    if (!strcmp(argv[1],"cadence-activity")) {
+        map_warn_configure();
+        assert(g_map_warn_enabled && !atomic_load(&created));
+        vma_worker_sample sample={.observed_epoch=nvn_dirty_lag_epoch()};
+        poll_now=1000000000;
+        vma_worker_poll(&sample,0,0,1);
+        assert(g_vma_test_reads==2 && vma_warn_period(&sample,poll_now)==60000);
+        poll_now+=1000000000;
+        atomic_fetch_add_explicit(&g_range_epoch,3,memory_order_release);
+        assert(vma_worker_activity(&sample,poll_now));
+        assert(!vma_worker_activity(&sample,poll_now) && g_vma_test_reads==2); /* coalesced, read-only */
+        assert(vma_warn_period(&sample,poll_now)==5000);
+        vma_worker_poll(&sample,0,0,1); /* old fresh sample predates the activity: must refresh */
+        assert(g_vma_test_reads==4 && sample.warning_scans==2 && !sample.warning_reuses);
+        assert(sample.activity_events==1 && !sample.activity_pending);
+        poll_now+=1000000000;
+        atomic_fetch_add_explicit(&g_range_epoch,1,memory_order_release);
+        assert(vma_worker_activity(&sample,poll_now));
+        vma_worker_poll(&sample,1,0,1); /* same-iteration lag scan satisfies the activity request */
+        assert(g_vma_test_reads==6 && sample.warning_scans==2 && sample.warning_reuses==1);
+        assert(sample.activity_events==2 && g_vma_scan_stats[0]==3);
+        puts("activity coalesced fresh-invalidated lag-reused no-producer-work PASS"); return 0;
+    }
     if (!strncmp(argv[1],"reuse-",6)) {
         map_warn_configure();
         assert(g_map_warn_mode==2 && !atomic_load(&created));
@@ -110,10 +213,12 @@ int main(int argc,char **argv) {
             }
             assert(sample.warning_scans==0 && sample.warning_reuses==120 && warnings==120);
         } else if (!strcmp(argv[1],"reuse-warning-only")) {
+            poll_now=1;
             for (unsigned tick=1;tick<=120;tick++) {
-                /* Production schedules the next warning after the completed poll, not before it. */
-                poll_now=tick*(period+1);
+                /* Production schedules from the current adaptive cadence after each poll. */
+                poll_now+=(uint64_t)vma_warn_period(&sample,poll_now)*1000000+1;
                 vma_worker_poll(&sample,0,0,1); scans++; warnings++;
+                assert(vma_warn_period(&sample,poll_now)==60000);
             }
             assert(sample.warning_scans==120 && !sample.warning_reuses);
         } else if (!strcmp(argv[1],"reuse-stale")) {
@@ -411,13 +516,53 @@ class MapWarning(unittest.TestCase):
                       result.stdout)
         self.assertEqual(result.stderr.count('maps count unavailable'), 1)
 
+    def test_back_to_back_hint_free_loads_can_leave_warning_late_in_each_band(self):
+        for band, seconds in (('slow', 60), ('medium', 20), ('fast', 5)):
+            result = self.run_probe('cadence-unobserved-' + band, TOTK_MAP_WARN='2')
+            self.assertIn(f'hint-free interval_s={seconds} scans=2 late_notice=1 '
+                          'two_observed_loads_safe=0', result.stdout)
+            self.assertEqual(result.stderr.count('SAVE AND RESTART GAME SOON'), 1)
+            self.assertIn('activity_events=0', result.stderr)
+
+    def test_two_observed_size_loads_fit_the_slow_band_headroom_but_do_not_wake_it(self):
+        result = self.run_probe('cadence-unobserved-two', TOTK_MAP_WARN='2')
+        self.assertIn('hint-free interval_s=60 scans=2 late_notice=0 two_observed_loads_safe=1',
+                      result.stdout)
+        self.assertNotIn('SAVE AND RESTART GAME SOON', result.stderr)
+
+    def test_adaptive_bands_hysteresis_jump_and_observed_load_reserve(self):
+        result = self.run_probe('cadence-policy')
+        self.assertIn('cadence bands hysteresis jump reserve unknown PASS', result.stdout)
+
+    def test_pool_activity_invalidates_older_samples_and_reuses_new_lag_sample(self):
+        result = self.run_probe('cadence-activity', TOTK_MAP_WARN='2')
+        self.assertIn('activity coalesced fresh-invalidated lag-reused no-producer-work PASS', result.stdout)
+        self.assertIn('activity=1 activity_events=1', result.stderr)
+        self.assertIn('warning_scans=2 warning_reuses=1 cadence_ms=5000', result.stderr)
+        dirty = (NVN / 'nvn_dirty.c').read_text()
+        probe = dirty.split('static int vma_worker_activity(', 1)[1].split('static void vma_worker_poll(', 1)[0]
+        self.assertNotRegex(probe, r'pthread_|vma_read|/proc/|atomic_(?:store|fetch).*g_range_epoch')
+
+    def test_test_only_forced_bands_require_diagnostic_mode_and_preserve_thresholds(self):
+        for band, number, period in (('slow', 1, 60000), ('medium', 2, 20000), ('fast', 3, 5000)):
+            result = self.run_probe('cadence-forced', TOTK_MAP_WARN='2', TOTK_MAP_WARN_TEST_BAND=band)
+            self.assertIn(f'forced mode=2 band={number} cadence_ms={period}', result.stdout)
+            self.assertIn(f'cadence_ms={period}', result.stderr)
+            self.assertIn('log=80 show=88 clear=84', result.stderr)
+        for mode in ('1', '3'):
+            result = self.run_probe('cadence-forced', TOTK_MAP_WARN=mode, TOTK_MAP_WARN_TEST_BAND='slow')
+            self.assertIn(f'forced mode={mode} band=0', result.stdout)
+        result = self.run_probe('cadence-forced', TOTK_MAP_WARN='2', TOTK_MAP_WARN_TEST_BAND='bad')
+        self.assertIn('invalid TOTK_MAP_WARN_TEST_BAND', result.stderr)
+        self.assertIn('forced mode=2 band=0 cadence_ms=60000', result.stdout)
+
     def test_sampler_trace_has_monotonic_time_duration_rows_and_frame_origin(self):
         before = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
         result = self.run_probe('worker', TOTK_MAP_WARN='2')
         after = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
         lines = [line for line in result.stderr.splitlines() if '[map-warn-scan]' in line]
         self.assertEqual(len(lines), 1)
-        self.assertLess(len(lines[0]), 384)  # one fixed, bounded record, not one per maps row
+        self.assertLess(len(lines[0]), 512)  # one fixed, bounded record, not one per maps row
         fields = dict(re.findall(r'([a-z_]+)=(\d+)', lines[0]))
         self.assertLessEqual(before, int(fields['start_ns']))
         self.assertLessEqual(int(fields['start_ns']), after)
@@ -431,6 +576,11 @@ class MapWarning(unittest.TestCase):
         self.assertEqual(fields['scanned'], '1')
         self.assertEqual(fields['warning_scans'], '1')
         self.assertEqual(fields['warning_reuses'], '0')
+        self.assertEqual(fields['cadence_ms'], '60000')
+        self.assertEqual(fields['jump_rows'], '0')
+        self.assertEqual(fields['activity'], '0')
+        self.assertEqual(fields['activity_events'], '0')
+        self.assertEqual(fields['forced_band'], '0')
         dirty = (NVN / 'nvn_dirty.c').read_text()
         worker = dirty.split('static void vma_worker_poll(', 1)[1].split('static void *vma_worker(', 1)[0]
         self.assertEqual(dirty.count('LOG("[map-warn-scan]'), 1)
