@@ -136,6 +136,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Adapt this warning's own scans to 60/20/5 s below 40% / 60% / above, with 37% / 55% de-escalation
   hysteresis, a 15,000-row observed-load headroom reserve, >2,048-row jump hold and worker-only five-second
   probes of the existing pool-lifetime epoch. Reuse fresh samples unless a later pool change invalidated them.
+  Give the smaller-limit headroom guard separate hysteresis (release strictly below entry minus 3%
+  of the current sampled limit), avoiding 20/5 s toggling at 13,835/13,836 rows on a 32,768 limit.
   No new game/render/fault-path work is added. Mode `2` logs cadence, activity, jump and requested/reused
   scan counts; TEST-ONLY forced-band controls support safe checks. Mode `3` retains its five-second test.
   This reduces warning overhead, **not mapping growth**. The warning remains **best-effort**: a jump is

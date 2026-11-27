@@ -118,7 +118,7 @@ static void cadence_policy(void) {
     s=(nvn_map_warn_cadence){0};
     nvn_map_warn_cadence_sample(&s,13835,32768,now); assert(s.band==1);
     nvn_map_warn_cadence_sample(&s,13836,32768,now); assert(s.band==2); /* 88% minus 15000 */
-    nvn_map_warn_cadence_sample(&s,13835,32768,now); assert(s.band==1);
+    nvn_map_warn_cadence_sample(&s,13835,32768,now); assert(s.band==2);
     nvn_map_warn_cadence_sample(&s,1,16000,now); assert(s.band==2); /* reserve consumes small limit */
     uint64_t below40=nvn_map_warn_boundary(65530,40)-1;
     assert(below40+2*NVN_MAP_WARN_LOAD_RESERVE_ROWS<nvn_map_warn_boundary(65530,88));
@@ -132,6 +132,34 @@ int main(int argc,char **argv) {
     if (!strcmp(argv[1],"policy")) { policy(); panel(); return 0; }
     if (!strcmp(argv[1],"marker")) { vk_overlay_mode(); vk_overlay_mode(); return 0; }
     if (!strcmp(argv[1],"cadence-policy")) { cadence_policy(); return 0; }
+    if (!strcmp(argv[1],"cadence-guard")) {
+        nvn_map_warn_cadence s={0};
+        uint64_t now=1000000000;
+        nvn_map_warn_cadence_sample(&s,13835,32768,now);
+        assert(!s.reserve_fast && nvn_map_warn_cadence_period(&s,now)==20000);
+        for (unsigned i=0;i<8;i++) {
+            nvn_map_warn_cadence_sample(&s,i%2 ? 13835 : 13836,32768,now);
+            assert(s.reserve_fast && nvn_map_warn_cadence_period(&s,now)==5000);
+        }
+        assert(!s.fast_until_ns); /* no jump hold can mask a flapping guard */
+        nvn_map_warn_cadence_sample(&s,0,32768,now);
+        nvn_map_warn_cadence_sample(&s,13835,32768,now);
+        assert(s.reserve_fast && nvn_map_warn_cadence_period(&s,now)==5000);
+        nvn_map_warn_cadence_sample(&s,12852,32768,now);
+        assert(s.reserve_fast); /* enter 13836 minus ceil(32768*3/100) = 12852 */
+        nvn_map_warn_cadence_sample(&s,12851,32768,now);
+        assert(!s.reserve_fast && nvn_map_warn_cadence_period(&s,now)==20000);
+        nvn_map_warn_cadence_sample(&s,12852,32768,now);
+        assert(!s.reserve_fast && nvn_map_warn_cadence_period(&s,now)==20000);
+        nvn_map_warn_cadence_sample(&s,13836,32768,now);
+        assert(s.reserve_fast);
+        nvn_map_warn_cadence_sample(&s,12124,32768,now);
+        assert(!s.reserve_fast && nvn_map_warn_cadence_period(&s,now)==60000);
+        nvn_map_warn_cadence_sample(&s,13836,32768,now);
+        nvn_map_warn_cadence_sample(&s,13836,65530,now); /* use the newly supplied actual limit */
+        assert(!s.reserve_fast && nvn_map_warn_cadence_period(&s,now)==60000 && !s.fast_until_ns);
+        puts("guard actual-limit hysteresis no-flapping PASS"); return 0;
+    }
     if (!strncmp(argv[1],"cadence-unobserved-",19)) {
         map_warn_configure();
         const int two=!strcmp(argv[1],"cadence-unobserved-two");
@@ -533,6 +561,10 @@ class MapWarning(unittest.TestCase):
     def test_adaptive_bands_hysteresis_jump_and_observed_load_reserve(self):
         result = self.run_probe('cadence-policy')
         self.assertIn('cadence bands hysteresis jump reserve unknown PASS', result.stdout)
+
+    def test_smaller_limit_headroom_guard_has_separate_hysteresis(self):
+        result = self.run_probe('cadence-guard')
+        self.assertIn('guard actual-limit hysteresis no-flapping PASS', result.stdout)
 
     def test_pool_activity_invalidates_older_samples_and_reuses_new_lag_sample(self):
         result = self.run_probe('cadence-activity', TOTK_MAP_WARN='2')

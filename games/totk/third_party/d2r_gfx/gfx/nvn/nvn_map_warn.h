@@ -29,7 +29,7 @@ enum {
 typedef struct {
     uint64_t last_count, fast_until_ns;
     unsigned band; /* 0: slow, 1: medium, 2: fast */
-    int known;
+    int known, reserve_fast;
 } nvn_map_warn_cadence;
 static inline void nvn_map_warn_cadence_boost(nvn_map_warn_cadence *s, uint64_t now) {
     const uint64_t hold = UINT64_C(10000000000); /* two fast periods after activity or a large jump */
@@ -49,8 +49,15 @@ static inline uint64_t nvn_map_warn_cadence_sample(nvn_map_warn_cadence *s, uint
     if (count >= nvn_map_warn_boundary(limit, 40) && s->band == 0) s->band = 1;
     else if (count < nvn_map_warn_boundary(limit, 37)) s->band = 0;
     uint64_t notice = nvn_map_warn_boundary(limit, 88);
-    if (notice <= NVN_MAP_WARN_LOAD_RESERVE_ROWS || count >= notice - NVN_MAP_WARN_LOAD_RESERVE_ROWS)
-        s->band = 2;
+    if (notice <= NVN_MAP_WARN_LOAD_RESERVE_ROWS) s->reserve_fast = 1;
+    else {
+        uint64_t enter = notice - NVN_MAP_WARN_LOAD_RESERVE_ROWS;
+        uint64_t margin = nvn_map_warn_boundary(limit, 3);
+        uint64_t clear = enter > margin ? enter - margin : 0;
+        if (count >= enter) s->reserve_fast = 1;
+        else if (count < clear) s->reserve_fast = 0;
+    }
+    if (s->reserve_fast) s->band = 2;
     if (jump > NVN_MAP_WARN_JUMP_ROWS) nvn_map_warn_cadence_boost(s, now);
     s->last_count = count; s->known = 1;
     return jump > NVN_MAP_WARN_JUMP_ROWS ? jump : 0;
