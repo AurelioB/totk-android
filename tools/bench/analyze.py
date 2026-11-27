@@ -32,7 +32,7 @@ its "caveats" are appended to the generated ones. Never writes a baseline file (
 import argparse, collections, datetime, json, os, re, statistics, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchlib import SCHEMA, SWITCH_EVIDENCE_VERSION, SWITCH_KEYS, caps_of_limits, device_signature, guard_output, log_switch_states, parse_freq_tokens, sig_caps_text  # noqa: E402
+from benchlib import SCHEMA, SWITCH_EVIDENCE_VERSION, SWITCH_KEYS, caps_of_limits, device_signature, guard_output, log_switch_states, open_current_log, parse_freq_tokens, sig_caps_text  # noqa: E402
 from sampler import GPU_SNAPSHOT_FILE, gpu_residency_delta, parse_gpu_snapshots, power_of_tokens  # noqa: E402
 from provenance import compilation_of, compilation_summary, compile_record, scene_state  # noqa: E402
 
@@ -148,61 +148,61 @@ def parse_log(path):
     frame_p99 = {}
     capture = info['switch_capture'] = {'evidence_version': SWITCH_EVIDENCE_VERSION,
         'starts': [], 'presents': [], 'errors': [], 'records': {key: [] for key in SWITCH_KEYS}}
-    for number, line in enumerate(open(path, encoding='utf-8', errors='replace'), 1):
-        capture_switch_line(capture, line, number)
-        if record := compile_record(line):
-            compilations[record[0]] = record[1]
-        if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):
-            timing[int(m[1])] = tuple(float(x) for x in m.groups()[1:])
-        if m := re.search(r'帧间隔 至帧 (\d+)：>16\.7ms \d+ / (\d+) 帧，p99 ([\d.]+) ms', line):
-            frame_p99[int(m[1])] = (float(m[3]), int(m[2]))
-        if m := re.search(r'\[nvn-vk\] frame (\d+), per frame: recording ([\d.]+) ms, waiting for the GPU ([\d.]+) ms, GPU ([\d.]+) ms', line):
-            gpu[int(m[1])] = float(m[4])
-            recording[int(m[1])] = float(m[2])
-        if m := re.search(r'\[nvn-vk\] frame (\d+): ([\d.]+) fps over the last 300', line):
-            fps[int(m[1])] = float(m[2])
-            last_window = int(m[1])
-            if d := re.search(r'over the last 300, (\d+) draws\b', line):
-                draw_samples.append((last_window, int(d[1])))
-        if m := re.search(r'\[nvn-vk\] frame (\d+), stutter: longest frame ([\d.]+) ms, (\d+) frames over (\d+) ms, (\d+) over (\d+) ms', line):
-            stut[int(m[1])] = (int(m[3]), int(m[4]), int(m[5]), int(m[6]))
-        if m := re.search(r'\[长帧\] 帧 (\d+)（([\d.]+) s）整帧 ([\d.]+) ms', line):
-            longf.append((int(m[1]), float(m[3])))
-            frame_ms[int(m[1])] = float(m[3])
-        if m := re.search(r'\[frame-tl late\] frame=(\d+).*?\bgame_iv=([\d.]+)', line):
-            frame_ms.setdefault(int(m[1]), float(m[2]))
-        if last_window is not None and 'window present-fence cadence,' in line:
-            if m := re.search(r'p50/p95/p99=([\d.]+)/([\d.]+)/([\d.]+)ms', line):
-                present_stats[last_window] = {'present_p95_ms': float(m[2]), 'present_p99_ms': float(m[3])}
-        if last_window is not None and (m := re.search(
-                r'window present-fence interval bins ms \[<12.5,12.5-20.9,20.9-29,29-37.5,37.5-45.8,>=45.8\]: all=(\d+)/(\d+)/(\d+)/(\d+)/(\d+)/(\d+)', line)):
-            bins = [int(x) for x in m.groups()]
-            present_bins[last_window] = bins
-            if sum(bins) == 300:
-                near33[last_window] = bins[3]
-        if 'game_version' not in info and (m := re.search(r'^\[totk\] game version (\S+)', line)):
-            info['game_version'] = m[1]
-        if 'turnip' not in info and (m := re.search(r'driver sha256=([0-9a-f]{64})', line)):
-            info['turnip'] = m[1]
-        if 'settings' not in info and (m := re.search(r'^\[totk-app\] settings\.env \([^)]*\): (.*)$', line)):
-            info['settings'] = dict(kv.split('=', 1) for kv in m[1].split() if '=' in kv)
-        if 'device lost' in line.lower():
-            info['device_lost'] = info.get('device_lost', 0) + 1
-        if '[present-trace]' in line:
-            fields = dict(re.findall(r'(\w+)=(\S+)', line))
-            keys = ('id', 'generation', 'source_frame', 'display_ns')
-            if all(fields.get(k, '').isdigit() for k in keys):
-                row = {k: int(fields[k]) for k in keys}
-                key = row['generation'], row['id']
-                # Identical duplicate delivery is harmless; conflicting identities cannot establish an interval.
-                traces[key] = row if key not in traces or traces[key] == row else None
+    with open_current_log(path) as log:
+        for number, line in enumerate(log, 1):
+            capture_switch_line(capture, line, number)
+            if record := compile_record(line):
+                compilations[record[0]] = record[1]
+            if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):
+                timing[int(m[1])] = tuple(float(x) for x in m.groups()[1:])
+            if m := re.search(r'帧间隔 至帧 (\d+)：>16\.7ms \d+ / (\d+) 帧，p99 ([\d.]+) ms', line):
+                frame_p99[int(m[1])] = (float(m[3]), int(m[2]))
+            if m := re.search(r'\[nvn-vk\] frame (\d+), per frame: recording ([\d.]+) ms, waiting for the GPU ([\d.]+) ms, GPU ([\d.]+) ms', line):
+                gpu[int(m[1])] = float(m[4])
+                recording[int(m[1])] = float(m[2])
+            if m := re.search(r'\[nvn-vk\] frame (\d+): ([\d.]+) fps over the last 300', line):
+                fps[int(m[1])] = float(m[2])
+                last_window = int(m[1])
+                if d := re.search(r'over the last 300, (\d+) draws\b', line):
+                    draw_samples.append((last_window, int(d[1])))
+            if m := re.search(r'\[nvn-vk\] frame (\d+), stutter: longest frame ([\d.]+) ms, (\d+) frames over (\d+) ms, (\d+) over (\d+) ms', line):
+                stut[int(m[1])] = (int(m[3]), int(m[4]), int(m[5]), int(m[6]))
+            if m := re.search(r'\[长帧\] 帧 (\d+)（([\d.]+) s）整帧 ([\d.]+) ms', line):
+                longf.append((int(m[1]), float(m[3])))
+                frame_ms[int(m[1])] = float(m[3])
+            if m := re.search(r'\[frame-tl late\] frame=(\d+).*?\bgame_iv=([\d.]+)', line):
+                frame_ms.setdefault(int(m[1]), float(m[2]))
+            if last_window is not None and 'window present-fence cadence,' in line:
+                if m := re.search(r'p50/p95/p99=([\d.]+)/([\d.]+)/([\d.]+)ms', line):
+                    present_stats[last_window] = {'present_p95_ms': float(m[2]), 'present_p99_ms': float(m[3])}
+            if last_window is not None and (m := re.search(
+                    r'window present-fence interval bins ms \[<12.5,12.5-20.9,20.9-29,29-37.5,37.5-45.8,>=45.8\]: all=(\d+)/(\d+)/(\d+)/(\d+)/(\d+)/(\d+)', line)):
+                bins = [int(x) for x in m.groups()]
+                present_bins[last_window] = bins
+                if sum(bins) == 300:
+                    near33[last_window] = bins[3]
+            if 'game_version' not in info and (m := re.search(r'^\[totk\] game version (\S+)', line)):
+                info['game_version'] = m[1]
+            if 'turnip' not in info and (m := re.search(r'driver sha256=([0-9a-f]{64})', line)):
+                info['turnip'] = m[1]
+            if 'settings' not in info and (m := re.search(r'^\[totk-app\] settings\.env \([^)]*\): (.*)$', line)):
+                info['settings'] = dict(kv.split('=', 1) for kv in m[1].split() if '=' in kv)
+            if 'device lost' in line.lower():
+                info['device_lost'] = info.get('device_lost', 0) + 1
+            if '[present-trace]' in line:
+                fields = dict(re.findall(r'(\w+)=(\S+)', line))
+                keys = ('id', 'generation', 'source_frame', 'display_ns')
+                if all(fields.get(k, '').isdigit() for k in keys):
+                    row = {k: int(fields[k]) for k in keys}
+                    key = row['generation'], row['id']
+                    # Identical duplicate delivery is harmless; conflicting identities cannot establish an interval.
+                    traces[key] = row if key not in traces or traces[key] == row else None
     info['frame_ms'], info['near33'] = frame_ms, near33
     info['draw_rates'] = cumulative_draw_rates(draw_samples)
     info['compilations'] = compilations
     info.update(recording=recording, present_stats=present_stats, present_bins=present_bins, frame_p99=frame_p99,
                 present_intervals=present_trace_intervals(traces))
     return timing, gpu, fps, stut, longf, info
-
 
 
 def present_trace_intervals(traces):
@@ -318,7 +318,7 @@ def parse_ctl(path):
     """The live-switch generations of a log, in order: [{'gen', 'frame', 'applied': [tokens], 'marks': [texts],
     'arm', 'block', 'direction'}]. Missing direction marks in old runs are inferred from the block index."""
     gens = {}
-    with open(path, encoding='utf-8', errors='replace') as fh:
+    with open_current_log(path) as fh:
         lines = [line.rstrip('\n') for line in fh if '[totk-ctl]' in line]
     for line in lines:
         if not (m := CTL_RE.search(line)):

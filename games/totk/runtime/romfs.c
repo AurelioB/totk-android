@@ -196,28 +196,106 @@ static void sha_range(int fd,uint64_t offset,uint64_t size,const char *expected,
 }
 static uint64_t lower(const char *name);
 static int path_ok(const char *p);
-static void overlay_load(const char *dir,int required) {
- char path[4096];need(snprintf(path,sizeof(path),"%s/manifest.tsv",dir)<(int)sizeof(path),"RomFS overlay path");FILE *m=fopen(path,"r");
- if(!m&&required){fprintf(stderr,"[totk] RomFS overlay: %s missing; build it with scripts/make_output_res_overlay.py <w>x<h>\n",path);runtime_fail("true-2K HeapDef overlay missing (make romfs-patches-out OUTPUT_RES=<w>x<h>)");}
- if(!m){fprintf(stderr,"[totk] RomFS overlay: none (%s)\n",path);return;}
- char line[8192];size_t first=noverlay;uint64_t hashed=0,t0=runtime_now_ns();
+/* Adapted from upstream PR #54. Reuse a full overlay verification only while
+   its manifest entries, opened files, base image parts and index still match. */
+static void overlay_identity_begin(host_sha256_ctx *identity) {
+ host_sha256_init(identity);
+ host_sha256_update(identity,ROMFS_INDEX_SHA256,65);
+ host_sha256_update(identity,&nchunks,sizeof nchunks);
+ for(unsigned i=0;i<(nchunks?nchunks:1);i++){
+  struct stat st;
+  need(fstat(nchunks?chunk_fds[i]:image_fd,&st)==0&&S_ISREG(st.st_mode),"RomFS overlay base image stat");
+  RomfsProof proof=proof_for(&st);
+  host_sha256_update(identity,&proof,sizeof proof);
+ }
+}
+static int overlay_read_proof(const char *dir,const char *name,uint8_t digest[32]) {
+ char path[4096];
+ if(snprintf(path,sizeof path,"%s/%s",dir,name)>=(int)sizeof path)return 0;
+ int fd=open(path,O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+ if(fd<0)return 0;
+ struct stat st;
+ int ok=fstat(fd,&st)==0&&S_ISREG(st.st_mode)&&st.st_size==32&&read(fd,digest,32)==32;
+ close(fd);
+ return ok;
+}
+enum OverlayPass { OVERLAY_IDENTIFY, OVERLAY_VERIFY, OVERLAY_REUSE };
+static uint64_t overlay_walk(FILE *m,const char *dir,enum OverlayPass pass,host_sha256_ctx *identity) {
+ char line[8192];size_t first=noverlay;uint64_t hashed=0;
  while(fgets(line,sizeof(line),m)){
   if(line[0]=='#'||line[0]=='\n')continue;char name[4096],sha[65],orig[65];unsigned long long size=0;
   need(sscanf(line,"%4095[^\t]\t%llu\t%64[0-9a-f]\t%64[0-9a-f-]",name,&size,sha,orig)==4&&strlen(sha)==64&&(strlen(orig)==64||!strcmp(orig,"-")),"RomFS overlay manifest line");
   need(path_ok(name),"RomFS overlay path");uint64_t i=lower(name);int known=i<file_count&&!strcmp(entry_name(entry(i)),name),add=!strcmp(orig,"-");
   if(!known&&!add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv names %s, which the RomFS lacks; a new file has \"-\" as its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay names a file the RomFS lacks");}
   if(known&&add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv adds %s, which the RomFS already has; give its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay adds a file the RomFS already has");}
-  Entry e={0};if(known){e=entry(i);sha_range(image_fd,e.offset,e.size,orig,"original");}else i=ADDED;
-  char file[8200];need(snprintf(file,sizeof(file),"%s/%s",dir,name)<(int)sizeof(file),"RomFS overlay file path");int fd=open(file,O_RDONLY|O_CLOEXEC);struct stat st;
-  need(fd>=0&&fstat(fd,&st)==0&&(uint64_t)st.st_size==size,"RomFS overlay file missing or wrong size");sha_range(fd,0,size,sha,name);close(fd);
-  hashed+=e.size+size;
+  Entry e={0};if(known)e=entry(i);else i=ADDED;
+  char file[8200];need(snprintf(file,sizeof(file),"%s/%s",dir,name)<(int)sizeof(file),"RomFS overlay file path");
+  int fd=open(file,O_RDONLY|O_CLOEXEC|O_NONBLOCK);struct stat st;
+  need(fd>=0&&fstat(fd,&st)==0&&S_ISREG(st.st_mode)&&(uint64_t)st.st_size==size,"RomFS overlay file missing or wrong size");
+  if(pass==OVERLAY_VERIFY){
+   if(known)sha_range(image_fd,e.offset,e.size,orig,"original");
+   sha_range(fd,0,size,sha,name);
+   hashed+=e.size+size;
+  }
+  if(identity){
+   RomfsProof proof=romfs_proof_for(&st,sha);
+   if(pass==OVERLAY_VERIFY){
+    struct stat after;
+    need(fstat(fd,&after)==0,"RomFS overlay file stat after hash");
+    RomfsProof finished=romfs_proof_for(&after,sha);
+    need(proof_equal(&proof,&finished),"RomFS overlay changed during verification");
+   }
+   host_sha256_update(identity,line,strlen(line)+1);
+   host_sha256_update(identity,&proof,sizeof proof);
+  }
+  close(fd);
+  if(pass==OVERLAY_IDENTIFY)continue;
   if(noverlay==overlay_cap){overlay_cap=overlay_cap?overlay_cap*2:16;overlays=realloc(overlays,overlay_cap*sizeof(*overlays));need(overlays!=NULL,"RomFS overlay table");}
   char *copy=strdup(file),*rel=strdup(name);need(copy&&rel,"RomFS overlay path copy");overlays[noverlay++]=(Overlay){i,size,copy,st.st_dev,st.st_ino,st.st_mtimespec,rel,NULL};
   if(noverlay-first<=16)fprintf(stderr,"[totk] RomFS overlay: %s (%llu bytes) %s\n",name,size,add?"is added":"replaces the original");
  }
- fclose(m);
+ need(!ferror(m),"read RomFS overlay manifest");
  if(noverlay-first>16)fprintf(stderr,"[totk] RomFS overlay: %zu files from %s (%zu more not listed)\n",noverlay-first,dir,noverlay-first-16);
- if(noverlay>first)fprintf(stderr,"[totk] RomFS overlay: %s checked, %zu files, %.1f MB hashed in %.2f s\n",dir,noverlay-first,hashed/1048576.0,(runtime_now_ns()-t0)/1e9);
+ return hashed;
+}
+static void overlay_load(const char *dir,int required) {
+ char path[4096];need(snprintf(path,sizeof(path),"%s/manifest.tsv",dir)<(int)sizeof(path),"RomFS overlay path");FILE *m=fopen(path,"r");
+ if(!m&&required){fprintf(stderr,"[totk] RomFS overlay: %s missing; build it with scripts/make_output_res_overlay.py <w>x<h>\n",path);runtime_fail("true-2K HeapDef overlay missing (make romfs-patches-out OUTPUT_RES=<w>x<h>)");}
+ if(!m){fprintf(stderr,"[totk] RomFS overlay: none (%s)\n",path);return;}
+ const char *proof_dir=getenv("TOTK_ROMFS_PROOF_DIR"),*verify=getenv("TOTK_ROMFS_VERIFY");
+ int cache=proof_dir&&*proof_dir, reuse=0;
+ char key[65],record[96];uint8_t saved[32];host_sha256_ctx base,identity;
+ uint64_t started=runtime_now_ns();
+ if(cache){
+  host_sha256_hex(dir,strlen(dir),key);
+  snprintf(record,sizeof record,".overlay-verified-v1-%s",key);
+  overlay_identity_begin(&base);
+  if((!verify||strcmp(verify,"full"))&&overlay_read_proof(proof_dir,record,saved)){
+   uint8_t candidate[32];identity=base;
+   overlay_walk(m,dir,OVERLAY_IDENTIFY,&identity);
+   host_sha256_final(&identity,candidate);
+   reuse=!memcmp(candidate,saved,sizeof saved);
+   need(fseek(m,0,SEEK_SET)==0,"rewind RomFS overlay manifest");
+  }
+  identity=base;
+ }
+ size_t first=noverlay;
+ uint64_t hashed=overlay_walk(m,dir,reuse?OVERLAY_REUSE:OVERLAY_VERIFY,cache?&identity:NULL);
+ fclose(m);
+ if(cache&&(reuse||noverlay>first)){
+  uint8_t digest[32],base_before[32],base_after[32];
+  host_sha256_final(&identity,digest);
+  host_sha256_final(&base,base_before);
+  overlay_identity_begin(&base);host_sha256_final(&base,base_after);
+  need(!memcmp(base_before,base_after,sizeof base_before),"RomFS overlay base image changed during verification");
+  if(reuse)need(!memcmp(saved,digest,sizeof saved),"RomFS overlay changed during verification");
+  else record_write(proof_dir,record,digest,sizeof digest);
+ }
+ if(noverlay>first){
+  double seconds=(runtime_now_ns()-started)/1e9;
+  if(reuse)fprintf(stderr,"[totk] RomFS overlay: %s unchanged; reused SHA-256 verification (%zu files in %.2f s)\n",dir,noverlay-first,seconds);
+  else fprintf(stderr,"[totk] RomFS overlay: %s checked, %zu files, %.1f MB hashed in %.2f s\n",dir,noverlay-first,hashed/1048576.0,seconds);
+ }
 }
 static int overlay_order(const void *a,const void *b) {uint64_t x=((const Overlay *)a)->index,y=((const Overlay *)b)->index;return (x>y)-(x<y);}
 static int added_order(const void *a,const void *b) {const Overlay *x=*(Overlay *const *)a,*y=*(Overlay *const *)b;return strcmp(x->name,y->name);}

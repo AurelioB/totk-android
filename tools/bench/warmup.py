@@ -74,10 +74,11 @@ def main():
         # Small bounded tail, not an ever-growing full log pull. Missing reports remain unknown.
         # A byte-offset tail can start inside a multibyte character; replace it rather than abort.
         command = 'tail -c 65536 ' + shlex.quote(args.game_dir + '/totk.log')
-        return subprocess.run([sys.executable, str(here / 'rootsh.py'), '-s', args.s, 'run',
+        log = subprocess.run([sys.executable, str(here / 'rootsh.py'), '-s', args.s, 'run',
                                '--timeout', str(max(0.01, min(10, remaining))), '-c', command],
                               capture_output=True, text=True, encoding='utf-8', errors='replace',
                               check=True, timeout=max(0.01, remaining)).stdout
+        return log.rsplit('\n[totk-log] ===== Launch ', 1)[-1]
 
     record = {'device': args.device, 'scene': args.scene, 'started_epoch': time.time(),
               **wait_for_calm(read_log, args.calm_windows, args.timeout)}

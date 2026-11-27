@@ -3329,6 +3329,9 @@ static void sleep_until_ns(uint64_t dl) {   // 单调时钟上的绝对时刻 | 
 // DM_PRESENT_HZ=0 (uncapped frame rate) serves only as an explicit performance profiling switch: some of the game's UI logic counts frames (with the same save, uncapped gives
 // 4181 SaveIndicatorPanel entries and capped at 60 fps gives 0, which matches the ground truth), so uncapped is a semantically wrong way to run and must not be used as a criterion / cross-check / default. Unit tests set it directly with nvn_present_config
 static int g_hz = -1, g_display_mode;
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+static int g_use_guest_ticks;
+#endif
 /* TOTK_UNCAPPED (Mac and iPhone, default on; =0 off): like vsync off in other games. The game no longer waits for the display: it is
    paced by our own clock at UNCAPPED_HZ, and the display link shows the newest finished frame at every refresh (older ones
    are merged away, as when the game runs ahead). The ceiling is 120 because the real-time frame step (game_patches.c)
@@ -3355,6 +3358,7 @@ static void present_cfg(const win_t *o) {
     { const char *u = getenv("TOTK_UNCAPPED"), *f60 = getenv("TOTK_FPS60");   // the original 30-frame mode needs fixed pacing; MetalFX interpolation suspends it while on (uncapped_now)
       g_uncapped = !e && realtime && !(u && !strcmp(u, "0")) && !(f60 && !strcmp(f60, "0")) && g_hz < UNCAPPED_HZ; }
 #if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+    g_use_guest_ticks = !e && !mtl_link_active() && !acquire_clock_on();
     /* Display pacing is an explicit Android policy: keep the guest's requested
      * interval, never silently enter the inherited 120-Hz uncapped mode. */
     if (mtl_link_active()) { g_uncapped = 0; g_hz = g_paced_hz = scr; }
@@ -3420,6 +3424,25 @@ static unsigned present_ticks(const win_t *o) {   /* display ticks per game fram
         return g_fps_auto_ticks; /* Exact adaptive alone may shorten host pacing. */
     if ((runtime_android_fps_auto_active() || runtime_fps_hybrid_selected()) && g_fps_auto_ticks>ticks)
         ticks=g_fps_auto_ticks;
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+    /* NVN intervals count the guest's60Hz ticks, not panel refreshes. Using
+     * interval2 directly at120Hz doubled the selected30fps mode. Convert once
+     * here so acquire waits, credits and queued presents share the same units.
+     * Adaptive returns physical slots above; interpolation/uncapped own theirs.
+     * Round up on panels without an exact divisor. Round measured Hz first:
+     * fractional rates and callback calibration noise near60/120Hz must not
+     * add a whole refresh. Durations still use the precise observed period. */
+    if (g_use_guest_ticks && !uncapped_now() && !dm_detclock_enabled() && mfx_enabled() == MFX_OFF &&
+            !g_display_mode && !runtime_android_fps_auto_active() &&
+            !runtime_fps_hybrid_selected() && !runtime_fps_adaptive_selected()) {
+        uint64_t refresh = runtime_android_display_period(1);
+        if (refresh) {
+            uint64_t hz = (1000000000ull + refresh / 2) / refresh;
+            uint64_t physical = ((uint64_t)ticks * hz + 59) / 60;
+            ticks = !physical ? 1 : physical > UINT32_MAX ? UINT32_MAX : (unsigned)physical;
+        }
+    }
+#endif
     if (acquire_clock_on()) return cutscene_present_ticks(ticks);
     /* TOTK_MFX / key 2: MetalFX makes the frame between two game frames. Half the refresh rate: the game presents every
        second display tick (50 + 50 on a 100 Hz display); 30+30: hz / 30 ticks (2 at 60 Hz; at 100 Hz the own clock paces,

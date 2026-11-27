@@ -291,23 +291,29 @@ line records frozen effective states, including opt-outs, independently of menu 
 from the actual startup install outcome, not its requested environment: applied is ON, inactive is OFF,
 and guard/padding refusal or an unavailable outcome is UNKNOWN. Legacy versions without the installer are OFF.
 Analyzer metadata and signatures include all three states (and warning mode); mismatches are **NOT COMPARABLE**.
-`UNKNOWN` never matches, even another `UNKNOWN`. The reliable raw startup bracket starts at the sole
-`[totk-app] build ...` line and ends at the first subsequent `[nvn-vk] frame N: ... fps over the last 300`
-line. The neutral marker must lie strictly inside that bracket; it cannot close or authenticate its own bracket.
-The parser retains every positioned observation. Invalid, conflicting, duplicate single-startup, stale or
-out-of-bracket state records make the affected switch UNKNOWN, independently of the others. Multiple
-launches or presentation records before the build start invalidate all three; a filtered/prefixed or truncated
-capture cannot borrow state from another launch.
+`UNKNOWN` never matches, even another `UNKNOWN`. In the selected current segment, the reliable raw startup
+bracket starts at the sole `[totk-app] build ...` line and ends at the first subsequent
+`[nvn-vk] frame N: ... fps over the last 300` line. The marker must lie strictly inside that bracket;
+it cannot close or authenticate its own bracket.
+The parser first selects the current segment at the last `[totk-log] ===== Launch ` heading, then retains
+every positioned observation from that segment only (legacy logs without headings remain single-run).
+Both bracket ends and all three switches' evidence must belong to that same segment; an older menu state,
+including a retained `(before log history)` segment, cannot authenticate current menu admission or a
+missing/truncated current bracket. The latter stays UNKNOWN.
+Invalid, conflicting, duplicate single-startup, stale or out-of-bracket state records make the affected
+switch UNKNOWN independently of the others. Multiple build starts inside that segment or presentation
+records before its build start invalidate all three; filtered/prefixed captures cannot borrow state.
 Older complete captures can prove ON through alias enable/statistics, map-warning start and original-admission
 menu applied records; a raw menu-off startup record can prove OFF. A v1 marker reports only alias/warning:
 it does not imply menu OFF. Normal repeated post-startup alias statistics may corroborate an authenticated
 ON state, but cannot establish missing startup; stale, malformed or contradictory telemetry rejects admission.
 Absence alone is not OFF. Exact known pre-switch provenance (the pinned 1.0.0 commit/APK pair) establishes
-marker-less all-OFF only in a complete raw startup bracket after rejecting contradictory/invalid observations.
-The immutable registered baseline/index retain their authenticated pre-switch identity and metrics.
-Effective-state evidence version **3** is required by comparison and ledger tools. Older stored metadata must
-be regenerated from raw logs; UNKNOWN cannot match through a legacy stored signature. Runtime marker v2
-adds menu state; the parser still reconciles v1 markers with independent raw startup evidence. Mixed old/new
+marker-less all-OFF only in a complete current-segment startup bracket after rejecting contradictory/invalid
+observations. The immutable registered baseline/index retain their authenticated pre-switch identity and metrics.
+Effective-state evidence version **4** is required by comparison and ledger tools. Version 3 and older metadata
+must be regenerated from raw logs because they did not enforce this combined current-launch/menu contract;
+UNKNOWN cannot match through a legacy stored signature. Runtime marker v2 still adds menu state; the parser
+reconciles v1 markers with independent raw startup evidence from the same current segment. Mixed old/new
 resolver metadata is NOT COMPARABLE. Legacy metrics and pinned hashes stay unchanged; never rewrite history.
 An intentional menu-policy A/B is a workload-changing experiment: record that attribution separately, not as
 an ordinary matching baseline or an automatic SAME performance verdict.

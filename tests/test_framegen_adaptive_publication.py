@@ -400,6 +400,8 @@ int main(void) {
     vk_fg_slot_boundary();
     assert(!g_slot_prepared[0].generation && !g_slot_prepared_count);
     assert(!atomic_load(&g_pres[0].busy) && !atomic_load(&vk_fg_slot_boundary_active));
+    (void)g_bound_pipe;
+    (void)g_dyn_dirty;
     assert(g_slot_dispatch_stats.cancelled==1 && !g_slot_dispatch_stats.no_publication);
     for (int state=PREPARING;state<=QUARANTINED;state++) {
         setup(state);vk_fg_slot_boundary();

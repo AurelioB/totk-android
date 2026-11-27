@@ -160,6 +160,10 @@ int main(int argc, char **argv) {
     assert(resumed.interval == 3 && resumed.desired_ns >= stale.desired_ns + 3 * hz120);
     assert(!memcmp(&queued, &saved, sizeof saved));
     assert(invalidations == 3);
+    (void)display_callback_observation;
+    (void)display_fence_observation;
+    (void)display_callback_measured_ns;
+    (void)display_callback_calibrated;
     return 0;
 }
 '''
@@ -182,22 +186,26 @@ int main(int argc, char **argv) {
 #include <stdlib.h>
 #include <string.h>
 #include "games/totk/android/gfx/vk_present_slots.h"
+#include "games/totk/android/gfx/acquire_slack.h"
+#include "games/totk/android/gfx/predict_pace.h"
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
 enum { MFX_OFF, MFX_HALF, MFX_30, MFX_MAX };
 #define UNCAPPED_HZ 120
 typedef struct { int interval; } win_t;
 static int g_uncapped, g_paced_hz, g_hz = -1, g_display_mode;
+static int g_use_guest_ticks;
 static unsigned g_fps_auto_ticks;
 static uint64_t actual_refresh;
 static int mfx_enabled(void) { return MFX_OFF; }
+static int display_pace, acquire_vsync, fps_auto;
 static int dm_detclock_enabled(void) { return 0; }
-static int acquire_clock_on(void) { return 0; }
+static int acquire_clock_on(void) { return acquire_vsync; }
 static int runtime_fps_adaptive_selected(void) { return 0; }
-static int runtime_android_fps_auto_active(void) { return 0; }
+static int runtime_android_fps_auto_active(void) { return fps_auto; }
 static int runtime_fps_hybrid_selected(void) { return 0; }
-static uint64_t runtime_android_acquire_period(unsigned interval) { (void)interval; return 0; }
+static uint64_t runtime_android_acquire_period(unsigned interval) { return acquire_vsync ? actual_refresh * interval : 0; }
 static uint64_t runtime_android_display_period(unsigned interval) { return actual_refresh * interval; }
-static int runtime_android_display_pace_active(void) { return 0; } /* PACE=0, as generated. */
+static int runtime_android_display_pace_active(void) { return display_pace; }
 static int runtime_android_display_hz(void) { return (int)((1000000000 + actual_refresh / 2) / actual_refresh); }
 static unsigned (*runtime_cutscene_present_ticks)(unsigned, uint64_t);
 static int uncapped_interval_on(void) { return atoi(getenv("TOTK_UNCAPPED_INTERVAL")) != 0; }
@@ -284,7 +292,75 @@ int main(void) {
     assert(present_period(&window) == 1000000000 / 55 && g_hz == 55); /* Developer cap wins. */
     window.interval = 2;
     assert(!setenv("TOTK_UNCAPPED", "0", 1)); g_hz = -1;
-    assert(present_period(&window) == 2 * actual_refresh && !uncapped_now());
+    /* Guest intervals are 60Hz units even on a120Hz panel. The same bug
+     * made the menu's30fps choice run at60 after a touch boosted refresh. */
+    runtime_cutscene_present_ticks = NULL;
+    for (unsigned mode = 0; mode < 2; mode++) {
+        assert(!setenv("TOTK_FPS60", mode ? "1" : "0", 1));
+        for (unsigned display = 0; display < 2; display++) {
+            actual_refresh = display ? 8333333 : 16666667; g_hz = -1;
+            for (unsigned guest = 1; guest <= 3; guest++) {
+                window.interval = guest;
+                assert(present_ticks(&window) == guest * (display ? 2 : 1));
+                uint64_t period = present_period(&window);
+                assert(period == guest * (display ? 2 : 1) * actual_refresh && !uncapped_now());
+            }
+        }
+    }
+    /* Do not reset the configured producer across observed mode changes.
+     * Frame lag is a submission/fence policy, not a guest tick multiplier. */
+    const unsigned displays[] = {60, 90, 100, 120, 144, 60, 120, 60};
+    const unsigned slots[][2] = {{1,2}, {2,3}, {2,4}, {2,4}, {3,5}, {1,2}, {2,4}, {1,2}};
+    for (unsigned lag = 0; lag <= 1; lag++) {
+        assert(!setenv("TOTK_FRAME_LAG", lag ? "1" : "0", 1));
+        for (unsigned mode = 0; mode < 2; mode++) {
+            assert(!setenv("TOTK_FPS60", mode ? "1" : "0", 1)); g_hz = -1;
+            acquire_slack_policy slack = {0};
+            predict_pacer predict = {0};
+            vk_present_slots reservations = {0};
+            uint64_t callback = 1000000000ull;
+            for (unsigned d = 0; d < sizeof displays / sizeof *displays; d++) {
+                actual_refresh = (1000000000ull + displays[d] / 2) / displays[d];
+                for (unsigned guest = 1; guest <= 2; guest++) {
+                    window.interval = guest;
+                    unsigned ticks = slots[d][guest - 1];
+                    uint64_t period = present_period(&window);
+                    assert(present_ticks(&window) == ticks && period == ticks * actual_refresh);
+                    vk_present_slot slot = vk_present_slots_reserve(&reservations, 1,
+                        callback, actual_refresh, ticks, callback);
+                    assert(slot.mode == VK_PRESENT_SLOTS_ACTIVE && slot.interval == ticks);
+                    assert(vk_present_slots_interval(period / 1e9, actual_refresh) == ticks);
+                    acquire_slack_observe(&slack, slot.desired_ns, period);
+                    assert(slack.target_ns == period);
+                    predict_decision decision = predict_pacer_choose(&predict, slot.desired_ns, period);
+                    assert(decision.period_ns == period && decision.lead_ns == period);
+                    assert(decision.release_ns == slot.desired_ns - 2 * period);
+                    callback = slot.desired_ns + period;
+                }
+            }
+        }
+    }
+    /* Suspended FPS Auto still owns physical units on non-60Hz panels.
+     * active here is the configured/active flag, with no auto tick output. */
+    actual_refresh = 8333333; g_hz = -1; window.interval = 2; fps_auto = 1;
+    assert(present_ticks(&window) == 2 && present_period(&window) == 16666666);
+    fps_auto = 0;
+    assert(present_ticks(&window) == 4 && present_period(&window) == 33333332);
+    for (unsigned policy = 0; policy < 2; policy++) {
+        display_pace = !policy; acquire_vsync = policy; g_hz = -1;
+        assert(present_ticks(&window) == 2 && present_period(&window) == 16666666);
+        assert(!g_use_guest_ticks);
+    }
+    display_pace = acquire_vsync = 0;
+    /* Calibrated callback/fence clocks have small jitter. A60Hz panel must
+     * not acquire a third slot when its measured period is16.65ms. */
+    actual_refresh = 16650000; g_hz = -1; window.interval = 2;
+    assert(present_ticks(&window) == 2);
+    actual_refresh = 8325000; g_hz = -1;
+    assert(present_ticks(&window) == 4);
+    /* Locked frame generation supplies a 60 Hz profile and owns its interval. */
+    assert(!setenv("DM_PRESENT_HZ", "60", 1)); g_hz = -1;
+    assert(present_ticks(&window) == 2);
     return 0;
 }
 '''

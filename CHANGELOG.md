@@ -29,7 +29,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 - Include actual menu admission (applied/on, inactive/off, refused/UNKNOWN) in the one-time startup
   switch marker and benchmark comparison/ledger workload signatures. Reconcile raw current-launch
   startup evidence, retain legacy marker parsing without inventing menu OFF, and require resolver
-  evidence version 3. Pin all three historical opt-outs; keep immutable baseline metrics/hashes unchanged.
+  evidence version 4 for the combined current-launch/menu contract. Pin all three historical opt-outs;
+  keep immutable baseline metrics/hashes unchanged.
 - Log the frozen effective write-back-alias state and map-warning mode once at first presenter startup,
   including explicit opt-outs, so benchmark tools need not infer build-dependent defaults from menu settings.
 - Record effective alias/warning states from complete startup evidence, including the warning mode, in benchmark
@@ -39,6 +40,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Reject stale, duplicate, malformed and conflicting records per switch before marker or pre-switch-provenance
   admission; require current evidence metadata so older resolver results cannot bypass UNKNOWN rejection.
   Preserve window metrics and immutable baseline identities.
+- Scope all three effective-switch states, including menu admission and both startup-bracket ends,
+  to the current launch in retained ten-launch logs. Historical markers or a migrated pre-history segment
+  never authenticate missing, different or incomplete current menu admission.
 - Make optional frame-timeline and fence-evidence ring producers single-attempt/nonblocking, with counted
   dropped updates and skipped snapshots. Reuse per-walk elapsed clocks instead of enabling recorder
   opcode/category probes, and batch recorder-worker draws/descriptors at slot assembly instead of each job.
@@ -85,12 +89,32 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Per-thread period-weighted self/inclusive reports separate walker, recorder, submit and game CPU.
 - Give newly linked `libtotk.so` a SHA-1 GNU build ID retained in the packaged library,
   so native profiles can identify matching unstripped symbols without relying on source revision alone.
-- Add experimental `TOTK_FRAME_RATE_HINT_HZ` (default off, needs `TOTK_FRAME_RATE_HINT=1`): request integer
-  rates advertised by the current game-window display, or `max` for its highest rate (including fractional Hz),
-  through the existing FIXED_SOURCE window/AHB-child hints. Invalid or unavailable rates retain the old hint
-  policy; game pacing and Android settings remain unchanged.
+- Add `TOTK_FRAME_RATE_HINT_HZ`: request integer rates advertised by the current game-window display,
+  or `max` for its highest rate (including fractional Hz), through FIXED_SOURCE window/AHB-child hints.
+  Ordinary fixed-rate Samsung gameplay now defaults to `max`; elsewhere explicit enablement is required.
+  Invalid, unavailable or zero rates fall back to content-rate hints; Android's user limits remain authoritative.
 
 ### Runtime
+- Correct ordinary Android capped pacing from guest 60-Hz ticks to display slots: 30/60-fps caps
+  remain 30/60 on 60/120-Hz panels. Non-divisor displays round up to whole slots (at 144 Hz,
+  30/60 choices yield 28.8/48 fps). `TOTK_FRAME_RATE_HINT=0` disables refresh votes, not this cap fix.
+  Explicit display/acquire clocks, frame generation, FPS Auto and uncapped policies retain their own authority.
+- Keep validated refresh preferences while foregrounded, clearing on pause and restoring on resume.
+  The Samsung controller-only idle fix still requires affected-Samsung testing; local handhelds cannot verify it.
+- Show non-touchable startup stage/progress until the first real compositor handoff, not measured scanout.
+  Reuse metadata-bound verified RomFS overlay proofs on warm launches; this is not a fresh full hash.
+  `TOTK_ROMFS_VERIFY=full` forces rehashing.
+- Retain the current native log plus up to nine old launches in the selected game-data folder, with lock/temp
+  siblings. Old launches retain roughly 512 KiB each (head/tail; middles discarded); the live log is unbounded.
+  Failed compaction preserves evidence and may exceed that history budget. Benchmark tools select the latest launch.
+- Stop startup-popup polling and dismiss the popup when its activity finishes or is destroyed;
+  repeated resume calls keep a single poll queued. Host tests execute the production Java UI
+  with framework doubles and the native progress snapshot through a real host JVM/JNI bridge.
+  Resolve JNI headers from the selected compiler's actual JVM home, including version-manager shims;
+  missing headers skip with a clear prerequisite reason.
+- Dismiss the startup indicator before any game-activity update or previous-session notice can take focus.
+  A pending update comes first, then the notice; both wait for the first real handoff. Keep session-token
+  recording independent of that UI gate and preserve background hold and refresh-request lifecycle.
 - Follow Link's environment-based map layer, display in-game map coordinates without losing integer-boundary
   precision, and separate overview/detail caches to stop stationary tile eviction loops. Reject invalid, unreadable
   or replaced layer samples using the previous layer heuristic; always keep the visible detail tiles plus one, scale

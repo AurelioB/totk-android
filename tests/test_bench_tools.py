@@ -241,6 +241,70 @@ class EffectiveSwitches(unittest.TestCase):
             self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
             self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
 
+    def test_ten_launch_history_uses_only_current_off_startup_bracket(self):
+        old = ''.join(
+            f'[totk-log] ===== Launch 2026-11-26T00:00:{n:02}Z (pid {100 + n}) =====\n'
+            + self.START + self.marker('on', 1, 'on') + self.END for n in range(9))
+        heading = '[totk-log] ===== Launch 2026-11-26T00:00:09Z (pid 109) =====\n'
+        current = self.START + self.marker()
+        plain = self.document(current)
+        history = self.document(old + heading + current)
+        self.assertEqual(self.values(history), dict.fromkeys(benchlib.SWITCH_KEYS, 'off'))
+        self.assertEqual(history['runs'], plain['runs'])
+        self.assertEqual(benchlib.device_signature(history, 'thor')['sha256'],
+                         benchlib.device_signature(plain, 'thor')['sha256'])
+        self.assertEqual(self.compare(plain, history)[0], {'match'})
+
+    def test_current_history_without_marker_or_closed_bracket_stays_unknown(self):
+        old = ''.join(
+            f'[totk-log] ===== Launch 2026-11-26T00:00:{n:02}Z (pid {100 + n}) =====\n'
+            + self.START + self.marker('on', 1, 'on') + self.END for n in range(9))
+        heading = '[totk-log] ===== Launch 2026-11-26T00:00:09Z (pid 109) =====\n'
+        for current in ('', self.START, self.START + '[totk-switches] v=1 TOTK_WB_ALIAS=off'):
+            with self.subTest(current=current):
+                states = self.parse_states(old + heading + current)
+                self.assertEqual({value['state'] for value in states.values()}, {'UNKNOWN'})
+                doc = self.document(old + heading + current)
+                self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
+                self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
+                self.assertIn('NOT COMPARABLE', self.compare(doc, doc)[1])
+
+    def test_history_menu_state_is_independent_and_comes_only_from_current_launch(self):
+        old_heading = '[totk-log] ===== Launch old =====\n'
+        current_heading = '[totk-log] ===== Launch current =====\n'
+        for previous, current in (('on', 'off'), ('off', 'on')):
+            old = old_heading + self.START + self.marker(menu=previous) + self.END
+            latest = self.START + self.marker(menu=current) + self.END
+            states = self.parse_states(old + current_heading + latest)
+            self.assertEqual({key: record['state'] for key, record in states.items()},
+                             {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'off', 'TOTK_MENU_CAPTURE_FIX': current})
+            self.assertEqual(states['TOTK_MENU_CAPTURE_FIX']['evidence_lines'], [3])
+            plain, history = self.document(latest), self.document(old + current_heading + latest)
+            self.assertEqual(self.compare(plain, history)[0], {'match'})
+            self.assertEqual(self.compare(self.document(self.START + self.marker(menu=previous)), history)[0],
+                             {'mismatch'})
+
+    def test_truncated_current_menu_bracket_never_borrows_a_complete_old_launch(self):
+        old = ('[totk-log] ===== Launch old =====\n' + self.START + self.marker(menu='on') + self.END)
+        for current in ('', self.START, self.START + self.marker(menu='off'),
+                        self.START + self.marker(menu='on') + self.END.rstrip('\n')):
+            states = self.parse_states(old + '[totk-log] ===== Launch current =====\n' + current)
+            self.assertEqual({record['state'] for record in states.values()}, {'UNKNOWN'})
+
+    def test_migrated_pre_history_menu_evidence_never_supplies_current_state(self):
+        old = ('[totk-log] ===== Launch (before log history) =====\n'
+               + self.START + self.marker(menu='on') + self.END)
+        heading = '[totk-log] ===== Launch current =====\n'
+        v1 = '[totk-switches] v=1 TOTK_WB_ALIAS=off TOTK_MAP_WARN=off map_warn_mode=0\n'
+        off = '[totk] 1.4.3 menu capture experiment off (TOTK_MENU_CAPTURE_FIX=1 opts in)\n'
+        refused = '[totk] 1.4.3 menu capture fix skipped: original instruction mismatch\n'
+        for records, expected in ((self.marker(menu='off'), 'off'), (v1, 'UNKNOWN'),
+                                  (off + v1, 'off'), (refused + self.marker(menu='UNKNOWN'), 'UNKNOWN')):
+            states = self.parse_states(old + heading + self.START + records + self.END)
+            self.assertEqual(states['TOTK_MENU_CAPTURE_FIX']['state'], expected)
+            self.assertEqual(states['TOTK_WB_ALIAS']['state'], 'off')
+            self.assertEqual(states['TOTK_MAP_WARN']['state'], 'off')
+
     def test_marker_after_startup_end_cannot_authenticate_current_launch(self):
         doc = self.document(self.START + self.END + self.marker())
         self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
@@ -438,13 +502,14 @@ class EffectiveSwitches(unittest.TestCase):
             states = self.parse_states(text)
             self.assertEqual(states['TOTK_MENU_CAPTURE_FIX']['state'], 'UNKNOWN')
 
-    def test_older_resolver_version_cannot_reuse_pre_menu_signature(self):
+    def test_older_resolver_versions_cannot_reuse_pre_current_launch_menu_signatures(self):
         current = self.document(self.START + self.marker())
-        old = json.loads(json.dumps(current))
-        for record in old['devices']['thor']['effective_switches'].values():
-            record['evidence_version'] = 2
-        self.assertEqual(self.compare(old, current)[0], {'unknown'})
-        self.assertIn('NOT COMPARABLE', self.compare(old, current)[1])
+        for version in (2, 3):
+            old = json.loads(json.dumps(current))
+            for record in old['devices']['thor']['effective_switches'].values():
+                record['evidence_version'] = version
+            self.assertEqual(self.compare(old, current)[0], {'unknown'})
+            self.assertIn('NOT COMPARABLE', self.compare(old, current)[1])
 
 
 class Compare(unittest.TestCase):
@@ -906,6 +971,51 @@ class InSessionAB(unittest.TestCase):
                          [(1, 1000, 'A', 1), (2, 2500, 'B', 2), (3, 4000, 'B', 3), (4, 5200, 'A', 4), (5, 6500, None, None)])
         self.assertEqual(gens[1]['applied'], ['TOTK_VK_DESC_STOCK=1'])
         self.assertEqual([g['direction'] for g in gens], ['right', 'left', 'right', 'left', None])
+
+    def test_measures_only_the_latest_launch_in_an_android_history(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'totk.log'
+            path.write_text(
+                '[totk-log] ===== Launch old =====\n'
+                '[nvn-vk] frame 600: 60.0 fps over the last 300\n'
+                '[totk-ctl] gen=2 frame=600 mark ab arm=B block=2\n'
+                '[totk-log] ===== Launch current =====\n'
+                '[nvn-vk] frame 300: 27.0 fps over the last 300\n'
+                '[totk-ctl] gen=1 frame=300 mark ab arm=A block=1\n', encoding='utf-8')
+            _, _, fps, *_ = analyze.parse_log(path)
+            self.assertEqual(fps, {300: 27.0})
+            self.assertEqual([g['arm'] for g in analyze.parse_ctl(path)], ['A'])
+
+    def test_history_excludes_old_faults_provenance_and_compile_counts(self):
+        old = ('[totk] game version stale\n[totk-app] settings.env (menu): TOTK_FPS60=0\n'
+               'driver sha256=' + 'a' * 64 + '\n[vk] device lost\n' +
+               ab_log({300: (60, 99, 50, 9)}, []) +
+               '[nvn-vk] frame 300, stutter: 91 new pipelines took 1.2 ms; '
+               '92 compiled on worker threads in 3.4 ms; sync compiles 93 in 5.6 ms\n')
+        current = ('[totk] game version 1.4.3\n[totk-app] settings.env (menu): TOTK_FPS60=1\n'
+                   'driver sha256=' + 'b' * 64 + '\n' +
+                   ab_log({300: (30, 34, 10, 0)}, [
+                       (1, '[totk-ctl] gen=1 frame=1 mark ab arm=A block=1')]))
+        with tempfile.TemporaryDirectory() as d:
+            legacy, mixed = Path(d) / 'legacy.log', Path(d) / 'mixed.log'
+            legacy.write_text(current, encoding='utf-8')
+            mixed.write_text(''.join('[totk-log] ===== Launch old =====\n' + old for _ in range(9)) +
+                             '[totk-log] ===== Launch current =====\n' + current, encoding='utf-8')
+            expected = analyze.parse_log(legacy)
+            # The retained current heading adds exactly one line to positioned startup evidence.
+            # Keep full-output equality (including all states/metrics), adjusting only that real offset.
+            capture = expected[-1]['switch_capture']
+            for key in ('starts', 'presents'):
+                capture[key] = [number + 1 for number in capture[key]]
+            for records in capture['records'].values():
+                for record in records:
+                    record['line'] += 1
+            self.assertEqual(analyze.parse_log(mixed), expected)
+            self.assertEqual(analyze.parse_ctl(mixed), analyze.parse_ctl(legacy))
+            info = analyze.parse_log(mixed)[-1]
+            self.assertNotIn('device_lost', info)
+            self.assertEqual(info['game_version'], '1.4.3')
+            self.assertEqual(info['turnip'], 'b' * 64)
 
     def test_explicit_pan_direction(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1374,7 +1484,7 @@ class PanMeasurement(unittest.TestCase):
             self.assertEqual(calls.count('pan 16000 24\n'), 3)
             self.assertNotIn('sleep 24\n', calls)  # sleeps are inside one device command now
             pan_index = calls.index('pan 16000 24\n')
-            final_read = calls.index("grep -ao", pan_index)
+            final_read = calls.index("awk '", pan_index)
             final_gpu = calls.index('--boundary end', pan_index)
             self.assertLess(pan_index, final_read)
             self.assertLess(final_read, final_gpu)

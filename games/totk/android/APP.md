@@ -2091,14 +2091,21 @@ needs `su`). The folder holds what the adb-shell folder holds:
 | `driver.so` | the custom Vulkan driver (a Turnip build), picked as an AdrenoTools `.zip` or a 64-bit ARM `.so`. It's copied into the app's private folder at each start, because files on shared storage cannot be loaded as code. Without it, the bundled Turnip driver is used. |
 | `user-data/` | saves to import: on the first start (no private saves yet) they're copied into the app's private storage, where the game keeps its saves from then on. `install_app.sh saves` copies those to the computer. |
 | `totk.env` | options, one `NAME=value` per line (`#` comments), e.g. `TOTK_VK_SHOT=300` or `TOTK_FACE_BUTTONS=position`. Read after the launcher menu's `settings.env` (app-private `files/settings.env`, written by the menu; only the menu's own option keys are accepted there, others are logged and ignored), so a line here overrides the menu. |
-| `totk.log` | the log of the last start (`install_app.sh log`) |
+| `totk.log` | the current launch and up to nine prior launches (`install_app.sh log`) |
 | `totk.ctl` | live switches for in-session A/B runs (below), atomically replaced with each new batch by `tools/bench/live.sh`; startup contents are skipped |
 
 ### Diagnostics: logcat copy, crash reports and the stall watchdog
 
-- **`TOTK_LOGCAT`** (default off; only `1` opts in). `totk.log` stays the primary log (written directly, so a sudden end
-  loses nothing). Normally there is no mirror thread, watch, polling or logcat write. When opted in, a thread at nice 10
-  (on the slower CPUs when sysfs shows them) copies its complete lines to logcat with
+- Each launch adds a timestamp and PID to `totk.log` in the already-selected game-data folder
+  (not necessarily app-private storage), alongside `totk.log.lock` and temporary `totk.log.tmp`.
+  At the next launch, up to nine old entries retain about 512 KiB each: the first 64 KiB and tail,
+  with middle sections deliberately discarded. The live launch is unbounded. Failed compaction
+  preserves/appends the original log with a warning, so the old-history budget can also be exceeded.
+  Benchmark tools read the latest entry; external runners must delimit it at the last line beginning
+  `[totk-log] ===== Launch ` before checking readiness, faults or frame/shader counts.
+- **`TOTK_LOGCAT`** (default off; only `1` opts in). `totk.log` stays the primary log and receives output
+  directly even during a sudden exit. When opted in, a thread at nice 10 (on the slower CPUs when sysfs
+  shows them) copies complete lines from the current launch to logcat with
   tag `totk`: FATAL, CRASH or "device lost" as errors, red messages (`【红】`, `[RED]`) as warnings, the rest as info;
   lines over 1000 bytes are cut and marked ` [...]`. It sleeps on an inotify watch of the file (20 ms polling only
   without inotify), so an idle log costs no wakeup (`tests/test_log_mirror.py` measures it). The log's
@@ -2289,6 +2296,11 @@ is safe, and adding its row here. Each switch's per-300 report shows the value i
   the focusable, controller-dismissable notice says:
   “Android closed the previous game session to free memory. Load a saved game; progress since the last save may be lost.”
   A matched abnormal/unknown platform reason says: “The previous session ended unexpectedly.”
+  On the direct-game/title path, the startup indicator is dismissed after the first real compositor
+  handoff before a modal can appear: an already pending update prompt comes first, then this notice.
+  Pause/resume does not resurrect a completed indicator or repeat an acknowledged notice. Native
+  session-token recording still begins at successful game-thread creation, not at indicator dismissal;
+  the Settings hold and foreground refresh preference retain their independent lifecycle.
   This diagnoses loss; it does not restore unsaved progress or certify saves. Normal self-exit, user stop,
   accepted save-safe Close and package update/reinstall show no notice. Missing, rotated-away or ambiguous
   history, missing summary tokens, and cleared/corrupt stored state show **no notice**, not a guessed warning.
@@ -4203,8 +4215,8 @@ HUD/sky through load, static, pan and reload; unchanged save behavior is not yet
 | `TOTK_VK_REC_ASYNC_SUBMIT` | On when recorder workers are enabled | Explicit `0` keeps walking-thread assembly/submit. Existing diagnostic and software-protection exclusions are unchanged. |
 | `TOTK_ADPF` | Existing render-only session (unset/`legacy`) | `0` disables all CPU hints; `full` opts into the bounded critical-thread group, profile-derived targets and wait-stripped work reporting. |
 | `TOTK_ADPF_TARGET_MS` | `33.3` | Existing render-only target override; nonpositive disables the legacy session. Retained for existing profiles; ignored by `TOTK_ADPF=full`. |
-| `TOTK_FRAME_RATE_HINT` | `0` | `1` requests FIXED_SOURCE content cadence through the window and zero-copy SurfaceControl. It is only a request, never evidence of a panel-mode change. |
-| `TOTK_FRAME_RATE_HINT_HZ` | unset (`0`, off) | Startup-only integer decimal Hz or `max` for the highest advertised window-display rate; needs `TOTK_FRAME_RATE_HINT=1`. Invalid/unavailable rates retain the existing policy. See below. |
+| `TOTK_FRAME_RATE_HINT` | on for fixed-rate Samsung gameplay, off elsewhere | `1` enables FIXED_SOURCE native-window/AHB-child hints and validated foreground window preferences. `0` disables refresh votes, not the guest-unit cap correction. |
+| `TOTK_FRAME_RATE_HINT_HZ` | `max` with the implicit Samsung profile, unset elsewhere | Startup-only integer decimal Hz or `max` for the highest advertised window-display rate. Zero, empty, invalid or unavailable rates fall back to content-rate hints; they do not disable all votes. |
 | `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
 | `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
 
@@ -4306,9 +4318,8 @@ nothing in our hint code; session creation happens only at configuration changes
 `TOTK_FRAME_RATE_HINT=1` requests 60fps for locked/native60. Plain30 requests 30fps only
 without a physical-clock lattice; fixed present slots, display pacing or acquire clocks
 retain a 60fps request so a 30Hz panel mode cannot turn two physical slots into 15fps.
-The SurfaceControl request is also applied to the actual zero-copy child, not only its
-parent window, and permits seamless switches only. No preferred display mode or Android setting is
-written. Panel offerings, request acceptance and actual physical panel cadence must be measured separately
+The SurfaceControl request applies to the zero-copy child and permits seamless switches only.
+Panel offerings, request acceptance and actual physical panel cadence must be measured separately
 on each handheld. Game frame intervals, framework/SurfaceFlinger fences and physical scanout are distinct:
 a successful window return, void transaction or fence diagnostic does not prove a panel-rate change.
 
@@ -4320,18 +4331,29 @@ rate of the last `<ms>`: up at once, down only after the lower rate held that lo
 which follows a panel that took a lower request. Logs `[totk-perf] TOTK_RATE_HINT_HOLD=N ms (launch|live)`; each
 change still logs `window frame-rate hint=`. Measure the number of those lines and fps dips after 60→30→60 per arm.
 
-`TOTK_FRAME_RATE_HINT_HZ=120` plus `TOTK_FRAME_RATE_HINT=1` is an experimental app-side FIXED_SOURCE
-request on both the native window and actual AHB child. Unset/empty/`0` keeps the exact existing hint
-policy. Integer decimal Hz is accepted (no signs, fractions or suffixes); the current window's
+`TOTK_FRAME_RATE_HINT_HZ=120` plus `TOTK_FRAME_RATE_HINT=1` requests 120 Hz on the native window
+and AHB child. An explicit enable with an unset, empty or zero rate keeps the content-rate policy.
+Integer decimal Hz is accepted (no signs, fractions or suffixes). The current window's
 `decorView.getDisplay().getSupportedModes()` must advertise that rate within 0.01 Hz, allowing float
 rounding such as 120.00001 but not substituting a distinct fractional mode. `max` instead selects the highest finite
 positive rate advertised by that same display, retaining its fractional Hz through both native hint targets.
+On Samsung, ordinary fixed-rate gameplay defaults to `max` so the request persists during controller-only play.
+Frame generation, FPS Auto and explicit display-clock profiles keep their own refresh policies.
+A validated override also sets the activity window's preferred refresh rate during gameplay.
+Pausing clears that preference and resuming reapplies it. Android still applies the user's refresh-rate setting.
 There is no default-display fallback. Window creation/recreation and existing readiness/configuration/focus/resume callbacks
 revalidate against the current window display; a missing display, unadvertised rate or JNI failure logs
 a refusal and restores the old hint policy. A validated override takes precedence over per-frame
-content-rate recomputation and `TOTK_RATE_HINT_HOLD`, but changes no game/presentation pacing.
-`TOTK_FRAME_RATE_HINT=0` leaves the override ineffective and logs that it requires `=1`.
-This is not a preferred-mode/system-setting write and cannot override an OS/user refresh-rate vote.
+content-rate recomputation and `TOTK_RATE_HINT_HOLD`. Ordinary fixed guest pacing converts 60 Hz guest ticks to
+physical refresh slots on Android so that 30/60 FPS caps stay at 30/60 on compatible 60/120 Hz panels.
+Non-divisor displays deliberately round up to whole display slots, not alternating fractional cadence:
+at 90 Hz the 30/60 choices yield 30/45 fps, at 100 Hz 25/50, and at 144 Hz 28.8/48.
+Explicit display/acquire clocks, uncapped, frame generation and FPS Auto retain their own authority;
+configured FPS Auto suspended on a non-60-Hz panel is not repaired by this ordinary-cap conversion.
+`TOTK_FRAME_RATE_HINT=0` disables refresh votes, but does not undo the cap correction.
+Zero/empty/invalid `TOTK_FRAME_RATE_HINT_HZ` retains content-rate fallback, including implicit Samsung hints.
+Samsung-specific controller-only idle behavior and its power/thermal cost still need an affected Samsung device;
+non-Samsung handheld checks cannot establish that vendor fix.
 Treat an accepted hint only as a request; measure game intervals, framework fences and real physical
 panel cadence separately before claiming even 40 fps at 120 Hz.
 
