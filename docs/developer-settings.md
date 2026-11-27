@@ -96,7 +96,7 @@ Everything not in the menu is a developer switch. A selection:
 | `TOTK_PSO_PREWARM=0` | Turns off the startup pipeline prewarm from the packaged key list. |
 | `TOTK_VK_VARYING_FIX=0` | Startup-only opt-out of the default-on, pair-specific missing vertex-output correction for wind/air-flow white boxes (#4). Off performs no varying classification/rewrite work. Changes the driver-cache and prewarm-resume namespace; restart after editing. |
 | `TOTK_VK_NAN_MINMAX=1` | Startup-only, **default-off experiment**: replace GLSL FMin/FMax/FClamp with NMin/NMax/NClamp in loaded VS/FS/CS modules. Has its own `.nan-v1` cache namespace; special-value semantics and driver cost await separate device qualification. Not required to enable the varying fix. |
-| `TOTK_MENU_CAPTURE_FIX=1` | Startup-only, **default-off 1.4.3 experiment** for randomly black ability-wheel / quick-selector backgrounds. Draw accepts an already-armed pane OR any pending request, reproducing contributor PR #44. Unset and all other values leave code untouched; there is no guarded alternative. iOS does not install it. Does not synchronize update/draw or change texture layouts, aliases, copies or cache identities. See the qualification limits below. |
+| `TOTK_MENU_CAPTURE_FIX=0` | Startup-only opt-out of the **default-on 1.4.3 quick-menu capture fix** for randomly black ability-wheel / quick-selector backgrounds. Unset or exact `1` enables it: draw accepts an already-armed pane OR any pending request, reproducing contributor PR #44. `0` and all other values leave guest code untouched; there is no guarded alternative. iOS and non-1.4.3 builds do not install it. Does not synchronize update/draw or change texture layouts, aliases, copies or cache identities. See the qualification limits below. |
 | `TU_DEBUG=…` | Turnip debug flags (e.g. `noslabcs`); on Adreno 722 an absent `TU_DEBUG` defaults to `sysmem`. |
 | `TOTK_WB_ALIAS=0` | Startup-only opt-out of default-on private write-back aliases; unset or exact `1` enables supported dma-buf-backed stores. `0` restores the original store path and logs. Unsupported backing and contended publication keep their existing fallbacks. See [VULKAN.md](../games/totk/android/VULKAN.md#private-write-back-aliases-totk_wb_alias-default-on). Not a menu option; no `settings.env` migration is needed. |
 
@@ -105,7 +105,7 @@ The complete, current list of switches with their status and evidence is in
 [Device profiles](../games/totk/android/APP.md#device-profiles), and the sections on the picture, frame rate and
 presentation) and the diagnostic switches in [games/totk/android/DEBUGGING.md](../games/totk/android/DEBUGGING.md).
 
-### Quick-menu capture experiment
+### Quick-menu capture fix
 
 PR #44 admits a request before the pane's update arms it. Our added visibility guard suppressed that early path:
 Odin traces show pending requests while the visibility bit is still zero. In the finite diagnostic comparison,
@@ -116,7 +116,11 @@ not the contributor's admission. These clustered, observer-perturbed Odin result
 Native update prepares state after arming; completion can republish requests. The original admission produced
 two completion-site visits per trace-covered opening, including one on the next present, not a proven once-only
 capture. The smoke set showed no new wrong picture, but does not establish global preparation/lifetime safety.
-Keep the switch default off until matched final-tree Thor/Odin/Duo results and repeated-capture cost qualify it.
+The fix is default on; `TOTK_MENU_CAPTURE_FIX=0` preserves the original unpatched admission and writes
+nothing, even if the original words or padding are invalid. Exact `1` explicitly enables the same patch as
+unset; empty/malformed values remain off. Restart after editing. No menu setting or `settings.env` migration
+is needed. The iOS installer returns without writes, and other versions use the unchanged legacy patch file.
+Finite device qualification is not proof of global preparation/publication safety or a once-per-opening cost bound.
 
 There is no unconditional per-frame framebuffer copy, allocation, GPU wait or readback added by the patch.
 Newly admitted requests use the existing capture/blur body. The veneer reproduces the contributor's `w8 |= w9`

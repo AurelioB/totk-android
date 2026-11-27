@@ -1101,19 +1101,18 @@ void runtime_diag_xpoke(unsigned off,float value){
     fprintf(stderr,"[totk] xpoke X+%#x: %g -> %g\n",off,old,value);
 }
 #endif
-/* Experimental quick-menu capture admission: reproduce PR #44's armed OR
-   requested gate, including w9 scratch use. Our former visibility guard
-   excluded the hidden-pending window and suppressed the observed Odin fix.
+/* Quick-menu capture admission: reproduce PR #44's armed OR requested gate,
+   including w9 scratch use. Our former visibility guard excluded the
+   hidden-pending window and suppressed the observed Odin fix.
    This is not synchronization: update prepares state after arming, and the
-   native completion can republish requests. Device traces also show a second
-   completion on the next present. Keep opt-in pending cross-device safety
-   and cost qualification. */
+   native completion can republish requests. Default on; exact =0 retains
+   native admission without writing guest code. */
 enum { MENU_CAPTURE_STUB = 276, MENU_CAPTURE_TAIL = 340,
        MENU_CAPTURE_HEAD_WORDS = 3, MENU_CAPTURE_TAIL_WORDS = 2 };
 static int patch_menu_capture(Module *m){
     const char *e=getenv("TOTK_MENU_CAPTURE_FIX");
-    if(!e||strcmp(e,"1")){
-        fprintf(stderr,"[totk] 1.4.3 menu capture experiment off (TOTK_MENU_CAPTURE_FIX=1 opts in)\n");
+    if(e&&strcmp(e,"1")){
+        fprintf(stderr,"[totk] 1.4.3 menu capture experiment off (unset or TOTK_MENU_CAPTURE_FIX=1 enables)\n");
         return 0;
     }
 #if TARGET_OS_IPHONE

@@ -14,14 +14,17 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   without exiting or partially installing a group. Preflight full module bounds and generated B/ADRP
   references; cover all switch combinations/install orders on the complete Android rewrite geometry,
   corrupted sites/padding and invalid layouts, plus real 30/60-preset startup with player-supplied data.
-- Keep PR #44's quick-menu capture fix default off (`TOTK_MENU_CAPTURE_FIX=1` opts in), but restore
-  the contributor's original armed-OR-requested admission. Our added visibility guard suppressed the fix:
+- Enable PR #44's 1.4.3 quick-menu capture fix by default: unset or exact `TOTK_MENU_CAPTURE_FIX=1`
+  uses the contributor's original armed-OR-requested admission; `=0` leaves guest code untouched.
+  Other explicit values remain off, and iOS/non-1.4.3 paths are unchanged.
+  Our added visibility guard suppressed the fix:
   Odin requests were pending while hidden; original admission removed the black backgrounds in the finite
   30/60-fps comparison, while the guarded version did not. Remove the guarded alternative entirely.
   Retain all-before-any-write bounds, original-word, padding and branch checks. Split the veneer across
   two existing text-tail gaps so thermal-step and FPS60 hardening coexist without moving their code.
-  Test real ARM admission/continuation/completion and all six install orders. Three-device safety,
-  preparation/publication and repeated-capture cost remain unqualified; no default-on claim is made.
+  Test real ARM admission/continuation/completion, unset/explicit-on byte equality, explicit-off
+  no-write behavior and all six install orders. This does not prove preparation/publication safety
+  or a once-per-opening capture bound.
 - Log the frozen effective write-back-alias state and map-warning mode once at first presenter startup,
   including explicit opt-outs, so benchmark tools need not infer build-dependent defaults from menu settings.
 - Record effective alias/warning states from complete startup evidence, including the warning mode, in benchmark

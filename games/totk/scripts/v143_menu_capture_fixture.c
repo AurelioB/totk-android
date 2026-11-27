@@ -54,7 +54,8 @@ static void applied(void){
 int main(int argc,char **argv){
     module=(Module){.name="main",.base=aligned_alloc(0x4000,ALLOCATION)};
     before=malloc(ALLOCATION);assert(module.base&&before);
-    reset();unchanged();module.base[SITE]^=1;unchanged();
+    reset();applied();unchanged();
+    reset();module.base[SITE]^=1;unchanged();
     const char *disabled[]={"0","","2","true","-1","1 "," 1"};
     for(unsigned i=0;i<sizeof disabled/sizeof *disabled;i++){
         reset();setenv("TOTK_MENU_CAPTURE_FIX",disabled[i],1);unchanged();
@@ -129,12 +130,12 @@ int main(int argc,char **argv){
     memset(module.base+TEXT_END,0xa5,1024);
     memset(module.base+stub(),0,MENU_CAPTURE_HEAD_WORDS*4);
     memset(module.base+tail(),0,MENU_CAPTURE_TAIL_WORDS*4);applied();
-    if(argc==3){
-        reset();setenv("TOTK_MENU_CAPTURE_FIX",argv[2],1);patch_menu_capture(&module);
+    if(argc==2||argc==3){
+        reset();if(argc==3)setenv("TOTK_MENU_CAPTURE_FIX",argv[2],1);patch_menu_capture(&module);
         FILE *f=fopen(argv[1],"wb");assert(f);
         assert(fwrite(module.base,1,ALLOCATION,f)==ALLOCATION);assert(!fclose(f));
     }
     free(before);free(module.base);
-    puts("menu capture guards PASS: exact opt-in, both hashes, 20 occupied bytes, real tail geometry, bounds/range, exact boundaries, three branches, eight policy combinations, all six menu/thermal/hardening orders (24 combinations)");
+    puts("menu capture guards PASS: default on, exact 1 on, explicit 0/malformed off without writes, both hashes, 20 occupied bytes, real tail geometry, bounds/range, exact boundaries, three branches, eight policy combinations, all six menu/thermal/hardening orders (24 combinations)");
     return 0;
 }

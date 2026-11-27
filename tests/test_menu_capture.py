@@ -56,10 +56,16 @@ class MenuCapture(unittest.TestCase):
             seeds = self.seeds.write_seeds(directory / 'seeds.bin', original, [SITE, SITE + 4, *HARDENING_SITES])
             executable = self.seeds.build(SCRIPTS / 'v143_menu_capture_fixture.c', directory / 'fixture')
             images = {}
-            for enabled in (0, 1):
+            explicit_on = b''
+            for enabled in (0, 1, None):
                 image_path = directory / f'patched-{enabled}.bin'
-                self.run_fixture(executable, [image_path, str(enabled)], seeds)
+                self.run_fixture(executable, [image_path, *([] if enabled is None else [str(enabled)])], seeds)
                 image = bytearray(image_path.read_bytes())
+                if enabled == 1:
+                    explicit_on = bytes(image)
+                if enabled is None:
+                    self.assertEqual(image, explicit_on, 'unset must install exactly the explicit-on image')
+                    continue
                 # Supply native dispatch, continuation, update and completion;
                 # only the production installer decides admission.
                 image[SITE + 4:0x105bc10] = original(SITE + 4, 0x105bc10 - SITE - 4)
