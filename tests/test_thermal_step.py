@@ -45,6 +45,19 @@ class ThermalStep(unittest.TestCase):
     def test_patch_installation(self):
         payload = json.loads(self.compile_run('games/totk/runtime/test_thermal_patch.c', patch=True))
         self.assertEqual(len(bytes.fromhex(payload['code'])), 108)
+        self.assertEqual(payload['floor'], 0x4520090)
+        self.assertGreater(payload['floor'] - payload['stub'], 1 << 20)
+        code = struct.unpack('<27I', bytes.fromhex(payload['code']))
+        for entry in range(3):
+            adr, load = code[entry * 9 + 2:entry * 9 + 4]
+            self.assertEqual(adr & 0x9f00001f, 0x90000011)
+            self.assertEqual(load & 0xffc003ff, 0xb9400231)
+            pages = ((adr >> 5 & 0x7ffff) << 2) | (adr >> 29 & 3)
+            if pages & 0x100000:
+                pages -= 0x200000
+            target = ((payload['stub'] + entry * 36 + 8) & ~4095) + pages * 4096
+            target += (load >> 10 & 0xfff) * 4
+            self.assertEqual(target, payload['floor'])
 
     def test_patch_machine_semantics(self):
         try:
@@ -58,7 +71,7 @@ class ThermalStep(unittest.TestCase):
             dest = (10, 21, 12)[entry]
             for floor in (1, 2):
                 for flags in range(16):
-                    for value in (0, 1, 2, 3, 0x7fffffff):
+                    for value in (0, 1, 2, 3, 0x7fffffff, 0x80000000, 0xffffffff):
                         registers = [0x12340000 + r for r in range(31)]
                         registers[9] = registers[10] = registers[13] = value
                         def execute(thermal):

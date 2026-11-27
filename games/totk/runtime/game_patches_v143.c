@@ -27,6 +27,44 @@
  * (code_guard.h); SITES passes a table's offsets to code_guard. */
 typedef struct { uint64_t off; uint32_t replacement; } Patch;
 #define SITES(t) &(t)[0].off,sizeof (t)/sizeof *(t),sizeof *(t)
+
+/* Optional startup groups return -1/refused, 0/inactive or 1/applied. Guard
+ * failures must not enter runtime_fail()/exit() after host libraries start. */
+static int patch_refuse(const char *name,const char *why){
+    fprintf(stderr,"[totk] 1.4.3 %s skipped: %s\n",name,why);return -1;
+}
+static int patch_module_valid(const Module *m){
+    return m->base&&!(m->text_end&3)&&m->text_end<=m->file_size&&m->file_size<=m->size&&
+        m->text_end<=UINT64_MAX-0x3fff&&m->file_size<=UINT64_MAX-0x3fff&&
+        (uintptr_t)m->base<=UINTPTR_MAX-m->size;
+}
+static int patch_branch_fits(uint64_t pc,uint64_t target){
+    return !((pc|target)&3)&&(target>=pc?target-pc<(1u<<27):pc-target<=(1u<<27));
+}
+static int patch_adrp_fits(uint64_t pc,uint64_t target){
+    pc>>=12;target>>=12;
+    return target>=pc?target-pc<(1u<<20):pc-target<=(1u<<20);
+}
+static int patch_region_fits(const Module *m,uint64_t stub,size_t bytes,uint64_t data,size_t data_bytes){
+    return stub>=m->text_end&&stub<=m->size&&bytes<=m->size-stub&&
+        stub+bytes<=((m->text_end+0xfff)&~0xfffULL)&&
+        data<=m->size&&data_bytes<=m->size-data;
+}
+/* Conservative endpoint checks cover every generated B/ADRP before a group
+ * constructs its code, including branches back from the last veneer word. */
+static int patch_refs_fit(const Module *m,const uint64_t *sites,size_t count,size_t stride,
+                          uint64_t stub,size_t bytes,uint64_t data){
+    const uint8_t *at=(const uint8_t *)sites;
+    if(data&&(!patch_adrp_fits((uintptr_t)m->base+stub,(uintptr_t)m->base+data)||
+              !patch_adrp_fits((uintptr_t)m->base+stub+bytes-4,(uintptr_t)m->base+data)))return 0;
+    for(size_t i=0;i<count;i++){
+        uint64_t site;memcpy(&site,at+i*stride,8);
+        if(site>m->text_end||m->text_end-site<4||
+           !patch_branch_fits(site,stub)||!patch_branch_fits(site,stub+bytes-4)||
+           !patch_branch_fits(stub,site+4)||!patch_branch_fits(stub+bytes-4,site+4))return 0;
+    }
+    return 1;
+}
 static const Patch fps60[] = {
     {0x2db204, 0x7100055f},
     {0x2db208, 0x1a9fa52a},
@@ -40,15 +78,16 @@ static const Patch fps60[] = {
 /* Optional policy experiment: keep the measured-work calculation, candidate
    clamps, callbacks/veto and window setter; change only the native counter
    limits. Fixed experiment limits intentionally replace configuration overrides. */
-static void patch_fps60_hysteresis(Module *m) {
+static int patch_fps60_hysteresis(Module *m) {
     const char *e = getenv("TOTK_FPS60_HYSTERESIS");
     int on = e && !strcmp(e, "1");
     fprintf(stderr, "[totk] TOTK_FPS60_HYSTERESIS=%d: %s\n", on,
             on ? "over limit 6 (raise on seventh consecutive over-budget call), cooldown reload 2" :
                  "native over-limit/cooldown configuration");
-    if (!on) return;
+    if (!on) return 0;
+    if(!patch_module_valid(m))return patch_refuse("FPS60 hysteresis","module bounds");
 #if TARGET_OS_IPHONE
-    runtime_fail("TOTK_FPS60_HYSTERESIS requires a runtime-patched main");
+    return patch_refuse("FPS60 hysteresis","requires a runtime-patched main");
 #else
     static const Patch sites[] = {
         {0x2db2b8, 0x528000cc}, /* ldr w12,[x20,#0x10] -> mov w12,#6 */
@@ -58,13 +97,14 @@ static void patch_fps60_hysteresis(Module *m) {
     uint32_t original[3];
     for (unsigned i = 0; i < 3; i++)
         if (sites[i].off + 4 > m->text_end)
-            runtime_fail("1.4.3 FPS60 hysteresis site outside text");
+            return patch_refuse("FPS60 hysteresis","site outside text");
     if (!code_guard(m, SITES(sites), original,
                     "ea577c9101d653362c01f832a336c10798bc2e2845bf77fed4b26fafb51197cc"))
-        runtime_fail("1.4.3 FPS60 hysteresis original instruction mismatch");
+        return patch_refuse("FPS60 hysteresis","original instruction mismatch");
     for (unsigned i = 0; i < 3; i++)
         memcpy(m->base + sites[i].off, &sites[i].replacement, 4);
 #endif
+    return 1;
 }
 
 
@@ -273,10 +313,11 @@ unsigned runtime_cutscene_present_ticks(unsigned ticks,uint64_t refresh_ns){
     }
     return result;
 }
-static void patch_fps60_hardening(Module *m){
+static int patch_fps60_hardening(Module *m){
     const char *fps=getenv("TOTK_FPS60"),*fg=getenv("TOTK_FRAMEGEN");
     const char *enabled=getenv("TOTK_FPS60_HARDENING"),*clamp=getenv("TOTK_FPS60_FADE_CLAMP");
-    if(fps&&!strcmp(fps,"0"))return;
+    if(fps&&!strcmp(fps,"0"))return 0;
+    if(!patch_module_valid(m))return patch_refuse("FPS60 hardening","module bounds");
     /* TOTK_FPS60_FADE_CLAMP=0 is the matched A/B control: same image and
      * veneers, the four fade sites keep their original fcvtzs. */
     int fades_enabled=!(clamp&&!strcmp(clamp,"0"));
@@ -304,16 +345,12 @@ static void patch_fps60_hardening(Module *m){
     uint64_t stub=((m->text_end+15)&~15ULL)+416;
     enum { FADE_WORDS=10, MARK_WORDS=8, CAMERA_WORDS=26, EXIT_WORDS=10, INTERVAL_WORDS=25,
            WORDS=4*FADE_WORDS+3*MARK_WORDS+CAMERA_WORDS+EXIT_WORDS+INTERVAL_WORDS };
-    if(data>m->size||CUTSCENE_DATA_END>m->size-data||
-       stub>m->size||WORDS*4>m->size-stub||
-       stub+WORDS*4>((m->text_end+0xfff)&~0xfffULL))
-        runtime_fail("1.4.3 FPS60 hardening patch layout");
-    for(unsigned i=0;i<NSITE;i++)
-        if(sites[i].off>m->text_end||m->text_end-sites[i].off<4)
-            runtime_fail("1.4.3 FPS60 hardening site outside text");
+    if(!patch_region_fits(m,stub,WORDS*4,data,CUTSCENE_DATA_END)||
+       !patch_refs_fit(m,SITES(sites),stub,WORDS*4,data))
+        return patch_refuse("FPS60 hardening","layout/site/PC-relative range");
     for(unsigned i=0;i<NPRED;i++)
         if(predicate_guards[i].off>m->text_end||m->text_end-predicate_guards[i].off<4)
-            runtime_fail("1.4.3 FPS60 hardening predicate outside text");
+            return patch_refuse("FPS60 hardening","predicate outside text");
     /* Check ALL sites and the complete veneer/data space before writing
      * any member of this group. A different dump fails closed, not half-on. */
     uint32_t orig[NSITE],pred[NPRED];
@@ -324,9 +361,9 @@ static void patch_fps60_hardening(Module *m){
 #else
     if(!code_guard(m,SITES(sites),orig,sites_sha256))
 #endif
-        runtime_fail("1.4.3 FPS60 hardening original instruction mismatch");
+        return patch_refuse("FPS60 hardening","original instruction mismatch");
     if(!code_guard(m,SITES(predicate_guards),pred,predicates_sha256))
-        runtime_fail("1.4.3 FPS60 hardening predicate original instruction mismatch");
+        return patch_refuse("FPS60 hardening","predicate original instruction mismatch");
     uint32_t code[WORDS],jumps[NSITE];unsigned n=0;
     for(unsigned i=0;i<4;i++){
         uint64_t at=stub+4*n;unsigned rd=orig[i]&31;
@@ -398,7 +435,7 @@ static void patch_fps60_hardening(Module *m){
         orig[8],branch(at+96,sites[8].off+4),
     };
     memcpy(code+n,interval,sizeof interval);
-    for(unsigned i=0;i<NSITE;i++)if(code[replay[i]]!=orig[i])runtime_fail("1.4.3 FPS60 hardening veneer layout");
+    for(unsigned i=0;i<NSITE;i++)if(code[replay[i]]!=orig[i])return patch_refuse("FPS60 hardening","veneer layout");
 #if TARGET_OS_IPHONE
     for(unsigned i=0;i<NSITE;i++){
         uint32_t got;memcpy(&got,m->base+sites[i].off,4);
@@ -406,18 +443,18 @@ static void patch_fps60_hardening(Module *m){
         if(got!=expected){
             fprintf(stderr,"[totk] FPS60 hardening main+%#llx: found %08x, expected %08x\n",
                 (unsigned long long)sites[i].off,got,expected);
-            runtime_fail("1.4.3 FPS60 hardening original instruction mismatch");
+            return patch_refuse("FPS60 hardening","original instruction mismatch");
         }
     }
 #endif
 #if TARGET_OS_IPHONE
     if(memcmp(m->base+stub,code,sizeof code))
-        runtime_fail("1.4.3 embedded FPS60 hardening veneer mismatch");
+        return patch_refuse("FPS60 hardening","embedded veneer mismatch");
 #else
     for(unsigned i=0;i<sizeof code;i++)if(m->base[stub+i])
-        runtime_fail("1.4.3 FPS60 hardening veneer padding in use");
+        return patch_refuse("FPS60 hardening","veneer padding in use");
     for(unsigned i=CUTSCENE_STAMP_SLOT;i<CUTSCENE_DATA_END;i++)if(m->base[data+i])
-        runtime_fail("1.4.3 FPS60 hardening data padding in use");
+        return patch_refuse("FPS60 hardening","data padding in use");
     memcpy(m->base+stub,code,sizeof code);
     for(unsigned i=0;i<sizeof sites/sizeof *sites;i++)
         if(i<4?fades_enabled:floor_enabled)memcpy(m->base+sites[i].off,jumps+i,4);
@@ -439,51 +476,58 @@ static void patch_fps60_hardening(Module *m){
         fades_enabled?"4 positive fade clamps":"fade clamps OFF, original fcvtzs (TOTK_FPS60_FADE_CLAMP=0)",
         floor_enabled?"4 diagnostic markers; active scripted-camera subset only, exit clear/200ms expiry, guest/present 30fps floor (TOTK_FPS60_HARDENING=0 opts out)":
                       "cutscene floor off (framegen or TOTK_FPS60_HARDENING=0)");
+    return 1;
 }
 
 /* The FPS60 selects override stored min=2. Clamp their RESULTS, not the stored
  * bounds, so the game's own candidate/current update and NVN interval setter
- * stay authoritative. Installed only with startup TOTK_THERMAL_STEP=1; off
- * retains the original seven-word policy and allocates no thermal veneer.
- * Each veneer preserves incoming NZCV and x16/x17, replaying its select first.
- * The aligned literal is a single machine-word publication, with no side data. */
+ * stay authoritative. Startup TOTK_THERMAL_STEP=1 only; off allocates nothing.
+ * Preserve x16/x17 and NZCV. The floor is published only as 1 or 2.
+ * Use ADRP+LDR: the real rewritten image's private data page is about 25 MiB
+ * past this native text tail, far outside LDR-literal's +/-1 MiB range. */
 #if (defined(__ANDROID__) && defined(TOTK_ANDROID_APP)) || defined(TOTK_THERMAL_PATCH_TEST)
-static void patch_thermal_step(Module *m) {
+static int patch_thermal_step(Module *m) {
     const char *enabled = getenv("TOTK_THERMAL_STEP");
-    if (!enabled || strcmp(enabled, "1")) return;
+    if (!enabled || strcmp(enabled, "1")) return 0;
+    const char *fps=getenv("TOTK_FPS60");
+    if(fps&&!strcmp(fps,"0")){
+        fprintf(stderr,"[totk] 1.4.3 thermal-step inactive: shipping 30 FPS controller\n");return 0;
+    }
+    if(!patch_module_valid(m))return patch_refuse("thermal-step","module bounds");
     const unsigned indices[] = {1, 6, 4};
     const unsigned destinations[] = {10, 21, 12};
     enum { WORDS = 9, COUNT = 3, FLOOR_SLOT = 144 };
     uint64_t stub = ((m->text_end + 15) & ~15ULL) + 916;
     uint64_t data = ((m->file_size + 0x3fff) & ~0x3fffULL) + FLOOR_SLOT;
-    if (stub > m->size || COUNT * WORDS * 4 > m->size - stub ||
-        stub + COUNT * WORDS * 4 > ((m->text_end + 0xfff) & ~0xfffULL) ||
-        data > m->size || 4 > m->size - data)
-        runtime_fail("1.4.3 thermal veneer layout");
+    const Patch sites[]={{fps60[1].off,0},{fps60[6].off,0},{fps60[4].off,0}};
+    if(!patch_region_fits(m,stub,COUNT*WORDS*4,data,4)||
+       !patch_refs_fit(m,SITES(sites),stub,COUNT*WORDS*4,data)||
+       (((uintptr_t)m->base+data)&3))
+        return patch_refuse("thermal-step","layout/site/PC-relative range");
     for (unsigned i = 0; i < COUNT; i++) {
         uint32_t word;
         memcpy(&word, m->base + fps60[indices[i]].off, 4);
         if (word != fps60[indices[i]].replacement)
-            runtime_fail("1.4.3 thermal FPS60 select mismatch");
+            return patch_refuse("thermal-step","FPS60 select mismatch");
     }
     for (unsigned i = 0; i < COUNT * WORDS * 4; i++)
-        if (m->base[stub + i]) runtime_fail("1.4.3 thermal veneer padding in use");
+        if (m->base[stub + i]) return patch_refuse("thermal-step","veneer padding in use");
     for (unsigned i = 0; i < 4; i++)
-        if (m->base[data + i]) runtime_fail("1.4.3 thermal data padding in use");
+        if (m->base[data + i]) return patch_refuse("thermal-step","data padding in use");
     uint32_t code[COUNT * WORDS], jumps[COUNT];
     for (unsigned i = 0; i < COUNT; i++) {
         uint64_t at = stub + i * WORDS * 4;
-        int64_t delta = (int64_t)data - (int64_t)(at + 12);
-        if ((delta & 3) || delta < -(1 << 20) || delta >= (1 << 20))
-            runtime_fail("1.4.3 thermal literal outside range");
         unsigned d = destinations[i], index = indices[i];
+        uintptr_t floor_address=(uintptr_t)m->base+data;
         uint32_t veneer[] = {
             fps60[index].replacement,
-            0xa9bf47f0, 0xd53b4210, /* save x16/x17; mrs x16,nzcv */
-            0x18000011u | (((uint32_t)(delta >> 2) & 0x7ffff) << 5),
-            0x6b11001fu | (d << 5), /* cmp wD,w17 (floor) */
-            0x1a912000u | (d << 5) | d, /* csel wD,wD,w17,hs */
-            0xd51b4210, 0xa8c147f0, /* msr nzcv,x16; restore x16/x17 */
+            0xa9bf47f0, /* save x16/x17; all following instructions retain NZCV */
+            adrp(17,(uintptr_t)m->base+at+8,floor_address),
+            0xb9400231u|((uint32_t)(floor_address&0xfff)/4<<10),
+            0x53017c10u|(d<<5), /* lsr w16,wD,#1: retain every result >=2 */
+            0x35000050,         /* cbnz w16,restore */
+            0x2a1103e0u|d,      /* mov wD,w17: max(0 or 1,published 1 or 2) */
+            0xa8c147f0, /* restore x16/x17 */
             branch(at + 32, fps60[index].off + 4),
         };
         memcpy(code + i * WORDS, veneer, sizeof veneer);
@@ -495,6 +539,9 @@ static void patch_thermal_step(Module *m) {
     for (unsigned i = 0; i < COUNT; i++)
         memcpy(m->base + fps60[indices[i]].off, jumps + i, 4);
     runtime_thermal_bind((_Atomic uint32_t *)(void *)(m->base + data));
+    fprintf(stderr,"[totk] 1.4.3 thermal-step applied: three veneers +%#llx; ADRP floor +%#llx\n",
+            (unsigned long long)stub,(unsigned long long)data);
+    return 1;
 }
 #endif
 /* The actor animation update has a second, unscaled clock for cloth/hair
@@ -852,15 +899,16 @@ static const char DRS_TIME_UNIT_SHA256[]="2ba64480db226174427cab3b3d43e54926077f
  * Cap that comparison operand to 100 (16.667 ms); keep an already tighter
  * budget, actual measurements, cost mirror, scale palette and hysteresis.
  * Both ordinary and reset decisions call this one predictor. */
-static void patch_drs60(Module *m){
+static int patch_drs60(Module *m){
     const char *e=getenv("TOTK_DRS60");
-    if(!e||!*e||!strcmp(e,"0"))return;
-    if(strcmp(e,"1"))runtime_fail("TOTK_DRS60 must be 0 or 1");
+    if(!e||!*e||!strcmp(e,"0"))return 0;
+    if(strcmp(e,"1"))return patch_refuse("DRS60","TOTK_DRS60 must be 0 or 1");
     const char *fps=getenv("TOTK_FPS60");
     if(fps&&!strcmp(fps,"0")){
         fprintf(stderr,"[totk] TOTK_DRS60=1 ignored: shipping 30 FPS controller (TOTK_FPS60=0)\n");
-        return;
+        return 0;
     }
+    if(!patch_module_valid(m))return patch_refuse("DRS60","module bounds");
     uint64_t stub=((m->text_end+15)&~15ULL)+320;
     const Patch sites[]={
         {0x584e84,0}, /* ldr s17,[x8,#0xc]: native budget */
@@ -873,15 +921,19 @@ static void patch_drs60(Module *m){
         {0x0a1bb4,0}, /* / 16666.666 us */
     };
     enum { CODE_WORDS=5 };
-    if(stub>m->size||CODE_WORDS*4>m->size-stub||
-       stub+CODE_WORDS*4>((m->text_end+0xfff)&~0xfffULL))
-        runtime_fail("1.4.3 DRS60 veneer layout");
+    if(!patch_region_fits(m,stub,CODE_WORDS*4,0,0)||
+       !patch_refs_fit(m,SITES(sites),stub,CODE_WORDS*4,0))
+        return patch_refuse("DRS60","layout/site/PC-relative range");
     uint32_t orig[sizeof sites/sizeof *sites];
-    verify_render_sites(m,sites,sizeof sites/sizeof *sites,orig,"b33749330db7c306c70881258fc4bbb70b0913391d6694840f31f60677e93c68");
+#if TARGET_OS_IPHONE
+    return patch_refuse("DRS60","requires writable code");
+#endif
+    if(!code_guard(m,SITES(sites),orig,"b33749330db7c306c70881258fc4bbb70b0913391d6694840f31f60677e93c68"))
+        return patch_refuse("DRS60","original instruction mismatch");
     if(DRS_TIME_UNIT[0].off>m->file_size||m->file_size-DRS_TIME_UNIT[0].off<4||DRS_TIME_UNIT[0].off>m->size||m->size-DRS_TIME_UNIT[0].off<4)
-        runtime_fail("1.4.3 DRS60 time-unit constant outside module");
+        return patch_refuse("DRS60","time-unit constant outside module");
     uint32_t unit;
-    if(!code_guard(m,SITES(DRS_TIME_UNIT),&unit,DRS_TIME_UNIT_SHA256))runtime_fail("1.4.3 DRS60 GPU stress time-unit mismatch");
+    if(!code_guard(m,SITES(DRS_TIME_UNIT),&unit,DRS_TIME_UNIT_SHA256))return patch_refuse("DRS60","GPU stress time-unit mismatch");
     /* s22 is predictor-local caller-saved scratch: each candidate loop writes
      * it before reading it. s17 was the original destination; no GPR, LR,
      * stack or flags is changed before the original comparison resumes. */
@@ -893,11 +945,12 @@ static void patch_drs60(Module *m){
     };
     uint32_t jump=branch(0x584e84,stub);
     for(size_t i=0;i<sizeof code;i++)if(m->base[stub+i])
-        runtime_fail("1.4.3 DRS60 veneer padding not empty");
+        return patch_refuse("DRS60","veneer padding not empty");
     memcpy(m->base+stub,code,sizeof code);
     memcpy(m->base+sites[0].off,&jump,4);
     fprintf(stderr,"[totk] 1.4.3 TOTK_DRS60=1 applied: native predicted GPU queue-span budget=min(original,100%% of 16.667 ms); main+0x584e84 %08x -> %08x, veneer +%#llx; native palette/hysteresis retained\n",
             orig[0],jump,(unsigned long long)stub);
+    return 1;
 }
 
 /* Separate from DRS60: a mutable operand, never mutable executable text.
@@ -918,16 +971,17 @@ void runtime_drs_framegen_budget(double ms){
 uint64_t runtime_drs_framegen_level(void){
     return drs_framegen_sample?atomic_load_explicit(drs_framegen_sample,memory_order_acquire):0;
 }
-static void patch_drs_framegen(Module *m){
+static int patch_drs_framegen(Module *m){
     const char *e=getenv("TOTK_DRS_FRAMEGEN"),*diag=getenv("TOTK_FRAMEGEN_DIAG");
     int on=e&&!strcmp(e,"1"),sample=diag&&!strcmp(diag,"1");
-    if(e&&strcmp(e,"0")&&strcmp(e,"1"))runtime_fail("TOTK_DRS_FRAMEGEN must be 0 or 1");
+    if(e&&strcmp(e,"0")&&strcmp(e,"1"))return patch_refuse("DRS framegen","TOTK_DRS_FRAMEGEN must be 0 or 1");
     const char *fg=getenv("TOTK_FRAMEGEN"),*fps=getenv("TOTK_FPS60");
     if(!fg||strcmp(fg,"locked")||!fps||strcmp(fps,"0")){
         if(on)fprintf(stderr,"[totk] TOTK_DRS_FRAMEGEN=1 ignored: requires locked framegen and TOTK_FPS60=0\n");
-        return;
+        return 0;
     }
-    if(!on&&!sample)return;
+    if(!on&&!sample)return 0;
+    if(!patch_module_valid(m))return patch_refuse("DRS framegen","module bounds");
     uint64_t data=(m->file_size+0x3fff)&~0x3fffULL;
     uint64_t stub=((m->text_end+15)&~15ULL)+352,level_stub=stub+32;
     const Patch sites[]={
@@ -939,20 +993,24 @@ static void patch_drs_framegen(Module *m){
         {0x5848ac,0}, /* then restore manager/callee-saved registers */
         {0x5848b0,0}, /* packed return flags | scale */
     };
-    if(data>m->size||DRS_FRAMEGEN_SAMPLE_SLOT+8>m->size-data||level_stub+32>((m->text_end+0xfff)&~0xfffULL)||
-       level_stub>m->size||32>m->size-level_stub)
-        runtime_fail("1.4.3 DRS framegen patch layout");
+    if(!patch_region_fits(m,stub,64,data,DRS_FRAMEGEN_SAMPLE_SLOT+8)||
+       !patch_refs_fit(m,SITES(sites),stub,64,data))
+        return patch_refuse("DRS framegen","layout/site/PC-relative range");
     uint32_t orig[sizeof sites/sizeof *sites];
-    verify_render_sites(m,sites,sizeof sites/sizeof *sites,orig,"be02b6cf05e6445af876956d5d10a831818e69c5c97d1b1a884bf304ac4d0c3f");
+#if TARGET_OS_IPHONE
+    return patch_refuse("DRS framegen","requires writable code");
+#endif
+    if(!code_guard(m,SITES(sites),orig,"be02b6cf05e6445af876956d5d10a831818e69c5c97d1b1a884bf304ac4d0c3f"))
+        return patch_refuse("DRS framegen","original instruction mismatch");
     uint32_t unit;
     if(m->file_size<DRS_TIME_UNIT[0].off+4||m->size<DRS_TIME_UNIT[0].off+4)
-        runtime_fail("1.4.3 DRS framegen time-unit constant outside module");
-    if(!code_guard(m,SITES(DRS_TIME_UNIT),&unit,DRS_TIME_UNIT_SHA256))runtime_fail("1.4.3 DRS framegen GPU stress time-unit mismatch");
+        return patch_refuse("DRS framegen","time-unit constant outside module");
+    if(!code_guard(m,SITES(DRS_TIME_UNIT),&unit,DRS_TIME_UNIT_SHA256))return patch_refuse("DRS framegen","GPU stress time-unit mismatch");
     for(unsigned i=0;i<64;i++)if(m->base[stub+i])
-        runtime_fail("1.4.3 DRS framegen veneer padding not empty");
+        return patch_refuse("DRS framegen","veneer padding not empty");
     for(unsigned i=DRS_FRAMEGEN_CAP_SLOT;i<DRS_FRAMEGEN_SAMPLE_SLOT+8;i++)
         if((i<DRS_FRAMEGEN_CAP_SLOT+8||i>=DRS_FRAMEGEN_SAMPLE_SLOT)&&m->base[data+i])
-            runtime_fail("1.4.3 DRS framegen data padding not empty");
+            return patch_refuse("DRS framegen","data padding not empty");
     uint32_t code[]={
         orig[0],0xf81f0fe9, /* the original load; save x9, aligned stack */
         adrp(9,(uintptr_t)m->base+stub+8,(uintptr_t)m->base+data),
@@ -966,19 +1024,21 @@ static void patch_drs_framegen(Module *m){
         0xf9000000u|((DRS_FRAMEGEN_SAMPLE_SLOT/8)<<10)|(10<<5)|11, /* str x11,[x10,#sample] */
         0xa8c12fea,branch(level_stub+28,0x5848ac),
     };
+    uint32_t cap_jump=branch(0x584e84,stub),level_jump=branch(0x5848a8,level_stub);
     if(on){
-        uint32_t native=0x7f7fffff,jump=branch(0x584e84,stub);
+        uint32_t native=0x7f7fffff,jump=cap_jump;
         memcpy(m->base+data+DRS_FRAMEGEN_CAP_SLOT,&native,4);
         memcpy(m->base+stub,code,sizeof code);memcpy(m->base+0x584e84,&jump,4);
         drs_framegen_cap=(_Atomic uint32_t *)(void *)(m->base+data+DRS_FRAMEGEN_CAP_SLOT);
         fprintf(stderr,"[totk] 1.4.3 TOTK_DRS_FRAMEGEN=1 applied: mutable min(native,published) predicted GPU budget; starts native, backend clamps active target to 24..30 ms; palette/floor/hysteresis unchanged\n");
     }
     if(sample){
-        uint32_t jump=branch(0x5848a8,level_stub);
+        uint32_t jump=level_jump;
         memcpy(m->base+level_stub,level,sizeof level);memcpy(m->base+0x5848a8,&jump,4);
         drs_framegen_sample=(_Atomic uint64_t *)(void *)(m->base+data+DRS_FRAMEGEN_SAMPLE_SLOT);
         fprintf(stderr,"[totk] 1.4.3 DRS framegen DIAG: selected native priority/scale snapshot at data+%u, disjoint from camera aspect +%u (no host reads of guest manager)\n",DRS_FRAMEGEN_SAMPLE_SLOT,ASPECT_DATA_SLOT);
     }
+    return 1;
 }
 #if TARGET_OS_OSX   /* Mac diagnostics (Mach thread debug state) */
 /* High-frame-rate diagnostics (Mac, TOTK_INPUT_FILE commands). Such bugs sit in game code that compares the game's time
@@ -1041,6 +1101,79 @@ void runtime_diag_xpoke(unsigned off,float value){
     fprintf(stderr,"[totk] xpoke X+%#x: %g -> %g\n",off,old,value);
 }
 #endif
+/* Quick-menu capture admission: reproduce PR #44's armed OR requested gate,
+   including w9 scratch use. Our former visibility guard excluded the
+   hidden-pending window and suppressed the observed Odin fix.
+   This is not synchronization: update prepares state after arming, and the
+   native completion can republish requests. Default on only on Android;
+   exact =0 retains native admission without writing guest code. iOS export
+   and the phone runtime must never bake/install this optional patch. */
+enum { MENU_CAPTURE_STUB = 276, MENU_CAPTURE_TAIL = 340,
+       MENU_CAPTURE_HEAD_WORDS = 3, MENU_CAPTURE_TAIL_WORDS = 2 };
+static _Atomic int menu_capture_state=-1;
+int runtime_menu_capture_state(void){
+    return atomic_load_explicit(&menu_capture_state,memory_order_acquire);
+}
+static int patch_menu_capture(Module *m){
+    atomic_store_explicit(&menu_capture_state,-1,memory_order_release);
+#if TARGET_OS_IPHONE
+    (void)m;
+    atomic_store_explicit(&menu_capture_state,0,memory_order_release);
+    fprintf(stderr,"[totk] 1.4.3 menu capture fix inactive: iOS runtime\n");
+    return 0;
+#else
+    const char *e=getenv("TOTK_MENU_CAPTURE_FIX");
+    if(getenv("TOTK_EXPORT_IOS")){
+        atomic_store_explicit(&menu_capture_state,0,memory_order_release);
+        fprintf(stderr,"[totk] 1.4.3 menu capture fix inactive: iOS export\n");
+        return 0;
+    }
+    if((!e&&!TOTK_ANDROID)||(e&&strcmp(e,"1"))){
+        atomic_store_explicit(&menu_capture_state,0,memory_order_release);
+        if(!e)fprintf(stderr,"[totk] 1.4.3 menu capture fix inactive: non-Android default\n");
+        else fprintf(stderr,"[totk] 1.4.3 menu capture experiment off (unset or TOTK_MENU_CAPTURE_FIX=1 enables)\n");
+        return 0;
+    }
+    const uint64_t site=0x105bbcc;
+    const Patch guards[]={{0x105bbcc,0},{0x105bbd0,0}};
+    uint32_t orig[2];
+    if(!patch_module_valid(m)||m->text_end<site+8){
+        return patch_refuse("menu capture fix","text bounds");
+    }
+    /* The real text tail has only 1024 bytes. Use two existing gaps:
+       +276..288 after bounce, +340..348 after DRS60. One extra branch
+       joins them, leaving DRS/framegen, hardening and thermal-step intact. */
+    uint64_t base=(m->text_end+15)&~15ULL;
+    uint64_t stub=base+MENU_CAPTURE_STUB,tail=base+MENU_CAPTURE_TAIL;
+    if(tail>m->size||MENU_CAPTURE_TAIL_WORDS*4>m->size-tail||
+       tail+MENU_CAPTURE_TAIL_WORDS*4>((m->text_end+0xfff)&~0xfffULL)||
+       stub-site>=(1u<<27)||tail+4-(site+4)>(1u<<27)){
+        return patch_refuse("menu capture fix","veneer layout/range");
+    }
+    if(!code_guard(m,SITES(guards),orig,"a5e2a3003d86bfbb936dc67e51990369aea8bf463786eea310b99463fc3a901d")){
+        return patch_refuse("menu capture fix","original instruction mismatch");
+    }
+    for(unsigned i=0;i<MENU_CAPTURE_HEAD_WORDS*4;i++)if(m->base[stub+i]){
+        return patch_refuse("menu capture fix","veneer space in use");
+    }
+    for(unsigned i=0;i<MENU_CAPTURE_TAIL_WORDS*4;i++)if(m->base[tail+i]){
+        return patch_refuse("menu capture fix","veneer space in use");
+    }
+    const uint32_t head[]={orig[0],       /* ldrb w8,[x0,#0xd5]: armed */
+        0x39435009,                       /* ldrb w9,[x0,#0xd4]: requested */
+        branch(stub+8,tail)};
+    const uint32_t end[]={0x2a090108,     /* orr w8,w8,w9: original admission */
+        branch(tail+4,site+4)};
+    uint32_t word=branch(site,stub);     /* validate every branch before any write */
+    memcpy(m->base+stub,head,sizeof head);
+    memcpy(m->base+tail,end,sizeof end);
+    memcpy(m->base+site,&word,4);
+    atomic_store_explicit(&menu_capture_state,1,memory_order_release);
+    fprintf(stderr,"[totk] 1.4.3 menu capture experiment: armed or requested pane (original admission), veneers +%#llx/+%#llx\n",
+            (unsigned long long)stub,(unsigned long long)tail);
+#endif
+    return 1;
+}
 static void patch_output_res(Module *m);
 static void patch_render_res(Module *m);
 void runtime_game_patches(Module *m) {
@@ -1058,6 +1191,7 @@ void runtime_game_patches(Module *m) {
     patch_fxaa(m);
     patch_drs60(m);
     patch_drs_framegen(m);
+    patch_menu_capture(m);
 #if TARGET_OS_OSX   /* Mac diagnostics (Mach thread debug state) */
     diag_main=m;   /* frmwatch / xpoke */
 #endif

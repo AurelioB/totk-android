@@ -1,11 +1,9 @@
 /* Host-only production guard/publication fixture; synthetic module, no game. The site words come from the player's
    main (verify_v143_drs_framegen.py) or, built with -DCODE_GUARD_STANDIN, are stand-ins (fixture_seeds.h). */
 #include <assert.h>
-#include <setjmp.h>
 #include "../runtime/game_patches_v143.c"
 #include "fixture_seeds.h"
-static jmp_buf failure;
-_Noreturn void runtime_fail(const char *message){(void)message;longjmp(failure,1);}
+_Noreturn void runtime_fail(const char *message){fprintf(stderr,"unexpected fatal: %s\n",message);abort();}
 int mfxup_output_enabled(void){return 0;}
 void runtime_oe_push_message(uint32_t value){(void)value;}
 void dm_gfx_set_flag(const char *name,int value){(void)name;(void)value;}
@@ -25,7 +23,7 @@ static void reset(void){
 }
 static void reject(void){
  memcpy(before,module.base,module.size);
- if(!setjmp(failure)){patch_drs_framegen(&module);assert(!"DRS framegen accepted invalid input");}
+ assert(patch_drs_framegen(&module)==-1);
  assert(!memcmp(before,module.base,module.size));
 }
 static void unchanged(void){

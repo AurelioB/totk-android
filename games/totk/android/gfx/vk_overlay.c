@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include "build_kind.h"
 extern int runtime_handheld_mode(void);
+extern int runtime_menu_capture_state(void) __attribute__((weak));
 #include <pthread.h>
 #include <errno.h>
 #include <limits.h>
@@ -680,9 +681,10 @@ static void init(void) {
 #endif
     map_warn_enabled = nvn_dirty_map_warn_init();
     /* Actual frozen backend states, including opt-outs; independent of build-dependent defaults. */
-    fprintf(stderr, "[totk-switches] v=1 TOTK_WB_ALIAS=%s TOTK_MAP_WARN=%s map_warn_mode=%u\n",
+    int menu = runtime_menu_capture_state ? runtime_menu_capture_state() : 0;
+    fprintf(stderr, "[totk-switches] v=2 TOTK_WB_ALIAS=%s TOTK_MAP_WARN=%s map_warn_mode=%u TOTK_MENU_CAPTURE_FIX=%s\n",
             vk_wb_alias_enabled() ? "on" : "off", map_warn_enabled ? "on" : "off",
-            nvn_dirty_map_warn_mode());
+            nvn_dirty_map_warn_mode(), menu == 1 ? "on" : menu == 0 ? "off" : "UNKNOWN");
     if (map_warn_enabled) available = 1; /* warnings remain visible with TOTK_OVERLAY=off */
     position = getenv("TOTK_OVERLAY_POS");
     e = getenv("TOTK_FPS60"); history.target_ms = e && !strcmp(e, "1") ? 1000.0 / 60 : 1000.0 / 30;

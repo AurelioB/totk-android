@@ -6,6 +6,31 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Fix the pre-existing thermal-step veneer on the real 1.4.3 Android rewrite: its mutable floor
+  is about 25 MiB past native text, outside an LDR-literal's reach. Use ADRP+LDR and a flag-free
+  clamp for the published one/two-tick floor, retaining the same 108-byte tail allocation.
+  Model the full rewritten image in host fixtures and verify all floor addresses/register semantics.
+- Make menu/thermal, FPS60 hardening/hysteresis and DRS startup guard failures refuse-and-log
+  without exiting or partially installing a group. Preflight full module bounds and generated B/ADRP
+  references; cover all switch combinations/install orders on the complete Android rewrite geometry,
+  corrupted sites/padding and invalid layouts, plus real 30/60-preset startup with player-supplied data.
+- Enable PR #44's Android 1.4.3 quick-menu capture fix by default: unset or exact `TOTK_MENU_CAPTURE_FIX=1`
+  uses the contributor's original armed-OR-requested admission; `=0` leaves guest code untouched.
+  Other explicit values remain off. Keep other writable hosts opt-in, and explicitly exclude both the
+  iOS runtime and writable-host iOS export before any write; non-1.4.3 paths are unchanged.
+  Our added visibility guard suppressed the fix:
+  Odin requests were pending while hidden; original admission removed the black backgrounds in the finite
+  30/60-fps comparison, while the guarded version did not. Remove the guarded alternative entirely.
+  Retain all-before-any-write bounds, original-word, padding and branch checks. Split the veneer across
+  two existing text-tail gaps so thermal-step and FPS60 hardening coexist without moving their code.
+  Test real ARM admission/continuation/completion, unset/explicit-on byte equality, explicit-off
+  no-write behavior and all six install orders. This does not prove preparation/publication safety
+  or a once-per-opening capture bound.
+- Include actual menu admission (applied/on, inactive/off, refused/UNKNOWN) in the one-time startup
+  switch marker and benchmark comparison/ledger workload signatures. Reconcile raw current-launch
+  startup evidence, retain legacy marker parsing without inventing menu OFF, and require resolver
+  evidence version 4 for the combined current-launch/menu contract. Pin all three historical opt-outs;
+  keep immutable baseline metrics/hashes unchanged.
 - Log the frozen effective write-back-alias state and map-warning mode once at first presenter startup,
   including explicit opt-outs, so benchmark tools need not infer build-dependent defaults from menu settings.
 - Record effective alias/warning states from complete startup evidence, including the warning mode, in benchmark
@@ -15,8 +40,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Reject stale, duplicate, malformed and conflicting records per switch before marker or pre-switch-provenance
   admission; require current evidence metadata so older resolver results cannot bypass UNKNOWN rejection.
   Preserve window metrics and immutable baseline identities.
-- Scope effective-switch evidence, including both startup-bracket ends, to the current launch in retained
-  ten-launch logs. Historical markers never authenticate a missing or incomplete current startup.
+- Scope all three effective-switch states, including menu admission and both startup-bracket ends,
+  to the current launch in retained ten-launch logs. Historical markers or a migrated pre-history segment
+  never authenticate missing, different or incomplete current menu admission.
 - Make optional frame-timeline and fence-evidence ring producers single-attempt/nonblocking, with counted
   dropped updates and skipped snapshots. Reuse per-walk elapsed clocks instead of enabling recorder
   opcode/category probes, and batch recorder-worker draws/descriptors at slot assembly instead of each job.

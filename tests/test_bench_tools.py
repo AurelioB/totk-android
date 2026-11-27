@@ -116,9 +116,9 @@ class EffectiveSwitches(unittest.TestCase):
             site + '=' + buckets for site in ('landing', 'store', 'publication')) + '\n'
 
     @staticmethod
-    def marker(alias='off', mode=0):
-        return (f'[totk-switches] v=1 TOTK_WB_ALIAS={alias} '
-                f'TOTK_MAP_WARN={"on" if mode else "off"} map_warn_mode={mode}\n')
+    def marker(alias='off', mode=0, menu='off'):
+        return (f'[totk-switches] v=2 TOTK_WB_ALIAS={alias} '
+                f'TOTK_MAP_WARN={"on" if mode else "off"} map_warn_mode={mode} TOTK_MENU_CAPTURE_FIX={menu}\n')
 
     def parse_states(self, text, build=None):
         with tempfile.TemporaryDirectory() as tmp:
@@ -155,7 +155,7 @@ class EffectiveSwitches(unittest.TestCase):
     def test_historical_off_and_explicit_optouts_keep_numbers_and_signature(self):
         old_build = benchlib.load_result(BASELINE)['build']
         old = self.document(self.START, old_build)
-        off = self.document(self.START + self.marker(), env='TOTK_WB_ALIAS=0\nTOTK_MAP_WARN=0\n')
+        off = self.document(self.START + self.marker(), env='TOTK_WB_ALIAS=0\nTOTK_MAP_WARN=0\nTOTK_MENU_CAPTURE_FIX=0\n')
         self.assertEqual(self.values(old), dict.fromkeys(benchlib.SWITCH_KEYS, 'off'))
         self.assertEqual(self.values(off), self.values(old))
         self.assertEqual(old['runs'], off['runs'])
@@ -165,7 +165,7 @@ class EffectiveSwitches(unittest.TestCase):
 
     def test_new_defaults_are_not_comparable_to_historical_off(self):
         old = self.document(self.START, benchlib.load_result(BASELINE)['build'])
-        new = self.document(self.START + self.ALIAS + self.WARN + self.marker('on', 1))
+        new = self.document(self.START + self.ALIAS + self.WARN + self.marker('on', 1, 'on'))
         self.assertEqual(self.values(new), dict.fromkeys(benchlib.SWITCH_KEYS, 'on'))
         self.assertEqual(old['runs'], new['runs'])
         self.assertNotEqual(benchlib.device_signature(old, 'thor')['sha256'],
@@ -175,6 +175,7 @@ class EffectiveSwitches(unittest.TestCase):
         self.assertIn('NOT COMPARABLE', text)
         self.assertIn('TOTK_WB_ALIAS: off -> on', text)
         self.assertIn('TOTK_MAP_WARN: off -> on', text)
+        self.assertIn('TOTK_MENU_CAPTURE_FIX: off -> on', text)
 
     def test_truncated_and_missing_startup_are_unknown_even_against_themselves(self):
         for text in ('', self.marker('on', 1), self.START + '[totk-switches] v=1 TOTK_WB_ALIAS=off'):
@@ -198,7 +199,8 @@ class EffectiveSwitches(unittest.TestCase):
                       self.statistics()):
             states = self.parse_states(self.START + alias + self.WARN
                 + '[nvn-vk] frame 300: 30 fps over the last 300\n')
-            self.assertEqual({value['state'] for value in states.values()}, {'on'})
+            self.assertEqual({key: value['state'] for key, value in states.items()},
+                             {'TOTK_WB_ALIAS': 'on', 'TOTK_MAP_WARN': 'on', 'TOTK_MENU_CAPTURE_FIX': 'UNKNOWN'})
             self.assertEqual(states['TOTK_MAP_WARN']['mode'], 1)
 
     def test_marker_overrides_env_intent_and_modes_do_not_match(self):
@@ -226,7 +228,7 @@ class EffectiveSwitches(unittest.TestCase):
         for text, build in cases:
             with self.subTest(build=build):
                 doc = self.document(text, build)
-                self.assertEqual(self.values(doc), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'})
+                self.assertEqual(self.values(doc), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN', 'TOTK_MENU_CAPTURE_FIX': 'off'})
                 self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
                 self.assertIn('TOTK_MAP_WARN=UNKNOWN', self.compare(doc, doc)[1])
 
@@ -242,7 +244,7 @@ class EffectiveSwitches(unittest.TestCase):
     def test_ten_launch_history_uses_only_current_off_startup_bracket(self):
         old = ''.join(
             f'[totk-log] ===== Launch 2026-11-26T00:00:{n:02}Z (pid {100 + n}) =====\n'
-            + self.START + self.marker('on', 1) + self.END for n in range(9))
+            + self.START + self.marker('on', 1, 'on') + self.END for n in range(9))
         heading = '[totk-log] ===== Launch 2026-11-26T00:00:09Z (pid 109) =====\n'
         current = self.START + self.marker()
         plain = self.document(current)
@@ -256,7 +258,7 @@ class EffectiveSwitches(unittest.TestCase):
     def test_current_history_without_marker_or_closed_bracket_stays_unknown(self):
         old = ''.join(
             f'[totk-log] ===== Launch 2026-11-26T00:00:{n:02}Z (pid {100 + n}) =====\n'
-            + self.START + self.marker('on', 1) + self.END for n in range(9))
+            + self.START + self.marker('on', 1, 'on') + self.END for n in range(9))
         heading = '[totk-log] ===== Launch 2026-11-26T00:00:09Z (pid 109) =====\n'
         for current in ('', self.START, self.START + '[totk-switches] v=1 TOTK_WB_ALIAS=off'):
             with self.subTest(current=current):
@@ -266,6 +268,42 @@ class EffectiveSwitches(unittest.TestCase):
                 self.assertEqual(self.values(doc), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
                 self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
                 self.assertIn('NOT COMPARABLE', self.compare(doc, doc)[1])
+
+    def test_history_menu_state_is_independent_and_comes_only_from_current_launch(self):
+        old_heading = '[totk-log] ===== Launch old =====\n'
+        current_heading = '[totk-log] ===== Launch current =====\n'
+        for previous, current in (('on', 'off'), ('off', 'on')):
+            old = old_heading + self.START + self.marker(menu=previous) + self.END
+            latest = self.START + self.marker(menu=current) + self.END
+            states = self.parse_states(old + current_heading + latest)
+            self.assertEqual({key: record['state'] for key, record in states.items()},
+                             {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'off', 'TOTK_MENU_CAPTURE_FIX': current})
+            self.assertEqual(states['TOTK_MENU_CAPTURE_FIX']['evidence_lines'], [3])
+            plain, history = self.document(latest), self.document(old + current_heading + latest)
+            self.assertEqual(self.compare(plain, history)[0], {'match'})
+            self.assertEqual(self.compare(self.document(self.START + self.marker(menu=previous)), history)[0],
+                             {'mismatch'})
+
+    def test_truncated_current_menu_bracket_never_borrows_a_complete_old_launch(self):
+        old = ('[totk-log] ===== Launch old =====\n' + self.START + self.marker(menu='on') + self.END)
+        for current in ('', self.START, self.START + self.marker(menu='off'),
+                        self.START + self.marker(menu='on') + self.END.rstrip('\n')):
+            states = self.parse_states(old + '[totk-log] ===== Launch current =====\n' + current)
+            self.assertEqual({record['state'] for record in states.values()}, {'UNKNOWN'})
+
+    def test_migrated_pre_history_menu_evidence_never_supplies_current_state(self):
+        old = ('[totk-log] ===== Launch (before log history) =====\n'
+               + self.START + self.marker(menu='on') + self.END)
+        heading = '[totk-log] ===== Launch current =====\n'
+        v1 = '[totk-switches] v=1 TOTK_WB_ALIAS=off TOTK_MAP_WARN=off map_warn_mode=0\n'
+        off = '[totk] 1.4.3 menu capture experiment off (TOTK_MENU_CAPTURE_FIX=1 opts in)\n'
+        refused = '[totk] 1.4.3 menu capture fix skipped: original instruction mismatch\n'
+        for records, expected in ((self.marker(menu='off'), 'off'), (v1, 'UNKNOWN'),
+                                  (off + v1, 'off'), (refused + self.marker(menu='UNKNOWN'), 'UNKNOWN')):
+            states = self.parse_states(old + heading + self.START + records + self.END)
+            self.assertEqual(states['TOTK_MENU_CAPTURE_FIX']['state'], expected)
+            self.assertEqual(states['TOTK_WB_ALIAS']['state'], 'off')
+            self.assertEqual(states['TOTK_MAP_WARN']['state'], 'off')
 
     def test_marker_after_startup_end_cannot_authenticate_current_launch(self):
         doc = self.document(self.START + self.END + self.marker())
@@ -286,8 +324,8 @@ class EffectiveSwitches(unittest.TestCase):
 
     def test_duplicate_single_startup_records_invalidate_each_affected_switch(self):
         cases = (
-            (self.ALIAS * 2 + self.marker('on'), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
-            (self.WARN * 2 + self.marker('off', 1), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}),
+            (self.ALIAS * 2 + self.marker('on'), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off', 'TOTK_MENU_CAPTURE_FIX': 'off'}),
+            (self.WARN * 2 + self.marker('off', 1), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN', 'TOTK_MENU_CAPTURE_FIX': 'off'}),
             (self.marker() * 2, dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN')),
         )
         for records, expected in cases:
@@ -297,8 +335,8 @@ class EffectiveSwitches(unittest.TestCase):
             self.assertIn('duplicated', self.compare(doc, doc)[1])
 
     def test_invalid_marker_fields_are_independent_and_do_not_become_off(self):
-        alias_unknown = {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}
-        warn_unknown = {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}
+        alias_unknown = {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off', 'TOTK_MENU_CAPTURE_FIX': 'off'}
+        warn_unknown = {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN', 'TOTK_MENU_CAPTURE_FIX': 'off'}
         cases = (
             (self.marker().replace('TOTK_WB_ALIAS=off', 'TOTK_WB_ALIAS=bad'), alias_unknown),
             (self.marker().replace('TOTK_WB_ALIAS=off', 'TOTK_WB_ALIAS=off TOTK_WB_ALIAS=off'), alias_unknown),
@@ -307,7 +345,7 @@ class EffectiveSwitches(unittest.TestCase):
             (self.marker().replace('map_warn_mode=0', 'map_warn_mode=1'), warn_unknown),
             (self.marker().replace('map_warn_mode=0', 'map_warn_mode=bad'), warn_unknown),
             (self.marker().replace('map_warn_mode=0', 'map_warn_mode=0 map_warn_mode=0'), warn_unknown),
-            (self.marker().replace('v=1', 'v=2'), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN')),
+            (self.marker().replace('v=2', 'v=3'), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN')),
             (self.marker().rstrip('\n') + ' unexpected=1\n', dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN')),
         )
         for marker, expected in cases:
@@ -318,14 +356,14 @@ class EffectiveSwitches(unittest.TestCase):
 
     def test_stale_late_and_conflicting_feature_records_are_independent(self):
         cases = (
-            (self.ALIAS + self.START + self.marker(), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
-            (self.WARN + self.START + self.marker(), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}),
+            (self.ALIAS + self.START + self.marker(), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off', 'TOTK_MENU_CAPTURE_FIX': 'off'}),
+            (self.WARN + self.START + self.marker(), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN', 'TOTK_MENU_CAPTURE_FIX': 'off'}),
             (self.START + self.marker() + self.END + self.ALIAS,
-             {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
+             {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off', 'TOTK_MENU_CAPTURE_FIX': 'off'}),
             (self.START + self.marker() + self.END + self.WARN,
-             {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}),
-            (self.START + self.ALIAS + self.marker(), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
-            (self.START + self.WARN + self.marker(), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}),
+             {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN', 'TOTK_MENU_CAPTURE_FIX': 'off'}),
+            (self.START + self.ALIAS + self.marker(), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off', 'TOTK_MENU_CAPTURE_FIX': 'off'}),
+            (self.START + self.WARN + self.marker(), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN', 'TOTK_MENU_CAPTURE_FIX': 'off'}),
         )
         for text, expected in cases:
             doc = self.document(text)
@@ -348,9 +386,9 @@ class EffectiveSwitches(unittest.TestCase):
     def test_pre_switch_provenance_cannot_hide_alias_or_marker_conflicts(self):
         build = benchlib.load_result(BASELINE)['build']
         for records, expected in (
-            (self.ALIAS, {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
-            (self.marker('on'), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'}),
-            (self.marker('off', 1), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'}),
+            (self.ALIAS, {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off', 'TOTK_MENU_CAPTURE_FIX': 'off'}),
+            (self.marker('on'), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off', 'TOTK_MENU_CAPTURE_FIX': 'off'}),
+            (self.marker('off', 1), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN', 'TOTK_MENU_CAPTURE_FIX': 'off'}),
         ):
             doc = self.document(self.START + records, build)
             self.assertEqual(self.values(doc), expected)
@@ -380,13 +418,13 @@ class EffectiveSwitches(unittest.TestCase):
 
     def test_periodic_telemetry_corroborates_but_never_authenticates_missing_startup(self):
         valid = self.document(self.START + self.marker('on') + self.END + self.statistics() * 2)
-        self.assertEqual(self.values(valid), {'TOTK_WB_ALIAS': 'on', 'TOTK_MAP_WARN': 'off'})
+        self.assertEqual(self.values(valid), {'TOTK_WB_ALIAS': 'on', 'TOTK_MAP_WARN': 'off', 'TOTK_MENU_CAPTURE_FIX': 'off'})
         self.assertEqual(self.compare(valid, valid)[0], {'match'})
         for text in (self.START + self.marker() + self.END + self.statistics(),
                      self.statistics() + self.START + self.marker(),
                      self.START + self.marker() + '[nvn-vk] memory write-back alias paths: malformed\n'):
             doc = self.document(text)
-            self.assertEqual(self.values(doc), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off'})
+            self.assertEqual(self.values(doc), {'TOTK_WB_ALIAS': 'UNKNOWN', 'TOTK_MAP_WARN': 'off', 'TOTK_MENU_CAPTURE_FIX': 'off'})
             self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
         missing = self.document(self.START + self.END + self.statistics())
         self.assertEqual(self.values(missing), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN'))
@@ -397,7 +435,7 @@ class EffectiveSwitches(unittest.TestCase):
                         self.WARN.replace('mode=1', 'mode=1 mode=2'),
                         'logcat: ' + self.WARN):
             doc = self.document(self.START + warning + self.marker())
-            self.assertEqual(self.values(doc), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN'})
+            self.assertEqual(self.values(doc), {'TOTK_WB_ALIAS': 'off', 'TOTK_MAP_WARN': 'UNKNOWN', 'TOTK_MENU_CAPTURE_FIX': 'off'})
             self.assertEqual(self.compare(doc, doc)[0], {'unknown'})
         states = self.parse_states(self.START + self.marker() + self.END + self.WARN.rstrip('\n'))
         self.assertEqual(states['TOTK_WB_ALIAS']['state'], 'off')
@@ -425,6 +463,53 @@ class EffectiveSwitches(unittest.TestCase):
         verdict = ledger.verdict_block(unknown, 'thor', unknown, 'thor')
         self.assertEqual({scene['overall'] for scene in verdict['scenes'].values()}, {'NOT COMPARABLE'})
         self.assertTrue(any('UNKNOWN' in warning for warning in verdict['warnings']))
+
+    def test_menu_outcome_distinguishes_default_on_and_explicit_off(self):
+        on = self.document(self.START + self.marker(menu='on'))
+        off = self.document(self.START + self.marker(), env='TOTK_MENU_CAPTURE_FIX=0\n')
+        self.assertEqual(self.values(on)['TOTK_MENU_CAPTURE_FIX'], 'on')
+        self.assertEqual(self.values(off)['TOTK_MENU_CAPTURE_FIX'], 'off')
+        relations, text = self.compare(off, on)
+        self.assertEqual(relations, {'mismatch'})
+        self.assertIn('NOT COMPARABLE', text)
+        self.assertIn('TOTK_MENU_CAPTURE_FIX: off -> on', text)
+        verdict = ledger.verdict_block(off, 'thor', on, 'thor')
+        self.assertEqual({scene['overall'] for scene in verdict['scenes'].values()}, {'NOT COMPARABLE'})
+
+    def test_old_marker_requires_raw_menu_outcome_or_complete_pre_switch_provenance(self):
+        v1 = '[totk-switches] v=1 TOTK_WB_ALIAS=off TOTK_MAP_WARN=off map_warn_mode=0\n'
+        off = '[totk] 1.4.3 menu capture experiment off (TOTK_MENU_CAPTURE_FIX=1 opts in)\n'
+        on = ('[totk] 1.4.3 menu capture experiment: armed or requested pane (original admission), '
+              'veneers +0x2bb9d14/+0x2bb9d54\n')
+        for outcome, expected in (('', 'UNKNOWN'), (off, 'off'), (on, 'on')):
+            states = self.parse_states(self.START + outcome + v1 + self.END)
+            self.assertEqual(states['TOTK_MENU_CAPTURE_FIX']['state'], expected)
+        build = benchlib.load_result(BASELINE)['build']
+        self.assertEqual(self.parse_states(self.START + self.END, build)['TOTK_MENU_CAPTURE_FIX']['state'], 'off')
+        for text in ('', self.START, self.START + v1):
+            self.assertEqual(self.parse_states(text, build)['TOTK_MENU_CAPTURE_FIX']['state'], 'UNKNOWN')
+
+    def test_menu_refusal_and_truncated_or_invalid_outcomes_never_mean_on(self):
+        refused = '[totk] 1.4.3 menu capture fix skipped: original instruction mismatch\n'
+        for text in (self.START + self.marker(menu='on'),
+                     self.START + refused + self.marker(menu='UNKNOWN') + self.END,
+                     self.START + refused + self.marker(menu='on') + self.END,
+                     self.START + self.marker(menu='on') + self.marker(menu='off') + self.END,
+                     self.START + self.marker(menu='bad') + self.END,
+                     self.START + self.marker().replace(' TOTK_MENU_CAPTURE_FIX=off', '') + self.END,
+                     self.marker(menu='on') + self.START + self.END,
+                     self.START + self.END + self.marker(menu='on')):
+            states = self.parse_states(text)
+            self.assertEqual(states['TOTK_MENU_CAPTURE_FIX']['state'], 'UNKNOWN')
+
+    def test_older_resolver_versions_cannot_reuse_pre_current_launch_menu_signatures(self):
+        current = self.document(self.START + self.marker())
+        for version in (2, 3):
+            old = json.loads(json.dumps(current))
+            for record in old['devices']['thor']['effective_switches'].values():
+                record['evidence_version'] = version
+            self.assertEqual(self.compare(old, current)[0], {'unknown'})
+            self.assertIn('NOT COMPARABLE', self.compare(old, current)[1])
 
 
 class Compare(unittest.TestCase):

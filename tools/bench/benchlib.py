@@ -190,9 +190,9 @@ def settings_sha256(env):
 
 
 SIGNATURE_FIELDS = ('model', 'soc', 'settings_env_sha256', 'cpu_caps_khz', 'gpu_cap_hz')
-SWITCH_KEYS = ('TOTK_WB_ALIAS', 'TOTK_MAP_WARN')
-SWITCH_EVIDENCE_VERSION = 2
-# Exact provenance of the immutable 1.0.0 baseline, before either switch existed.
+SWITCH_KEYS = ('TOTK_WB_ALIAS', 'TOTK_MAP_WARN', 'TOTK_MENU_CAPTURE_FIX')
+SWITCH_EVIDENCE_VERSION = 4
+# Exact provenance of the immutable 1.0.0 baseline, before these switches existed.
 PRE_SWITCH_COMMIT = 'edc526df8c95'
 PRE_SWITCH_APK = '393576ab9b01b9c2370b5dd515b941e0e0a851c763d16b5b624092aab9f68ad6'
 
@@ -214,8 +214,7 @@ def log_switch_states(info, build):
     capture = info.get('switch_capture', {})
     legacy = legacy_switch_provenance(build)
     if not isinstance(capture, dict) or capture.get('evidence_version') != SWITCH_EVIDENCE_VERSION:
-        return switch_states('off', 'known pre-switch baseline build') if not capture and legacy \
-            else switch_states(reason='unvalidated or obsolete startup capture')
+        return switch_states(reason='unvalidated or obsolete startup capture')
     starts, presents = capture.get('starts', []), capture.get('presents', [])
     errors = list(capture.get('errors', []))
     start = starts[0] if len(starts) == 1 else None
@@ -236,7 +235,7 @@ def log_switch_states(info, build):
                 invalid.append(f'line {record["line"]}: stale or out-of-bracket {record["kind"]}')
             elif record['kind'] != 'telemetry' and end is not None and record['line'] >= end:
                 invalid.append(f'line {record["line"]}: out-of-bracket {record["kind"]}')
-        for kind in ('marker', 'alias-start', 'warning-start'):
+        for kind in ('marker', 'alias-start', 'warning-start', 'menu-start'):
             if sum(record['kind'] == kind for record in records) > 1:
                 invalid.append('duplicated ' + kind + ' records')
         values = {(record['state'], record.get('mode') if key == 'TOTK_MAP_WARN' else None)
@@ -245,16 +244,17 @@ def log_switch_states(info, build):
             invalid.append('conflicting startup/telemetry states or warning modes')
         if legacy and any(record.get('state') == 'on' for record in records):
             invalid.append('positive switch evidence contradicts known pre-switch provenance')
+        if key == 'TOTK_MENU_CAPTURE_FIX' and any(record.get('state') == 'UNKNOWN' and not record.get('error')
+                                                 for record in records):
+            invalid.append('menu installer refused or outcome unavailable')
         candidates = [record for record in records if complete and start < record['line'] < end]
         mode = None
         if invalid:
             state, reason = 'UNKNOWN', '; '.join(dict.fromkeys(invalid))
-        elif records and not complete:
+        elif not complete:
             state, reason = 'UNKNOWN', 'missing or truncated startup bracket (build start through first FPS record)'
         elif legacy:
             state, mode, reason = 'off', 0, 'known pre-switch baseline build'
-        elif not complete:
-            state, reason = 'UNKNOWN', 'missing or truncated startup bracket (build start through first FPS record)'
         elif not candidates:
             state, reason = 'UNKNOWN', 'no authenticated startup state; absence is not off'
         else:
@@ -326,7 +326,7 @@ def switch_admission(base_doc, base_label, new_doc, new_label):
 
 def signature_of_fields(fields):
     payload = {k: fields[k] for k in SIGNATURE_FIELDS}
-    # Keep the pinned off/off historical hash, but domain-separate any other effective workload.
+    # Keep the pinned all-off historical hash, but domain-separate any other effective workload.
     states = fields.get('effective_switches')
     if states is not None and states != dict.fromkeys(SWITCH_KEYS, 'off'):
         payload.update(effective_switches=states, map_warn_mode=fields.get('map_warn_mode'),
