@@ -1105,19 +1105,26 @@ void runtime_diag_xpoke(unsigned off,float value){
    including w9 scratch use. Our former visibility guard excluded the
    hidden-pending window and suppressed the observed Odin fix.
    This is not synchronization: update prepares state after arming, and the
-   native completion can republish requests. Default on; exact =0 retains
-   native admission without writing guest code. */
+   native completion can republish requests. Default on only on Android;
+   exact =0 retains native admission without writing guest code. iOS export
+   and the phone runtime must never bake/install this optional patch. */
 enum { MENU_CAPTURE_STUB = 276, MENU_CAPTURE_TAIL = 340,
        MENU_CAPTURE_HEAD_WORDS = 3, MENU_CAPTURE_TAIL_WORDS = 2 };
 static int patch_menu_capture(Module *m){
+#if TARGET_OS_IPHONE
+    (void)m;
+    fprintf(stderr,"[totk] 1.4.3 menu capture fix inactive: iOS runtime\n");
+    return 0;
+#else
     const char *e=getenv("TOTK_MENU_CAPTURE_FIX");
-    if(e&&strcmp(e,"1")){
-        fprintf(stderr,"[totk] 1.4.3 menu capture experiment off (unset or TOTK_MENU_CAPTURE_FIX=1 enables)\n");
+    if(getenv("TOTK_EXPORT_IOS")){
+        fprintf(stderr,"[totk] 1.4.3 menu capture fix inactive: iOS export\n");
         return 0;
     }
-#if TARGET_OS_IPHONE
-    (void)m;return 0;
-#else
+    if((!e&&!TOTK_ANDROID)||(e&&strcmp(e,"1"))){
+        fprintf(stderr,"[totk] 1.4.3 menu capture experiment off (Android default on; TOTK_MENU_CAPTURE_FIX=1 enables, =0 disables)\n");
+        return 0;
+    }
     const uint64_t site=0x105bbcc;
     const Patch guards[]={{0x105bbcc,0},{0x105bbd0,0}};
     uint32_t orig[2];

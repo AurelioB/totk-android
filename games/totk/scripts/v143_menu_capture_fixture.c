@@ -2,6 +2,12 @@
    Real-word mode is seeded from the player's authenticated NSO by the verifier. */
 #define TOTK_THERMAL_PATCH_TEST 1
 #include <assert.h>
+#include "../runtime/platform.h"
+/* Exercise the Android policy without importing Android system headers. */
+#ifndef MENU_CAPTURE_NATIVE_HOST
+#undef TOTK_ANDROID
+#define TOTK_ANDROID 1
+#endif
 #include "../runtime/game_patches_v143.c"
 #include "fixture_seeds.h"
 _Noreturn void runtime_fail(const char *message){fprintf(stderr,"unexpected failure: %s\n",message);abort();}
@@ -54,6 +60,19 @@ static void applied(void){
 int main(int argc,char **argv){
     module=(Module){.name="main",.base=aligned_alloc(0x4000,ALLOCATION)};
     before=malloc(ALLOCATION);assert(module.base&&before);
+    if(argc==2&&!strcmp(argv[1],"unsupported")){
+        const char *values[]={NULL,"0","1"};
+        for(unsigned i=0;i<sizeof values/sizeof *values;i++){
+            reset();
+            if(values[i])setenv("TOTK_MENU_CAPTURE_FIX",values[i],1);
+            memcpy(before,module.base,ALLOCATION);
+            assert(patch_menu_capture(&module)==0);
+            assert(!memcmp(before,module.base,ALLOCATION));
+        }
+        free(before);free(module.base);
+        puts("unsupported menu capture path PASS: complete image unchanged");
+        return 0;
+    }
     reset();applied();unchanged();
     reset();module.base[SITE]^=1;unchanged();
     const char *disabled[]={"0","","2","true","-1","1 "," 1"};

@@ -14,9 +14,10 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   without exiting or partially installing a group. Preflight full module bounds and generated B/ADRP
   references; cover all switch combinations/install orders on the complete Android rewrite geometry,
   corrupted sites/padding and invalid layouts, plus real 30/60-preset startup with player-supplied data.
-- Enable PR #44's 1.4.3 quick-menu capture fix by default: unset or exact `TOTK_MENU_CAPTURE_FIX=1`
+- Enable PR #44's Android 1.4.3 quick-menu capture fix by default: unset or exact `TOTK_MENU_CAPTURE_FIX=1`
   uses the contributor's original armed-OR-requested admission; `=0` leaves guest code untouched.
-  Other explicit values remain off, and iOS/non-1.4.3 paths are unchanged.
+  Other explicit values remain off. Keep other writable hosts opt-in, and explicitly exclude both the
+  iOS runtime and writable-host iOS export before any write; non-1.4.3 paths are unchanged.
   Our added visibility guard suppressed the fix:
   Odin requests were pending while hidden; original admission removed the black backgrounds in the finite
   30/60-fps comparison, while the guarded version did not. Remove the guarded alternative entirely.

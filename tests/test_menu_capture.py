@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / 'games/totk/scripts'
@@ -43,6 +44,29 @@ class MenuCapture(unittest.TestCase):
             self.seeds.build(SCRIPTS / 'v143_menu_capture_fixture.c', executable, standin=True)
             result = self.run_fixture(executable, [])
             self.assertIn('menu capture guards PASS', result.stdout)
+
+    def test_ios_runtime_and_writable_export_leave_complete_image_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            for phone in (False, True):
+                source = directory / 'platform.c'
+                source.write_text(('#define TARGET_OS_IPHONE 1\n#define MENU_CAPTURE_NATIVE_HOST 1\n' if phone else '')
+                                  + f'#include "{SCRIPTS / "v143_menu_capture_fixture.c"}"\n')
+                executable = self.seeds.build(source, directory / 'platform', standin=True)
+                with mock.patch.dict(os.environ, {'TOTK_EXPORT_IOS': str(directory / 'export')}):
+                    result = self.run_fixture(executable, ['unsupported'])
+                self.assertIn('complete image unchanged', result.stdout)
+                self.assertIn('inactive: iOS runtime' if phone else 'inactive: iOS export', result.stderr)
+
+    def test_non_v143_startup_does_not_read_menu_switch_or_change_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            for version in ('', 'V112', 'V121'):
+                source = directory / 'legacy.c'
+                source.write_text((f'#define TOTK_GAME_{version} 1\n' if version else '')
+                                  + f'#include "{SCRIPTS / "legacy_menu_capture_fixture.c"}"\n')
+                executable = self.seeds.build(source, directory / 'legacy', standin=True)
+                self.assertIn('legacy menu image unchanged', self.run_fixture(executable, []).stdout)
 
     @unittest.skipUnless(importlib.util.find_spec('unicorn') and importlib.util.find_spec('lz4') and MAIN_NSO.is_file(),
                          'Unicorn/lz4 and the 1.4.3 main NSO ($TOTK_MAIN_NSO) required')
