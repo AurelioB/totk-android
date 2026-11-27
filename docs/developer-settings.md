@@ -98,6 +98,7 @@ Everything not in the menu is a developer switch. A selection:
 | `TOTK_VK_NAN_MINMAX=1` | Startup-only, **default-off experiment**: replace GLSL FMin/FMax/FClamp with NMin/NMax/NClamp in loaded VS/FS/CS modules. Has its own `.nan-v1` cache namespace; special-value semantics and driver cost await separate device qualification. Not required to enable the varying fix. |
 | `TOTK_MENU_CAPTURE_FIX=1` | Startup-only, **default-off 1.4.3 experiment** for randomly black ability-wheel / quick-selector backgrounds. Draw accepts an already-armed pane OR any pending request, reproducing contributor PR #44. Unset and all other values leave code untouched; there is no guarded alternative. iOS does not install it. Does not synchronize update/draw or change texture layouts, aliases, copies or cache identities. See the qualification limits below. |
 | `TU_DEBUG=…` | Turnip debug flags (e.g. `noslabcs`); on Adreno 722 an absent `TU_DEBUG` defaults to `sysmem`. |
+| `TOTK_WB_ALIAS=0` | Startup-only opt-out of default-on private write-back aliases; unset or exact `1` enables supported dma-buf-backed stores. `0` restores the original store path and logs. Unsupported backing and contended publication keep their existing fallbacks. See [VULKAN.md](../games/totk/android/VULKAN.md#private-write-back-aliases-totk_wb_alias-default-on). Not a menu option; no `settings.env` migration is needed. |
 
 The complete, current list of switches with their status and evidence is in
 [games/totk/android/APP.md](../games/totk/android/APP.md) (the *Integration opt-in qualification index* under

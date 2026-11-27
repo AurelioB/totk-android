@@ -63,7 +63,7 @@ static void inflight(int shutdown) {
     size_t n = 131072, pg = (size_t)getpagesize(); uint8_t *src = pages(n), *alias = pages(n);
     int alias_fd = -1;
     const char *alias_setting = getenv("TOTK_WB_ALIAS");
-    if (alias_setting && !strcmp(alias_setting, "1")) {
+    if (!alias_setting || !strcmp(alias_setting, "1")) {
         alias_fd = memfd_create("finalize-private-alias", MFD_CLOEXEC);
         need(alias_fd >= 0 && !ftruncate(alias_fd, n), "private alias fixture backing");
         need(mmap(src, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, alias_fd, 0) == src,

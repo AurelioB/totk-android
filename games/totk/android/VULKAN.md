@@ -3435,7 +3435,7 @@ eligible consumers below50ms without weakening an unfinished producer's completi
 | `TOTK_VK_SETTLED_WB_DETAIL=1` | At most 64 `[settledwb]` lines per 300-frame window: shape/format/levels, serial/storage/pool, guest/image bytes, storage landing count, old/next quiet interval, idle/invalidate cause. |
 | `TOTK_VK_WB_SERVICE_STATS=1` | Default OFF. Every300presents: recording-lock hold max/peak and owner-service delay p50/p99 upper bounds/max (100µs histogram bins, overflow uses max); no idle opcode clocks/locks. |
 | `TOTK_VK_WRITEBACK=1` | Select full legacy invalidate flush/authority behavior, default off; not required for fresh default explicit consumers. `TOTK_VK_OFF=writeback` disables only this legacy path. |
-| `TOTK_WB_ALIAS=1` | Experimental, launch-only, default OFF; only exact `1` enables it. Retain one backend-private RW mapping per dma-buf-backed owner and land supported dirty-tracked extents through it without temporarily making protected guest pages writable. Unset/other values preserve the original path and logs. |
+| `TOTK_WB_ALIAS=0` | Launch-only, default ON when unset; exact `1` also enables it. `0` (and explicit values other than `1`) preserves the original path and logs. Retain one backend-private RW mapping per dma-buf-backed owner and land supported dirty-tracked extents through it without temporarily making protected guest pages writable. Unsupported backing and registry contention keep their existing fallbacks and counters. |
 | `TOTK_VK_OFF=settledbackoff` | Disable learned history; use the base quiet interval for every rendering. |
 | `TOTK_VK_OFF=settledinval` | Disable default explicit-consumer landing at all ages; keep ordinary automatic settled copies. |
 | `TOTK_VK_OFF=settleddrain` | Diagnostic only: omit frontend drain for a matched default consumer; may weaken queued-command ordering. |
@@ -3502,9 +3502,10 @@ one unbounded draw-free jump stream, proving no draw/return/submit is needed. Ru
 Run `--settled-wb-budget` for partial >10MiB landings, byte/yield accounting, complete invalidate and CPU/GPU/pool
 cancellation between chunks, plus a point-address swizzle oracle covering2D/array/3D/linear layouts and padding.
 
-### Private write-back aliases (`TOTK_WB_ALIAS=1`, experimental)
+### Private write-back aliases (`TOTK_WB_ALIAS`, default on)
 
-Launch-only and **default off**; only the exact value `1` enables it.
+Launch-only and **default on when unset**; exact `1` also enables it. Set `TOTK_WB_ALIAS=0` in
+`totk.env` and restart to restore the original path and logs. Other explicit values remain disabled.
 This does not enable write-back or frame lag; their existing policies remain in force. It retains the original
 temporary `MAP_SHARED`, `PROT_READ | PROT_WRITE` mapping made when each `K_OWN` dma-buf is populated, instead of
 unmapping it. Guest and private mappings use the same fd, offsets and exporter-selected memory attributes.
@@ -3559,7 +3560,7 @@ These are source facts, **not proof of the actual Odin vendor exporter/kernel id
 do not eliminate CPU/GPU coherency, fences, barriers or cache synchronization: all existing device synchronization
 remains required and unchanged. See `.scratch/perf/map-limit/wb-alias/design.md` for the source-selection analysis.
 
-Enabled startup adds `[nvn-vk] write-back alias: enabled (TOTK_WB_ALIAS=1); backend-private RW dma-buf mapping per owned pool; host-import/CPU ranges use existing path`.
+Enabled startup adds `[nvn-vk] write-back alias: enabled (default on; TOTK_WB_ALIAS=0 disables); backend-private RW dma-buf mapping per owned pool; host-import/CPU ranges use existing path`.
 The existing memory report additionally emits `[nvn-vk] memory write-back aliases: mappings N, bytes B (backend-private RW dma-buf; not guest pools)`,
 where N/B are current live retained mappings/page-rounded owner bytes. These are not guest-pool counts.
 Off adds neither line and leaves existing logs unchanged. The earlier eight-run settled-write-back qualification
@@ -3573,7 +3574,12 @@ stopped input during load six at the planned mapping-pressure safety threshold, 
 Sampled pictures showed no switch-attributable corruption; this is not exhaustive rendering/cache-coherency proof.
 All pooled metrics for thirteen admitted standing window pairs, including frame tails, were SAME. Some
 individual Hateno phases had tool-WORSE tails, and no pan pairs were admitted: the ordered pair is not a
-causal speed proof or grounds to enable by default. Odin and Duo have **not** been tested with this switch.
+causal speed proof. This earlier evidence alone did not qualify a default change; final device checks remain
+required before landing the default-on change. Odin and Duo were not part of that earlier pair.
+Subsequent Duo combined no-env/opt-out checks passed; Odin's restart quartet failed workload admission
+and remains **INCONCLUSIVE**, not an admitted non-regression or a waiver of its alias-performance gate.
+Benchmark state/admission now comes from the shared prerequisite's frozen-state marker; historical
+controls must pin `TOTK_WB_ALIAS=0 TOTK_MAP_WARN=0`, not replay an unset older profile.
 Other watch/fault/host and non-pool mapping growth remains. Full controls, limitations and picture evidence:
 `.scratch/perf/map-limit/wb-alias/thor/report.md`. Earlier settled-write-back evidence above remains distinct.
 
