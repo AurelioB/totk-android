@@ -166,16 +166,32 @@ public final class SaveMetadataProbe {
                 if(command.equals("stage-folder")) SaveMirror.stageFolder(context,Uri.parse(source.getPath()),staged);
                 else SaveMirror.stageZip(context,Uri.parse(source.getPath()),staged);
                 SaveManager.replace(context.getFilesDir(),staged,"import",1700000000000L);
+                File live=SaveManager.saveRoot(context.getFilesDir());
+                SaveManager.Backup backup=SaveManager.backup(live,SaveManager.backupsDir(context.getFilesDir()),"manual",1700000001000L);
+                SaveManager.restore(context.getFilesDir(),backup,1700000002000L);
+                if(!content(live).equals(content(backup.saves()))) throw new AssertionError("backup/restore changed content");
+                try(OutputStream out=new FileOutputStream(new File(base,"roundtrip.zip"))) { SaveMirror.export(context,out); }
                 return content(SaveManager.saveRoot(context.getFilesDir()));
             });
             return;
         }
         File root=SaveManager.saveRoot(context.getFilesDir()); root.mkdirs();
         Files.write(new File(root,"option.sav").toPath(),new byte[]{1,2,3});
+        if(command.equals("historical-nested")) {
+            for(String name:new String[]{"slot_00/progress.sav","album/"+SaveManager.MANIFEST,"slot_00/backup.json",
+                    "backup.json","album/"+SaveManager.MANIFEST+".tmp","slot_00/"+SaveManager.TOP+"/note.txt"}) {
+                File f=new File(root,name); f.getParentFile().mkdirs(); Files.writeString(f.toPath(),"ordinary "+name);
+            }
+        }
+        if(command.equals("historical-root")) {
+            for(String name:new String[]{SaveManager.MANIFEST+".tmp",".option.sav.partial",SaveManager.TOP+"/note.txt"}) {
+                File f=new File(root,name); f.getParentFile().mkdirs(); Files.writeString(f.toPath(),"old envelope "+name);
+            }
+        }
         SaveManager.Manifest clean=SaveManager.manifest(root,null,"host","host",1700000000000L);
         File cleanZip=new File(base,"clean.zip");
         try(OutputStream out=new FileOutputStream(cleanZip)) { SaveManager.writeZip(root,clean,out); }
-        if(command.equals("clean")) { System.out.println("clean="+cleanZip); return; }
+        if(command.equals("clean") || command.startsWith("historical-")) { System.out.println("clean="+cleanZip); return; }
         // A genuine production manifest, deliberately placed among the game's files as found on the device.
         try(java.util.zip.ZipFile zip=new java.util.zip.ZipFile(cleanZip)) {
             Files.copy(zip.getInputStream(zip.getEntry(SaveManager.TOP+"/"+SaveManager.MANIFEST)),
@@ -184,9 +200,7 @@ public final class SaveMetadataProbe {
         if(command.equals("opaque")) Files.writeString(new File(root,SaveManager.MANIFEST).toPath(),"possibly user data");
         byte[] originalManifest=Files.readAllBytes(new File(root,SaveManager.MANIFEST).toPath());
         if(command.equals("reserved")) {
-            for(String name:new String[]{SaveManager.MANIFEST+".tmp","backup.json","backup.json.tmp",
-                    ".option.sav.partial","slot_00/.caption.sav.partial",SaveManager.TOP+"/option.sav",
-                    "album/"+SaveManager.MANIFEST}) {
+            for(String name:new String[]{SaveManager.MANIFEST+".tmp",".option.sav.partial",SaveManager.TOP+"/option.sav"}) {
                 File f=new File(root,name); f.getParentFile().mkdirs(); Files.writeString(f.toPath(),"not save content");
             }
         }

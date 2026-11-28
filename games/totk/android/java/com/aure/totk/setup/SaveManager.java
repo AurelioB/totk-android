@@ -60,24 +60,20 @@ final class SaveManager {
     private static final Pattern SLOT_PROGRESS = Pattern.compile("(?:.*/)?slot_\\d\\d/progress\\.sav");
     private static final Pattern KNOWN = Pattern.compile("(?i).*\\.(sav|dat|jpg|jpeg|bin)");
 
-    /** Save-set envelopes and interrupted metadata/provider writes are never game content, at any depth.
-     * Existing live files with these names are left untouched; readers and safety copies simply omit them. */
+    /** Case-sensitive reserved first components relative to a save-set root (subtrees too if directories):
+     * MANIFEST, MANIFEST.tmp, TOP and hidden *.partial markers. A matching name deeper in the
+     * content tree is ordinary save content. backup.json belongs outside the set in a backup envelope;
+     * FileStore's per-directory hidden *.partial writes belong to its generation-store namespace.
+     * Existing live reserved files are left untouched, not deleted by enumeration or safety copies. */
     static boolean reserved(String path) {
-        for (int start = 0; start < path.length();) {
-            int end = path.indexOf('/', start);
-            if (end < 0) end = path.length();
-            if (named(path, start, end, MANIFEST) || named(path, start, end, MANIFEST + ".tmp")
-                    || named(path, start, end, TOP) || named(path, start, end, "backup.json")
-                    || named(path, start, end, "backup.json.tmp")
-                    || path.charAt(start) == '.' && end - start >= ".partial".length()
-                        && path.regionMatches(end - ".partial".length(), ".partial", 0, ".partial".length()))
-                return true;
-            start = end + 1;
-        }
-        return false;
+        int end = path.indexOf('/');
+        if (end < 0) end = path.length();
+        return named(path, end, MANIFEST) || named(path, end, MANIFEST + ".tmp") || named(path, end, TOP)
+                || end >= ".partial".length() && path.charAt(0) == '.'
+                    && path.regionMatches(end - ".partial".length(), ".partial", 0, ".partial".length());
     }
-    private static boolean named(String path, int start, int end, String name) {
-        return end - start == name.length() && path.regionMatches(start, name, 0, name.length());
+    private static boolean named(String path, int end, String name) {
+        return end == name.length() && path.regionMatches(0, name, 0, name.length());
     }
 
     // ---------- errors ----------
@@ -339,7 +335,9 @@ final class SaveManager {
                 }
             }
             if (name == null) name = normalize("");
-            if (reserved(name)) throw corrupt("reserved manifest path " + name);
+            // Older writers could list root envelope/temp files. Project only those records out; every
+            // retained entry (including nested same-named files) still needs its size/hash verified.
+            if (reserved(name)) return;
             if (sha.length() != 64) throw corrupt("manifest digest");
             boolean uppercase = false;
             for (int i = 0; i < sha.length(); i++) {
@@ -774,7 +772,7 @@ final class SaveManager {
         File[] children = dir.listFiles();
         if (children == null) return;
         for (File child : children) {
-            if (Files.isSymbolicLink(child.toPath()) || reserved(child.getName())) continue;
+            if (Files.isSymbolicLink(child.toPath()) || prefix.isEmpty() && reserved(child.getName())) continue;
             String path = prefix + child.getName();
             if (child.isDirectory()) walk(child, path + "/", out);
             else if (child.isFile()) out.add(path);
@@ -1225,13 +1223,16 @@ final class SaveManager {
         try (FileChannel channel = FileChannel.open(dir.toPath(), StandardOpenOption.READ)) { channel.force(true); } catch (IOException | RuntimeException ignored) { }
     }
     static void copyTree(File from, File to) throws IOException {
+        copyTree(from, to, true);
+    }
+    private static void copyTree(File from, File to, boolean root) throws IOException {
         if (!to.isDirectory() && !to.mkdirs()) throw new IOException("cannot create " + to);
         File[] children = from.listFiles();
         if (children == null) return;
         for (File child : children) {
-            if (Files.isSymbolicLink(child.toPath()) || reserved(child.getName())) continue;
+            if (Files.isSymbolicLink(child.toPath()) || root && reserved(child.getName())) continue;
             File target = new File(to, child.getName());
-            if (child.isDirectory()) copyTree(child, target);
+            if (child.isDirectory()) copyTree(child, target, false);
             else if (child.isFile()) try (InputStream in = new FileInputStream(child)) { copyLimited(in, target, Long.MAX_VALUE, child.lastModified()); }
         }
     }

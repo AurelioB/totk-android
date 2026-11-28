@@ -23,9 +23,14 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   failures and cancellation retain their existing classifications. Verification requirements are unchanged.
 
 ### Fixed
-- Ignore reserved save-set metadata and interrupted metadata writes when exporting, syncing, backing up or importing
-  saves (#19). Leave existing stray files untouched in the live folder; restore no longer copies them from old backups.
-  This fixes an older duplicate-manifest export failure, not a regression of the photo-heavy save limits.
+- Ignore reserved save-set root metadata when exporting, syncing, backing up or importing saves (#19).
+  Matching is case-sensitive and root-only: `totk-native-saves.json`, `totk-native-saves.json.tmp`,
+  the `TotK Native saves` wrapper subtree and hidden `.*.partial` markers/subtrees.
+  Identically named files deeper in the set remain ordinary content, verified and counted; `backup.json`
+  belongs outside the set in a backup envelope and is not reserved inside saves.
+  Project older manifests onto retained content without weakening its size/hash verification.
+  Leave existing root strays untouched; restore omits them from old backups. This fixes an older
+  duplicate-manifest export failure, not a regression of the photo-heavy save limits.
 - Accept photo-heavy save imports with up to 16,384 files, instead of 500 (#19, duplicate #27).
   Keep the 128 MiB total and per-file limits, with a separate 65,536-entry archive guard.
   Count-limit errors now describe the current limits rather than declaring a photo-heavy save invalid.
