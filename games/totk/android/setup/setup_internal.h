@@ -83,7 +83,7 @@ struct SetupCtx {
     struct {
         unsigned good, failed;
         uint64_t base_size, update_size, merged_size, expected_size;
-        char base_header_sha256[65], update_header_sha256[65];
+        uint64_t section_offset[2][4], section_size[2][4];   /* base/update NCA section table geometry only */
     } romfs_verify;
     SetupPins pins;
     const SetupRequest *req;
@@ -146,6 +146,7 @@ typedef struct { char dir[SETUP_PATH]; uint64_t total, part_bytes, submitted, wr
 int romfs_writer_open(SetupCtx *, RomfsWriter *, const char *dir, uint64_t total, uint64_t part_bytes);
 int romfs_writer_reserve(SetupCtx *, RomfsWriter *, uint8_t **p, size_t *room);
 int romfs_writer_commit(SetupCtx *, RomfsWriter *, size_t n);
+int romfs_writer_drain(SetupCtx *, RomfsWriter *);   /* close/flush pending writes without accepting an image */
 int romfs_writer_finish(SetupCtx *, RomfsWriter *, char sha_hex[65]);
 void romfs_writer_abort(RomfsWriter *);
 /* The filesystem type of the volume holding path (mounts: a /proc/self/mounts-format table, NULL = that file); 0 when no
@@ -188,6 +189,7 @@ int hactool_run(SetupCtx *, const char *stage, const char *const *args, const Se
                 const char *const *env, const char *log_path, uint64_t progress_total,
                 SetupFollow *follow, char **log_text, int *exit_code);   /* 0 once hactool exited normally */
 int hactool_log_ok(const char *log, int require_ivfc);   /* the extract_update_romfs.py acceptance rules */
+int hactool_log_ivfc_only(const char *log);   /* same error/signature rules, ignoring only complete IVFC FAIL records */
 void hactool_scrub(char *line);                          /* hex runs >= 32 -> "<hex removed>" */
 
 /* ---- stages (stages.c / romfs_index.c / fonts.c) ---- */

@@ -3237,9 +3237,17 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                             .put("expectedBytes", verification.optLong("expectedBytes"));
                     for (String role : new String[]{"base", "update"}) {
                         JSONObject input = verification.optJSONObject(role);
-                        if (input != null) details.put(role, new JSONObject()
-                                .put("programBytes", input.optLong("programBytes"))
-                                .put("headerSha256", SetupDetails.headerDigest(input.optString("headerSha256"))));
+                        if (input != null) {
+                            JSONObject source = new JSONObject().put("programBytes", input.optLong("programBytes"));
+                            JSONArray sections = input.optJSONArray("sections"), geometry = new JSONArray();
+                            for (int i = 0; sections != null && i < Math.min(4, sections.length()); i++) {
+                                JSONObject section = sections.optJSONObject(i);
+                                if (section != null) geometry.put(new JSONObject()
+                                        .put("index", section.optInt("index")).put("offset", section.optLong("offset"))
+                                        .put("bytes", section.optLong("bytes")));
+                            }
+                            details.put(role, source.put("sections", geometry));
+                        }
                     }
                     shared.put("romfsVerification", details);
                 }

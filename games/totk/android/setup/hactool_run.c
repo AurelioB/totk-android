@@ -33,7 +33,7 @@ void hactool_scrub(char *line) {
 /* The acceptance rules of scripts/extract_update_romfs.py: hactool reports the unsigned fixed-key / NPDM signatures (and
    the ACID signature of newer updates) as FAIL without Nintendo's public keys; those lines are not data failures. Any other
    FAIL / INVALID / "Failed to" / "Error:" fails, and a RomFS merge needs all six IVFC levels GOOD. */
-int hactool_log_ok(const char *log, int require_ivfc) {
+static int hactool_log_check(const char *log, int require_ivfc, int ivfc_only) {
     regex_t unsigned_re, acid_re, acid_sig_re, fail_re;
     if (regcomp(&unsigned_re, "^[[:space:]]*(Fixed-Key Signature|NPDM Signature) \\(FAIL\\)", REG_EXTENDED | REG_NOSUB)) return 0;
     regcomp(&acid_re, "^[[:space:]]*ACID:[[:space:]]*$", REG_EXTENDED | REG_NOSUB);
@@ -43,18 +43,37 @@ int hactool_log_ok(const char *log, int require_ivfc) {
     const char *p = log;
     while (*p) {
         const char *e = strchr(p, '\n'); size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (ivfc_only && n >= 1024) { ok = 0; break; }   /* incomplete diagnostic lines cannot establish integrity-only */
         char line[1024]; if (n >= sizeof line) n = sizeof line - 1;
         memcpy(line, p, n); line[n] = 0;
         p += e ? (size_t)(e - p) + 1 : strlen(p);
         if (!regexec(&acid_re, line, 0, NULL, 0)) in_acid = 1;
         else if (in_acid && strncmp(line, "        ", 8)) in_acid = 0;
-        if (!regexec(&unsigned_re, line, 0, NULL, 0) || (in_acid && !regexec(&acid_sig_re, line, 0, NULL, 0))) continue;
+        if (ivfc_only && (strstr(line, "Failed to") || strstr(line, "Error:") || strstr(line, "(INVALID)"))) { ok = 0; break; }
+        if (!regexec(&unsigned_re, line, 0, NULL, 0) || (in_acid && !regexec(&acid_sig_re, line, 0, NULL, 0))) {
+            const char *first = ivfc_only ? strstr(line, "(FAIL)") : NULL;
+            if (first && strstr(first + 6, "(FAIL)")) ok = 0;
+            continue;
+        }
+        if (ivfc_only) {
+            const char *level = line + strspn(line, " \t");
+            if (strlen(level) >= 14 && !memcmp(level, "Level ", 6) && level[6] >= '0' && level[6] <= '5'
+                    && level[7] == ' ' && !memcmp(level + 8, "(FAIL)", 6)) {
+                const char *tail = level + 14;
+                if (*tail == ':') tail++;
+                tail += strspn(tail, " \t\r");
+                if (!*tail) continue;   /* ignore only the complete level verdict, never another error on that line */
+            }
+        }
         if (!regexec(&fail_re, line, 0, NULL, 0)) ok = 0;
         for (int i = 0; i < 6; i++) { char want[32]; snprintf(want, sizeof want, "Level %d (GOOD)", i); if (strstr(line, want)) levels |= 1 << i; }
     }
     regfree(&unsigned_re); regfree(&acid_re); regfree(&acid_sig_re); regfree(&fail_re);
     return ok && (!require_ivfc || levels == 0x3f);
 }
+
+int hactool_log_ok(const char *log, int require_ivfc) { return hactool_log_check(log, require_ivfc, 0); }
+int hactool_log_ivfc_only(const char *log) { return hactool_log_check(log, 0, 1); }
 
 /* Drains what the FIFO holds now (non-blocking) into the writer's ring. A read of 0 means no writer: not connected yet
    while hactool starts, or done once it has closed the output after writing. */

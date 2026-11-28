@@ -321,14 +321,18 @@ class RomfsDiagnostics(Base):
         return ''.join(f'        Level {i} ({"FAIL" if i in failed else "GOOD"}):\n'
                        for i in range(6) if i not in missing) + '\nDone!\n'
 
-    def merge(self, log, exit_code=0, crash=False, run=False, payload=None, pins=None):
+    def merge(self, log, exit_code=0, crash=False, run=False, payload=None, pins=None, writer_error=False, cancel=False):
         tool = self.lib / 'libhactool.so'
-        script = '#!' + sys.executable + '\nimport os, signal, sys\n'
+        script = '#!' + sys.executable + '\nimport os, signal, sys, time\n'
+        if writer_error:
+            target = str(self.dir / 'work/romfs/romfs.bin')
+            script += (f'os.symlink("/dev/full", {target!r})\n' if writer_error == 'no_space' else f'os.mkdir({target!r})\n')
         if payload is not None:
             script += ('target = next(arg.split("=", 1)[1] for arg in sys.argv if arg.startswith("--section"))\n'
                        + f'with open(target, "wb") as output: output.write({payload!r})\n')
         tool.write_text(script + f'print({log!r}, flush=True)\n'
-                        + ('os.kill(os.getpid(), signal.SIGTERM)\n' if crash else f'sys.exit({exit_code})\n'))
+                        + ('os.kill(os.getppid(), signal.SIGTERM)\ntime.sleep(2)\n' if cancel else
+                           'os.kill(os.getpid(), signal.SIGTERM)\n' if crash else f'sys.exit({exit_code})\n'))
         tool.chmod(0o700)
         work = self.dir / 'work'
         work.mkdir(exist_ok=True)
@@ -352,7 +356,12 @@ class RomfsDiagnostics(Base):
         self.assertEqual(detail['ivfcGood'], [i for i in range(6) if i not in failed])
         self.assertEqual((detail['mergedBytes'], detail['expectedBytes']), (0, PINS['romfs']['size']))
         for role, data, header in [('base', self.base_nca, self.base_header), ('update', self.update_nca, self.update_header)]:
-            self.assertEqual(detail[role], {'programBytes': len(data), 'headerSha256': sha(header)})
+            sections = []
+            for i in range(4):
+                start, end = struct.unpack_from('<II', header, 0x240 + 16 * i)
+                if end > start:
+                    sections.append({'index': i, 'offset': start * 512, 'bytes': (end - start) * 512})
+            self.assertEqual(detail[role], {'programBytes': len(data), 'sections': sections})
         self.assertEqual(set(detail), {'ivfcGood', 'ivfcFailed', 'mergedBytes', 'expectedBytes', 'base', 'update'})
         self.assertFalse((self.dir / 'work/romfs/romfs.bin').exists())
 
@@ -384,6 +393,67 @@ class RomfsDiagnostics(Base):
                 self.assertEqual(result['code'], 'internal', result)
                 self.assertNotIn('romfsVerification', result)
                 self.assertIn('crashed (signal 15)' if crash else f'exit {code}', result['message'])
+
+    def test_mixed_tool_failures_stay_internal(self):
+        errors = ['Failed to read BKTR Virtual RomFS header!', 'Failed to read from Base NCA RomFS!',
+                  'Failed to read section!', 'Error: read failed', 'Hash Table (FAIL):', 'Superblock (INVALID):',
+                  '    Signature (FAIL):', '        Level 5 (FAIL): Error: read failed',
+                  'Fixed-Key Signature (FAIL): Error: another failure', 'NPDM Signature (FAIL): Hash Table (FAIL)']
+        for error in errors:
+            with self.subTest(error=error):
+                _, result = self.merge(self.log() + error + '\n')
+                self.assertEqual(result['code'], 'internal', result)
+                self.assertNotIn('romfsVerification', result)
+        _, result = self.merge(self.log() + '!' * 1200 + 'Error: beyond the bounded line\n')
+        self.assertEqual(result['code'], 'internal', result)
+        self.assertNotIn('romfsVerification', result)
+
+    def test_signature_exceptions_remain_exceptions_for_integrity_diagnosis(self):
+        signatures = ('Fixed-Key Signature (FAIL): ignored\nNPDM Signature (FAIL): ignored\n'
+                      '    ACID:\n        Signature Key (FAIL): ignored\n        Signature (FAIL): ignored\n'
+                      '    ACI0:\n')
+        _, result = self.merge(signatures + self.log())
+        self.assert_integrity(result, (5,))
+        _, result = self.merge(signatures + self.log() + '    Signature (FAIL): not in ACID\n')
+        self.assertEqual(result['code'], 'internal', result)
+
+    def test_pending_partial_buffer_write_failure_precedes_integrity_diagnosis(self):
+        for error, code, message in [(True, 'io', 'Is a directory'), ('no_space', 'no_space', 'No space left')]:
+            with self.subTest(error=error):
+                _, result = self.merge(self.log(), payload=bytes(256), writer_error=error)
+                self.assertEqual(result['code'], code, result)
+                self.assertNotIn('romfsVerification', result)
+                self.assertIn(message, result['message'])
+                target = self.dir / 'work/romfs/romfs.bin'
+                if target.is_dir():
+                    target.rmdir()
+
+    def test_cancel_with_failed_ivfc_keeps_cancelled_classification(self):
+        p, result = self.merge(self.log(), cancel=True)
+        self.assertEqual((p.returncode, result['code']), (3, 'cancelled'), result)
+        self.assertNotIn('romfsVerification', result)
+
+    def test_diagnostics_do_not_depend_on_rights_keys_or_signatures(self):
+        _, before = self.merge(self.log())
+        new_rights = bytes(range(32, 48))
+        changed_ticket = bytearray(ticket())
+        changed_ticket[0x2a0:0x2b0] = new_rights
+        for path, data, header, update in [(self.base, self.base_nca, self.base_header, False),
+                                           (self.update, self.update_nca, self.update_header, True)]:
+            changed = bytearray(header)
+            changed[:0x200] = bytes([37]) * 0x200   # signatures
+            changed[0x230:0x240] = new_rights
+            changed[0x300:0x340] = bytes(range(64))   # encrypted key area: unused by rights-managed fixture
+            encrypted = b''.join(encrypt(HEADER, modes.XTS(i.to_bytes(16, 'big')),
+                                         changed[i * 512:(i + 1) * 512]) for i in range(6)) + data[0xc00:]
+            entries = [('program.nca', encrypted), ('a.tik', bytes(changed_ticket))]
+            if update:
+                entries.append(('meta.cnmt.nca', nca(content=1, title=0x0100F2C0115B6800)))
+            path.write_bytes(partition(entries))
+        _, after = self.merge(self.log())
+        self.assertEqual(before['romfsVerification'], after['romfsVerification'])
+        self.assertNotIn('headerSha256', json.dumps(after))
+        self.assertNotIn(new_rights.hex(), json.dumps(after))
 
     def test_good_ivfc_still_requires_exact_image_size_and_hash(self):
         _, result = self.merge(self.log(failed=()))

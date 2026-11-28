@@ -278,7 +278,7 @@ int romfs_writer_commit(SetupCtx *c, RomfsWriter *w, size_t n) {
     if (r->fill == r->slot_bytes || (w->submitted == w->total && r->fill)) ring_hand_over(r);
     return 0;
 }
-int romfs_writer_finish(SetupCtx *c, RomfsWriter *w, char sha_hex[65]) {
+int romfs_writer_drain(SetupCtx *c, RomfsWriter *w) {
     RomfsRing *r = w->ring;
     if (r->fill) ring_hand_over(r);
     pthread_mutex_lock(&r->mu);
@@ -288,6 +288,11 @@ int romfs_writer_finish(SetupCtx *c, RomfsWriter *w, char sha_hex[65]) {
     if (rc) return rc;
     ring_join(w);
     if (!rc && w->fd >= 0 && close_part(w)) rc = ring_failed(c, w);
+    if (rc) return rc;
+    return setup_cancelled(c) ? SETUP_CANCELLED : 0;
+}
+int romfs_writer_finish(SetupCtx *c, RomfsWriter *w, char sha_hex[65]) {
+    int rc = romfs_writer_drain(c, w);
     if (rc) return rc;
     if (w->written != w->total) {
         setup_fail(c, "hash_mismatch", "The RomFS has %llu bytes; the 1.4.3 RomFS has %llu", (unsigned long long)w->written, (unsigned long long)w->total);

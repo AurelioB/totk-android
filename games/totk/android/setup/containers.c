@@ -148,8 +148,8 @@ int containers_exefs(SetupCtx *c, SetupContainers *s, const char *out_dir) {
     return rc;
 }
 
-/* Diagnose only explicit, complete data verdicts. Missing or contradictory levels remain an internal/tool failure,
-   as do nonzero exits and crashes. This does not change hactool_log_ok or any acceptance rule. */
+/* Diagnose only explicit, complete data verdicts after the caller excludes every other tool/write/cancel failure.
+   Missing or contradictory levels remain an internal/tool failure. Acceptance rules are unchanged. */
 static int romfs_integrity_failure(SetupCtx *c, const SetupContainers *s, const char *log, uint64_t merged_size) {
     unsigned good = 0, failed = 0;
     for (const char *p = log; *p;) {
@@ -169,10 +169,16 @@ static int romfs_integrity_failure(SetupCtx *c, const SetupContainers *s, const 
     const NcaRecord *base = &s->base.ncas[s->base.program], *update = &s->update.ncas[s->update.program];
     c->romfs_verify.base_size = base->size; c->romfs_verify.update_size = update->size;
     c->romfs_verify.merged_size = merged_size; c->romfs_verify.expected_size = c->pins.romfs_size;
-    /* Hash the already-resident decrypted 0xc00-byte headers, not their rights IDs or encrypted key areas separately.
-       These one-way identities require no extra input reads and never expose header/key/ticket bytes. */
-    sha256_buf_hex(base->hdr, sizeof base->hdr, c->romfs_verify.base_header_sha256);
-    sha256_buf_hex(update->hdr, sizeof update->hdr, c->romfs_verify.update_header_sha256);
+    /* No header fingerprint: rights IDs, key areas, signatures and hashes may be key/ticket-dependent.
+       Only copy section media offsets [0x240 + 16*i, 0x248 + 16*i), already bounds-checked by inventory. */
+    const NcaRecord *records[2] = { base, update };
+    for (int role = 0; role < 2; role++) for (int i = 0; i < 4; i++) {
+        const uint8_t *entry = records[role]->hdr + 0x240 + 16 * i;
+        uint64_t start = 0, end = 0;
+        for (int j = 0; j < 4; j++) { start |= (uint64_t)entry[j] << (8 * j); end |= (uint64_t)entry[j + 4] << (8 * j); }
+        c->romfs_verify.section_offset[role][i] = start * 512;
+        c->romfs_verify.section_size[role][i] = (end - start) * 512;
+    }
     char levels[32]; size_t n = 0; int count = 0;
     for (int i = 0; i < 6; i++) if (failed >> i & 1) {
         n += (size_t)snprintf(levels + n, sizeof levels - n, "%s%d", count ? ", " : "", i);
@@ -188,12 +194,20 @@ void setup_romfs_failure_json(Buf *b, const SetupCtx *c) {
     for (int i = 0, first = 1; i < 6; i++) if (c->romfs_verify.good >> i & 1) { buf_printf(b, "%s%d", first ? "" : ",", i); first = 0; }
     buf_puts(b, "],\"ivfcFailed\":[");
     for (int i = 0, first = 1; i < 6; i++) if (c->romfs_verify.failed >> i & 1) { buf_printf(b, "%s%d", first ? "" : ",", i); first = 0; }
-    buf_printf(b, "],\"mergedBytes\":%llu,\"expectedBytes\":%llu,"
-                  "\"base\":{\"programBytes\":%llu,\"headerSha256\":\"%s\"},"
-                  "\"update\":{\"programBytes\":%llu,\"headerSha256\":\"%s\"}}",
-               (unsigned long long)c->romfs_verify.merged_size, (unsigned long long)c->romfs_verify.expected_size,
-               (unsigned long long)c->romfs_verify.base_size, c->romfs_verify.base_header_sha256,
-               (unsigned long long)c->romfs_verify.update_size, c->romfs_verify.update_header_sha256);
+    buf_printf(b, "],\"mergedBytes\":%llu,\"expectedBytes\":%llu",
+               (unsigned long long)c->romfs_verify.merged_size, (unsigned long long)c->romfs_verify.expected_size);
+    for (int role = 0; role < 2; role++) {
+        buf_printf(b, ",\"%s\":{\"programBytes\":%llu,\"sections\":[", role ? "update" : "base",
+                   (unsigned long long)(role ? c->romfs_verify.update_size : c->romfs_verify.base_size));
+        for (int i = 0, first = 1; i < 4; i++) if (c->romfs_verify.section_size[role][i]) {
+            buf_printf(b, "%s{\"index\":%d,\"offset\":%llu,\"bytes\":%llu}", first ? "" : ",", i,
+                       (unsigned long long)c->romfs_verify.section_offset[role][i],
+                       (unsigned long long)c->romfs_verify.section_size[role][i]);
+            first = 0;
+        }
+        buf_puts(b, "]}");
+    }
+    buf_puts(b, "}");
 }
 
 /* hactool writes the merged image into an app-private FIFO that the follow loop drains into a RomfsWriter (one
@@ -231,10 +245,20 @@ int containers_romfs(SetupCtx *c, SetupContainers *s, const char *out_dir, uint6
     char *log = NULL; int code = -1;
     setup_progress(c, "romfs", 0, c->pins.romfs_size, "merging base + update");
     rc = run_with_keys(c, s, "romfs", args, 3, fds, 1, env, 2, "hactool-romfs.log", c->pins.romfs_size, &follow, &log, &code);
+    if (!rc && setup_cancelled(c)) rc = SETUP_CANCELLED;
     if (!rc && (code || !hactool_log_ok(log, 1))) {
-        if (code || !romfs_integrity_failure(c, s, log, follow.bytes))
-            setup_fail(c, "internal", "The base + update merge did not verify (exit %d; use Share details for the log)", code);
-        rc = -1;
+        int only_ivfc = !code && hactool_log_ivfc_only(log);
+        if (only_ivfc) {
+            /* A partial final ring buffer may still hide a write/fsync failure. Observe it before diagnosing the log. */
+            rc = romfs_writer_drain(c, &w);
+            if (!rc && st_fsync_dir(w.dir)) rc = st_io_fail(c, "sync", w.dir);
+            if (!rc && setup_cancelled(c)) rc = SETUP_CANCELLED;
+        }
+        if (!rc) {
+            if (!only_ivfc || !romfs_integrity_failure(c, s, log, follow.bytes))
+                setup_fail(c, "internal", "The base + update merge did not verify (exit %d; use Share details for the log)", code);
+            rc = -1;
+        }
     }
     free(log);
     if (rc) goto out;

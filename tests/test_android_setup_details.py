@@ -50,14 +50,10 @@ class SetupDetailsTests(unittest.TestCase):
         self.assertIn('No game files or keys are included; nothing is sent until you choose an app.', report)
         self.assertIn('Share details before Resume to include the logs', report)
 
-    def test_integrity_details_preserve_safe_header_identities(self):
-        digest = '0123456789abcdef' * 4
-        grouped = subprocess.run([self.java, '-cp', str(self.classes), 'com.aure.totk.setup.SetupDetailsProbe',
-                                  'header-digest', digest], capture_output=True, text=True, check=True).stdout
-        self.assertEqual(grouped.replace('-', ''), digest)
+    def test_integrity_details_preserve_geometry_but_redact_all_long_hex(self):
         verification = {'ivfcGood': [0, 1, 2, 3, 4], 'ivfcFailed': [5], 'mergedBytes': 17, 'expectedBytes': 19,
-                        'base': {'programBytes': 100, 'headerSha256': grouped},
-                        'update': {'programBytes': 50, 'headerSha256': grouped}}
+                        'base': {'programBytes': 100, 'sections': [{'index': 1, 'offset': 20, 'bytes': 80}]},
+                        'update': {'programBytes': 50, 'sections': [{'index': 1, 'offset': 20, 'bytes': 30}]}}
         result = {'ok': False, 'stage': 'romfs', 'code': 'romfs_integrity',
                   'message': 'The merged game data failed its integrity check (IVFC level 5).',
                   'romfsVerification': verification}
@@ -67,10 +63,7 @@ class SetupDetailsTests(unittest.TestCase):
         self.assertNotIn('a' * 32, report)
         self.assertNotIn('b' * 32, report)
         self.assertNotRegex(report, r'[0-9a-fA-F]{32,}')
-        for invalid in ['f' * 32, 'g' * 64, '/private/path', digest + 'extra']:
-            output = subprocess.run([self.java, '-cp', str(self.classes), 'com.aure.totk.setup.SetupDetailsProbe',
-                                     'header-digest', invalid], capture_output=True, text=True, check=True).stdout
-            self.assertEqual(output, '[invalid digest]')
+        self.assertNotIn('headerSha256', report)
 
     def test_integrity_error_explains_the_known_failure_without_blame(self):
         strings = (SOURCE.parent / 'Strings.java').read_text()

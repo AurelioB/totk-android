@@ -30,18 +30,6 @@ final class SetupDetails {
         return suffix.matches("\\.[a-zA-Z0-9]{1,12}") ? suffix.toLowerCase(Locale.ROOT) : "(none)";
     }
 
-    /** Only native-computed header digests use this representation. Keep eight hex groups so the unchanged blanket
-     *  key/rights-ID redaction still scrubs every other long hex run in metadata and logs. Join the groups to compare. */
-    static String headerDigest(String sha256) {
-        if (!sha256.matches("[0-9a-f]{64}")) return "[invalid digest]";
-        StringBuilder grouped = new StringBuilder(71);
-        for (int i = 0; i < 64; i += 8) {
-            if (i != 0) grouped.append('-');
-            grouped.append(sha256, i, i + 8);
-        }
-        return grouped.toString();
-    }
-
     static String build(String metadata, File game, String stage, List<String> excluded) {
         String intro = "TotK Native setup details\n" + PRIVACY + "\n"
                 + "Share details before Resume to include the logs.\n\n";
