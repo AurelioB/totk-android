@@ -27,6 +27,7 @@ import java.util.Map;
  *    folder DIR STAGING              SaveManager.extractFolder: root/files or invalid CODE
  *    entries COUNT                   select over COUNT synthetic candidates: invalid CODE
  *    export ROOT ZIP                 manifest + writeZip: number of files
+ *    manifest FILE                   bounded manifest reader used by save-sync.json: number of files
  *    decide LIVE FOLDER LAST         SaveManager.decide over three directories (each scanned; "-" = none)
  *    backup ROOT BACKUPS REASON T    SaveManager.backup: the backup folder name or none
  *    backups BACKUPS                 SaveManager.backups: name:reason:slots ... newest first
@@ -136,6 +137,7 @@ public final class SavesProbe {
                         answer = String.valueOf(m.files.size());
                         break;
                     }
+                    case "manifest": answer = String.valueOf(SaveManager.Manifest.read(new File(w[1])).files.size()); break;
                     case "decide": answer = SaveManager.decide(manifest(w[1]), manifest(w[2]), manifest(w[3])).name(); break;
                     case "backup": {
                         SaveManager.Backup b = SaveManager.backup(new File(w[1]), new File(w[2]), w[3], Long.parseLong(w[4]));

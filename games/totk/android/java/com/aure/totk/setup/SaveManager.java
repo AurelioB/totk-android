@@ -48,6 +48,11 @@ final class SaveManager {
     static final long MAX_KNOWN_FILE = 32L << 20, MAX_OTHER_FILE = 1L << 20;
     /** Zip entries anywhere in the archive (outside the save root too): a cap against archives that are not save dumps. */
     static final int MAX_ENTRIES = 65_536;
+    /** File-list metadata: allow a 256-byte relative path even if every byte needs a six-byte JSON escape,
+     * plus 256 bytes for each entry's keys/digest/numbers. Fixed fields (including a sync URI) get 64 KiB.
+     * This is a finite metadata budget, independent of the save payload and zip central-directory limits. */
+    static final long MAX_MANIFEST_HEADER = 64L << 10;
+    static final long MAX_MANIFEST = MAX_MANIFEST_HEADER + MAX_FILES * (6L * 256 + 256);
     private static final Pattern SLOT_PROGRESS = Pattern.compile("(?:.*/)?slot_\\d\\d/progress\\.sav");
     private static final Pattern KNOWN = Pattern.compile("(?i).*\\.(sav|dat|jpg|jpeg|bin)");
 
@@ -85,14 +90,24 @@ final class SaveManager {
             return true;
         }
         long exportedMillis() { return parseTime(exportedAt); }
-        String toJson() {
+        String toJson() throws Invalid {
             StringBuilder out = new StringBuilder("{\"format\":").append(format);
             field(out, "title_id", titleId); field(out, "exported_at", exportedAt); field(out, "app_version", appVersion);
             field(out, "device", device);
             if (!folder.isEmpty()) field(out, "folder", folder);
             out.append(",\"files\":");
             entries(out, files, true);
-            return out.append("}\n").toString();
+            out.append("}\n");
+            long bytes = 0;
+            for (int i = 0; i < out.length(); i++) {
+                char c = out.charAt(i);
+                if (c < 0x80) bytes++;
+                else if (c < 0x800) bytes += 2;
+                else if (Character.isHighSurrogate(c) && i + 1 < out.length() && Character.isLowSurrogate(out.charAt(i + 1))) { bytes += 4; i++; }
+                else bytes += Character.isSurrogate(c) ? 1 : 3;   // UTF-8 replaces an unpaired surrogate with '?'
+                if (bytes > MAX_MANIFEST) throw new Invalid("too_big", "manifest");
+            }
+            return out.toString();
         }
         private static void entries(StringBuilder out, List<FileEntry> list, boolean digests) {
             out.append('[');
@@ -107,6 +122,11 @@ final class SaveManager {
             out.append(']');
         }
         private static void field(StringBuilder out, String key, String value) { out.append(",\"").append(key).append("\":"); quote(out, value); }
+
+        static Manifest read(InputStream in) throws IOException { return parse(readText(in, MAX_MANIFEST)); }
+        static Manifest read(File file) throws IOException {
+            try (InputStream in = new FileInputStream(file)) { return read(in); }
+        }
 
         static Manifest parse(String text) throws Invalid {
             Object root;
@@ -592,7 +612,7 @@ final class SaveManager {
             }
             if (selection.manifestSource != null) {
                 ZipEntry entry = file.getEntry(original.get(selection.manifestSource));
-                try (InputStream in = file.getInputStream(entry)) { verifyAgainst(staging, Manifest.parse(readText(in, 4L << 20))); }
+                try (InputStream in = file.getInputStream(entry)) { verifyAgainst(staging, Manifest.read(in)); }
             }
             return selection;
         } catch (java.util.zip.ZipException bad) {
@@ -603,8 +623,8 @@ final class SaveManager {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         byte[] buffer = new byte[16 * 1024];
         for (int n; (n = in.read(buffer)) > 0;) {
+            if (n > limit - out.size()) throw new Invalid("too_big", "manifest");
             out.write(buffer, 0, n);
-            if (out.size() > limit) throw new Invalid("too_big", "manifest");
         }
         return out.toString("UTF-8");
     }
@@ -765,8 +785,8 @@ final class SaveManager {
         for (File dir : dirs) {
             if (!dir.isDirectory() || dir.getName().endsWith(".partial")) continue;
             String reason = "manual"; long created = dir.lastModified(); int slots = -1;
-            try {
-                Object parsed = new Json(new String(Files.readAllBytes(new File(dir, "backup.json").toPath()), StandardCharsets.UTF_8)).document();
+            try (InputStream in = new FileInputStream(new File(dir, "backup.json"))) {
+                Object parsed = new Json(readText(in, MAX_MANIFEST_HEADER)).document();
                 if (parsed instanceof Map) {
                     Map<?, ?> m = (Map<?, ?>) parsed;
                     if (m.get("reason") instanceof String) reason = (String) m.get("reason");
@@ -913,7 +933,7 @@ final class SaveManager {
         for (Candidate c : selection.files)
             try (InputStream in = new FileInputStream(new File(base, selection.sources.get(c.path)))) { copyLimited(in, new File(staging, c.path), c.size, c.mtime); }
         if (selection.manifestSource != null)
-            try (InputStream in = new FileInputStream(new File(base, selection.manifestSource))) { verifyAgainst(staging, Manifest.parse(readText(in, 4L << 20))); }
+            try (InputStream in = new FileInputStream(new File(base, selection.manifestSource))) { verifyAgainst(staging, Manifest.read(in)); }
         return selection;
     }
     static final String GENERATION = "sync-";
@@ -947,7 +967,7 @@ final class SaveManager {
             Map<String, long[]> files = store.files(gen);
             if (!files.containsKey(MANIFEST)) continue;
             Manifest m;
-            try (InputStream in = store.open(gen, MANIFEST)) { m = Manifest.parse(readText(in, 4L << 20)); }
+            try (InputStream in = store.open(gen, MANIFEST)) { m = Manifest.read(in); }
             catch (Invalid torn) { continue; }   // the manifest write itself was interrupted
             for (FileEntry e : m.files) {
                 long[] f = files.get(e.path);

@@ -103,7 +103,7 @@ public final class SaveMirror {
     }
     private static SaveManager.Manifest readSync(Context context) {
         try {
-            SaveManager.Manifest m = SaveManager.Manifest.parse(new String(Files.readAllBytes(new File(context.getFilesDir(), SYNC_FILE).toPath()), StandardCharsets.UTF_8));
+            SaveManager.Manifest m = SaveManager.Manifest.read(new File(context.getFilesDir(), SYNC_FILE));
             return m.folder.equals(folderString(context)) ? m : null;
         } catch (IOException missing) { return null; }
     }
@@ -323,7 +323,7 @@ public final class SaveMirror {
         for (SaveManager.Candidate c : selection.files)
             try (InputStream in = folder.open(docs.get(selection.sources.get(c.path)))) { SaveManager.copyLimited(in, new File(staged, c.path), c.size, c.mtime); }
         if (selection.manifestSource != null)
-            try (InputStream in = folder.open(docs.get(selection.manifestSource))) { SaveManager.verifyAgainst(staged, SaveManager.Manifest.parse(SaveManager.readText(in, 4L << 20))); }
+            try (InputStream in = folder.open(docs.get(selection.manifestSource))) { SaveManager.verifyAgainst(staged, SaveManager.Manifest.read(in)); }
         return selection;
     }
     /** Stage the save set in a picked zip. With All files access the zip is read where it is; otherwise it is copied to

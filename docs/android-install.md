@@ -246,6 +246,13 @@ symbolic links are refused. The file-count allowance leaves room above six indep
 That is a conservative example, not a verified maximum picture-book capacity; slot thumbnails are already inside
 `caption.sav`. The remaining allowance covers albums, other auxiliary files and fuller picture books.
 
+File-list manifests have a separate bounded allowance derived from the file count: 64 KiB for fixed metadata plus
+`16,384 × (6 × 256 + 256)` bytes for escaped paths and per-file metadata (28 MiB + 64 KiB). Export, import and the
+save folder use the same budget. The zip central directory is independently limited to 16 MiB, so unusually long
+names, extra data or comments can reach a metadata limit before the file-count limit. Backup metadata without a
+file list is limited to the fixed 64 KiB allowance. Ten full backups can hold 1.25 GiB of save payload, plus filesystem
+blocks/metadata; an eleventh copy temporarily exists during rotation. Small files still consume filesystem blocks.
+
 Saves live in the app's private storage. Uninstalling the app removes them: export them first.
 
 ## Drivers

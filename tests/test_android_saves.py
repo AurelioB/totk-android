@@ -66,14 +66,16 @@ def save_set(base, slots=(0, 1), seed=1, option=False, extra=True):
     return base
 
 
-def counted_save_set(base, count):
+def counted_save_set(base, count, path_length=0):
     """Small synthetic payloads with real slot names, plus one file per picture; count includes all save files."""
     save_set(base, slots=range(6), option=True, extra=False)
     (base / 'storage').mkdir()
     (base / 'storage/CacheStorageKey.dat').write_bytes(b'key')
     for i in range(count - 6 * len(SLOT_FILES) - 2):
         slot, picture = i % 6, i // 6
-        path = base / f'slot_{slot:02d}/picturebook/{picture:04d}.jpg'
+        prefix = f'slot_{slot:02d}/picturebook/'
+        name = f'{picture:04d}.jpg'
+        path = base / (prefix + 'p' * max(0, path_length - len(prefix) - len(name)) + name)
         path.parent.mkdir(exist_ok=True)
         path.write_bytes(struct.pack('<I', i))
     return base
@@ -192,6 +194,30 @@ class SavesTests(unittest.TestCase):
                     expected = tree(live)
                     self.assertEqual(tree(folder_stage), expected)
                     self.assertEqual(tree(zip_stage), expected)
+
+    def test_long_path_manifest_at_file_limit_round_trips_and_mirrors(self):
+        live = counted_save_set(self.dir / 'live', MAX_SAVE_FILES, path_length=196)
+        expected = tree(live)
+        archive = self.dir / 'export.zip'
+        self.assertEqual(self.one('export', live, archive), str(MAX_SAVE_FILES))
+        with zipfile.ZipFile(archive) as z:
+            manifest = z.read('TotK Native saves/totk-native-saves.json')
+        self.assertGreater(len(manifest), 4 << 20, 'exercise the old manifest-reader failure')
+        self.assertEqual(self.one('zip', archive, self.dir / 'zip'), f'root=TotK Native saves/ files={MAX_SAVE_FILES}')
+        self.assertEqual(tree(self.dir / 'zip'), expected)
+        # Exercise the same bounded reader used by private save-sync.json and both folder-import routes.
+        manifest_file = live / 'totk-native-saves.json'
+        manifest_file.write_bytes(manifest)
+        self.assertEqual(self.one('manifest', manifest_file), str(MAX_SAVE_FILES))
+        self.assertEqual(self.one('folder', live, self.dir / 'folder'), f'root= files={MAX_SAVE_FILES}')
+        self.assertEqual(tree(self.dir / 'folder'), expected)
+        manifest_file.unlink()
+        top = self.dir / 'mirror'
+        top.mkdir()
+        self.assertEqual(self.one('push', top, live, -1), 'sync-000001')
+        self.assertEqual(self.one('read', top), f'gen sync-000001 {MAX_SAVE_FILES}')
+        self.assertEqual(self.one('fetch', top, self.dir / 'fetched'), f'ok {MAX_SAVE_FILES}')
+        self.assertEqual(tree(self.dir / 'fetched'), expected)
 
     def test_large_archives_still_enforce_size_name_and_entry_guards(self):
         live = counted_save_set(self.dir / 'live', COMPENDIUM_HEAVY_FILES)

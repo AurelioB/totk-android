@@ -16,6 +16,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 - Accept photo-heavy save imports with up to 16,384 files, instead of 500 (#19, duplicate #27).
   Keep the 128 MiB total and per-file limits, with a separate 65,536-entry archive guard.
   Count-limit errors now describe the current limits rather than declaring a photo-heavy save invalid.
+  Scale the shared manifest budget with the file allowance so long-path exports also import and mirror correctly;
+  bound private sync and backup metadata reads as well.
 
 ### Developer tools
 - Support explicit single-switch benchmark treatments with `--expected-difference SWITCH:REFERENCE:NEW` in
