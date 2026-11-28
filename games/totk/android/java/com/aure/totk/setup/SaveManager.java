@@ -60,6 +60,26 @@ final class SaveManager {
     private static final Pattern SLOT_PROGRESS = Pattern.compile("(?:.*/)?slot_\\d\\d/progress\\.sav");
     private static final Pattern KNOWN = Pattern.compile("(?i).*\\.(sav|dat|jpg|jpeg|bin)");
 
+    /** Save-set envelopes and interrupted metadata/provider writes are never game content, at any depth.
+     * Existing live files with these names are left untouched; readers and safety copies simply omit them. */
+    static boolean reserved(String path) {
+        for (int start = 0; start < path.length();) {
+            int end = path.indexOf('/', start);
+            if (end < 0) end = path.length();
+            if (named(path, start, end, MANIFEST) || named(path, start, end, MANIFEST + ".tmp")
+                    || named(path, start, end, TOP) || named(path, start, end, "backup.json")
+                    || named(path, start, end, "backup.json.tmp")
+                    || path.charAt(start) == '.' && end - start >= ".partial".length()
+                        && path.regionMatches(end - ".partial".length(), ".partial", 0, ".partial".length()))
+                return true;
+            start = end + 1;
+        }
+        return false;
+    }
+    private static boolean named(String path, int start, int end, String name) {
+        return end - start == name.length() && path.regionMatches(start, name, 0, name.length());
+    }
+
     // ---------- errors ----------
     /** A save set that must not be imported. code: absolute | traversal | symlink | too_many | path_bytes | too_big |
      * huge_file | no_saves | corrupt | not_zip | game_running. */
@@ -121,6 +141,7 @@ final class SaveManager {
             PathBudget paths = new PathBudget();
             for (FileEntry e : files) {
                 normalize(e.path);
+                if (reserved(e.path)) throw new Invalid("corrupt", "reserved manifest path " + e.path);
                 paths.add(e.path);
                 if (!digestHex(e.sha256)) throw new Invalid("corrupt", "manifest digest of " + e.path);
             }
@@ -318,6 +339,7 @@ final class SaveManager {
                 }
             }
             if (name == null) name = normalize("");
+            if (reserved(name)) throw corrupt("reserved manifest path " + name);
             if (sha.length() != 64) throw corrupt("manifest digest");
             boolean uppercase = false;
             for (int i = 0; i < sha.length(); i++) {
@@ -731,8 +753,8 @@ final class SaveManager {
         return String.format(Locale.ROOT, "%016x%016x", hi, lo);
     }
 
-    /** Every regular file under root (symbolic links are skipped), sorted by path, with SHA-256. A digest is reused from
-     * cache when the file's size and modification time are unchanged, so a sync check does not rehash the set. */
+    /** Every regular save-content file under root (symbolic links and reserved metadata are skipped), sorted by path,
+     * with SHA-256. A digest is reused when size and modification time are unchanged, so sync need not rehash the set. */
     static List<FileEntry> scan(File root, Manifest cache) throws IOException {
         Map<String, FileEntry> known = cache == null ? new HashMap<>() : cache.byPath();
         List<String> paths = new ArrayList<>();
@@ -752,7 +774,7 @@ final class SaveManager {
         File[] children = dir.listFiles();
         if (children == null) return;
         for (File child : children) {
-            if (Files.isSymbolicLink(child.toPath())) continue;
+            if (Files.isSymbolicLink(child.toPath()) || reserved(child.getName())) continue;
             String path = prefix + child.getName();
             if (child.isDirectory()) walk(child, path + "/", out);
             else if (child.isFile()) out.add(path);
@@ -957,6 +979,7 @@ final class SaveManager {
             if (!c.path.startsWith(best)) continue;
             String relative = c.path.substring(best.length());
             if (relative.equals(MANIFEST)) { selection.manifestSource = c.path; continue; }
+            if (reserved(relative)) continue;
             long limit = KNOWN.matcher(relative).matches() ? MAX_KNOWN_FILE : MAX_OTHER_FILE;
             if (c.size > limit) throw new Invalid("huge_file", relative + " (" + c.size + " bytes)");
             if (c.size < 0) throw new Invalid("corrupt", relative + " has no size");
@@ -1206,7 +1229,7 @@ final class SaveManager {
         File[] children = from.listFiles();
         if (children == null) return;
         for (File child : children) {
-            if (Files.isSymbolicLink(child.toPath())) continue;
+            if (Files.isSymbolicLink(child.toPath()) || reserved(child.getName())) continue;
             File target = new File(to, child.getName());
             if (child.isDirectory()) copyTree(child, target);
             else if (child.isFile()) try (InputStream in = new FileInputStream(child)) { copyLimited(in, target, Long.MAX_VALUE, child.lastModified()); }

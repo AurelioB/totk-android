@@ -269,13 +269,15 @@ class SavesTests(unittest.TestCase):
         self.assertEqual(self.one('manifest', manifest_file), str(MAX_SAVE_FILES))
         self.assertEqual(self.one('folder', live, self.dir / 'folder'), f'root= files={MAX_SAVE_FILES}')
         self.assertEqual(tree(self.dir / 'folder'), expected)
-        manifest_file.unlink()
         top = self.dir / 'mirror'
         top.mkdir()
         self.assertEqual(self.one('push', top, live, -1), 'sync-000001')
         self.assertEqual(self.one('read', top), f'gen sync-000001 {MAX_SAVE_FILES}')
         self.assertEqual(self.one('fetch', top, self.dir / 'fetched'), f'ok {MAX_SAVE_FILES}')
         self.assertEqual(tree(self.dir / 'fetched'), expected)
+        self.assertEqual(manifest_file.read_bytes(), manifest, 'sync must not delete existing live metadata')
+        backup = self.one('backup', live, self.dir / 'backups', 'manual', 1_700_000_000_000)
+        self.assertEqual(tree(self.dir / 'backups' / backup / 'save'), expected)
 
     def test_manifest_admission_properties_and_preflight(self):
         cases = [
