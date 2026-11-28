@@ -247,8 +247,10 @@ That is a conservative example, not a verified maximum picture-book capacity; sl
 `caption.sav`. The remaining allowance covers albums, other auxiliary files and fuller picture books.
 
 File-list manifests have a separate bounded allowance derived from the file count: 64 KiB for fixed metadata plus
-`16,384 × (6 × 256 + 256)` bytes for escaped paths and per-file metadata (28 MiB + 64 KiB). Export, import and the
-save folder use the same budget. The zip central directory is independently limited to 16 MiB, so unusually long
+`16,384 × 512` bytes for encoded paths and per-file metadata (8 MiB + 64 KiB). Export, import and the save folder
+use the same budget. Manifest parsing also caps arrays at 16,384 items, objects at 32 fields, nesting at 16 levels,
+strings at 1,024 characters and total values/containers at `6 × 16,384 + 32`, including ignored extension fields.
+The zip central directory is independently limited to 16 MiB, so unusually long
 names, extra data or comments can reach a metadata limit before the file-count limit. Backup metadata without a
 file list is limited to the fixed 64 KiB allowance. Ten full backups can hold 1.25 GiB of save payload, plus filesystem
 blocks/metadata; an eleventh copy temporarily exists during rotation. Small files still consume filesystem blocks.

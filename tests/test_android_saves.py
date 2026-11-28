@@ -5,6 +5,7 @@ decision table, and the stable in-game snapshot.
 """
 from pathlib import Path
 import fcntl
+import json
 import os
 import shutil
 import struct
@@ -209,6 +210,27 @@ class SavesTests(unittest.TestCase):
         manifest_file = live / 'totk-native-saves.json'
         manifest_file.write_bytes(manifest)
         self.assertEqual(self.one('manifest', manifest_file), str(MAX_SAVE_FILES))
+        # Parse at the full new byte allowance, not only this fixture's ordinary serialized length.
+        with manifest_file.open('ab') as out:
+            out.write(b' ' * ((64 << 10) + MAX_SAVE_FILES * 512 - len(manifest)))
+        measured = self.one('manifest-heap', manifest_file)
+        print('legitimate maximum manifest:', measured)
+        self.assertTrue(measured.startswith(f'ok {MAX_SAVE_FILES} peak_heap='), measured)
+        # Dense but admissible metadata: longer decoded paths, maximum files and an allowed extension array.
+        dense = json.loads(manifest)
+        for entry in dense['files']:
+            if '/picturebook/' in entry['path']:
+                directory, name = entry['path'].rsplit('/', 1)
+                entry['path'] = directory + '/' + 'p' * 128 + '/' + 'q' * (384 - len(directory) - len(name) - 130) + name
+        dense['extra'] = [{}] * MAX_SAVE_FILES
+        content = json.dumps(dense, separators=(',', ':')).encode()
+        budget = (64 << 10) + MAX_SAVE_FILES * 512
+        self.assertLessEqual(len(content), budget)
+        dense_file = self.dir / 'dense.json'
+        dense_file.write_bytes(content + b' ' * (budget - len(content)))
+        measured = self.one('manifest-heap', dense_file)
+        print('dense maximum manifest:', measured)
+        self.assertTrue(measured.startswith(f'ok {MAX_SAVE_FILES} peak_heap='), measured)
         self.assertEqual(self.one('folder', live, self.dir / 'folder'), f'root= files={MAX_SAVE_FILES}')
         self.assertEqual(tree(self.dir / 'folder'), expected)
         manifest_file.unlink()
@@ -218,6 +240,39 @@ class SavesTests(unittest.TestCase):
         self.assertEqual(self.one('read', top), f'gen sync-000001 {MAX_SAVE_FILES}')
         self.assertEqual(self.one('fetch', top, self.dir / 'fetched'), f'ok {MAX_SAVE_FILES}')
         self.assertEqual(tree(self.dir / 'fetched'), expected)
+
+    def test_manifest_parser_rejects_hostile_structure_under_small_heap(self):
+        prefix = b'{"format":1,"files":[],"extra":'
+        exact = self.dir / 'review-r2.json'
+        # Review r2's exact object count and old byte limit; write chunks rather than constructing a huge test string.
+        count, old_budget = 9_808_543, 29_425_664
+        with exact.open('wb') as out:
+            out.write(prefix + b'[')
+            chunks, remainder = divmod(count - 1, 4096)
+            for _ in range(chunks):
+                out.write(b'{},' * 4096)
+            out.write(b'{},' * remainder + b'{}]}')
+            out.write(b' ' * (old_budget - out.tell()))
+        self.assertEqual(exact.stat().st_size, old_budget)
+        shapes = {
+            'wide': prefix + b'[' + b'{},' * MAX_SAVE_FILES + b'{}]}',
+            'files': b'{"format":1,"files":[' + b'{},' * MAX_SAVE_FILES + b'{}]}',
+            'deep': prefix + b'[' * 100_000 + b'0' + b']' * 100_000 + b'}',
+            'string': prefix + b'"' + b'x' * (1 << 20) + b'"}',
+            'nodes': prefix + b'[' + b'[0,0,0,0,0,0],' * (MAX_SAVE_FILES - 1) + b'[0,0,0,0,0,0]]}',
+            'fields': prefix + b'{' + b'"x":0,' * 32 + b'"x":0}}',
+            'number': prefix + b'1' * 100_000 + b'}',
+        }
+        paths = [('review-r2', exact, 'invalid too_big')]
+        for name, content in shapes.items():
+            path = self.dir / f'{name}.json'
+            path.write_bytes(content)
+            paths.append((name, path, 'invalid corrupt'))
+        for name, path, expected in paths:
+            with self.subTest(shape=name):
+                measured = self.one('manifest-heap', path)
+                print(name + ' manifest:', measured)
+                self.assertTrue(measured.startswith(expected + ' peak_heap='), measured)
 
     def test_large_archives_still_enforce_size_name_and_entry_guards(self):
         live = counted_save_set(self.dir / 'live', COMPENDIUM_HEAVY_FILES)

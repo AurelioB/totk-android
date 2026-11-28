@@ -18,6 +18,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Count-limit errors now describe the current limits rather than declaring a photo-heavy save invalid.
   Scale the shared manifest budget with the file allowance so long-path exports also import and mirror correctly;
   bound private sync and backup metadata reads as well.
+  Bound manifest parser arrays, fields, nodes, strings and nesting before allocation amplification; keep the byte
+  allowance to 512 bytes per admitted file plus fixed metadata, rather than an arbitrary-JSON allowance.
 
 ### Developer tools
 - Support explicit single-switch benchmark treatments with `--expected-difference SWITCH:REFERENCE:NEW` in

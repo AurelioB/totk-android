@@ -28,6 +28,7 @@ import java.util.Map;
  *    entries COUNT                   select over COUNT synthetic candidates: invalid CODE
  *    export ROOT ZIP                 manifest + writeZip: number of files
  *    manifest FILE                   bounded manifest reader used by save-sync.json: number of files
+ *    manifest-heap FILE              bounded reader with 1 ms heap sampling: result, peak_heap and elapsed_ms
  *    decide LIVE FOLDER LAST         SaveManager.decide over three directories (each scanned; "-" = none)
  *    backup ROOT BACKUPS REASON T    SaveManager.backup: the backup folder name or none
  *    backups BACKUPS                 SaveManager.backups: name:reason:slots ... newest first
@@ -44,6 +45,23 @@ import java.util.Map;
  *                                    returned by successive busy()/generation() calls: ok FILES or unstable
  *    locked FILES                    SaveManager.gameLocked */
 public final class SavesProbe {
+    private static final class HeapSample implements AutoCloseable {
+        final Runtime runtime = Runtime.getRuntime();
+        volatile boolean running = true;
+        volatile long peak;
+        final Thread thread;
+        HeapSample() {
+            thread = new Thread(() -> {
+                while (running) {
+                    sample();
+                    try { Thread.sleep(1); } catch (InterruptedException stop) { break; }
+                }
+            });
+            sample(); thread.start();
+        }
+        void sample() { peak = Math.max(peak, runtime.totalMemory() - runtime.freeMemory()); }
+        @Override public void close() throws InterruptedException { running = false; thread.join(); sample(); }
+    }
     private static List<SaveManager.Candidate> listing(File dir) throws IOException {
         List<SaveManager.Candidate> out = new ArrayList<>();
         walk(dir, "", out);
@@ -138,6 +156,15 @@ public final class SavesProbe {
                         break;
                     }
                     case "manifest": answer = String.valueOf(SaveManager.Manifest.read(new File(w[1])).files.size()); break;
+                    case "manifest-heap": {
+                        HeapSample heap = new HeapSample();
+                        long start = System.nanoTime();
+                        try { answer = "ok " + SaveManager.Manifest.read(new File(w[1])).files.size(); }
+                        catch (SaveManager.Invalid invalid) { answer = "invalid " + invalid.code; }
+                        finally { heap.close(); }
+                        answer += " peak_heap=" + heap.peak + " elapsed_ms=" + (System.nanoTime() - start) / 1_000_000;
+                        break;
+                    }
                     case "decide": answer = SaveManager.decide(manifest(w[1]), manifest(w[2]), manifest(w[3])).name(); break;
                     case "backup": {
                         SaveManager.Backup b = SaveManager.backup(new File(w[1]), new File(w[2]), w[3], Long.parseLong(w[4]));

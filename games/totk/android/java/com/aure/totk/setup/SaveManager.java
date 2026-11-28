@@ -48,11 +48,12 @@ final class SaveManager {
     static final long MAX_KNOWN_FILE = 32L << 20, MAX_OTHER_FILE = 1L << 20;
     /** Zip entries anywhere in the archive (outside the save root too): a cap against archives that are not save dumps. */
     static final int MAX_ENTRIES = 65_536;
-    /** File-list metadata: allow a 256-byte relative path even if every byte needs a six-byte JSON escape,
-     * plus 256 bytes for each entry's keys/digest/numbers. Fixed fields (including a sync URI) get 64 KiB.
-     * This is a finite metadata budget, independent of the save payload and zip central-directory limits. */
+    /** File-list metadata: 384 encoded path bytes plus 128 bytes for keys/digest/numbers per file;
+     * fixed fields (including a sync URI) get 64 KiB. This is not an allowance for arbitrary JSON structure. */
     static final long MAX_MANIFEST_HEADER = 64L << 10;
-    static final long MAX_MANIFEST = MAX_MANIFEST_HEADER + MAX_FILES * (6L * 256 + 256);
+    static final int MAX_MANIFEST_ENTRY = 384 + 128, MAX_MANIFEST_STRING = 1024;
+    static final int MAX_MANIFEST_DEPTH = 16, MAX_MANIFEST_FIELDS = 32, MAX_MANIFEST_NODES = MAX_FILES * 6 + 32;
+    static final long MAX_MANIFEST = MAX_MANIFEST_HEADER + (long) MAX_FILES * MAX_MANIFEST_ENTRY;
     private static final Pattern SLOT_PROGRESS = Pattern.compile("(?:.*/)?slot_\\d\\d/progress\\.sav");
     private static final Pattern KNOWN = Pattern.compile("(?i).*\\.(sav|dat|jpg|jpeg|bin)");
 
@@ -91,6 +92,7 @@ final class SaveManager {
         }
         long exportedMillis() { return parseTime(exportedAt); }
         String toJson() throws Invalid {
+            checkString(titleId); checkString(exportedAt); checkString(appVersion); checkString(device); checkString(folder);
             StringBuilder out = new StringBuilder("{\"format\":").append(format);
             field(out, "title_id", titleId); field(out, "exported_at", exportedAt); field(out, "app_version", appVersion);
             field(out, "device", device);
@@ -109,10 +111,11 @@ final class SaveManager {
             }
             return out.toString();
         }
-        private static void entries(StringBuilder out, List<FileEntry> list, boolean digests) {
+        private static void entries(StringBuilder out, List<FileEntry> list, boolean digests) throws Invalid {
             out.append('[');
             for (int i = 0; i < list.size(); i++) {
                 FileEntry e = list.get(i);
+                checkString(e.path);
                 out.append(i == 0 ? "\n" : ",\n").append("{\"path\":");
                 quote(out, e.path);
                 out.append(",\"size\":").append(e.size);
@@ -122,6 +125,9 @@ final class SaveManager {
             out.append(']');
         }
         private static void field(StringBuilder out, String key, String value) { out.append(",\"").append(key).append("\":"); quote(out, value); }
+        private static void checkString(String value) throws Invalid {
+            if (value.length() > MAX_MANIFEST_STRING) throw new Invalid("corrupt", "manifest string is too long");
+        }
 
         static Manifest read(InputStream in) throws IOException { return parse(readText(in, MAX_MANIFEST)); }
         static Manifest read(File file) throws IOException {
@@ -130,7 +136,7 @@ final class SaveManager {
 
         static Manifest parse(String text) throws Invalid {
             Object root;
-            try { root = new Json(text).document(); } catch (RuntimeException bad) { throw new Invalid("corrupt", "manifest: " + bad.getMessage()); }
+            try { root = new Json(text, true).document(); } catch (RuntimeException bad) { throw new Invalid("corrupt", "manifest: " + bad.getMessage()); }
             if (!(root instanceof Map)) throw new Invalid("corrupt", "manifest is not an object");
             Map<?, ?> map = (Map<?, ?>) root;
             Manifest m = new Manifest();
@@ -177,25 +183,35 @@ final class SaveManager {
     /** A small strict JSON reader (org.json is not on the host test classpath): objects, arrays, strings, numbers,
      * true/false/null. */
     static final class Json {
-        private final String s; private int i;
-        Json(String s) { this.s = s; }
-        Object document() { Object v = value(); space(); if (i != s.length()) throw error("trailing data"); return v; }
+        private final String s; private final boolean bounded;
+        private int i, nodes;
+        Json(String s) { this(s, false); }
+        Json(String s, boolean bounded) { this.s = s; this.bounded = bounded; }
+        Object document() { Object v = value(0); space(); if (i != s.length()) throw error("trailing data"); return v; }
         private RuntimeException error(String what) { return new IllegalArgumentException(what + " at " + i); }
         private void space() { while (i < s.length() && " \t\r\n".indexOf(s.charAt(i)) >= 0) i++; }
-        private Object value() {
+        private Object value(int depth) {
+            if (bounded && (depth > MAX_MANIFEST_DEPTH || ++nodes > MAX_MANIFEST_NODES)) throw error("manifest structure limit");
             space();
             if (i >= s.length()) throw error("end of text");
             char c = s.charAt(i);
             if (c == '{') {
                 i++; Map<String, Object> map = new LinkedHashMap<>(); space();
                 if (peek('}')) return map;
-                do { space(); String key = string(); space(); expect(':'); map.put(key, value()); space(); } while (peek(','));
+                int fields = 0;
+                do {
+                    if (bounded && ++fields > MAX_MANIFEST_FIELDS) throw error("too many object fields");
+                    space(); String key = string(); space(); expect(':'); map.put(key, value(depth + 1)); space();
+                } while (peek(','));
                 expect('}'); return map;
             }
             if (c == '[') {
                 i++; List<Object> list = new ArrayList<>(); space();
                 if (peek(']')) return list;
-                do { list.add(value()); space(); } while (peek(','));
+                do {
+                    if (bounded && list.size() >= MAX_FILES) throw error("too many array entries");
+                    list.add(value(depth + 1)); space();
+                } while (peek(','));
                 expect(']'); return list;
             }
             if (c == '"') return string();
@@ -203,7 +219,10 @@ final class SaveManager {
             if (s.startsWith("false", i)) { i += 5; return Boolean.FALSE; }
             if (s.startsWith("null", i)) { i += 4; return null; }
             int start = i;
-            while (i < s.length() && "+-0123456789.eE".indexOf(s.charAt(i)) >= 0) i++;
+            while (i < s.length() && "+-0123456789.eE".indexOf(s.charAt(i)) >= 0) {
+                if (bounded && i - start >= 32) throw error("number is too long");
+                i++;
+            }
             String number = s.substring(start, i);
             if (number.isEmpty()) throw error("unexpected '" + c + "'");
             try { return number.matches("-?\\d{1,18}") ? (Object) Long.parseLong(number) : (Object) Double.parseDouble(number); }
@@ -215,6 +234,7 @@ final class SaveManager {
             expect('"');
             StringBuilder out = new StringBuilder();
             while (true) {
+                if (bounded && out.length() > MAX_MANIFEST_STRING) throw error("string is too long");
                 if (i >= s.length()) throw error("unterminated string");
                 char c = s.charAt(i++);
                 if (c == '"') return out.toString();
