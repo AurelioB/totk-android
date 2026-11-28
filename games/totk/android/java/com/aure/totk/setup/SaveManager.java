@@ -1,6 +1,9 @@
 package com.aure.totk.setup;
 
 import java.io.ByteArrayOutputStream;
+import java.io.BufferedWriter;
+import java.io.OutputStreamWriter;
+import java.io.Writer;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -48,21 +51,42 @@ final class SaveManager {
     static final long MAX_KNOWN_FILE = 32L << 20, MAX_OTHER_FILE = 1L << 20;
     /** Zip entries anywhere in the archive (outside the save root too): a cap against archives that are not save dumps. */
     static final int MAX_ENTRIES = 65_536;
-    /** File-list metadata: 384 encoded path bytes plus 128 bytes for keys/digest/numbers per file;
-     * fixed fields (including a sync URI) get 64 KiB. This is not an allowance for arbitrary JSON structure. */
-    static final long MAX_MANIFEST_HEADER = 64L << 10;
-    static final int MAX_MANIFEST_ENTRY = 384 + 128, MAX_MANIFEST_STRING = 1024;
+    /** A set's relative names share 4 MiB of UTF-8, not a per-path character limit. JSON quoting expands each
+     * path byte at most sixfold. A file record needs at most 146 other bytes; reserve 160, plus 64 KiB headers. */
+    static final long MAX_PATH_BYTES = 4L << 20, MAX_MANIFEST_HEADER = 64L << 10;
+    static final int MAX_MANIFEST_ENTRY = 160, MAX_MANIFEST_STRING = 1024;
     static final int MAX_MANIFEST_DEPTH = 16, MAX_MANIFEST_FIELDS = 32, MAX_MANIFEST_NODES = MAX_FILES * 6 + 32;
-    static final long MAX_MANIFEST = MAX_MANIFEST_HEADER + (long) MAX_FILES * MAX_MANIFEST_ENTRY;
+    static final long MAX_MANIFEST = 6 * MAX_PATH_BYTES + (long) MAX_FILES * MAX_MANIFEST_ENTRY + MAX_MANIFEST_HEADER;
     private static final Pattern SLOT_PROGRESS = Pattern.compile("(?:.*/)?slot_\\d\\d/progress\\.sav");
     private static final Pattern KNOWN = Pattern.compile("(?i).*\\.(sav|dat|jpg|jpeg|bin)");
 
     // ---------- errors ----------
-    /** A save set that must not be imported. code: absolute | traversal | symlink | too_many | too_big | huge_file |
-     * no_saves | corrupt | not_zip | game_running. */
+    /** A save set that must not be imported. code: absolute | traversal | symlink | too_many | path_bytes | too_big |
+     * huge_file | no_saves | corrupt | not_zip | game_running. */
     static final class Invalid extends IOException {
         final String code;
         Invalid(String code, String detail) { super(code + (detail == null ? "" : ": " + detail)); this.code = code; }
+    }
+
+    /** The same name/count admission for import selection, exported snapshots and parsed mirror/sync manifests. */
+    static final class PathBudget {
+        int files; long bytes;
+        void add(String path) throws Invalid {
+            if (++files > MAX_FILES) throw new Invalid("too_many", files + " files (limit " + MAX_FILES + ")");
+            bytes += utf8Length(path);
+            if (bytes > MAX_PATH_BYTES) throw new Invalid("path_bytes", bytes + " relative-path bytes (limit " + MAX_PATH_BYTES + ")");
+        }
+    }
+    static long utf8Length(String text) {
+        long bytes = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c < 0x80) bytes++;
+            else if (c < 0x800) bytes += 2;
+            else if (Character.isHighSurrogate(c) && i + 1 < text.length() && Character.isLowSurrogate(text.charAt(i + 1))) { bytes += 4; i++; }
+            else bytes += Character.isSurrogate(c) ? 1 : 3;
+        }
+        return bytes;
     }
 
     // ---------- manifest ----------
@@ -91,77 +115,488 @@ final class SaveManager {
             return true;
         }
         long exportedMillis() { return parseTime(exportedAt); }
-        String toJson() throws Invalid {
+        void validate() throws Invalid {
             checkString(titleId); checkString(exportedAt); checkString(appVersion); checkString(device); checkString(folder);
-            StringBuilder out = new StringBuilder("{\"format\":").append(format);
+            if (format != 1 || !titleId.isEmpty() && !TITLE_ID.equalsIgnoreCase(titleId)) throw new Invalid("corrupt", "manifest identity");
+            PathBudget paths = new PathBudget();
+            for (FileEntry e : files) {
+                normalize(e.path);
+                paths.add(e.path);
+                if (!digestHex(e.sha256)) throw new Invalid("corrupt", "manifest digest of " + e.path);
+            }
+        }
+        void write(OutputStream sink) throws IOException { validate(); writeValidated(sink); }
+        private void writeValidated(OutputStream sink) throws IOException {
+            Writer out = new BufferedWriter(new OutputStreamWriter(sink, StandardCharsets.UTF_8));
+            out.write("{\"format\":1");
             field(out, "title_id", titleId); field(out, "exported_at", exportedAt); field(out, "app_version", appVersion);
             field(out, "device", device);
             if (!folder.isEmpty()) field(out, "folder", folder);
-            out.append(",\"files\":");
-            entries(out, files, true);
-            out.append("}\n");
-            long bytes = 0;
-            for (int i = 0; i < out.length(); i++) {
-                char c = out.charAt(i);
-                if (c < 0x80) bytes++;
-                else if (c < 0x800) bytes += 2;
-                else if (Character.isHighSurrogate(c) && i + 1 < out.length() && Character.isLowSurrogate(out.charAt(i + 1))) { bytes += 4; i++; }
-                else bytes += Character.isSurrogate(c) ? 1 : 3;   // UTF-8 replaces an unpaired surrogate with '?'
-                if (bytes > MAX_MANIFEST) throw new Invalid("too_big", "manifest");
+            out.write(",\"files\":[");
+            for (int i = 0; i < files.size(); i++) {
+                FileEntry e = files.get(i);
+                out.write(i == 0 ? "\n{\"path\":" : ",\n{\"path\":");
+                quoted(out, e.path);
+                out.write(",\"size\":"); out.write(Long.toString(e.size));
+                out.write(",\"sha256\":"); quoted(out, e.sha256);
+                out.write(",\"mtime\":"); out.write(Long.toString(e.mtime)); out.write('}');
             }
-            return out.toString();
+            out.write("]}\n"); out.flush();
         }
-        private static void entries(StringBuilder out, List<FileEntry> list, boolean digests) throws Invalid {
-            out.append('[');
-            for (int i = 0; i < list.size(); i++) {
-                FileEntry e = list.get(i);
-                checkString(e.path);
-                out.append(i == 0 ? "\n" : ",\n").append("{\"path\":");
-                quote(out, e.path);
-                out.append(",\"size\":").append(e.size);
-                if (digests) { out.append(",\"sha256\":"); quote(out, e.sha256 == null ? "" : e.sha256); }
-                out.append(",\"mtime\":").append(e.mtime).append('}');
+        void writeAtomic(File target) throws IOException {
+            validate();
+            writeAtomicValidated(target);
+        }
+        private void writeAtomicValidated(File target) throws IOException {
+            File temp = new File(target.getPath() + ".tmp");
+            try {
+                try (FileOutputStream out = new FileOutputStream(temp)) { writeValidated(out); out.getFD().sync(); }
+                Files.move(temp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException failed) { temp.delete(); throw failed; }
+        }
+        private static void field(Writer out, String key, String value) throws IOException {
+            out.write(",\""); out.write(key); out.write("\":"); quoted(out, value);
+        }
+        private static void quoted(Writer out, String text) throws IOException {
+            final String hex = "0123456789abcdef";
+            out.write('"');
+            for (int i = 0; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (c == '"' || c == '\\') { out.write('\\'); out.write(c); }
+                else if (c < 0x20) {
+                    out.write("\\u00"); out.write(hex.charAt(c >>> 4)); out.write(hex.charAt(c & 15));
+                } else out.write(c);
             }
-            out.append(']');
+            out.write('"');
         }
-        private static void field(StringBuilder out, String key, String value) { out.append(",\"").append(key).append("\":"); quote(out, value); }
         private static void checkString(String value) throws Invalid {
-            if (value.length() > MAX_MANIFEST_STRING) throw new Invalid("corrupt", "manifest string is too long");
+            if (value.length() > MAX_MANIFEST_STRING) throw new Invalid("corrupt", "manifest header string is too long");
         }
-
-        static Manifest read(InputStream in) throws IOException { return parse(readText(in, MAX_MANIFEST)); }
+        static boolean digestHex(String digest) {
+            if (digest == null || digest.length() != 64) return false;
+            for (int i = 0; i < digest.length(); i++) {
+                char c = digest.charAt(i);
+                if (!(c >= '0' && c <= '9' || c >= 'a' && c <= 'f')) return false;
+            }
+            return true;
+        }
+        static Manifest read(InputStream in) throws IOException { return new ManifestReader(in).read(); }
         static Manifest read(File file) throws IOException {
             try (InputStream in = new FileInputStream(file)) { return read(in); }
         }
+    }
+    /** Streaming file-list reader: ignored extensions share the structural limits but allocate no value trees.
+     * Reject duplicate recognized fields as an ambiguous schema, rather than retaining superseded paths or lists;
+     * duplicate unknown fields remain valid extensions and still consume the object field budget. */
+    static final class ManifestReader {
+        private final java.io.BufferedReader in;
+        private final PathBudget paths = new PathBudget();
+        private final StringBuilder text = new StringBuilder();
+        private final char[] number = new char[32];
+        private final PathDecoder path = new PathDecoder();
+        private int next = -2, nodes;
+        private long position;
 
-        static Manifest parse(String text) throws Invalid {
-            Object root;
-            try { root = new Json(text, true).document(); } catch (RuntimeException bad) { throw new Invalid("corrupt", "manifest: " + bad.getMessage()); }
-            if (!(root instanceof Map)) throw new Invalid("corrupt", "manifest is not an object");
-            Map<?, ?> map = (Map<?, ?>) root;
-            Manifest m = new Manifest();
-            m.format = (int) number(map.get("format"), 0);
-            if (m.format != 1) throw new Invalid("corrupt", "unknown manifest format " + map.get("format"));
-            m.titleId = string(map.get("title_id")); m.exportedAt = string(map.get("exported_at"));
-            m.appVersion = string(map.get("app_version")); m.device = string(map.get("device")); m.folder = string(map.get("folder"));
-            if (!m.titleId.isEmpty() && !m.titleId.equalsIgnoreCase(TITLE_ID)) throw new Invalid("corrupt", "saves of another game (" + m.titleId + ")");
-            readEntries(map.get("files"), m.files, true);
-            return m;
+        ManifestReader(InputStream source) {
+            in = new java.io.BufferedReader(new java.io.InputStreamReader(
+                    new LimitedInput(source), java.nio.charset.StandardCharsets.UTF_8));
         }
-        private static void readEntries(Object value, List<FileEntry> out, boolean digests) throws Invalid {
-            if (value == null) return;
-            if (!(value instanceof List)) throw new Invalid("corrupt", "manifest file list");
-            for (Object item : (List<?>) value) {
-                if (!(item instanceof Map)) throw new Invalid("corrupt", "manifest file entry");
-                Map<?, ?> e = (Map<?, ?>) item;
-                String path = normalize(string(e.get("path")));
-                String sha = string(e.get("sha256")).toLowerCase(Locale.ROOT);
-                if (digests && !sha.matches("[0-9a-f]{64}")) throw new Invalid("corrupt", "manifest digest of " + path);
-                out.add(new FileEntry(path, number(e.get("size"), -1), digests ? sha : null, number(e.get("mtime"), 0)));
+
+        Manifest read() throws IOException {
+            if (value(0) != '{') throw corrupt("manifest is not an object");
+            take();
+            Manifest manifest = new Manifest();
+            manifest.format = 0;
+            manifest.titleId = manifest.exportedAt = manifest.appVersion = manifest.device = manifest.folder = "";
+            int fields = 0, seen = 0;
+            space();
+            if (!consume('}')) {
+                while (true) {
+                    if (++fields > MAX_MANIFEST_FIELDS) throw corrupt("too many object fields");
+                    space();
+                    String key = string(true, false);
+                    space();
+                    expect(':');
+                    int field = rootField(key);
+                    if ((seen & field) != 0) throw corrupt("duplicate manifest field " + key);
+                    seen |= field;
+                    switch (field) {
+                        case 1: manifest.format = (int) numericValue(1, 0); break;
+                        case 2: manifest.titleId = stringValue(1); break;
+                        case 4: manifest.exportedAt = stringValue(1); break;
+                        case 8: manifest.appVersion = stringValue(1); break;
+                        case 16: manifest.device = stringValue(1); break;
+                        case 32: manifest.folder = stringValue(1); break;
+                        case 64: files(1, manifest); break;
+                        default: skipValue(1);
+                    }
+                    space();
+                    if (consume('}')) break;
+                    expect(',');
+                }
+            }
+            space();
+            if (peek() != -1) throw corrupt("trailing data");
+            if (manifest.format != 1) throw corrupt("unknown manifest format " + manifest.format);
+            if (!manifest.titleId.isEmpty() && !manifest.titleId.equalsIgnoreCase(TITLE_ID))
+                throw corrupt("saves of another game (" + manifest.titleId + ")");
+            return manifest;
+        }
+
+        private static int rootField(String key) {
+            switch (key) {
+                case "format": return 1;
+                case "title_id": return 2;
+                case "exported_at": return 4;
+                case "app_version": return 8;
+                case "device": return 16;
+                case "folder": return 32;
+                case "files": return 64;
+                default: return 0;
             }
         }
-        private static String string(Object value) { return value instanceof String ? (String) value : ""; }
-        private static long number(Object value, long fallback) { return value instanceof Number ? ((Number) value).longValue() : fallback; }
+
+        private static int entryField(String key) {
+            switch (key) {
+                case "path": return 1;
+                case "size": return 2;
+                case "sha256": return 4;
+                case "mtime": return 8;
+                default: return 0;
+            }
+        }
+
+        private void files(int depth, Manifest manifest) throws IOException {
+            int c = value(depth);
+            if (c == 'n') { literal("null"); return; }
+            if (c != '[') throw corrupt("manifest file list");
+            take();
+            space();
+            if (consume(']')) return;
+            int entries = 0;
+            while (true) {
+                if (++entries > MAX_FILES) throw new Invalid("too_many", entries + " files (limit " + MAX_FILES + ")");
+                if (value(depth + 1) != '{') throw corrupt("manifest file entry");
+                entry(depth + 1, manifest);
+                space();
+                if (consume(']')) return;
+                expect(',');
+            }
+        }
+
+        /** The opening object's value/node has already been counted. */
+        private void entry(int depth, Manifest manifest) throws IOException {
+            expect('{');
+            String name = null, sha = "";
+            long size = -1, mtime = 0;
+            int fields = 0, seen = 0;
+            space();
+            if (!consume('}')) {
+                while (true) {
+                    if (++fields > MAX_MANIFEST_FIELDS) throw corrupt("too many object fields");
+                    space();
+                    String key = string(true, false);
+                    space();
+                    expect(':');
+                    int field = entryField(key);
+                    if ((seen & field) != 0) throw corrupt("duplicate file field " + key);
+                    seen |= field;
+                    switch (field) {
+                        case 1:
+                            int c = value(depth + 1);
+                            if (c == '"') name = string(true, true);
+                            else { skipStarted(c, depth + 1); name = normalize(""); }
+                            break;
+                        case 2: size = numericValue(depth + 1, -1); break;
+                        case 4: sha = stringValue(depth + 1); break;
+                        case 8: mtime = numericValue(depth + 1, 0); break;
+                        default: skipValue(depth + 1);
+                    }
+                    space();
+                    if (consume('}')) break;
+                    expect(',');
+                }
+            }
+            if (name == null) name = normalize("");
+            if (sha.length() != 64) throw corrupt("manifest digest");
+            boolean uppercase = false;
+            for (int i = 0; i < sha.length(); i++) {
+                char c = sha.charAt(i);
+                if (c >= 'A' && c <= 'F') uppercase = true;
+                else if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f'))
+                    throw corrupt("manifest digest");
+            }
+            if (uppercase) sha = sha.toLowerCase(java.util.Locale.ROOT);
+            manifest.files.add(new FileEntry(name, size, sha, mtime));
+        }
+
+        private String stringValue(int depth) throws IOException {
+            int c = value(depth);
+            if (c == '"') return string(true, false);
+            skipStarted(c, depth);
+            return "";
+        }
+
+        private long numericValue(int depth, long fallback) throws IOException {
+            int c = value(depth);
+            if (numberChar(c)) return number(true);
+            skipStarted(c, depth);
+            return fallback;
+        }
+
+        /** Count every value, including containers and ignored values, before descending. Keys are not values. */
+        private int value(int depth) throws IOException {
+            if (depth > MAX_MANIFEST_DEPTH || ++nodes > MAX_MANIFEST_NODES)
+                throw corrupt("manifest structure limit");
+            space();
+            int c = peek();
+            if (c == -1) throw corrupt("end of text");
+            return c;
+        }
+
+        private void skipValue(int depth) throws IOException { skipStarted(value(depth), depth); }
+
+        private void skipStarted(int c, int depth) throws IOException {
+            switch (c) {
+                case '{':
+                    take();
+                    space();
+                    if (consume('}')) return;
+                    int fields = 0;
+                    while (true) {
+                        if (++fields > MAX_MANIFEST_FIELDS) throw corrupt("too many object fields");
+                        space();
+                        string(false, false);
+                        space();
+                        expect(':');
+                        skipValue(depth + 1);
+                        space();
+                        if (consume('}')) return;
+                        expect(',');
+                    }
+                case '[':
+                    take();
+                    space();
+                    if (consume(']')) return;
+                    int entries = 0;
+                    while (true) {
+                        if (++entries > MAX_FILES) throw corrupt("too many array entries");
+                        skipValue(depth + 1);
+                        space();
+                        if (consume(']')) return;
+                        expect(',');
+                    }
+                case '"': string(false, false); return;
+                case 't': literal("true"); return;
+                case 'f': literal("false"); return;
+                case 'n': literal("null"); return;
+                default: number(false);
+            }
+        }
+
+        /** Retaining is only needed for recognized values and dispatch keys; skipped strings allocate no payload.
+         * Path characters go directly to the normalization accumulator, never through the metadata string cap. */
+        private String string(boolean retain, boolean isPath) throws IOException {
+            expect('"');
+            if (isPath) path.reset();
+            else if (retain) text.setLength(0);
+            int length = 0;
+            while (true) {
+                int c = take();
+                if (c == -1) throw corrupt("unterminated string");
+                if (c == '"') {
+                    if (isPath) return path.finish();
+                    return retain ? text.toString() : null;
+                }
+                if (c < 0x20) throw corrupt("control character in string");
+                if (c == '\\') {
+                    c = take();
+                    switch (c) {
+                        case '"': case '\\': case '/': break;
+                        case 'b': c = '\b'; break;
+                        case 'f': c = '\f'; break;
+                        case 'n': c = '\n'; break;
+                        case 'r': c = '\r'; break;
+                        case 't': c = '\t'; break;
+                        case 'u':
+                            c = 0;
+                            for (int i = 0; i < 4; i++) {
+                                int h = take(), digit;
+                                if (h >= '0' && h <= '9') digit = h - '0';
+                                else if (h >= 'a' && h <= 'f') digit = h - 'a' + 10;
+                                else if (h >= 'A' && h <= 'F') digit = h - 'A' + 10;
+                                else throw corrupt("bad \\u escape");
+                                c = c * 16 + digit;
+                            }
+                            break;
+                        default: throw corrupt("bad escape");
+                    }
+                }
+                if (isPath) path.append((char) c);
+                else {
+                    if (++length > MAX_MANIFEST_STRING) throw corrupt("string is too long");
+                    if (retain) text.append((char) c);
+                }
+            }
+        }
+
+        private static boolean numberChar(int c) {
+            return c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.' || c == 'e' || c == 'E';
+        }
+
+        private static boolean digit(char c) { return c >= '0' && c <= '9'; }
+
+        /** Preserve the old Long-or-Double coercion (including bounded exponents and decimal format values).
+         * Ignored numbers use the same decimal grammar without allocating a token String or boxed Number. */
+        private long number(boolean retain) throws IOException {
+            int length = 0;
+            while (numberChar(peek())) {
+                if (length == number.length) throw corrupt("number is too long");
+                number[length++] = (char) take();
+            }
+            if (length == 0) throw corrupt("unexpected value");
+            int i = number[0] == '-' || number[0] == '+' ? 1 : 0;
+            int start = i;
+            while (i < length && digit(number[i])) i++;
+            boolean digits = i > start;
+            boolean integer = digits && i == length && length - start <= 18 && number[0] != '+';
+            if (i < length && number[i] == '.') {
+                start = ++i;
+                while (i < length && digit(number[i])) i++;
+                digits |= i > start;
+            }
+            if (!digits) throw corrupt("bad number");
+            if (i < length && (number[i] == 'e' || number[i] == 'E')) {
+                i++;
+                if (i < length && (number[i] == '-' || number[i] == '+')) i++;
+                start = i;
+                while (i < length && digit(number[i])) i++;
+                if (i == start) throw corrupt("bad number");
+            }
+            if (i != length) throw corrupt("bad number");
+            if (!retain) return 0;
+            if (integer) {
+                long result = 0;
+                for (i = number[0] == '-' ? 1 : 0; i < length; i++) result = result * 10 + number[i] - '0';
+                return number[0] == '-' ? -result : result;
+            }
+            try { return (long) Double.parseDouble(new String(number, 0, length)); }
+            catch (NumberFormatException bad) { throw corrupt("bad number"); }
+        }
+
+        /** Drop empty and dot segments while decoding, so even redundant raw paths only allocate their admitted
+         * normalized size. Unpaired surrogates cost one byte, matching Java's UTF-8 replacement byte ('?'). */
+        private final class PathDecoder {
+            private final StringBuilder out = new StringBuilder();
+            private long bytes;
+            private int dots;
+            private boolean segment, started;
+
+            void reset() {
+                out.setLength(0);
+                bytes = 0;
+                dots = 0;
+                segment = started = false;
+            }
+
+            void append(char c) throws Invalid {
+                if (!started) {
+                    if (c == '/' || c == '\\') throw new Invalid("absolute", "manifest path");
+                    started = true;
+                }
+                if (c == '\0') throw new Invalid("corrupt", "NUL in manifest path");
+                if (c == '/' || c == '\\') { endSegment(); return; }
+                if (!segment) {
+                    if (c == '.' && dots < 2) { dots++; return; }
+                    if (out.length() != 0) put('/');
+                    while (dots > 0) { put('.'); dots--; }
+                    segment = true;
+                }
+                put(c);
+            }
+
+            private void endSegment() throws Invalid {
+                if (!segment && dots == 2) throw new Invalid("traversal", "manifest path");
+                dots = 0;
+                segment = false;
+            }
+
+            private void put(char c) throws Invalid {
+                int length = out.length();
+                long extra = Character.isLowSurrogate(c) && length != 0 && Character.isHighSurrogate(out.charAt(length - 1))
+                        ? 3 : c < 0x80 ? 1 : c < 0x800 ? 2 : Character.isSurrogate(c) ? 1 : 3;
+                long observed = paths.bytes + bytes + extra;
+                if (observed > MAX_PATH_BYTES)
+                    throw new Invalid("path_bytes", observed + " path bytes (limit " + MAX_PATH_BYTES + ")");
+                bytes += extra;
+                out.append(c);
+            }
+
+            String finish() throws Invalid {
+                endSegment();
+                String name = normalize(out.toString());
+                paths.add(name);
+                return name;
+            }
+        }
+
+        private int peek() throws IOException {
+            if (next == -2) next = in.read();
+            return next;
+        }
+
+        private int take() throws IOException {
+            int c = peek();
+            next = -2;
+            if (c != -1) position++;
+            return c;
+        }
+
+        private void space() throws IOException {
+            int c;
+            while ((c = peek()) == ' ' || c == '\t' || c == '\r' || c == '\n') take();
+        }
+
+        private boolean consume(int c) throws IOException {
+            if (peek() != c) return false;
+            take();
+            return true;
+        }
+
+        private void expect(int c) throws IOException {
+            if (!consume(c)) throw corrupt("expected '" + (char) c + "'");
+        }
+
+        private void literal(String value) throws IOException {
+            for (int i = 0; i < value.length(); i++) if (take() != value.charAt(i)) throw corrupt("bad literal");
+        }
+
+        private Invalid corrupt(String message) { return new Invalid("corrupt", "manifest: " + message + " at " + position); }
+
+        /** Bound raw bytes before decoder/reader read-ahead. EOF at the exact limit is allowed; one excess byte
+         * is sufficient to reject, and the caller retains ownership of the original stream. */
+        private static final class LimitedInput extends InputStream {
+            private final InputStream source;
+            private long remaining = MAX_MANIFEST;
+
+            LimitedInput(InputStream source) { this.source = source; }
+
+            @Override public int read() throws IOException {
+                int c = source.read();
+                if (c == -1) return -1;
+                if (remaining == 0) throw new Invalid("corrupt", "manifest exceeds " + MAX_MANIFEST + " bytes");
+                remaining--;
+                return c;
+            }
+
+            @Override public int read(byte[] buffer, int offset, int length) throws IOException {
+                if (length == 0) return 0;
+                if (remaining == 0) return read();
+                int count = source.read(buffer, offset, (int) Math.min((long) length, remaining));
+                if (count > 0) remaining -= count;
+                return count;
+            }
+        }
     }
     static void quote(StringBuilder out, String s) {
         out.append('"');
@@ -183,35 +618,25 @@ final class SaveManager {
     /** A small strict JSON reader (org.json is not on the host test classpath): objects, arrays, strings, numbers,
      * true/false/null. */
     static final class Json {
-        private final String s; private final boolean bounded;
-        private int i, nodes;
-        Json(String s) { this(s, false); }
-        Json(String s, boolean bounded) { this.s = s; this.bounded = bounded; }
-        Object document() { Object v = value(0); space(); if (i != s.length()) throw error("trailing data"); return v; }
+        private final String s; private int i;
+        Json(String s) { this.s = s; }
+        Object document() { Object v = value(); space(); if (i != s.length()) throw error("trailing data"); return v; }
         private RuntimeException error(String what) { return new IllegalArgumentException(what + " at " + i); }
         private void space() { while (i < s.length() && " \t\r\n".indexOf(s.charAt(i)) >= 0) i++; }
-        private Object value(int depth) {
-            if (bounded && (depth > MAX_MANIFEST_DEPTH || ++nodes > MAX_MANIFEST_NODES)) throw error("manifest structure limit");
+        private Object value() {
             space();
             if (i >= s.length()) throw error("end of text");
             char c = s.charAt(i);
             if (c == '{') {
                 i++; Map<String, Object> map = new LinkedHashMap<>(); space();
                 if (peek('}')) return map;
-                int fields = 0;
-                do {
-                    if (bounded && ++fields > MAX_MANIFEST_FIELDS) throw error("too many object fields");
-                    space(); String key = string(); space(); expect(':'); map.put(key, value(depth + 1)); space();
-                } while (peek(','));
+                do { space(); String key = string(); space(); expect(':'); map.put(key, value()); space(); } while (peek(','));
                 expect('}'); return map;
             }
             if (c == '[') {
                 i++; List<Object> list = new ArrayList<>(); space();
                 if (peek(']')) return list;
-                do {
-                    if (bounded && list.size() >= MAX_FILES) throw error("too many array entries");
-                    list.add(value(depth + 1)); space();
-                } while (peek(','));
+                do { list.add(value()); space(); } while (peek(','));
                 expect(']'); return list;
             }
             if (c == '"') return string();
@@ -219,10 +644,7 @@ final class SaveManager {
             if (s.startsWith("false", i)) { i += 5; return Boolean.FALSE; }
             if (s.startsWith("null", i)) { i += 4; return null; }
             int start = i;
-            while (i < s.length() && "+-0123456789.eE".indexOf(s.charAt(i)) >= 0) {
-                if (bounded && i - start >= 32) throw error("number is too long");
-                i++;
-            }
+            while (i < s.length() && "+-0123456789.eE".indexOf(s.charAt(i)) >= 0) i++;
             String number = s.substring(start, i);
             if (number.isEmpty()) throw error("unexpected '" + c + "'");
             try { return number.matches("-?\\d{1,18}") ? (Object) Long.parseLong(number) : (Object) Double.parseDouble(number); }
@@ -234,7 +656,6 @@ final class SaveManager {
             expect('"');
             StringBuilder out = new StringBuilder();
             while (true) {
-                if (bounded && out.length() > MAX_MANIFEST_STRING) throw error("string is too long");
                 if (i >= s.length()) throw error("unterminated string");
                 char c = s.charAt(i++);
                 if (c == '"') return out.toString();
@@ -341,6 +762,7 @@ final class SaveManager {
         Manifest m = new Manifest();
         m.exportedAt = isoTime(now); m.appVersion = appVersion == null ? "" : appVersion; m.device = device == null ? "" : device;
         if (root.isDirectory()) m.files.addAll(scan(root, cache));
+        m.validate();
         return m;
     }
     static String sha256(File file) throws IOException {
@@ -457,17 +879,38 @@ final class SaveManager {
     /** A dump path as a clean relative path ('/' separators, no "." segments); rejects absolute paths and "..". */
     static String normalize(String raw) throws Invalid {
         if (raw == null || raw.isEmpty()) throw new Invalid("corrupt", "empty name");
-        String p = raw.replace('\\', '/');
-        if (p.startsWith("/") || p.matches("^[A-Za-z]:.*")) throw new Invalid("absolute", raw);
+        if (raw.charAt(0) == '/' || raw.charAt(0) == '\\'
+                || raw.length() > 1 && ((raw.charAt(0) >= 'A' && raw.charAt(0) <= 'Z') || (raw.charAt(0) >= 'a' && raw.charAt(0) <= 'z')) && raw.charAt(1) == ':')
+            throw new Invalid("absolute", raw);
+        boolean changed = false;
+        int start = 0;
+        for (int i = 0; i <= raw.length(); i++) {
+            char c = i == raw.length() ? '/' : raw.charAt(i);
+            if (c == '\0') throw new Invalid("corrupt", raw);
+            if (c != '/' && c != '\\') continue;
+            int length = i - start;
+            if (length == 2 && raw.charAt(start) == '.' && raw.charAt(start + 1) == '.') throw new Invalid("traversal", raw);
+            if (length == 0 || length == 1 && raw.charAt(start) == '.' || c == '\\') changed = true;
+            start = i + 1;
+        }
+        if (!changed) return raw;
         StringBuilder out = new StringBuilder();
-        for (String segment : p.split("/")) {
-            if (segment.isEmpty() || segment.equals(".")) continue;
-            if (segment.equals("..")) throw new Invalid("traversal", raw);
-            if (segment.indexOf('\0') >= 0) throw new Invalid("corrupt", raw);
-            out.append(out.length() == 0 ? "" : "/").append(segment);
+        start = 0;
+        for (int i = 0; i <= raw.length(); i++) {
+            if (i < raw.length() && raw.charAt(i) != '/' && raw.charAt(i) != '\\') continue;
+            int length = i - start;
+            if (length != 0 && !(length == 1 && raw.charAt(start) == '.')) {
+                if (out.length() != 0) out.append('/');
+                out.append(raw, start, i);
+            }
+            start = i + 1;
         }
         if (out.length() == 0) throw new Invalid("corrupt", "empty name");
-        return out.toString();
+        String normalized = out.toString();
+        if (normalized.length() > 1 && ((normalized.charAt(0) >= 'A' && normalized.charAt(0) <= 'Z')
+                || (normalized.charAt(0) >= 'a' && normalized.charAt(0) <= 'z')) && normalized.charAt(1) == ':')
+            throw new Invalid("absolute", raw);
+        return normalized;
     }
     private static boolean junk(String path) {
         String name = path.substring(path.lastIndexOf('/') + 1);
@@ -509,6 +952,7 @@ final class SaveManager {
             if (depth < bestDepth || depth == bestDepth && e.getValue() > roots.get(best)) best = e.getKey();
         }
         Selection selection = new Selection(best);
+        PathBudget paths = new PathBudget();
         for (Candidate c : clean) {
             if (!c.path.startsWith(best)) continue;
             String relative = c.path.substring(best.length());
@@ -516,10 +960,10 @@ final class SaveManager {
             long limit = KNOWN.matcher(relative).matches() ? MAX_KNOWN_FILE : MAX_OTHER_FILE;
             if (c.size > limit) throw new Invalid("huge_file", relative + " (" + c.size + " bytes)");
             if (c.size < 0) throw new Invalid("corrupt", relative + " has no size");
+            paths.add(relative);
             selection.total += c.size;
             selection.files.add(new Candidate(relative, c.size, false, c.mtime));
             selection.sources.put(relative, c.path);
-            if (selection.files.size() > MAX_FILES) throw new Invalid("too_many", selection.files.size() + " files (limit " + MAX_FILES + ")");
             if (selection.total > MAX_TOTAL) throw new Invalid("too_big", selection.total + " bytes");
         }
         return selection;
@@ -650,6 +1094,7 @@ final class SaveManager {
     }
     /** The export: TOP/ with the save root's files and TOP/MANIFEST (written last). root is a consistent snapshot. */
     static void writeZip(File root, Manifest manifest, OutputStream sink) throws IOException {
+        manifest.validate();
         try (ZipOutputStream zip = new ZipOutputStream(sink)) {
             for (FileEntry e : manifest.files) {
                 ZipEntry entry = new ZipEntry(TOP + "/" + e.path);
@@ -661,7 +1106,7 @@ final class SaveManager {
             ZipEntry entry = new ZipEntry(TOP + "/" + MANIFEST);
             entry.setTime(manifest.exportedMillis());
             zip.putNextEntry(entry);
-            zip.write(manifest.toJson().getBytes(StandardCharsets.UTF_8));
+            manifest.writeValidated(zip);
             zip.closeEntry();
         }
     }
@@ -677,6 +1122,8 @@ final class SaveManager {
             if (!target.mkdirs()) throw new IOException("cannot create " + target);
             try {
                 Map<String, long[]> before = stats(root);
+                PathBudget names = new PathBudget();
+                for (String path : before.keySet()) { normalize(path); names.add(path); }
                 boolean changed = false;
                 for (Map.Entry<String, long[]> e : before.entrySet()) {
                     File from = new File(root, e.getKey()), to = new File(target, e.getKey());
@@ -693,7 +1140,8 @@ final class SaveManager {
                     m.files.clear(); m.files.addAll(files);
                     return m;
                 }
-            } catch (IOException raced) { last = raced; }
+            } catch (Invalid invalid) { delete(target); throw invalid; }
+            catch (IOException raced) { last = raced; }
             try { Thread.sleep(300L * (attempt + 1)); } catch (InterruptedException stop) { Thread.currentThread().interrupt(); break; }
         }
         delete(target);
@@ -988,7 +1436,10 @@ final class SaveManager {
             if (!files.containsKey(MANIFEST)) continue;
             Manifest m;
             try (InputStream in = store.open(gen, MANIFEST)) { m = Manifest.read(in); }
-            catch (Invalid torn) { continue; }   // the manifest write itself was interrupted
+            catch (Invalid invalid) {
+                if (invalid.code.equals("path_bytes") || invalid.code.equals("too_many")) throw invalid;
+                continue;   // a malformed manifest write can be an interrupted generation
+            }
             for (FileEntry e : m.files) {
                 long[] f = files.get(e.path);
                 if (f == null || f[0] != e.size) { s.incomplete = true; s.problem = gen + "/" + e.path; return s; }
@@ -1024,12 +1475,13 @@ final class SaveManager {
     /** Upload a snapshot as generation highest + 1: files, then the manifest, then remove every other generation
      * (complete, unfinished or mixed). Returns the new generation's name. */
     static String push(Store store, File snapshot, Manifest m, FolderState current) throws IOException {
+        m.validate();
         String gen = String.format(Locale.ROOT, GENERATION + "%06d", current.highest + 1);
         store.createDir(gen);
         for (FileEntry e : m.files) store.write(gen, e.path, new File(snapshot, e.path));
         File manifest = new File(snapshot.getParentFile(), snapshot.getName() + "-" + MANIFEST);
         try {
-            Settings.writeAtomic(manifest.getParentFile(), manifest.getName(), m.toJson());
+            m.writeAtomicValidated(manifest);
             store.write(gen, MANIFEST, manifest);
         } finally { manifest.delete(); }
         for (String d : store.dirs())

@@ -112,7 +112,7 @@ public final class SaveMirror {
         m.exportedAt = SaveManager.isoTime(System.currentTimeMillis()); m.appVersion = appVersion(context); m.device = Build.MODEL;
         m.folder = folderString(context);
         m.files.addAll(live.files);
-        Settings.writeAtomic(context.getFilesDir(), SYNC_FILE, m.toJson());
+        m.writeAtomic(new File(context.getFilesDir(), SYNC_FILE));
     }
     static String appVersion(Context context) {
         try { return context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName; }

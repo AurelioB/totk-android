@@ -513,6 +513,8 @@ final class Strings {
             case "symlink": return "This dump contains links, which a save set never has, so it was not imported.";
             case "too_many": return "This exceeds the limit of " + SaveManager.MAX_FILES + " save files or "
                     + SaveManager.MAX_ENTRIES + " dump entries" + (detail == null ? "." : ": " + detail);
+            case "path_bytes": return "The relative file names exceed " + SaveManager.MAX_PATH_BYTES
+                    + " bytes (" + (SaveManager.MAX_PATH_BYTES >> 20) + " MiB) for one save set" + (detail == null ? "." : ": " + detail);
             case "too_big": return "This is larger than 128 MB, so it is not a TotK save set.";
             case "huge_file": return "It contains a file far larger than any save file, so it was not imported.";
             case "no_saves": return "No TotK saves found. A save set has slot_00 … slot_05 folders with progress.sav, or option.sav.";

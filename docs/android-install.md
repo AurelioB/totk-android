@@ -246,12 +246,18 @@ symbolic links are refused. The file-count allowance leaves room above six indep
 That is a conservative example, not a verified maximum picture-book capacity; slot thumbnails are already inside
 `caption.sav`. The remaining allowance covers albums, other auxiliary files and fuller picture books.
 
-File-list manifests have a separate bounded allowance derived from the file count: 64 KiB for fixed metadata plus
-`16,384 × 512` bytes for encoded paths and per-file metadata (8 MiB + 64 KiB). Export, import and the save folder
-use the same budget. Manifest parsing also caps arrays at 16,384 items, objects at 32 fields, nesting at 16 levels,
-strings at 1,024 characters and total values/containers at `6 × 16,384 + 32`, including ignored extension fields.
-The zip central directory is independently limited to 16 MiB, so unusually long
-names, extra data or comments can reach a metadata limit before the file-count limit. Backup metadata without a
+Import, export and save-folder sync share one name allowance: the sum of the save files' relative UTF-8 path lengths
+must be at most **4,194,304 bytes (4 MiB)**, in addition to the file-count limit. There is no new individual path-length
+limit; a few long paths (including older exports with 1,100-character paths) remain supported. Over-budget sets are
+refused before export/upload writes their files, with the path-byte limit named in the message.
+
+The manifest allowance follows from that admission rule: `6 × 4 MiB + 16,384 × 160 + 64 KiB = 27,852,800 bytes`.
+JSON escaping expands a path byte at most sixfold; each file's digest, two signed-long fields and punctuation need
+at most 146 additional bytes (160 reserved). Fixed header fields fit in the 64 KiB slack. Manifests are read and
+written as streams, retaining only known fields rather than a full JSON tree or a full encoded text buffer.
+Ignored fields are skipped with the same array/node/depth/field guards; non-path strings are limited to 1,024
+UTF-16 units. Paths share the aggregate 4 MiB allowance instead. The zip central directory is independently limited
+to 16 MiB, so unusual extra data or comments can still reach that metadata limit. Backup metadata without a
 file list is limited to the fixed 64 KiB allowance. Ten full backups can hold 1.25 GiB of save payload, plus filesystem
 blocks/metadata; an eleventh copy temporarily exists during rotation. Small files still consume filesystem blocks.
 

@@ -20,6 +20,8 @@ SOURCES = [TOTK / 'android/java/com/aure/totk/setup/SaveManager.java', TOTK / 'a
            TOTK / 'android/java/com/aure/totk/setup/GameLock.java', TOTK / 'tests/saves/SavesProbe.java']
 SLOT_FILES = {'progress.sav': 2307856, 'caption.sav': 21620, 'footprint.sav': 614760, 'direct_file_save_related.sav': 1152}
 MAX_SAVE_FILES = 16_384
+MAX_SAVE_PATH_BYTES = 4 << 20
+MAX_SAVE_MANIFEST_BYTES = 6 * MAX_SAVE_PATH_BYTES + 160 * MAX_SAVE_FILES + (64 << 10)
 MAX_DUMP_ENTRIES = 65_536
 # Conservative independent picture books per slot, using #19's reported 526 pictures, not a proven game capacity.
 COMPENDIUM_HEAVY_FILES = 6 * (len(SLOT_FILES) + 526) + 2   # option.sav and storage key; caption includes its thumbnail
@@ -86,6 +88,50 @@ def tree(base):
     return {p.relative_to(base).as_posix(): p.read_bytes() for p in sorted(base.rglob('*')) if p.is_file()}
 
 
+# Compile this against each actual historical source tree, never a hand-copied serializer or fixture JSON.
+HISTORICAL_SAVES_PROBE = r'''
+package com.aure.totk.setup;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+
+public final class HistoricalSavesProbe {
+    private static String imagePath(int length) {
+        StringBuilder path = new StringBuilder("album/");
+        while (length - path.length() > 128) path.append("p".repeat(127)).append('/');
+        return path.append("p".repeat(length - path.length() - 4)).append(".jpg").toString();
+    }
+    public static void main(String[] args) throws Exception {
+        File base = new File(args[0]);
+        for (int length : new int[]{196, 1100}) {
+            File root = new File(base, "live-" + length);
+            String path = imagePath(length);
+            File image = new File(root, path);
+            if (!image.getParentFile().mkdirs()) throw new AssertionError("fixture directories");
+            Files.write(new File(root, "option.sav").toPath(), new byte[]{1});
+            Files.write(image.toPath(), new byte[]{2});
+            SaveManager.Selection selected = SaveManager.select(SaveManager.candidates(root));
+            if (!selected.root.isEmpty() || selected.files.size() != 2) throw new AssertionError("historical admission");
+            SaveManager.Manifest manifest = SaveManager.manifest(root, null, args[1], "host", 1_700_000_000_000L);
+            File json = new File(base, "manifest-" + length + ".json");
+            Files.writeString(json.toPath(), manifest.toJson(), StandardCharsets.UTF_8);
+            File archive = new File(base, "export-" + length + ".zip");
+            try (OutputStream out = new FileOutputStream(archive)) { SaveManager.writeZip(root, manifest, out); }
+            File staged = new File(base, "historical-import-" + length);
+            if (SaveManager.extractZip(archive, staged).files.size() != 2
+                    || !manifest.sameFiles(SaveManager.manifest(staged, null, args[1], "host", 0)))
+                throw new AssertionError("historical export/import");
+            if (manifest.format != 1 || path.length() != length) throw new AssertionError("historical fixture shape");
+            System.out.println(length + " files=2 format=1 manifest_bytes=" + json.length());
+        }
+    }
+}
+'''
+
+
 class SavesTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -93,6 +139,7 @@ class SavesTests(unittest.TestCase):
         if not javac or not java:
             raise unittest.SkipTest('javac/java not found')
         cls.java = java
+        cls.javac = javac
         cls.temp = tempfile.TemporaryDirectory(prefix='totk-saves-')
         cls.classes = Path(cls.temp.name) / 'classes'
         subprocess.run([javac, '--release', '17', '-encoding', 'UTF-8', '-d', str(cls.classes), *map(str, SOURCES)],
@@ -180,8 +227,18 @@ class SavesTests(unittest.TestCase):
             with self.subTest(count=count):
                 live = counted_save_set(self.dir / f'live-{count}', count)
                 archive = self.dir / f'{count}.zip'
-                # Export includes a manifest; it must not consume a save-file slot at the exact limit.
-                self.assertEqual(self.one('export', live, archive), str(count))
+                # Production export must reject over-count sets too; construct a raw archive independently to
+                # exercise import's own guard rather than depending on an invalid production export.
+                if count > MAX_SAVE_FILES:
+                    self.assertEqual(self.one('export', live, archive), 'invalid too_many')
+                    self.assertFalse(archive.exists(), 'export rejects before opening its output')
+                    with zipfile.ZipFile(archive, 'w') as z:
+                        for path in live.rglob('*'):
+                            if path.is_file():
+                                z.write(path, 'raw/' + path.relative_to(live).as_posix())
+                else:
+                    # The manifest itself must not consume a save-file slot at the exact limit.
+                    self.assertEqual(self.one('export', live, archive), str(count))
                 folder_stage, zip_stage = self.dir / f'folder-{count}', self.dir / f'zip-{count}'
                 answers = self.probe(('folder', live, folder_stage), ('zip', archive, zip_stage))
                 if count > MAX_SAVE_FILES:
@@ -210,27 +267,6 @@ class SavesTests(unittest.TestCase):
         manifest_file = live / 'totk-native-saves.json'
         manifest_file.write_bytes(manifest)
         self.assertEqual(self.one('manifest', manifest_file), str(MAX_SAVE_FILES))
-        # Parse at the full new byte allowance, not only this fixture's ordinary serialized length.
-        with manifest_file.open('ab') as out:
-            out.write(b' ' * ((64 << 10) + MAX_SAVE_FILES * 512 - len(manifest)))
-        measured = self.one('manifest-heap', manifest_file)
-        print('legitimate maximum manifest:', measured)
-        self.assertTrue(measured.startswith(f'ok {MAX_SAVE_FILES} peak_heap='), measured)
-        # Dense but admissible metadata: longer decoded paths, maximum files and an allowed extension array.
-        dense = json.loads(manifest)
-        for entry in dense['files']:
-            if '/picturebook/' in entry['path']:
-                directory, name = entry['path'].rsplit('/', 1)
-                entry['path'] = directory + '/' + 'p' * 128 + '/' + 'q' * (384 - len(directory) - len(name) - 130) + name
-        dense['extra'] = [{}] * MAX_SAVE_FILES
-        content = json.dumps(dense, separators=(',', ':')).encode()
-        budget = (64 << 10) + MAX_SAVE_FILES * 512
-        self.assertLessEqual(len(content), budget)
-        dense_file = self.dir / 'dense.json'
-        dense_file.write_bytes(content + b' ' * (budget - len(content)))
-        measured = self.one('manifest-heap', dense_file)
-        print('dense maximum manifest:', measured)
-        self.assertTrue(measured.startswith(f'ok {MAX_SAVE_FILES} peak_heap='), measured)
         self.assertEqual(self.one('folder', live, self.dir / 'folder'), f'root= files={MAX_SAVE_FILES}')
         self.assertEqual(tree(self.dir / 'folder'), expected)
         manifest_file.unlink()
@@ -241,10 +277,109 @@ class SavesTests(unittest.TestCase):
         self.assertEqual(self.one('fetch', top, self.dir / 'fetched'), f'ok {MAX_SAVE_FILES}')
         self.assertEqual(tree(self.dir / 'fetched'), expected)
 
+    def test_manifest_admission_properties_and_preflight(self):
+        cases = [
+            ('max-short', MAX_SAVE_FILES, 10 + (MAX_SAVE_FILES - 1) * 32, 'ascii', 'ok'),
+            ('few-1100', 5, 10 + 4 * 1100, 'ascii', 'ok'),
+            ('single-long-path-at-budget', 2, MAX_SAVE_PATH_BYTES, 'ascii', 'ok'),
+            ('single-long-path-over-budget', 2, MAX_SAVE_PATH_BYTES + 1, 'ascii', 'path_bytes'),
+            ('exact-path-budget', MAX_SAVE_FILES, MAX_SAVE_PATH_BYTES, 'ascii', 'ok'),
+            ('one-over-path-budget', MAX_SAVE_FILES, MAX_SAVE_PATH_BYTES + 1, 'ascii', 'path_bytes'),
+            ('max-600', MAX_SAVE_FILES, 10 + (MAX_SAVE_FILES - 1) * 600, 'ascii', 'path_bytes'),
+            ('max-plus-one', MAX_SAVE_FILES + 1, 10 + MAX_SAVE_FILES * 32, 'ascii', 'too_many'),
+            ('escaped-exact-budget', MAX_SAVE_FILES, MAX_SAVE_PATH_BYTES, 'escape', 'ok'),
+            ('escaped-over-budget', MAX_SAVE_FILES, MAX_SAVE_PATH_BYTES + 1, 'escape', 'path_bytes'),
+            ('mixed-width-exact-budget', MAX_SAVE_FILES, MAX_SAVE_PATH_BYTES, 'mixed', 'ok'),
+            ('mixed-width-over-budget', MAX_SAVE_FILES, MAX_SAVE_PATH_BYTES + 1, 'mixed', 'path_bytes'),
+        ]
+        for kind in ('two', 'three', 'four'):
+            for delta in (0, 1):
+                cases.append((f'{kind}-byte-plus-{delta}', MAX_SAVE_FILES, MAX_SAVE_PATH_BYTES + delta,
+                              kind, 'path_bytes' if delta else 'ok'))
+        for name, count, path_bytes, kind, expected in cases:
+            with self.subTest(shape=name):
+                case = self.dir / name
+                case.mkdir()
+                command = 'property-heap' if kind in ('escape', 'mixed') else 'property'
+                answer = self.one(command, count, path_bytes, kind, case / 'manifest.json', expected)
+                if expected == 'ok':
+                    self.assertTrue(answer.startswith(f'ok files={count} path_bytes={path_bytes} '), answer)
+                    self.assertIn('same=true format=1', answer)
+                    fields = dict(item.split('=', 1) for item in answer.split()[1:])
+                    self.assertLessEqual(int(fields['manifest_bytes']), MAX_SAVE_MANIFEST_BYTES)
+                    self.assertEqual(int(fields['max_manifest']), MAX_SAVE_MANIFEST_BYTES)
+                    if kind in ('escape', 'mixed'):
+                        print(kind + ' admitted maximum manifest:', answer)
+                        if kind == 'escape':
+                            self.assertGreater(int(fields['manifest_bytes']), 20 << 20)
+                        self.assertGreater(int(fields['peak_heap']), 0)
+                        self.assertGreaterEqual(int(fields['elapsed_ms']), 0)
+                        measured = self.one('manifest-heap', case / 'manifest.json')
+                        print(kind + ' parser-only admitted maximum:', measured)
+                        self.assertTrue(measured.startswith(f'ok {count} peak_heap='), measured)
+                else:
+                    self.assertTrue(answer.startswith(f'invalid {expected} files={count} path_bytes={path_bytes} '), answer)
+                    self.assertIn('preflight=clean output_bytes=0 mutations=0', answer)
+                    self.assertEqual(list(case.iterdir()), [], 'no file, zip, atomic temp or mirror output on rejection')
+        self.assertTrue(self.one('utf8').startswith('ok cases=1033 files=1033 path_bytes='))
+
+    def test_actual_historical_writers_remain_readable(self):
+        source_root = 'games/totk/android/java/com/aure/totk/setup'
+        for revision in ('v1.0.1', '25288a5'):
+            with self.subTest(revision=revision), tempfile.TemporaryDirectory(
+                    prefix='historical-', dir=self.temp.name) as temporary:
+                base = Path(temporary)
+                sources = base / 'sources'
+                sources.mkdir()
+                for name in ('SaveManager.java', 'Settings.java', 'GameLock.java'):
+                    result = subprocess.run(['git', 'show', f'{revision}:{source_root}/{name}'], cwd=ROOT,
+                                            check=True, capture_output=True)
+                    (sources / name).write_bytes(result.stdout)
+                helper = sources / 'HistoricalSavesProbe.java'
+                helper.write_text(HISTORICAL_SAVES_PROBE, encoding='utf-8')
+                classes = base / 'classes'
+                subprocess.run([self.javac, '--release', '17', '-encoding', 'UTF-8', '-d', str(classes),
+                                *map(str, sorted(sources.glob('*.java')))],
+                               check=True, capture_output=True, text=True)
+                result = subprocess.run([self.java, '-Xmx64m', '-cp', str(classes),
+                                         'com.aure.totk.setup.HistoricalSavesProbe', str(base), revision],
+                                        check=True, capture_output=True, text=True, timeout=120)
+                lines = result.stdout.splitlines()
+                self.assertEqual(len(lines), 2, result.stdout)
+                for length, line in zip((196, 1100), lines):
+                    self.assertTrue(line.startswith(f'{length} files=2 format=1 manifest_bytes='), line)
+                    print('historical writer ' + revision + ':', line)
+                    manifest = base / f'manifest-{length}.json'
+                    metadata = json.loads(manifest.read_bytes())
+                    self.assertEqual(metadata['format'], 1)
+                    self.assertEqual(len(metadata['files']), 2)
+                    path = next(entry['path'] for entry in metadata['files'] if entry['path'] != 'option.sav')
+                    self.assertEqual(len(path), length)
+                    self.assertTrue(all(len(component.encode('utf-8')) <= 128 for component in path.split('/')))
+                    self.assertEqual(self.one('manifest', manifest), '2')
+                    staged = base / f'current-import-{length}'
+                    self.assertEqual(self.one('zip', base / f'export-{length}.zip', staged),
+                                     'root=TotK Native saves/ files=2')
+                    self.assertEqual(tree(staged), tree(base / f'live-{length}'))
+
+    def test_manifest_reader_enforces_the_same_path_budget(self):
+        cases = [(MAX_SAVE_FILES, kind, MAX_SAVE_PATH_BYTES + 1)
+                 for kind in ('ascii', 'escape', 'two', 'three', 'four', 'mixed')]
+        cases.extend(((2, 'ascii', MAX_SAVE_PATH_BYTES + 1),
+                      (MAX_SAVE_FILES, 'ascii', 10 + (MAX_SAVE_FILES - 1) * 600),
+                      (MAX_SAVE_FILES + 1, 'ascii', 10 + MAX_SAVE_FILES * 32)))
+        for count, kind, path_bytes in cases:
+            with self.subTest(count=count, kind=kind, path_bytes=path_bytes):
+                fixture = self.dir / 'raw-over-budget.json'
+                expected = 'too_many' if count > MAX_SAVE_FILES else 'path_bytes'
+                self.assertEqual(self.one('path-reader', count, path_bytes, kind, fixture),
+                                 f'invalid {expected} reader={expected} path_bytes={path_bytes}')
+                self.assertFalse(fixture.exists())
+
     def test_manifest_parser_rejects_hostile_structure_under_small_heap(self):
         prefix = b'{"format":1,"files":[],"extra":'
         exact = self.dir / 'review-r2.json'
-        # Review r2's exact object count and old byte limit; write chunks rather than constructing a huge test string.
+        # The exact r2 attack is larger than the new byte cap, but must fail its array guard before reaching it.
         count, old_budget = 9_808_543, 29_425_664
         with exact.open('wb') as out:
             out.write(prefix + b'[')
@@ -263,7 +398,7 @@ class SavesTests(unittest.TestCase):
             'fields': prefix + b'{' + b'"x":0,' * 32 + b'"x":0}}',
             'number': prefix + b'1' * 100_000 + b'}',
         }
-        paths = [('review-r2', exact, 'invalid too_big')]
+        paths = [('review-r2', exact, 'invalid corrupt')]
         for name, content in shapes.items():
             path = self.dir / f'{name}.json'
             path.write_bytes(content)
