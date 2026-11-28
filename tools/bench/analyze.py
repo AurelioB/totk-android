@@ -86,9 +86,11 @@ def capture_switch_line(capture, line, number):
             key, value = token.split('=', 1)
             fields[key].append(value)
         version = fields.get('v')
-        marker_keys = SWITCH_KEYS if version == ['2'] else SWITCH_KEYS[:2]
-        invalid |= version not in (['1'], ['2']) or bool(set(fields) - {'v', *marker_keys, 'map_warn_mode'})
-        for key in SWITCH_KEYS:
+        marker_keys = SWITCH_KEYS[:2] if version == ['1'] else SWITCH_KEYS
+        if version == ['3']:
+            marker_keys = (*SWITCH_KEYS, 'TOTK_VK_REC_ONE_PRIMARY')
+        invalid |= version not in (['1'], ['2'], ['3']) or bool(set(fields) - {'v', *marker_keys, 'map_warn_mode'})
+        for key in (*SWITCH_KEYS, 'TOTK_VK_REC_ONE_PRIMARY') if version == ['3'] else SWITCH_KEYS:
             if key == 'TOTK_MENU_CAPTURE_FIX' and version == ['1'] and key not in fields:
                 continue  # v1 did not report menu outcome; independent raw evidence must establish it.
             values = fields.get(key, [])
@@ -104,7 +106,7 @@ def capture_switch_line(capture, line, number):
                 if mode is None or (state == 'off') != (mode == 0):
                     record['error'] = 'missing, duplicated, invalid or inconsistent warning mode'
                 record['mode'] = mode
-            records[key].append(record)
+            records.setdefault(key, []).append(record)
     if 'write-back alias:' in line.lower():
         valid = re.fullmatch(r'\[nvn-vk\] write-back alias: enabled(?: [^\n]*)?\n', line)
         records['TOTK_WB_ALIAS'].append({'line': number, 'kind': 'alias-start', 'state': 'on',

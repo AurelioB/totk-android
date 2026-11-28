@@ -191,6 +191,7 @@ def settings_sha256(env):
 
 SIGNATURE_FIELDS = ('model', 'soc', 'settings_env_sha256', 'cpu_caps_khz', 'gpu_cap_hz')
 SWITCH_KEYS = ('TOTK_WB_ALIAS', 'TOTK_MAP_WARN', 'TOTK_MENU_CAPTURE_FIX')
+EXPECTED_SWITCH_KEYS = (*SWITCH_KEYS, 'TOTK_VK_REC_ONE_PRIMARY')
 SWITCH_EVIDENCE_VERSION = 4
 # Exact provenance of the immutable 1.0.0 baseline, before these switches existed.
 PRE_SWITCH_COMMIT = 'edc526df8c95'
@@ -225,7 +226,9 @@ def log_switch_states(info, build):
         errors.append('stale presentation records precede the launch start')
     complete = start is not None and end is not None
     result = {}
-    for key in SWITCH_KEYS:
+    keys = (*SWITCH_KEYS, *(key for key in EXPECTED_SWITCH_KEYS
+                           if key not in SWITCH_KEYS and capture.get('records', {}).get(key)))
+    for key in keys:
         records = capture.get('records', {}).get(key, [])
         invalid = list(errors)
         for record in records:
@@ -275,16 +278,23 @@ def device_switch_states(doc, label):
         return switch_states('off', 'known pre-switch baseline build') \
             if legacy_switch_provenance(doc.get('build', {})) else switch_states()
     result = switch_states(reason='unvalidated or obsolete effective-state metadata; reparse the raw log')
-    for key in SWITCH_KEYS:
+    for key in EXPECTED_SWITCH_KEYS:
+        if key not in SWITCH_KEYS:
+            if not isinstance(states, dict) or key not in states:
+                continue
+            result[key] = dict(state='UNKNOWN', reason='unvalidated or obsolete effective-state metadata',
+                               evidence_version=SWITCH_EVIDENCE_VERSION)
         record = states.get(key) if isinstance(states, dict) else None
         if isinstance(record, dict) and record.get('evidence_version') == SWITCH_EVIDENCE_VERSION:
             state, mode = record.get('state'), record.get('mode')
             valid_mode = key != 'TOTK_MAP_WARN' or state == 'UNKNOWN' or \
                 type(mode) is int and (mode == 0 if state == 'off' else mode in (1, 2, 3))
             if state not in ('on', 'off', 'UNKNOWN') or not valid_mode:
-                result[key] = switch_states(reason='invalid effective-state metadata')[key]
+                result[key] = dict(state='UNKNOWN', reason='invalid effective-state metadata',
+                                   evidence_version=SWITCH_EVIDENCE_VERSION)
             elif legacy_switch_provenance(doc.get('build', {})) and state == 'on':
-                result[key] = switch_states(reason='positive switch evidence contradicts pre-switch provenance')[key]
+                result[key] = dict(state='UNKNOWN', reason='positive switch evidence contradicts pre-switch provenance',
+                                   evidence_version=SWITCH_EVIDENCE_VERSION)
             else:
                 result[key] = record
     return result
@@ -306,22 +316,60 @@ def switch_fields(states):
             'switch_evidence_version': SWITCH_EVIDENCE_VERSION}
 
 
-def switch_admission(base_doc, base_label, new_doc, new_label):
-    states = [device_switch_states(doc, label) for doc, label in
-              ((base_doc, base_label), (new_doc, new_label))]
+def parse_expected_difference(value):
+    """Parse SWITCH:REFERENCE:NEW, with an explicit on/off transition in reference-then-new order."""
+    parts = tuple(value.split(':')) if isinstance(value, str) else value
+    if not isinstance(parts, tuple) or len(parts) != 3 or not all(isinstance(part, str) for part in parts):
+        raise ValueError('expected difference must be SWITCH:REFERENCE:NEW')
+    key, reference, new = parts
+    if key not in EXPECTED_SWITCH_KEYS:
+        raise ValueError(f'expected difference switch must be one of {", ".join(EXPECTED_SWITCH_KEYS)}')
+    if reference not in ('on', 'off') or new not in ('on', 'off'):
+        raise ValueError('expected difference states must be on or off')
+    if reference == new:
+        raise ValueError('expected difference must declare different reference and new states')
+    return key, reference, new
+
+
+def _switch_admission(states, expected_difference):
     fields = [switch_fields(state) for state in states]
+    keys = list(SWITCH_KEYS)
+    if expected_difference is not None:
+        keys.extend(key for key in EXPECTED_SWITCH_KEYS if key not in SWITCH_KEYS and
+                    (key == expected_difference[0] or all(key in state for state in states)))
     reasons = []
-    for key in SWITCH_KEYS:
-        values = [field['effective_switches'][key] for field in fields]
+    for key in keys:
+        if key in SWITCH_KEYS:
+            values = [field['effective_switches'][key] for field in fields]
+        else:
+            records = [state.get(key, {}) for state in states]
+            values = [record.get('state') if isinstance(record, dict) and
+                      record.get('evidence_version') == SWITCH_EVIDENCE_VERSION and
+                      record.get('state') in ('on', 'off') else 'UNKNOWN' for record in records]
         for side, value, state in zip(('reference', 'new'), values, states):
             if value == 'UNKNOWN':
-                reasons.append(f'{side} {key}=UNKNOWN ({state.get(key, {}).get("reason", "effective mode unavailable")})')
-        if 'UNKNOWN' not in values and values[0] != values[1]:
-            reasons.append(f'{key}: {values[0]} -> {values[1]}')
+                record = state.get(key, {})
+                reason = record.get('reason', 'effective mode unavailable') if isinstance(record, dict) \
+                    else 'invalid effective-state metadata'
+                reasons.append(f'{side} {key}=UNKNOWN ({reason})')
+        if 'UNKNOWN' not in values:
+            if expected_difference is not None and key == expected_difference[0]:
+                if tuple(values) != expected_difference[1:]:
+                    reasons.append(f'expected difference {":".join(expected_difference)}; '
+                                   f'observed {key}: {values[0]} -> {values[1]}')
+            elif values[0] != values[1]:
+                reasons.append(f'{key}: {values[0]} -> {values[1]}')
     if all(field['effective_switches']['TOTK_MAP_WARN'] == 'on' for field in fields) \
             and fields[0]['map_warn_mode'] != fields[1]['map_warn_mode']:
         reasons.append(f'TOTK_MAP_WARN mode: {fields[0]["map_warn_mode"]} -> {fields[1]["map_warn_mode"]}')
     return reasons
+
+
+def switch_admission(base_doc, base_label, new_doc, new_label, expected_difference=None):
+    expected = parse_expected_difference(expected_difference) if expected_difference is not None else None
+    states = [device_switch_states(doc, label) for doc, label in
+              ((base_doc, base_label), (new_doc, new_label))]
+    return _switch_admission(states, expected)
 
 
 def signature_of_fields(fields):
@@ -351,14 +399,20 @@ def device_signature(doc, label, docs=None, path=None):
     fl = dev.get('freq_limits')
     if fl:
         cpu, gpu = caps_of_limits(fl)
-        sha, fields = signature_of(dev.get('name'), dev.get('soc'), dev.get('settings_env'), cpu, gpu,
-                                   device_switch_states(doc, label))
+        states = device_switch_states(doc, label)
+        sha, fields = signature_of(dev.get('name'), dev.get('soc'), dev.get('settings_env'), cpu, gpu, states)
         if 'effective_switches' not in dev and not legacy_switch_provenance(doc.get('build', {})):
             # Preserve immutable legacy identifiers, not admission: their UNKNOWN states still never match.
             sha = signature_of_fields({key: fields[key] for key in SIGNATURE_FIELDS})
-        return {'sha256': sha, 'short': sha[:12], 'fields': fields,
-                'cpu_hw_max_khz': [c['cpuinfo_max_khz'] for c in fl['cpu']],
-                'gpu_hw_max_hz': (fl.get('gpu') or {}).get('hw_max_hz')}
+        sig = {'sha256': sha, 'short': sha[:12], 'fields': fields,
+               'cpu_hw_max_khz': [c['cpuinfo_max_khz'] for c in fl['cpu']],
+               'gpu_hw_max_hz': (fl.get('gpu') or {}).get('hw_max_hz')}
+        optional = {key: record for key, record in states.items() if key not in SWITCH_KEYS}
+        if optional:
+            sig['optional_switches'] = optional
+        if isinstance(dev.get('settings_env'), dict):
+            sig['settings_env'] = dev['settings_env']
+        return sig
     if path is not None:
         docs = docs or BENCH_DOCS
         try:
@@ -368,7 +422,13 @@ def device_signature(doc, label, docs=None, path=None):
         for b in load_index(docs)['baselines']:
             if b['file'] == rel_name and b['device'] == label:
                 sig = index_sig(b)
-                sig['fields'].update(switch_fields(device_switch_states(doc, label)))
+                states = device_switch_states(doc, label)
+                sig['fields'].update(switch_fields(states))
+                optional = {key: record for key, record in states.items() if key not in SWITCH_KEYS}
+                if optional:
+                    sig['optional_switches'] = optional
+                if isinstance(dev.get('settings_env'), dict):
+                    sig['settings_env'] = dev['settings_env']
                 return sig
     return None
 
@@ -388,9 +448,10 @@ def index_sig(b):
             'cpu_hw_max_khz': b['cpu_hw_max_khz'], 'gpu_hw_max_hz': b['gpu_hw_max_hz']}
 
 
-def signature_relation(ref, new):
+def signature_relation(ref, new, expected_difference=None):
     """'match', 'reference-only' (the reference has no GPU cap; model, settings and CPU caps match), 'mismatch', or
     'unknown' (either side has no signature)."""
+    expected = parse_expected_difference(expected_difference) if expected_difference is not None else None
     if ref is None or new is None:
         return 'unknown'
     a, b = ref['fields'], new['fields']
@@ -399,6 +460,27 @@ def signature_relation(ref, new):
     if any(field.get('effective_switches', {}).get(key, 'UNKNOWN') == 'UNKNOWN'
            for field in (a, b) for key in SWITCH_KEYS):
         return 'unknown'
+    if expected is not None:
+        states = [{**sig.get('optional_switches', {}),
+                   **{key: {'state': field['effective_switches'][key], 'mode': field['map_warn_mode'],
+                            'evidence_version': field['switch_evidence_version']} for key in SWITCH_KEYS}}
+                  for sig, field in ((ref, a), (new, b))]
+        reasons = _switch_admission(states, expected)
+        if reasons:
+            return 'unknown' if any('UNKNOWN' in reason for reason in reasons) else 'mismatch'
+        env_matches = a['settings_env_sha256'] == b['settings_env_sha256']
+        if all(isinstance(sig.get('settings_env'), dict) for sig in (ref, new)):
+            envs = [{key: value for key, value in sig['settings_env'].items() if key != expected[0]}
+                    for sig in (ref, new)]
+            env_matches = envs[0] == envs[1]
+        if not env_matches:
+            return 'mismatch'
+        fields = tuple(key for key in SIGNATURE_FIELDS if key != 'settings_env_sha256')
+        if all(a[key] == b[key] for key in fields):
+            return 'match'
+        if a['gpu_cap_hz'] is None and all(a[key] == b[key] for key in fields if key != 'gpu_cap_hz'):
+            return 'reference-only'
+        return 'mismatch'
     if a['effective_switches'] != b['effective_switches'] or a['map_warn_mode'] != b['map_warn_mode']:
         return 'mismatch'
     if ref['sha256'] == new['sha256']:
@@ -558,16 +640,19 @@ def match_device(base_doc, label, dev):
     return None
 
 
-def comparability(base_doc, base_label, new_doc, new_label):
+def comparability(base_doc, base_label, new_doc, new_label, expected_difference=None):
     """Warnings that make two runs of one device not comparable: settings.env and cpufreq caps differences, and runs
     whose frequency limits changed during a pan (freq_stable false)."""
+    expected = parse_expected_difference(expected_difference) if expected_difference is not None else None
     warns = []
-    warns.extend(switch_admission(base_doc, base_label, new_doc, new_label))
+    warns.extend(switch_admission(base_doc, base_label, new_doc, new_label, expected))
     be = base_doc['devices'].get(base_label, {}).get('settings_env')
     ne = new_doc['devices'].get(new_label, {}).get('settings_env')
     if be is not None and ne is not None and be != ne:
-        diff = sorted(k for k in set(be) | set(ne) if be.get(k) != ne.get(k))
-        warns.append(f'settings_env differs ({", ".join(f"{k}: {be.get(k)} -> {ne.get(k)}" for k in diff)})')
+        diff = sorted(k for k in set(be) | set(ne) if be.get(k) != ne.get(k) and
+                      (expected is None or k != expected[0]))
+        if diff or expected is None:
+            warns.append(f'settings_env differs ({", ".join(f"{k}: {be.get(k)} -> {ne.get(k)}" for k in diff)})')
     bruns = {r['scene']: r for r in base_doc['runs'] if r['device'] == base_label}
     for r in new_doc['runs']:
         if r['device'] != new_label or r['scene'] not in bruns:
@@ -599,20 +684,23 @@ RELATION_TEXT = {
 }
 
 
-def compare_docs(base_doc, new_doc, out=sys.stdout, base_path=None, new_path=None):
+def compare_docs(base_doc, new_doc, out=sys.stdout, base_path=None, new_path=None, expected_difference=None):
     """Print the per device x scene comparison of two result documents, with the frequency-signature relation of each
     device pair (see signature_relation); returns {(new_label, scene): (overall, relation)}."""
+    expected = parse_expected_difference(expected_difference) if expected_difference is not None else None
+    if expected is not None:
+        print(f'Expected difference (reference -> new): {":".join(expected)}', file=out)
     verdicts = {}
     for new_label, dev in new_doc['devices'].items():
         base_label = match_device(base_doc, new_label, dev)
         if base_label is None:
             print(f'\n## {new_label}: not in the reference run, nothing to compare', file=out)
             continue
-        warns = comparability(base_doc, base_label, new_doc, new_label)
+        warns = comparability(base_doc, base_label, new_doc, new_label, expected)
         bsig = device_signature(base_doc, base_label, path=base_path)
         nsig = device_signature(new_doc, new_label, path=new_path)
-        relation = signature_relation(bsig, nsig)
-        switch_reasons = switch_admission(base_doc, base_label, new_doc, new_label)
+        relation = signature_relation(bsig, nsig, expected)
+        switch_reasons = switch_admission(base_doc, base_label, new_doc, new_label, expected)
         if switch_reasons:
             relation = 'unknown' if any('UNKNOWN' in reason for reason in switch_reasons) else 'mismatch'
         line = RELATION_TEXT[relation]

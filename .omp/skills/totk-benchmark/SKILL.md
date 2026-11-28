@@ -312,6 +312,16 @@ delta inside tolerance => SAME. The report includes individual pair deltas and O
 capped dip-confounding rules remain in force; uncapped compares throughput/tails. A quartet is not statistical
 significance and does not claim both-direction in-session confirmation. The existing mode below is unchanged.
 
+For an intentional on/off treatment, add `--expected-difference TOTK_MAP_WARN:off:on` (reference state first).
+`compare.py reference.json new.json` accepts the same flag. UNKNOWN, identical states, the wrong declared switch
+or any extra differing switch rejects admission. Signatures stay raw; hardware/settings/cap mismatches are not waived.
+For N ≥ 2 restart pairs, declare chronology with `--restart-order B,A,A,B,A,B,B,A --ref A` (four vs four).
+Every adjacent pair must contain one reference and one candidate. Without order, complete O/B/B/O quartets repeat.
+All N pair signs must agree, and reference **max−min** must stay within the existing tolerance; pooled and equal-weight
+paired means must both cross it. This is the direct range generalization of |O2−O1|, not a standard-error/significance
+rule; the two-pair result is unchanged. Missing pairs remain inconclusive. Original workload/power/continuity gates
+still apply; pooling never upgrades an interrupted campaign. See `tools/bench/README.md` for API and examples.
+
 ## In-session A/B (live switches)
 
 Compares experiment switches inside ONE running session and ONE loaded scene, alternating the arms (ABBA) instead of

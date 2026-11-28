@@ -345,7 +345,7 @@ class EffectiveSwitches(unittest.TestCase):
             (self.marker().replace('map_warn_mode=0', 'map_warn_mode=1'), warn_unknown),
             (self.marker().replace('map_warn_mode=0', 'map_warn_mode=bad'), warn_unknown),
             (self.marker().replace('map_warn_mode=0', 'map_warn_mode=0 map_warn_mode=0'), warn_unknown),
-            (self.marker().replace('v=2', 'v=3'), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN')),
+            (self.marker().replace('v=2', 'v=4'), dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN')),
             (self.marker().rstrip('\n') + ' unexpected=1\n', dict.fromkeys(benchlib.SWITCH_KEYS, 'UNKNOWN')),
         )
         for marker, expected in cases:
@@ -1795,6 +1795,111 @@ class RestartQuartet(unittest.TestCase):
         doc = abtest.restart_analysis(self.documents(fps_values, counts), 'O')
         return doc, doc['runs'][0]['ab']['arms']['O'], doc['runs'][0]['ab']['arms']['B']
 
+    def test_two_pair_metrics_match_current_main_golden(self):
+        # Captured before changing the production rule, from main45c46f9 on these existing fixture inputs.
+        golden = json.loads((ROOT / 'tests/fixtures/bench_restart_two_pair_main.json').read_text())
+        for case in golden:
+            with self.subTest(values=case['values'], counts=case['counts']):
+                _, ref, arm = self.records(case['values'], case['counts'])
+                paired = {k: abtest.paired_metric(k, ref, arm, 'restart-quartet') for k in analyze.AB_METRICS}
+                per = {k: abtest.metric_verdict(k, ref, arm, paired[k]) for k in analyze.AB_METRICS}
+                self.assertEqual(paired, case['paired'])
+                self.assertEqual({k: list(v) for k, v in per.items()}, case['metrics'])
+                self.assertEqual(abtest.arm_verdict(per, ref, arm, paired), case['overall'])
+
+    def treatment_documents(self, fps_values, order):
+        documents = self.documents(fps_values, [2] * len(fps_values))
+        for doc, label in zip(documents, order):
+            states = benchlib.switch_states('off')
+            states['TOTK_WB_ALIAS']['state'] = 'off' if label == 'A' else 'on'
+            doc['devices'] = {'thor': {'effective_switches': states}}
+        return documents
+
+    def test_four_pairs_pooled_difference_and_no_difference(self):
+        order = list('BAABABBA')
+        for effect, expected in ((2, 'better'), (-2, 'worse'), (0, 'same')):
+            documents = self.treatment_documents([40 + (effect if label == 'B' else 0) for label in order], order)
+            doc = abtest.restart_analysis(documents, 'A', 'TOTK_WB_ALIAS:off:on', order)
+            self.assertEqual(doc['expected_difference'], 'TOTK_WB_ALIAS:off:on')
+            ref, arm = (doc['runs'][0]['ab']['arms'][key] for key in 'AB')
+            paired = {k: abtest.paired_metric(k, ref, arm, 'restart-quartet') for k in analyze.AB_METRICS}
+            per = {k: abtest.metric_verdict(k, ref, arm, paired[k]) for k in analyze.AB_METRICS}
+            self.assertEqual([(p['reference_block'], p['arm_block']) for p in paired['throughput_fps']['pairs']],
+                             [(2, 1), (3, 4), (5, 6), (8, 7)])
+            self.assertEqual(abtest.arm_verdict(per, ref, arm, paired), expected)
+
+    def test_three_pairs_and_reference_range_gate(self):
+        order = list('BAABAB')
+        documents = self.treatment_documents((42, 40, 40, 42, 40, 42), order)
+        doc = abtest.restart_analysis(documents, 'A', 'TOTK_WB_ALIAS:off:on', order)
+        ref, arm = (doc['runs'][0]['ab']['arms'][key] for key in 'AB')
+        stats = abtest.paired_metric('throughput_fps', ref, arm, 'restart-quartet')
+        self.assertEqual(abtest.metric_verdict('throughput_fps', ref, arm, stats)[3], 'better')
+        ref['spread']['throughput_fps'] = .81
+        stats = abtest.paired_metric('throughput_fps', ref, arm, 'restart-quartet')
+        self.assertEqual(abtest.metric_verdict('throughput_fps', ref, arm, stats)[3], 'inconclusive')
+        ref['spread']['throughput_fps'] = 0
+        arm['blocks'][0]['summary']['throughput_fps'] = None
+        stats = abtest.paired_metric('throughput_fps', ref, arm, 'restart-quartet')
+        self.assertEqual(abtest.metric_verdict('throughput_fps', ref, arm, stats)[3], 'inconclusive')
+
+    def test_restart_treatment_rejects_wrong_extra_unknown_and_identical(self):
+        order = list('ABBA')
+        for failure in ('wrong', 'extra', 'unknown', 'identical', 'reference_unknown'):
+            with self.subTest(failure=failure):
+                docs = self.treatment_documents((40, 42, 42, 40), order)
+                declaration = 'TOTK_WB_ALIAS:off:on'
+                states = docs[1]['devices']['thor']['effective_switches']
+                if failure == 'wrong':
+                    declaration = 'TOTK_MENU_CAPTURE_FIX:off:on'
+                elif failure == 'extra':
+                    states['TOTK_MENU_CAPTURE_FIX']['state'] = 'on'
+                elif failure == 'unknown':
+                    states['TOTK_WB_ALIAS']['state'] = 'UNKNOWN'
+                elif failure == 'identical':
+                    states['TOTK_WB_ALIAS']['state'] = 'off'
+                else:
+                    docs[0]['devices']['thor']['effective_switches']['TOTK_MAP_WARN']['state'] = 'UNKNOWN'
+                with self.assertRaises(ValueError):
+                    abtest.restart_analysis(docs, 'A', declaration, order)
+
+    def test_restart_cli_four_pairs_records_declaration_and_rejects_bad_order(self):
+        order = list('BAABABBA')
+        docs = self.treatment_documents([42 if label == 'B' else 40 for label in order], order)
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for i, doc in enumerate(docs):
+                path = Path(tmp) / f'{i}.json'
+                path.write_text(json.dumps(doc))
+                paths.append(path)
+            result = run(BENCH / 'abtest.py', '--restart-quartet', *paths, '--ref', 'A',
+                         '--restart-order', ','.join(order), '--expected-difference', 'TOTK_WB_ALIAS:off:on')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('arm B vs A: BETTER', result.stdout)
+            self.assertIn('TOTK_WB_ALIAS:off:on', result.stdout)
+            self.assertIn('pairs: 4;', result.stdout)
+            result = run(BENCH / 'abtest.py', '--restart-quartet', *paths, '--ref', 'A',
+                         '--restart-order', 'A,A,B,B,A,B,B,A')
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('each adjacent pair', result.stderr)
+
+    def test_one_primary_v3_marker_is_authenticated_without_changing_default_keys(self):
+        capture = {'evidence_version': benchlib.SWITCH_EVIDENCE_VERSION, 'starts': [], 'presents': [],
+                   'errors': [], 'records': {key: [] for key in benchlib.SWITCH_KEYS}}
+        lines = ['[totk-app] build current\n',
+                 '[totk-switches] v=3 TOTK_WB_ALIAS=on TOTK_MAP_WARN=on map_warn_mode=1 '
+                 'TOTK_MENU_CAPTURE_FIX=on TOTK_VK_REC_ONE_PRIMARY=off\n',
+                 '[nvn-vk] frame 300: 40 fps over the last 300\n']
+        for i, line in enumerate(lines, 1):
+            analyze.capture_switch_line(capture, line, i)
+        states = benchlib.log_switch_states({'switch_capture': capture}, {})
+        self.assertEqual(states['TOTK_VK_REC_ONE_PRIMARY']['state'], 'off')
+        self.assertEqual(states['TOTK_WB_ALIAS']['state'], 'on')
+        self.assertNotIn('TOTK_VK_REC_ONE_PRIMARY', benchlib.SWITCH_KEYS)
+        analyze.capture_switch_line(capture, lines[1].replace('=off', '=on'), 2)
+        states = benchlib.log_switch_states({'switch_capture': capture}, {})
+        self.assertEqual(states['TOTK_VK_REC_ONE_PRIMARY']['state'], 'UNKNOWN')
+
     def test_explicit_restart_pairs_confirm_same_direction_sessions(self):
         for fps, expected in (((40, 42, 42, 40), 'better'), ((40, 38, 38, 40), 'worse'),
                               ((40, 40.8, 40.8, 40), 'same')):
@@ -1892,6 +1997,29 @@ class RestartQuartet(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn(f'arm B vs O: {headline}', result.stdout)
                     self.assertIn(note, result.stdout)
+
+    def test_clock_report_shows_arm_means_signed_difference_and_settings_cap(self):
+        low, high = {'615000000': 1.0}, {'680000000': 1.0}
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.clock_paths(tmp, (high, low, low, high))
+            for path in paths:
+                doc = json.loads(path.read_text())
+                doc['devices'] = {'thor': {'settings_env': {'TOTK_FPS60': '1'}}}
+                path.write_text(json.dumps(doc))
+            result = run(BENCH / 'abtest.py', '--restart-quartet', *paths, '--ref', 'O')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('arm B vs O: verdict confounded by GPU clock', result.stdout)
+            self.assertIn('GPU clock arm means: O 680.000 MHz; B 615.000 MHz', result.stdout)
+            self.assertIn('signed B - O: -65.000 MHz (-9.559% of max arm mean)', result.stdout)
+            self.assertIn('Frame cap from document settings per session: O on / on; B on / on', result.stdout)
+            for path in paths:
+                doc = json.loads(path.read_text())
+                doc['devices']['thor']['settings_env']['TOTK_UNCAPPED'] = '1'
+                path.write_text(json.dumps(doc))
+            result = run(BENCH / 'abtest.py', '--restart-quartet', *paths, '--ref', 'O', '--clock-lever')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('arm B vs O: BETTER', result.stdout)
+            self.assertIn('Frame cap from document settings per session: O off / off; B off / off', result.stdout)
 
 
 class CompileProvenance(unittest.TestCase):

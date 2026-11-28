@@ -6,6 +6,13 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Support explicit single-switch benchmark treatments with `--expected-difference SWITCH:REFERENCE:NEW` in
+  `compare.py` and restart `abtest.py`: require the declared on/off states, reject UNKNOWN, ineffective treatments
+  and extra switch differences, and preserve raw signatures. Parse authenticated one-primary v3 startup evidence.
+  Pool N ≥ 2 independent restart pairs with explicit chronological arm order, unanimous pair signs and the existing
+  tolerances; reference max−min generalizes the two-session spread without changing two-pair statistics.
+  Show per-arm mean GPU clocks, signed new-minus-reference differences and settings-derived frame-cap state
+  beside the unchanged 3% clock-confound guard; a capped governor's clock can follow the treatment's load.
 - Fix the pre-existing thermal-step veneer on the real 1.4.3 Android rewrite: its mutable floor
   is about 25 MiB past native text, outside an LDR-literal's reach. Use ADRP+LDR and a flag-free
   clamp for the published one/two-tick floor, retaining the same 108-byte tail allocation.

@@ -29,10 +29,13 @@ is better? / worse?, else same. Exit 1 when any arm is worse. Memory and pressur
 Prefer ABBAABBA or longer on 60 fps devices.
 
 Restart sessions: abtest.py --restart-quartet O1.json B1.json B2.json O2.json --ref O.
-This distinct mode pairs adjacent sessions (1 vs 2, 4 vs 3), with identical pan schedules, not alternating
-in-session directions. Exactly two pairs must agree in sign; pooled AND paired deltas must exceed tolerance
-(fps: max(0.5 fps, 2%)). Reference O1/O2 spread must not exceed tolerance; otherwise INCONCLUSIVE.
-Other metrics retain compare.py tolerances and capped/uncapped rules. A quartet is not statistical significance.
+For N >= 2 adjacent independent reference/candidate pairs, use --restart-order A,B,B,A,... to declare chronology;
+without it, complete O/B/B/O quartets repeat. All sessions need identical explicit pan schedules.
+All pair signs must agree; pooled AND paired deltas must exceed tolerance (fps: max(0.5 fps, 2%)).
+Reference max-min spread must not exceed tolerance; otherwise INCONCLUSIVE. Two-pair statistics are unchanged.
+Other metrics retain compare.py tolerances and capped/uncapped rules. This is not statistical significance.
+Declare an intentional single on/off treatment with --expected-difference SWITCH:REFERENCE:NEW. Every session must
+authenticate exactly those states; UNKNOWN, an ineffective treatment or another switch difference rejects pooling.
 GPU clock: each session's residency-weighted mean GPU clock comes from its pans' gpu_residency. When the arm means
 differ by more than 3% the overall result is 'verdict confounded by GPU clock' (a governor that settles at another
 clock changes GPU ms and fps by itself); --clock-lever keeps the verdict for arms that change the clock on purpose.
@@ -41,7 +44,8 @@ import argparse, io, json, math, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchlib import (DIP_CONFOUNDED, DIP_TIME_FRACTION_TOLERANCE, LEGACY_PRIMARY, METRICS, PRIMARY,  # noqa: E402
-                      guard_output, pacing_note, pacing_verdict, primary_metrics)
+                      guard_output, pacing_note, pacing_verdict, parse_expected_difference, primary_metrics,
+                      switch_admission)
 from analyze import AB_METRICS, MEMORY_FIELDS, block_metric, pan_direction, summarize, worst_memory  # noqa: E402
 
 GPU_CLOCK_CONFOUNDED = 'verdict confounded by GPU clock'
@@ -70,8 +74,19 @@ def gpu_clock_difference(ref, arm):
     return abs(a - r) / max(a, r)
 
 
-def restart_analysis(documents, reference):
-    """Build arm records from four independent analyzer outputs, preserving whole session pair units."""
+def restart_analysis(documents, reference, expected_difference=None, order=None):
+    """Pool independent sessions in declared adjacent reference/candidate pairs (at least two)."""
+    expected_difference = parse_expected_difference(expected_difference) if expected_difference is not None else None
+    if len(documents) < 4 or len(documents) % 2:
+        raise ValueError('restart comparison requires an even number of sessions, at least four')
+    candidate = 'B' if reference != 'B' else 'A'
+    if order is None:
+        if len(documents) % 4:
+            raise ValueError('provide restart order for sessions not arranged in complete O/B/B/O quartets')
+        order = [reference, candidate, candidate, reference] * (len(documents) // 4)
+    if (len(order) != len(documents) or set(order) != {reference, candidate} or
+            any(set(order[i:i + 2]) != {reference, candidate} for i in range(0, len(order), 2))):
+        raise ValueError(f'restart order needs one {reference} and one {candidate} in each adjacent pair')
     indexed = []
     for document in documents:
         runs = {}
@@ -82,21 +97,34 @@ def restart_analysis(documents, reference):
             runs[key] = run
         indexed.append(runs)
     if not indexed[0] or any(set(runs) != set(indexed[0]) for runs in indexed[1:]):
-        raise ValueError('all four restart sessions must contain the same nonempty device/scene set')
-    candidate = 'B' if reference != 'B' else 'A'
+        raise ValueError('all restart sessions must contain the same nonempty device/scene set')
     result = []
     for key in indexed[0]:
         sessions = [runs[key] for runs in indexed]
         schedules = [[(p.get('direction'), p.get('stick_value')) for p in r.get('pans', [])] for r in sessions]
-        if (not schedules[0] or any(direction not in ('right', 'left') for schedule in schedules
-                                     for direction, _ in schedule) or any(s != schedules[0] for s in schedules[1:])):
-            raise ValueError(f'{key}: restart quartet needs identical, explicit pan direction/stick schedules; '
+        if (not schedules[0] or any(direction not in ('right', 'left', 'standing') or
+                                     (direction == 'standing' and stick != 0)
+                                     for schedule in schedules for direction, stick in schedule) or
+                any(s != schedules[0] for s in schedules[1:])):
+            raise ValueError(f'{key}: restart comparison needs identical, explicit pan direction/stick schedules; '
                              're-analyze original pans.txt with current analyze.py')
+        if expected_difference is not None:
+            reference_index, candidate_index = order.index(reference), order.index(candidate)
+            if any(key[0] not in document.get('devices', {}) for document in documents):
+                raise ValueError(f'{key}: expected difference requires effective-switch device metadata in every session')
+            for i, document in enumerate(documents):
+                # Check each reference as a reference too: default admission may not track an optional treatment key.
+                base = document if order[i] == reference else documents[reference_index]
+                new = documents[candidate_index] if order[i] == reference else document
+                reasons = switch_admission(base, key[0], new, key[0], expected_difference)
+                if reasons:
+                    raise ValueError(f'{key}: session {i + 1} effective switches: ' + '; '.join(reasons))
         if len({bool(r['summary'].get('uncapped') or r['summary'].get('speed_mode') == 'uncapped')
                 for r in sessions}) != 1:
             raise ValueError(f'{key}: mixed capped/uncapped restart sessions are inconclusive; do not pool them')
         arms = {}
-        for name, indices in ((reference, (0, 3)), (candidate, (1, 2))):
+        for name in (reference, candidate):
+            indices = [i for i, label in enumerate(order) if label == name]
             blocks = [{'block': i + 1, 'summary': sessions[i]['summary'], 'direction': 'restart',
                        'session': i + 1} for i in indices]
             windows = [w for i in indices for w in sessions[i].get('windows', [])]
@@ -105,14 +133,19 @@ def restart_analysis(documents, reference):
             spread = {}
             for metric in AB_METRICS:
                 values = [block_metric(b['summary'], metric) for b in blocks]
-                spread[metric] = abs(values[1] - values[0]) if None not in values else None
+                spread[metric] = max(values) - min(values) if None not in values else None
             arms[name] = {'blocks': blocks, 'summary': summarize(windows), 'spread': spread,
                           'memory': worst_memory([sessions[i].get('memory', {}) for i in indices]),
-                          'gpu_clock_hz': [session_gpu_clock(sessions[i]) for i in indices]}
+                          'gpu_clock_hz': [session_gpu_clock(sessions[i]) for i in indices],
+                          'frame_cap_from_settings': [
+                              ('off' if settings.get('TOTK_UNCAPPED') == '1' else 'on')
+                              if isinstance(settings := documents[i].get('devices', {}).get(key[0], {}).get('settings_env'), dict)
+                              else 'UNKNOWN' for i in indices]}
         result.append({'device': key[0], 'scene': key[1], 'ab': {
             'mode': 'restart-quartet', 'arms': arms,
             'windows': {'assigned': sum(len(r['windows']) for r in sessions), 'straddling': 0, 'unlabelled': 0}}})
-    return {'runs': result}
+    return {'runs': result, **({'expected_difference': ':'.join(expected_difference)}
+                              if expected_difference is not None else {})}
 
 
 def paired_metric(key, ref, arm, mode='in-session'):
@@ -124,24 +157,36 @@ def paired_metric(key, ref, arm, mode='in-session'):
             if isinstance(index, int) and index > 0:
                 blocks.setdefault(index, []).append((label, b))
     pairs = []
-    for start in sorted({1 + 4 * ((i - 1) // 4) for i in blocks}):
-        if any(len(blocks.get(i, [])) != 1 for i in range(start, start + 4)):
-            continue
-        quartet = [blocks[i][0] for i in range(start, start + 4)]
-        labels = [label for label, _ in quartet]
-        if labels not in (['ref', 'arm', 'arm', 'ref'], ['arm', 'ref', 'ref', 'arm']):
-            continue
-        for i, j in (((0, 1), (3, 2)) if mode == 'restart-quartet' else ((0, 2), (3, 1))):
-            (_, x), (_, y) = quartet[i], quartet[j]
-            r, a = (x, y) if quartet[i][0] == 'ref' else (y, x)
-            direction = r.get('direction', pan_direction(r['block']))
-            if mode != 'restart-quartet' and (direction not in ('right', 'left') or
-                                             direction != a.get('direction', pan_direction(a['block']))):
+    if mode == 'restart-quartet':
+        units = []
+        for start in range(1, max(blocks, default=0) + 1, 2):
+            if any(len(blocks.get(i, [])) != 1 for i in (start, start + 1)):
                 continue
-            rv, av = block_metric(r['summary'], key), block_metric(a['summary'], key)
-            if rv is not None and av is not None:
-                pairs.append({'reference_block': r['block'], 'arm_block': a['block'], 'direction': direction,
-                              'delta': av - rv})
+            x, y = blocks[start][0], blocks[start + 1][0]
+            if {x[0], y[0]} == {'ref', 'arm'}:
+                units.append((x[1], y[1]) if x[0] == 'ref' else (y[1], x[1]))
+    else:
+        units = []
+        for start in sorted({1 + 4 * ((i - 1) // 4) for i in blocks}):
+            if any(len(blocks.get(i, [])) != 1 for i in range(start, start + 4)):
+                continue
+            quartet = [blocks[i][0] for i in range(start, start + 4)]
+            labels = [label for label, _ in quartet]
+            if labels not in (['ref', 'arm', 'arm', 'ref'], ['arm', 'ref', 'ref', 'arm']):
+                continue
+            for i, j in ((0, 2), (3, 1)):
+                (_, x), (_, y) = quartet[i], quartet[j]
+                r, a = (x, y) if quartet[i][0] == 'ref' else (y, x)
+                units.append((r, a))
+    for r, a in units:
+        direction = r.get('direction', pan_direction(r['block']))
+        if mode != 'restart-quartet' and (direction not in ('right', 'left') or
+                                         direction != a.get('direction', pan_direction(a['block']))):
+            continue
+        rv, av = block_metric(r['summary'], key), block_metric(a['summary'], key)
+        if rv is not None and av is not None:
+            pairs.append({'reference_block': r['block'], 'arm_block': a['block'], 'direction': direction,
+                          'delta': av - rv})
     ds = [p['delta'] for p in pairs]
     mean = sum(ds) / len(ds) if ds else None
     positive, negative = sum(d > 0 for d in ds), sum(d < 0 for d in ds)
@@ -171,12 +216,13 @@ def metric_verdict(key, ref, arm, paired=None):
     if paired.get('mode') == 'restart-quartet':
         spread = paired.get('reference_spread')
         n = len(paired['pairs'])
-        if n != 2 or spread is None or (spread > tol and not math.isclose(spread, tol, rel_tol=1e-12, abs_tol=1e-12)):
+        if (n < 2 or n != len(ref['blocks']) or n != len(arm['blocks']) or spread is None or
+                (spread > tol and not math.isclose(spread, tol, rel_tol=1e-12, abs_tol=1e-12))):
             return d, tol, noise, 'inconclusive'
         if abs(d) <= tol or math.isclose(abs(d), tol, rel_tol=1e-12, abs_tol=1e-12):
             return d, tol, noise, 'same'
         if (abs(a - r) <= tol or math.isclose(abs(a - r), tol, rel_tol=1e-12, abs_tol=1e-12) or
-                (a - r) * d <= 0 or paired['agreement'] != 2):
+                (a - r) * d <= 0 or paired['agreement'] != n):
             return d, tol, noise, 'inconclusive'
         return d, tol, noise, 'better' if d * direction > 0 else 'worse'
     if abs(d) <= tol or math.isclose(abs(d), tol, rel_tol=1e-12, abs_tol=1e-12):
@@ -234,32 +280,41 @@ def arm_verdict(per, ref=None, arm=None, paired=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0], epilog=__doc__.split('\n\n', 1)[1],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('result', nargs='+', help='one analyze.py --arms JSON, or four session JSONs in O/B/B/O order')
+    ap.add_argument('result', nargs='+', help='one analyze.py --arms JSON, or independent paired session JSONs')
     ap.add_argument('--ref', default='A', help='reference arm (default A)')
     ap.add_argument('--out', help='also write the report to this file')
     ap.add_argument('--restart-quartet', action='store_true',
                     help='explicit independent O/B/B/O session mode; adjacent pairs and O-spread gate')
     ap.add_argument('--clock-lever', action='store_true',
                     help='restart-quartet: the arm changes the GPU clock on purpose; report the difference, keep the verdict')
+    ap.add_argument('--expected-difference', metavar='SWITCH:REFERENCE:NEW',
+                    help='restart mode only: require exactly this effective on/off treatment')
+    ap.add_argument('--restart-order', help='restart arm labels in chronological order, comma-separated; '
+                    'default repeats reference,candidate,candidate,reference')
     a = ap.parse_args()
     if a.out:
         guard_output(a.out)
-    if len(a.result) != (4 if a.restart_quartet else 1):
-        ap.error('restart-quartet requires four session JSONs in O/B/B/O order; in-session requires one --arms JSON')
+    if not a.restart_quartet and (len(a.result) != 1 or a.expected_difference or a.restart_order):
+        ap.error('in-session requires one --arms JSON; expected-difference and restart-order require restart-quartet')
     documents = [json.load(open(path, encoding='utf-8')) for path in a.result]
     try:
-        doc = restart_analysis(documents, a.ref) if a.restart_quartet else documents[0]
+        doc = restart_analysis(documents, a.ref, a.expected_difference,
+                               a.restart_order.split(',') if a.restart_order else None) if a.restart_quartet else documents[0]
     except ValueError as exc:
         ap.error(str(exc))
     buf, worse = io.StringIO(), 0
     p = lambda *x: print(*x, file=buf)
     fmt = lambda v, nd=2: '-' if v is None else f'{v:+.{nd}f}' if isinstance(v, float) else str(v)
+    if doc.get('expected_difference'):
+        p('declared expected difference (reference -> new): ' + doc['expected_difference'])
+    if a.restart_order:
+        p('restart order: ' + a.restart_order)
     runs = [r for r in doc.get('runs', []) if r.get('ab')]
     if not runs:
         sys.exit(f'{a.result}: no run has "ab" (run analyze.py with --arms)')
     for run in runs:
         mode = run['ab'].get('mode', 'in-session') if a.restart_quartet else 'in-session'
-        p(f'comparison mode: {mode}' + (' (independent sessions O/B/B/O; pairs 1-2 and 4-3)' if a.restart_quartet else ''))
+        p(f'comparison mode: {mode}' + (' (independent sessions; adjacent reference/candidate pairs)' if a.restart_quartet else ''))
         ab = run['ab']; arms = ab['arms']; c = ab['windows']
         p(f'## {run["device"]} / {run["scene"]}: {c["assigned"]} windows in arms, {c["straddling"]} straddling and '
           f'{c["unlabelled"]} unlabelled dropped')
@@ -288,6 +343,19 @@ def main():
                   ('residency unavailable, clock confound not checked' if clock is None else
                    f'arms differ by {100 * clock:.1f}% (limit {100 * GPU_CLOCK_TOLERANCE:.0f}%)' +
                    (', intended (--clock-lever)' if a.clock_lever and clock > GPU_CLOCK_TOLERANCE else '')))
+                mean_clock = lambda record: (sum(values) / len(values) if
+                    (values := record.get('gpu_clock_hz', [])) and None not in values and min(values) > 0 else None)
+                reference_clock, new_clock = mean_clock(ref), mean_clock(arm)
+                means = '; '.join(f'{label} ' + ('unavailable' if hz is None else f'{hz / 1e6:.3f} MHz')
+                                  for label, hz in ((a.ref, reference_clock), (name, new_clock)))
+                signed = ('unavailable' if reference_clock is None or new_clock is None else
+                          f'{(new_clock - reference_clock) / 1e6:+.3f} MHz '
+                          f'({100 * (new_clock - reference_clock) / max(reference_clock, new_clock):+.3f}% of max arm mean)')
+                p(f'  GPU clock arm means: {means}; signed {name} - {a.ref}: {signed}')
+                p('  Frame cap from document settings per session: ' + '; '.join(
+                    label + ' ' + ' / '.join(record.get('frame_cap_from_settings', ['UNKNOWN']))
+                    for label, record in ((a.ref, ref), (name, arm))) +
+                  '; under a frame cap the governor derives clock from load; the 3% confound rule is unchanged.')
             primary = primary_metrics(ref['summary'], arm['summary'])
             p(f'  {"metric":<16} {a.ref:>9} {name:>9} {"pooled Δ":>9} {"paired Δ":>9} {"tolerance":>9} {"spread":>9}  verdict')
             for key, label, *_ in METRICS:
@@ -308,8 +376,9 @@ def main():
                   f'sign agreement {stats["agreement"]}/{len(stats["pairs"])} (ties {stats["ties"]}); '
                   f'exact sign p={probability}')
                 if a.restart_quartet:
-                    p(f'    O-spread: {fmt(stats["reference_spread"])}; must be <= tolerance; '
-                      'both adjacent pair signs must agree (no direction-confirmation claim)')
+                    p(f'    O-spread: {fmt(stats["reference_spread"])}; must be <= tolerance; ' +
+                      ('both adjacent pair signs must agree' if len(stats['pairs']) == 2 else
+                       'all adjacent pair signs must agree') + ' (no direction-confirmation claim)')
                     p('    session pair deltas: ' + ', '.join(
                         f'positions {pair["reference_block"]}/{pair["arm_block"]} (B-O) {fmt(pair["delta"])}'
                         for pair in stats['pairs']))
@@ -319,7 +388,7 @@ def main():
                     f'{k} {"-" if r is None else r} -> {"-" if x is None else x}' for k, r, x in mem if r is not None or x is not None))
         if a.restart_quartet:
             p('\n  * primary metric. RESTART-QUARTET rule: pooled AND paired deltas beyond tolerance in the same '
-              'direction (fps: max(0.5 fps, 2%)); both adjacent pair signs agree; O1/O2 spread <= tolerance. '
+              'direction (fps: max(0.5 fps, 2%)); all adjacent pair signs agree; reference max-min spread <= tolerance. '
               'Missing pairs/spread or unstable O => INCONCLUSIVE. Other metrics use compare.py tolerances. '
               'This is not in-session direction confirmation or statistical significance. '
               'Capped dip-confounding and uncapped throughput/tail rules are unchanged.')

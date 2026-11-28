@@ -1,0 +1,2928 @@
+[
+  {
+    "values": [
+      40,
+      42,
+      42,
+      40
+    ],
+    "counts": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "paired": {
+      "fps_steady": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "dip_time_fraction": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "throughput_fps": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 2.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 2.0
+          }
+        ],
+        "delta": 2.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_mean": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 2.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 2.0
+          }
+        ],
+        "delta": 2.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_min": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 2
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 2
+          }
+        ],
+        "delta": 2.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_stddev": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_median": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p95_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p99_ms_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "p99_p50_ratio_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "max_ms": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "gpu_ms_mean": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "over33_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "over50_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "long_ge45_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      }
+    },
+    "metrics": {
+      "fps_steady": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "dip_time_fraction": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "throughput_fps": [
+        2.0,
+        0.8,
+        0.0,
+        "better"
+      ],
+      "fps_mean": [
+        2.0,
+        0.8,
+        0.0,
+        "better"
+      ],
+      "fps_min": [
+        2.0,
+        2.0,
+        0,
+        "same"
+      ],
+      "fps_stddev": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "p50_ms_median": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p50_ms_max": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p95_ms_max": [
+        0.0,
+        1.5,
+        0,
+        "same"
+      ],
+      "p99_ms_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "p99_p50_ratio_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "max_ms": [
+        0.0,
+        6.0,
+        0,
+        "same"
+      ],
+      "gpu_ms_mean": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "over33_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "over50_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "long_ge45_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ]
+    },
+    "overall": "better"
+  },
+  {
+    "values": [
+      40,
+      38,
+      38,
+      40
+    ],
+    "counts": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "paired": {
+      "fps_steady": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "dip_time_fraction": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "throughput_fps": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": -2.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": -2.0
+          }
+        ],
+        "delta": -2.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_mean": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": -2.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": -2.0
+          }
+        ],
+        "delta": -2.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_min": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": -2
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": -2
+          }
+        ],
+        "delta": -2.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_stddev": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_median": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p95_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p99_ms_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "p99_p50_ratio_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "max_ms": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "gpu_ms_mean": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "over33_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "over50_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "long_ge45_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      }
+    },
+    "metrics": {
+      "fps_steady": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "dip_time_fraction": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "throughput_fps": [
+        -2.0,
+        0.8,
+        0.0,
+        "worse"
+      ],
+      "fps_mean": [
+        -2.0,
+        0.8,
+        0.0,
+        "worse"
+      ],
+      "fps_min": [
+        -2.0,
+        2.0,
+        0,
+        "same"
+      ],
+      "fps_stddev": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "p50_ms_median": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p50_ms_max": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p95_ms_max": [
+        0.0,
+        1.5,
+        0,
+        "same"
+      ],
+      "p99_ms_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "p99_p50_ratio_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "max_ms": [
+        0.0,
+        6.0,
+        0,
+        "same"
+      ],
+      "gpu_ms_mean": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "over33_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "over50_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "long_ge45_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ]
+    },
+    "overall": "worse"
+  },
+  {
+    "values": [
+      40,
+      40.8,
+      40.8,
+      40
+    ],
+    "counts": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "paired": {
+      "fps_steady": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "dip_time_fraction": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "throughput_fps": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.7999999999999972
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.7999999999999972
+          }
+        ],
+        "delta": 0.7999999999999972,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_mean": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.7999999999999972
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.7999999999999972
+          }
+        ],
+        "delta": 0.7999999999999972,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_min": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.7999999999999972
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.7999999999999972
+          }
+        ],
+        "delta": 0.7999999999999972,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_stddev": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_median": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p95_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p99_ms_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "p99_p50_ratio_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "max_ms": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "gpu_ms_mean": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "over33_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "over50_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "long_ge45_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      }
+    },
+    "metrics": {
+      "fps_steady": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "dip_time_fraction": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "throughput_fps": [
+        0.7999999999999972,
+        0.8,
+        0.0,
+        "same"
+      ],
+      "fps_mean": [
+        0.7999999999999972,
+        0.8,
+        0.0,
+        "same"
+      ],
+      "fps_min": [
+        0.7999999999999972,
+        2.0,
+        0,
+        "same"
+      ],
+      "fps_stddev": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "p50_ms_median": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p50_ms_max": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p95_ms_max": [
+        0.0,
+        1.5,
+        0,
+        "same"
+      ],
+      "p99_ms_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "p99_p50_ratio_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "max_ms": [
+        0.0,
+        6.0,
+        0,
+        "same"
+      ],
+      "gpu_ms_mean": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "over33_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "over50_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "long_ge45_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ]
+    },
+    "overall": "same"
+  },
+  {
+    "values": [
+      40,
+      44,
+      44,
+      42
+    ],
+    "counts": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "paired": {
+      "fps_steady": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "dip_time_fraction": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "throughput_fps": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 2.0
+          }
+        ],
+        "delta": 3.0,
+        "mode": "restart-quartet",
+        "reference_spread": 2.0,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_mean": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 2.0
+          }
+        ],
+        "delta": 3.0,
+        "mode": "restart-quartet",
+        "reference_spread": 2.0,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_min": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 2
+          }
+        ],
+        "delta": 3.0,
+        "mode": "restart-quartet",
+        "reference_spread": 2,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_stddev": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_median": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p95_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p99_ms_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "p99_p50_ratio_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "max_ms": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "gpu_ms_mean": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "over33_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "over50_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "long_ge45_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      }
+    },
+    "metrics": {
+      "fps_steady": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "dip_time_fraction": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "throughput_fps": [
+        3.0,
+        0.8196,
+        2.0,
+        "inconclusive"
+      ],
+      "fps_mean": [
+        3.0,
+        0.8200000000000001,
+        2.0,
+        "inconclusive"
+      ],
+      "fps_min": [
+        3.0,
+        2.0,
+        2,
+        "better"
+      ],
+      "fps_stddev": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "p50_ms_median": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p50_ms_max": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p95_ms_max": [
+        0.0,
+        1.5,
+        0,
+        "same"
+      ],
+      "p99_ms_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "p99_p50_ratio_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "max_ms": [
+        0.0,
+        6.0,
+        0,
+        "same"
+      ],
+      "gpu_ms_mean": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "over33_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "over50_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "long_ge45_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ]
+    },
+    "overall": "inconclusive"
+  },
+  {
+    "values": [
+      40,
+      44,
+      44,
+      40.8
+    ],
+    "counts": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "paired": {
+      "fps_steady": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "dip_time_fraction": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "throughput_fps": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 3.200000000000003
+          }
+        ],
+        "delta": 3.6000000000000014,
+        "mode": "restart-quartet",
+        "reference_spread": 0.7999999999999972,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_mean": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 3.200000000000003
+          }
+        ],
+        "delta": 3.6000000000000014,
+        "mode": "restart-quartet",
+        "reference_spread": 0.7999999999999972,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_min": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 3.200000000000003
+          }
+        ],
+        "delta": 3.6000000000000014,
+        "mode": "restart-quartet",
+        "reference_spread": 0.7999999999999972,
+        "directions": {},
+        "agreement": 2,
+        "ties": 0,
+        "p_value": 0.5
+      },
+      "fps_stddev": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_median": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p95_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p99_ms_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "p99_p50_ratio_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "max_ms": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "gpu_ms_mean": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "over33_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "over50_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "long_ge45_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      }
+    },
+    "metrics": {
+      "fps_steady": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "dip_time_fraction": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "throughput_fps": [
+        3.6000000000000014,
+        0.8079999999999999,
+        0.7999999999999972,
+        "better"
+      ],
+      "fps_mean": [
+        3.6000000000000014,
+        0.8079999999999999,
+        0.7999999999999972,
+        "better"
+      ],
+      "fps_min": [
+        3.6000000000000014,
+        2.0,
+        0.7999999999999972,
+        "better"
+      ],
+      "fps_stddev": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "p50_ms_median": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p50_ms_max": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p95_ms_max": [
+        0.0,
+        1.5,
+        0,
+        "same"
+      ],
+      "p99_ms_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "p99_p50_ratio_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "max_ms": [
+        0.0,
+        6.0,
+        0,
+        "same"
+      ],
+      "gpu_ms_mean": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "over33_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "over50_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "long_ge45_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ]
+    },
+    "overall": "better"
+  },
+  {
+    "values": [
+      40,
+      44,
+      39,
+      40
+    ],
+    "counts": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "paired": {
+      "fps_steady": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "dip_time_fraction": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "throughput_fps": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": -1.0
+          }
+        ],
+        "delta": 1.5,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 1,
+        "ties": 0,
+        "p_value": 1.0
+      },
+      "fps_mean": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": -1.0
+          }
+        ],
+        "delta": 1.5,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 1,
+        "ties": 0,
+        "p_value": 1.0
+      },
+      "fps_min": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": -1
+          }
+        ],
+        "delta": 1.5,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 1,
+        "ties": 0,
+        "p_value": 1.0
+      },
+      "fps_stddev": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_median": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p95_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p99_ms_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "p99_p50_ratio_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "max_ms": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "gpu_ms_mean": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "over33_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "over50_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "long_ge45_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      }
+    },
+    "metrics": {
+      "fps_steady": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "dip_time_fraction": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "throughput_fps": [
+        1.5,
+        0.8,
+        5.0,
+        "inconclusive"
+      ],
+      "fps_mean": [
+        1.5,
+        0.8,
+        5.0,
+        "inconclusive"
+      ],
+      "fps_min": [
+        1.5,
+        2.0,
+        5,
+        "same"
+      ],
+      "fps_stddev": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "p50_ms_median": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p50_ms_max": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p95_ms_max": [
+        0.0,
+        1.5,
+        0,
+        "same"
+      ],
+      "p99_ms_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "p99_p50_ratio_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "max_ms": [
+        0.0,
+        6.0,
+        0,
+        "same"
+      ],
+      "gpu_ms_mean": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "over33_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "over50_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "long_ge45_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ]
+    },
+    "overall": "inconclusive"
+  },
+  {
+    "values": [
+      40,
+      44,
+      39.9,
+      40
+    ],
+    "counts": [
+      2,
+      1,
+      100,
+      2
+    ],
+    "paired": {
+      "fps_steady": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "dip_time_fraction": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "throughput_fps": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": -0.10000000000000142
+          }
+        ],
+        "delta": 1.9499999999999993,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 1,
+        "ties": 0,
+        "p_value": 1.0
+      },
+      "fps_mean": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": -0.10000000000000142
+          }
+        ],
+        "delta": 1.9499999999999993,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 1,
+        "ties": 0,
+        "p_value": 1.0
+      },
+      "fps_min": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 4
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": -0.10000000000000142
+          }
+        ],
+        "delta": 1.9499999999999993,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 1,
+        "ties": 0,
+        "p_value": 1.0
+      },
+      "fps_stddev": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_median": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p50_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p95_ms_max": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "p99_ms_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "p99_p50_ratio_max": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "max_ms": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "gpu_ms_mean": {
+        "pairs": [],
+        "delta": null,
+        "mode": "restart-quartet",
+        "reference_spread": null,
+        "directions": {},
+        "agreement": 0,
+        "ties": 0,
+        "p_value": null
+      },
+      "over33_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "over50_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      },
+      "long_ge45_total": {
+        "pairs": [
+          {
+            "reference_block": 1,
+            "arm_block": 2,
+            "direction": "restart",
+            "delta": 0.0
+          },
+          {
+            "reference_block": 4,
+            "arm_block": 3,
+            "direction": "restart",
+            "delta": 0.0
+          }
+        ],
+        "delta": 0.0,
+        "mode": "restart-quartet",
+        "reference_spread": 0.0,
+        "directions": {},
+        "agreement": 0,
+        "ties": 2,
+        "p_value": 1.0
+      }
+    },
+    "metrics": {
+      "fps_steady": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "dip_time_fraction": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "throughput_fps": [
+        1.9499999999999993,
+        0.8,
+        4.100000000000001,
+        "inconclusive"
+      ],
+      "fps_mean": [
+        1.9499999999999993,
+        0.8,
+        4.100000000000001,
+        "inconclusive"
+      ],
+      "fps_min": [
+        1.9499999999999993,
+        2.0,
+        4.100000000000001,
+        "same"
+      ],
+      "fps_stddev": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "p50_ms_median": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p50_ms_max": [
+        0.0,
+        0.5,
+        0,
+        "same"
+      ],
+      "p95_ms_max": [
+        0.0,
+        1.5,
+        0,
+        "same"
+      ],
+      "p99_ms_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "p99_p50_ratio_max": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "max_ms": [
+        0.0,
+        6.0,
+        0,
+        "same"
+      ],
+      "gpu_ms_mean": [
+        null,
+        null,
+        null,
+        "n/a"
+      ],
+      "over33_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "over50_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ],
+      "long_ge45_total": [
+        0.0,
+        0.5,
+        0.0,
+        "same"
+      ]
+    },
+    "overall": "inconclusive"
+  }
+]

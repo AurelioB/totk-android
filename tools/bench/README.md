@@ -68,8 +68,8 @@ measurements, not the timeline's own counters alone; host microbenchmarks cannot
 | `sampler.py -s <serial> --device <label> --out <dir> [--duration S]` | Every 3 s: newest frame, max CPU/GPU zone temperature, cooling states, GPU `thermal_pwrlevel`/clock/`max_gpuclk`, cpufreq `scaling_max/cpuinfo_max`, MemAvailable, the game's VmRSS / VmSwap / RssShmem, its kgsl memory (`/sys/class/kgsl/kgsl/proc/<pid>/{kernel,gpumem_mapped,imported_mem}`; falls back to legacy `imported`), PSI cpu / memory some / full avg10 and kswapd CPU % → `<dir>/samples-<label>.txt` (values a device lacks stay empty → null). Stops on Ctrl-C / SIGTERM / `--duration` and removes its device loop. |
 | `collect.sh -s <serial> --device <label> --out <dir> [--mark]` | `--mark`: dmesg marker (after the scene settles). Default: pulls `logs/<label>.log`, `logs/<label>-dmesg.txt` (from the marker), `settings-<label>.env`, `facts-<label>.txt` (model, SoC, GPU, Android, displays, app version, APK sha256, serial hash), warns about a developer `totk.env`, prints the GPU-fault check. Exit 3 when there is no `totk.log`. |
 | `analyze.py <dir> [--json <file>] [--name <name>] [--commit <sha>] [--meta <json>] [--arms]` | Per device × scene: the 300-frame windows that started after the stick was pushed and ended before it was released (end frame in `[F0+600, F1]`), thermal state over each pan, the frequency limits of each pan and whether they stayed put (`freq_stable`), each device's frequency signature, a results table and caveats; `--json` writes schema `totk-android-benchmark/1`. `--arms`: each window goes to the live-switch generation that covered it whole and that generation's arm (windows straddling a change are dropped); per arm pooled metrics, per block metrics and the same-arm spread (`ab` in the JSON). With the sampler's memory fields, each window, run and arm also gets `memory`: MemAvailable minimum and the maxima of the rest. |
-| `compare.py <reference.json> <new.json>` | Per device × scene: fps mean/min, p50 median, p95 max, worst frame, GPU ms mean, long ≥45 ms, >50 ms, max temperatures, with deltas and verdicts (thresholds in `compare.py --help`); labels each device pair by frequency signature: match / reference only / NOT COMPARABLE; warns when `settings_env` or cpufreq caps differ or caps changed during a run. Exit 1 if a scene with a matching signature is worse. |
-| `abtest.py <ab.json> [--ref A]` | In-session arms: pooled and same-direction ABBA paired deltas, per-direction deltas, sign agreement, exact sign p-value, tolerance and informational spread. Better/worse requires both deltas beyond tolerance plus unanimous signs (or p < 0.05 with ≥6 pairs) and both directions. Distinct restart mode: `--restart-quartet O1.json B1.json B2.json O2.json --ref O` (see below). Exit 1 if an arm is worse. |
+| `compare.py <reference.json> <new.json> [--expected-difference SWITCH:REFERENCE:NEW]` | Per device × scene: metric deltas/verdicts, and signature match / reference only / NOT COMPARABLE. An explicit one-switch on/off treatment must match exactly; other signature admission stays strict. Exit 1 if a scene with a matching comparison signature is worse. |
+| `abtest.py <ab.json> [--ref A]` | In-session arms: pooled and same-direction ABBA paired deltas, per-direction deltas, sign agreement, exact sign p-value, tolerance and informational spread. Better/worse requires both deltas beyond tolerance plus unanimous signs (or p < 0.05 with ≥6 pairs) and both directions. Independent restart mode: `--restart-quartet` supports N ≥ 2 adjacent session pairs, `--restart-order` and `--expected-difference` (see below). Exit 1 if an arm is worse. |
 | `ledger.py add <result.json> --commit <sha> --apk <apk> --profile <text> [--note ...]` | Append a run to `docs/benchmarks/ledger.jsonl` (+ `docs/benchmarks/runs/<run-id>/<device>.json`), tied to the clean commit the APK was built from (its `assets/build.txt`); compared with the baseline of its frequency signature, or, for a signature seen for the first time (with stable caps), recorded as that signature's NEW baseline (`docs/benchmarks/baselines/<device>/<signature>.json`, pinned, indexed); re-renders `docs/benchmarks/LEDGER.md`. Also `render`, `show <run-id>`, `compare <run-id> <run-id>`. |
 | `check_baselines.py` | Fails if a baseline file (`docs/benchmarks/baseline-*`, `docs/benchmarks/baselines/**`) differs from `docs/benchmarks/BASELINES.sha256` or is unpinned, or `docs/benchmarks/baselines/index.json` is inconsistent (also run by `tests/test_bench_tools.py`). |
 
@@ -153,34 +153,64 @@ estimate for missing pairs or proof of physical scanout. It is null without vali
 Cadence tracing is high-volume and has measurably perturbed Thor timing: keep it off in ordinary performance arms,
 do not mix traced/untraced arms, and use independent distinct-picture evidence for displayed smoothness.
 
-### Restart quartets (distinct from in-session A/B)
+### Restart pairs (distinct from in-session A/B)
 
-For launch-only switches, collect and analyze **four separate session directories**, in the declared
-**O1 → B1 → B2 → O2** order (one restart, same named save, settle and pan schedule each time). Do not concatenate
-their logs: frame counters reset. No synthetic live-control marks are necessary:
+For launch-only switches, collect and analyze **separate session directories**, one restart, same named save,
+settle and schedule each time. Do not concatenate logs: frame counters reset. A two-pair O/B/B/O example:
 
 ```sh
 python3 tools/bench/abtest.py --restart-quartet \
-  "$OUT/O1/result.json" "$OUT/B1/result.json" "$OUT/B2/result.json" "$OUT/O2/result.json" --ref O
+  "$OUT/O1/result.json" "$OUT/B1/result.json" "$OUT/B2/result.json" "$OUT/O2/result.json" --ref O \
+  --expected-difference TOTK_MAP_WARN:off:on
 ```
 
-The report is labelled **restart-quartet**, never in-session direction-confirmed. All four JSONs must contain the
-same device/scene set, nonempty measured windows and identical explicit pan direction/stick schedules; current
-`analyze.py` records `pans[].direction` from `pans.txt D`. Re-analyze older captures rather than inventing directions.
-Keep pan durations, save, cache, caps, power and thermal admission the same; inspect each source result's caveats,
-frequency stability, compile flags and GPU residency. The command does not establish physical scene equivalence.
-Mixed capped/uncapped sessions are rejected rather than pooled.
+`--expected-difference SWITCH:REFERENCE:NEW` is also supported by `compare.py reference.json new.json`.
+The states are ordered, lowercase `on` or `off`, and must differ. The declaration is printed in the report.
+Admission requires **exactly that switch** to realize those states: UNKNOWN anywhere in the required effective
+states, the wrong switch, another differing switch, or identical treatment states rejects the comparison.
+For `TOTK_MAP_WARN`, its on/off mode transition belongs to that treatment; differing modes while both on still
+reject. Hardware/cap mismatches and unrelated settings are not waived by `compare.py`. When both raw settings maps
+are available, only the declared switch's env entry is excluded from comparison (explicit `0` versus an unset
+default can realize the intended transition). Raw documents, signature fields and hashes are never rewritten.
+Without the declaration, existing comparison admission is unchanged. Supported switch names are `TOTK_WB_ALIAS`,
+`TOTK_MAP_WARN`, `TOTK_MENU_CAPTURE_FIX`, and `TOTK_VK_REC_ONE_PRIMARY`; the last needs authenticated v3 startup
+markers, obtained by re-analyzing original logs with this analyzer. Missing evidence is never inferred from env.
+The base signature keys and historical hashes stay unchanged; one-primary metadata is additional admission evidence.
 
-Each complete session is one block. Pairs are **B1−O1 (positions 2−1)** and **B2−O2 (3−4)**, equal weight regardless
-of window count. Pooled values are recomputed from both sessions' original windows (throughput remains frames/time).
-Per-metric BETTER/WORSE requires pooled **and** paired-mean deltas strictly beyond tolerance in the same direction,
-and **both pair signs agreeing**, with no sign-test relaxation. FPS tolerance is **max(0.5 fps, 2% of pooled O fps)**;
-other metrics retain `compare.py` tolerances and per-window count rates. **O-spread = |O2−O1| must be ≤ tolerance**,
-so any confirmed effect also exceeds O-spread. Larger/missing O-spread, missing pairs, sign disagreement or a
-paired-only/pooled-only crossing are INCONCLUSIVE, not a confirmed improvement. With admitted O-spread, a paired
-delta within tolerance is SAME. The report shows both individual pair deltas and O-spread. Primary-tail regressions
-and capped dip-confounding still apply; uncapped uses throughput/tails. This two-pair rule is not statistical
-significance. The existing in-session mode and its both-directions requirement are unchanged.
+Python API: `benchlib.compare_docs(base, new, ..., expected_difference='TOTK_MAP_WARN:off:on')` and
+`abtest.restart_analysis(documents, reference, expected_difference=None, order=None)`.
+The shared `benchlib.parse_expected_difference` also accepts a `(switch, reference_state, new_state)` tuple.
+Restart `order` is the chronological list of arm names; the candidate name is B (A when reference is B).
+The CLI takes comma-separated labels. For four vs four, for example:
+
+```sh
+python3 tools/bench/abtest.py --restart-quartet \
+  B1.json A1.json A2.json B2.json A3.json B3.json B4.json A4.json \
+  --ref A --restart-order B,A,A,B,A,B,B,A --expected-difference TOTK_WB_ALIAS:off:on
+```
+
+The report retains the **restart-quartet** mode name for compatibility, never in-session direction-confirmed.
+There must be **N ≥ 2 genuine adjacent reference/candidate pairs**; every adjacent pair contains one arm of each
+kind. Default chronology repeats complete reference/candidate/candidate/reference quartets. Other even lengths
+need an explicit order. All JSONs need the same device/scene set, nonempty measured windows, and identical explicit
+pan direction/stick schedules. Standing schedules must also retain their original metadata, not fabricated pan
+directions. Re-analyze older captures rather than inventing missing metadata. Mixed capped/uncapped is rejected.
+Inspect each source result's caveats, frequency stability, compile flags, save, cache, power/thermal and residency
+admission; the command does not establish physical scene equivalence or campaign continuity across interruptions.
+
+Each complete session is one block. Adjacent candidate-minus-reference differences receive **equal weight**,
+regardless of window count. Pooled summaries use **all original windows** (throughput remains frames/time).
+BETTER/WORSE requires pooled **and** paired-mean deltas strictly beyond tolerance in the same direction,
+and **all N pair signs agreeing**, with no sign-test relaxation. FPS tolerance remains
+**max(0.5 fps, 2% of pooled reference fps)**; other metrics retain `compare.py` tolerances and per-window count rates.
+**Reference spread = max(reference session values) − min(reference session values) must be ≤ tolerance**.
+The range is the direct conservative generalization of the old two-reference absolute difference: every pair of
+reference sessions remains within the existing stability bound. No standard-error shrinkage or significance claim
+is introduced. With two pairs, the numbers and verdicts are unchanged, including boundary tolerances.
+Larger/missing reference spread, any missing pair, sign disagreement or a paired-only/pooled-only crossing is
+INCONCLUSIVE. With admitted reference spread, paired delta within tolerance is SAME (as before).
+The report shows all pair deltas and reference spread. Primary-tail regressions, capped dip-confounding and the
+GPU-clock guard below still apply; uncapped uses throughput/tails. The in-session mode is unchanged.
 
 **GPU clock guard.** A GPU governor can settle at a different clock from one session to the next (the Thor ran the
 same scene at 680 MHz and 42.5 fps, then at 615 MHz and 37 fps), and that alone moves GPU ms and fps. The report
@@ -189,6 +219,13 @@ by more than **3%** the overall result is **verdict confounded by GPU clock** in
 the quartet with the clock in the same state in both arms. Pass `--clock-lever` when the arm changes the clock on
 purpose (a clock floor): the difference is still printed and the verdict stands. Sessions without residency are
 reported as **not checked**, never treated as equal.
+
+The clock report includes each **arm's mean**, signed **new minus reference** MHz and percentage (denominator:
+the larger arm mean, matching the guard), and frame-cap on/off per session from document `settings_env`
+(`TOTK_UNCAPPED=1` means off; missing settings metadata is UNKNOWN).
+**Under a frame cap the governor derives clock from load**: a lower new-arm clock can reflect reduced work as well
+as a disturbance. The printed direction/settings provide context, not a causal diagnosis; the absolute **3% rule
+and all verdicts remain unchanged**, including `--clock-lever` behavior.
 
 ### Compile and scene provenance
 

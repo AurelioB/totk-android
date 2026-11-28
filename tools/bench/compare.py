@@ -49,7 +49,7 @@ run (freq_stable false)."""
 import argparse, io, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchlib import DIP_CONFOUNDED, compare_docs, guard_output, load_result  # noqa: E402
+from benchlib import DIP_CONFOUNDED, compare_docs, guard_output, load_result, parse_expected_difference  # noqa: E402
 
 
 def main():
@@ -58,13 +58,16 @@ def main():
     ap.add_argument('baseline', help='the reference result JSON')
     ap.add_argument('new')
     ap.add_argument('--out', help='also write the comparison to this file')
+    ap.add_argument('--expected-difference', type=parse_expected_difference, metavar='SWITCH:REFERENCE:NEW',
+                    help='admit exactly this effective-switch transition (reference then new); all other checks apply')
     a = ap.parse_args()
     if a.out:
         guard_output(a.out)
     base, new = load_result(a.baseline), load_result(a.new)
     buf = io.StringIO()
     print(f'# {new.get("name")} vs {base.get("name")}', file=buf)
-    verdicts = compare_docs(base, new, buf, base_path=a.baseline, new_path=a.new)
+    verdicts = compare_docs(base, new, buf, base_path=a.baseline, new_path=a.new,
+                           expected_difference=a.expected_difference)
     count = lambda v, rel: sum(1 for o, r in verdicts.values() if o == v and r == rel)
     extra = ''.join(f', {count(v, "match")} {v}' for v in ('inconclusive', DIP_CONFOUNDED, 'n/a') if count(v, 'match'))
     print(f'\nscenes with matching signatures: {count("better", "match")} better, {count("worse", "match")} worse, '
