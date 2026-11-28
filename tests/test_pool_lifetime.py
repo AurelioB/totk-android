@@ -286,7 +286,7 @@ class PoolLifetimeParity(unittest.TestCase):
     def test_unrelated_lookup_and_lifecycle_routing_remain_byte_for_byte_main(self):
         main_res, main_pool, main_vpool = self.sources['main']
         acd_res, acd_pool, acd_vpool = self.sources['acd']
-        for name in ('stor_key_of', 'vk_wb_range_gone'):
+        for name in ('stor_key_of', 'tex_mark_gpu_written_inner', 'vk_wb_range_gone'):
             self.assertEqual(fixture.function(main_res, name), fixture.function(acd_res, name), name)
         for name in ('add_range', 'back_pool', 'pool_remove_locked', 'pool_retired', 'mtl_vpool_del',
                      'mtl_vpool_add', 'mtl_vpool_release', 'mtl_pool_finalize'):
