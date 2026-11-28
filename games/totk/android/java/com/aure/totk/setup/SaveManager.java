@@ -40,12 +40,14 @@ final class SaveManager {
     static final String TITLE_ID = "0100F2C0115B6000";
     /** Top folder of an export zip and of the mirror folder; the manifest sits inside it next to the save files. */
     static final String TOP = "TotK Native saves", MANIFEST = "totk-native-saves.json";
-    static final int MAX_FILES = 500, KEEP_BACKUPS = 10;
+    /** Six slots with 526 picture-book files each already exceed 3,000 files (#19); 526 is a report, not a capacity.
+     * Leave room for fuller picture books and albums. Byte limits still apply to every picture. */
+    static final int MAX_FILES = 16_384, KEEP_BACKUPS = 10;
     static final long MAX_TOTAL = 128L << 20;
     /** Game save files are a few MB (progress.sav ~2.3 MB); a large file with another name is not part of a save set. */
     static final long MAX_KNOWN_FILE = 32L << 20, MAX_OTHER_FILE = 1L << 20;
     /** Zip entries anywhere in the archive (outside the save root too): a cap against archives that are not save dumps. */
-    static final int MAX_ENTRIES = 10_000;
+    static final int MAX_ENTRIES = 65_536;
     private static final Pattern SLOT_PROGRESS = Pattern.compile("(?:.*/)?slot_\\d\\d/progress\\.sav");
     private static final Pattern KNOWN = Pattern.compile("(?i).*\\.(sav|dat|jpg|jpeg|bin)");
 
@@ -447,7 +449,7 @@ final class SaveManager {
      * progress.sav is newest). Any absolute path, "..", or symbolic link anywhere rejects the dump; under the root,
      * more than MAX_FILES files, more than MAX_TOTAL bytes, or an oversized file rejects it too. */
     static Selection select(Collection<Candidate> all) throws Invalid {
-        if (all.size() > MAX_ENTRIES) throw new Invalid("too_many", all.size() + " entries");
+        if (all.size() > MAX_ENTRIES) throw new Invalid("too_many", all.size() + " entries (limit " + MAX_ENTRIES + ")");
         List<Candidate> clean = new ArrayList<>();
         for (Candidate c : all) {
             String path = normalize(c.path);
@@ -477,7 +479,7 @@ final class SaveManager {
             selection.total += c.size;
             selection.files.add(new Candidate(relative, c.size, false, c.mtime));
             selection.sources.put(relative, c.path);
-            if (selection.files.size() > MAX_FILES) throw new Invalid("too_many", "more than " + MAX_FILES + " files");
+            if (selection.files.size() > MAX_FILES) throw new Invalid("too_many", selection.files.size() + " files (limit " + MAX_FILES + ")");
             if (selection.total > MAX_TOTAL) throw new Invalid("too_big", selection.total + " bytes");
         }
         return selection;
@@ -530,7 +532,7 @@ final class SaveManager {
                 if (le32(z, 0) != 0x06064b50L) throw new Invalid("not_zip", "zip64 end record");
                 count = le64(z, 32); cdSize = le64(z, 40); cdOffset = le64(z, 48);
             }
-            if (count > MAX_ENTRIES) throw new Invalid("too_many", count + " entries");
+            if (count > MAX_ENTRIES) throw new Invalid("too_many", count + " entries (limit " + MAX_ENTRIES + ")");
             if (cdSize > 16L << 20 || cdOffset + cdSize > length) throw new Invalid("not_zip", "central directory out of range");
             byte[] cd = new byte[(int) cdSize];
             f.seek(cdOffset); f.readFully(cd);
@@ -854,7 +856,7 @@ final class SaveManager {
             File[] children = d.listFiles();
             if (children == null) throw new FileNotFoundException(d.getPath());
             for (File c : children) {
-                if (out.size() > MAX_ENTRIES) throw new Invalid("too_many", "more than " + MAX_ENTRIES + " entries");
+                if (out.size() > MAX_ENTRIES) throw new Invalid("too_many", out.size() + " entries (limit " + MAX_ENTRIES + ")");
                 if (Files.isSymbolicLink(c.toPath())) continue;
                 if (c.isDirectory()) list(c, prefix + c.getName() + "/", out);
                 else if (!(c.getName().startsWith(".") && c.getName().endsWith(PARTIAL))) out.put(prefix + c.getName(), new long[]{c.length(), c.lastModified()});
@@ -896,12 +898,23 @@ final class SaveManager {
         File[] children = d.listFiles();
         if (children == null) throw new FileNotFoundException(d.getPath());
         for (File c : children) {
-            if (out.size() > MAX_ENTRIES) throw new Invalid("too_many", "more than " + MAX_ENTRIES + " entries");
+            if (out.size() > MAX_ENTRIES) throw new Invalid("too_many", out.size() + " entries (limit " + MAX_ENTRIES + ")");
             String rel = prefix + c.getName();
             if (Files.isSymbolicLink(c.toPath())) out.add(new Candidate(rel, 0, true, 0));
             else if (c.isDirectory()) collect(c, rel + "/", out);
             else out.add(new Candidate(rel, c.length(), false, c.lastModified()));
         }
+    }
+    /** Validate and stage a picked folder with a real path; file contents are streamed, just like zip extraction. */
+    static Selection extractFolder(File base, File staging) throws IOException {
+        Selection selection = select(candidates(base));
+        delete(staging);
+        if (!staging.mkdirs()) throw new IOException("cannot create " + staging);
+        for (Candidate c : selection.files)
+            try (InputStream in = new FileInputStream(new File(base, selection.sources.get(c.path)))) { copyLimited(in, new File(staging, c.path), c.size, c.mtime); }
+        if (selection.manifestSource != null)
+            try (InputStream in = new FileInputStream(new File(base, selection.manifestSource))) { verifyAgainst(staging, Manifest.parse(readText(in, 4L << 20))); }
+        return selection;
     }
     static final String GENERATION = "sync-";
     private static final Pattern GENERATION_NAME = Pattern.compile("sync-(\\d{1,18})");

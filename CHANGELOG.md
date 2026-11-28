@@ -12,6 +12,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   omit fingerprints so identities cannot depend on rights IDs or encrypted key fields. Mixed tool/read/write
   failures and cancellation retain their existing classifications. Verification requirements are unchanged.
 
+### Fixed
+- Accept photo-heavy save imports with up to 16,384 files, instead of 500 (#19, duplicate #27).
+  Keep the 128 MiB total and per-file limits, with a separate 65,536-entry archive guard.
+  Count-limit errors now describe the current limits rather than declaring a photo-heavy save invalid.
+
 ### Developer tools
 - Support explicit single-switch benchmark treatments with `--expected-difference SWITCH:REFERENCE:NEW` in
   `compare.py` and restart `abtest.py`: require the declared on/off states, reject UNKNOWN, ineffective treatments

@@ -24,6 +24,8 @@ import java.util.Map;
  * line per command. "-" stands for "none".
  *    select DIR                      SaveManager.select over DIR's files (symlinks flagged): root/files/total or invalid CODE
  *    zip ZIP STAGING                 SaveManager.extractZip: root/files or invalid CODE
+ *    folder DIR STAGING              SaveManager.extractFolder: root/files or invalid CODE
+ *    entries COUNT                   select over COUNT synthetic candidates: invalid CODE
  *    export ROOT ZIP                 manifest + writeZip: number of files
  *    decide LIVE FOLDER LAST         SaveManager.decide over three directories (each scanned; "-" = none)
  *    backup ROOT BACKUPS REASON T    SaveManager.backup: the backup folder name or none
@@ -105,13 +107,27 @@ public final class SavesProbe {
             try {
                 switch (w[0]) {
                     case "select": {
-                        SaveManager.Selection s = SaveManager.select(listing(new File(w[1])));
+                        SaveManager.Selection s = SaveManager.select(SaveManager.candidates(new File(w[1])));
                         answer = "root=" + s.root + " files=" + s.files.size() + " total=" + s.total + " manifest=" + (s.manifestSource != null);
                         break;
                     }
                     case "zip": {
                         SaveManager.Selection s = SaveManager.extractZip(new File(w[1]), new File(w[2]));
                         answer = "root=" + s.root + " files=" + s.files.size();
+                        break;
+                    }
+                    case "folder-detail":
+                    case "folder": {
+                        SaveManager.Selection s = SaveManager.extractFolder(new File(w[1]), new File(w[2]));
+                        answer = "root=" + s.root + " files=" + s.files.size();
+                        break;
+                    }
+                    case "entries": {
+                        List<SaveManager.Candidate> all = new ArrayList<>();
+                        for (int n = 0; n < Integer.parseInt(w[1]); n++)
+                            all.add(new SaveManager.Candidate(n == 0 ? "option.sav" : "outside/" + n, 0, false, 0));
+                        SaveManager.select(all);
+                        answer = "accepted";
                         break;
                     }
                     case "export": {
@@ -191,7 +207,7 @@ public final class SavesProbe {
                     default: answer = "unknown command " + w[0];
                 }
             } catch (SaveManager.Invalid invalid) {
-                answer = "invalid " + invalid.code;
+                answer = "invalid " + invalid.code + (w[0].endsWith("-detail") ? " " + invalid.getMessage() : "");
             }
             System.out.println(answer);
         }

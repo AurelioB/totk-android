@@ -238,6 +238,14 @@ Saves always stay in the app's private storage, wherever the game data is. *Save
   other side is kept as a backup. If the folder is missing or access was taken away, the menu shows *Save folder
   unavailable* and nothing is deleted on either side.
 
+Zip and folder imports accept up to **16,384 save files** and **128 MiB total**; Compendium pictures count as files
+and are kept. A single recognized save/image file is limited to 32 MiB, other files to 1 MiB. Dumps are also limited
+to 65,536 entries, including files outside the selected save root (and zip directory entries). Unsafe names and
+symbolic links are refused. The file-count allowance leaves room above six independent picture books with the
+526 pictures reported in issue #19: `6 × (526 pictures + 4 slot files) + option.sav + storage key = 3,182 files`.
+That is a conservative example, not a verified maximum picture-book capacity; slot thumbnails are already inside
+`caption.sav`. The remaining allowance covers albums, other auxiliary files and fuller picture books.
+
 Saves live in the app's private storage. Uninstalling the app removes them: export them first.
 
 ## Drivers

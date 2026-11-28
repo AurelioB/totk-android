@@ -308,13 +308,7 @@ public final class SaveMirror {
     static SaveManager.Selection stageFolder(Context context, Uri tree, File staged) throws IOException {
         File direct = FileAccess.directFolder(context, tree);
         if (direct != null) {
-            SaveManager.Selection selection = SaveManager.select(SaveManager.candidates(direct));
-            SaveManager.delete(staged);
-            if (!staged.mkdirs()) throw new IOException("cannot create " + staged);
-            for (SaveManager.Candidate c : selection.files)
-                try (InputStream in = new FileInputStream(new File(direct, selection.sources.get(c.path)))) { SaveManager.copyLimited(in, new File(staged, c.path), c.size, c.mtime); }
-            if (selection.manifestSource != null)
-                try (InputStream in = new FileInputStream(new File(direct, selection.manifestSource))) { SaveManager.verifyAgainst(staged, SaveManager.Manifest.parse(SaveManager.readText(in, 4L << 20))); }
+            SaveManager.Selection selection = SaveManager.extractFolder(direct, staged);
             Log.i(TAG, "import: staged " + selection.files.size() + " files from " + direct + " (direct)");
             return selection;
         }
@@ -514,7 +508,7 @@ public final class SaveMirror {
         void list(String id, String prefix, Map<String, Doc> out) throws IOException {
             for (Doc d : children(id)) {
                 if (d.name == null) continue;
-                if (out.size() > SaveManager.MAX_ENTRIES) throw new SaveManager.Invalid("too_many", "more than " + SaveManager.MAX_ENTRIES + " entries");
+                if (out.size() > SaveManager.MAX_ENTRIES) throw new SaveManager.Invalid("too_many", out.size() + " entries (limit " + SaveManager.MAX_ENTRIES + ")");
                 if (d.dir()) list(d.id, prefix + d.name + "/", out);
                 else out.put(prefix + d.name, d);
             }

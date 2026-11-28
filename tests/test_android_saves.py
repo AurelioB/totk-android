@@ -18,6 +18,10 @@ TOTK = ROOT / 'games/totk'
 SOURCES = [TOTK / 'android/java/com/aure/totk/setup/SaveManager.java', TOTK / 'android/java/com/aure/totk/setup/Settings.java',
            TOTK / 'android/java/com/aure/totk/setup/GameLock.java', TOTK / 'tests/saves/SavesProbe.java']
 SLOT_FILES = {'progress.sav': 2307856, 'caption.sav': 21620, 'footprint.sav': 614760, 'direct_file_save_related.sav': 1152}
+MAX_SAVE_FILES = 16_384
+MAX_DUMP_ENTRIES = 65_536
+# Conservative independent picture books per slot, using #19's reported 526 pictures, not a proven game capacity.
+COMPENDIUM_HEAVY_FILES = 6 * (len(SLOT_FILES) + 526) + 2   # option.sav and storage key; caption includes its thumbnail
 
 
 def jpeg_caption(seed):
@@ -62,6 +66,19 @@ def save_set(base, slots=(0, 1), seed=1, option=False, extra=True):
     return base
 
 
+def counted_save_set(base, count):
+    """Small synthetic payloads with real slot names, plus one file per picture; count includes all save files."""
+    save_set(base, slots=range(6), option=True, extra=False)
+    (base / 'storage').mkdir()
+    (base / 'storage/CacheStorageKey.dat').write_bytes(b'key')
+    for i in range(count - 6 * len(SLOT_FILES) - 2):
+        slot, picture = i % 6, i // 6
+        path = base / f'slot_{slot:02d}/picturebook/{picture:04d}.jpg'
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(struct.pack('<I', i))
+    return base
+
+
 def tree(base):
     return {p.relative_to(base).as_posix(): p.read_bytes() for p in sorted(base.rglob('*')) if p.is_file()}
 
@@ -86,7 +103,7 @@ class SavesTests(unittest.TestCase):
         self.dir = Path(tempfile.mkdtemp(prefix='case-', dir=self.temp.name))
 
     def probe(self, *commands):
-        result = subprocess.run([self.java, '-cp', str(self.classes), 'com.aure.totk.setup.SavesProbe'],
+        result = subprocess.run([self.java, '-Xmx64m', '-cp', str(self.classes), 'com.aure.totk.setup.SavesProbe'],
                                 input='\n'.join('\t'.join(map(str, c)) for c in commands) + '\n',
                                 capture_output=True, text=True, timeout=120, check=True)
         return result.stdout.splitlines()
@@ -122,10 +139,6 @@ class SavesTests(unittest.TestCase):
         (base / 'slot_00/escape.sav').symlink_to('/etc/passwd')
         big = save_set(self.dir / 'big', slots=(0,))
         (big / 'slot_00/movie.mp4').write_bytes(b'\0' * (2 << 20))   # an unknown file far beyond any save file
-        many = save_set(self.dir / 'many', slots=(0,), extra=False)
-        (many / 'album').mkdir()
-        for i in range(501):
-            (many / f'album/{i:03d}_Thumb.jpg').write_bytes(b'x')
         huge = save_set(self.dir / 'huge', slots=(0,), extra=False)
         with open(huge / 'slot_00/progress.sav', 'r+b') as f:
             f.truncate(33 << 20)
@@ -134,8 +147,8 @@ class SavesTests(unittest.TestCase):
         for i in range(5):
             with open(total / f'album/{i}.bin', 'wb') as f:
                 f.truncate(30 << 20)
-        self.assertEqual(self.probe(('select', self.dir / 'link'), ('select', big), ('select', many), ('select', huge), ('select', total)),
-                         ['invalid symlink', 'invalid huge_file', 'invalid too_many', 'invalid huge_file', 'invalid too_big'])
+        self.assertEqual(self.probe(('select', self.dir / 'link'), ('select', big), ('select', huge), ('select', total)),
+                         ['invalid symlink', 'invalid huge_file', 'invalid huge_file', 'invalid too_big'])
 
         def zipped(name, entries, unix_link=None):
             path = self.dir / name
@@ -158,6 +171,65 @@ class SavesTests(unittest.TestCase):
         self.assertEqual(answers, ['invalid traversal', 'invalid absolute', 'invalid symlink', 'invalid not_zip'])
         for z in (traversal, absolute, link):
             self.assertFalse((self.dir / f'staged-{z.stem}').exists(), 'nothing is staged from a refused dump')
+
+    def test_file_count_boundaries_for_zip_and_folder_import(self):
+        for count in (501, COMPENDIUM_HEAVY_FILES, MAX_SAVE_FILES, MAX_SAVE_FILES + 1):
+            with self.subTest(count=count):
+                live = counted_save_set(self.dir / f'live-{count}', count)
+                archive = self.dir / f'{count}.zip'
+                # Export includes a manifest; it must not consume a save-file slot at the exact limit.
+                self.assertEqual(self.one('export', live, archive), str(count))
+                folder_stage, zip_stage = self.dir / f'folder-{count}', self.dir / f'zip-{count}'
+                answers = self.probe(('folder', live, folder_stage), ('zip', archive, zip_stage))
+                if count > MAX_SAVE_FILES:
+                    self.assertEqual(answers, ['invalid too_many', 'invalid too_many'])
+                    self.assertEqual(self.one('folder-detail', live, folder_stage),
+                                     f'invalid too_many too_many: {count} files (limit {MAX_SAVE_FILES})')
+                    self.assertFalse(folder_stage.exists())
+                    self.assertFalse(zip_stage.exists())
+                else:
+                    self.assertEqual(answers, [f'root= files={count}', f'root=TotK Native saves/ files={count}'])
+                    expected = tree(live)
+                    self.assertEqual(tree(folder_stage), expected)
+                    self.assertEqual(tree(zip_stage), expected)
+
+    def test_large_archives_still_enforce_size_name_and_entry_guards(self):
+        live = counted_save_set(self.dir / 'live', COMPENDIUM_HEAVY_FILES)
+        archive = self.dir / 'safe.zip'
+        self.one('export', live, archive)
+        # Retain thousands of legitimate entries while changing only central-directory sizes: rejection must
+        # happen before extraction, without allocating or reading the advertised payload.
+        for label, names, size, reason in (
+                ('file', ['slot_00/progress.sav'], 33 << 20, 'huge_file'),
+                ('other', ['slot_00/caption.sav'], 32 << 20, 'too_big')):
+            edited = bytearray(archive.read_bytes())
+            at = 0
+            while True:
+                at = edited.find(bytes((0x50, 0x4b, 1, 2)), at)
+                if at < 0:
+                    break
+                length, extra, comment = struct.unpack_from('<HHH', edited, at + 28)
+                name = edited[at + 46:at + 46 + length].decode()
+                # Individually allowed 32-MiB .sav files exceed the unchanged total-byte limit.
+                if (label == 'other' and name.endswith('/progress.sav')) or any(name.endswith('/' + n) for n in names):
+                    struct.pack_into('<I', edited, at + 24, size)
+                at += 46 + length + extra + comment
+            bad = self.dir / f'{label}.zip'
+            bad.write_bytes(edited)
+            staged = self.dir / f'staged-{label}'
+            self.assertEqual(self.one('zip', bad, staged), f'invalid {reason}')
+            self.assertFalse(staged.exists())
+        with zipfile.ZipFile(archive, 'a') as z:
+            z.writestr('TotK Native saves/../escape.jpg', b'x')
+        self.assertEqual(self.one('zip', archive, self.dir / 'traversal'), 'invalid traversal')
+        self.assertEqual(self.one('entries', MAX_DUMP_ENTRIES + 1), 'invalid too_many')
+        # ZIP64 count is checked before any central-directory buffer is allocated.
+        zip64 = self.dir / 'entries.zip'
+        zip64.write_bytes(struct.pack('<IQHHIIQQQQ', 0x06064b50, 44, 45, 45, 0, 0,
+                                      MAX_DUMP_ENTRIES + 1, MAX_DUMP_ENTRIES + 1, 0, 0)
+                          + struct.pack('<IIQI', 0x07064b50, 0, 0, 1)
+                          + struct.pack('<IHHHHIIH', 0x06054b50, 0, 0, 0xffff, 0xffff, 0, 0, 0))
+        self.assertEqual(self.one('zip', zip64, self.dir / 'entries'), 'invalid too_many')
 
     # ---------- export and import ----------
     def test_export_zip_round_trip_and_manifest_check(self):
@@ -228,13 +300,13 @@ class SavesTests(unittest.TestCase):
 
     # ---------- backups and the swap ----------
     def test_backup_rotation_keeps_the_newest_ten(self):
-        live = save_set(self.dir / 'live', slots=(0, 1, 2))
+        live = counted_save_set(self.dir / 'live', COMPENDIUM_HEAVY_FILES)
         backups = self.dir / 'backups'
         names = self.probe(*(('backup', live, backups, 'import' if i % 2 else 'mirror', 1_700_000_000_000 + i * 60_000) for i in range(12)))
         listed = self.one('backups', backups).split()
         self.assertEqual(len(listed), 10)
         self.assertEqual([entry.split(':')[0] for entry in listed], list(reversed(names))[:10])   # newest first, the two oldest gone
-        self.assertTrue(all(entry.endswith(':3') for entry in listed))
+        self.assertTrue(all(entry.endswith(':6') for entry in listed))
         self.assertEqual(tree(backups / names[-1] / 'save'), tree(live))
         self.assertEqual(self.one('backup', self.dir / 'nothing', backups, 'manual', 1), 'none')
 

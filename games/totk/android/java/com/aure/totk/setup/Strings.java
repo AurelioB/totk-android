@@ -511,7 +511,8 @@ final class Strings {
         switch (code == null ? "" : code) {
             case "absolute": case "traversal": return "This dump has file names that point outside its folder, so it was not imported.";
             case "symlink": return "This dump contains links, which a save set never has, so it was not imported.";
-            case "too_many": return "This has more than 500 files, so it is not a TotK save set.";
+            case "too_many": return "This exceeds the limit of " + SaveManager.MAX_FILES + " save files or "
+                    + SaveManager.MAX_ENTRIES + " dump entries" + (detail == null ? "." : ": " + detail);
             case "too_big": return "This is larger than 128 MB, so it is not a TotK save set.";
             case "huge_file": return "It contains a file far larger than any save file, so it was not imported.";
             case "no_saves": return "No TotK saves found. A save set has slot_00 … slot_05 folders with progress.sav, or option.sav.";
