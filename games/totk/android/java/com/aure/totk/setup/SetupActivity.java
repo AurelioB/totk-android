@@ -1536,7 +1536,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                     break;
                 }
                 case "rumble":
-                    fact(Strings.STRENGTH, value.equals("0") ? Strings.valueName(key, value) : value + " % of the game's rumble");
+                    fact(Strings.STRENGTH, value.equals("0") ? Strings.valueName(key, value) : value + " % of the game's rumble signal"
+                            + (settings.number(key) > 100 ? ", capped at the motor's maximum" : ""));
                     break;
                 case "audio_latency":
                     fact(Strings.SOUND_BUFFER, value.equals("low") ? "10 ms" : value.equals("safe") ? "40 ms" : "20 ms");

@@ -93,6 +93,23 @@ class RumbleMix(unittest.TestCase):
         self.assertEqual(self.amp(0.9, 0.9, gain=2), 255)           # clamped
         self.assertEqual(self.amp(1, 1, gain=0), 0)
 
+    def test_fourfold_gain_saturates_without_wrap(self):
+        self.assertEqual(self.amp(0.03, 0.04, gain=4), 51)        # a quiet signal is amplified, not always saturated
+        self.assertEqual(self.amp(0.15, 0.2, gain=4), 255)        # exact saturation boundary
+        self.assertEqual(self.amp(0.25, 0, gain=4), 255)          # either band alone saturates
+        self.assertEqual(self.amp(0, 0.25, gain=4), 255)
+        for lo in (0, 0.01, 0.1, 0.25, 0.5, 0.75, 1):
+            amplitudes = [self.amp(lo, hi, gain=4) for hi in (0, 0.01, 0.1, 0.25, 0.5, 0.75, 1)]
+            self.assertEqual(amplitudes, sorted(amplitudes))
+            self.assertTrue(all(0 <= amplitude <= 255 for amplitude in amplitudes))
+        self.assertEqual(self.amp(1, 1, gain=4), 255)
+        self.assertEqual(self.amp('3e38', '3e38', gain=4), 255)    # float overflow clamps before integer conversion
+        self.assertEqual(self.amp('inf', 0, gain=4), 255)
+        self.assertEqual(self.amp(0, 0, gain=4), 0)
+        self.assertEqual(self.amp(1, 1, gain=4, at=0), 0)         # stop clears the timestamp for both sides
+        self.assertEqual(self.amp(1, 1, gain=4, now=1250 * MS), 0)
+        self.assertEqual(self.amp('nan', 1, gain=4), 0)
+
     def test_stale_or_missing_values_are_silence(self):
         self.assertEqual(self.amp(1, 1, at=0), 0)
         self.assertEqual(self.amp(1, 1, at=1000 * MS, now=1249 * MS), 255)
@@ -178,6 +195,26 @@ class FeedbackContract(unittest.TestCase):
         start = frontend[frontend.index('static int start_game('):]
         self.assertLess(start.index('runtime_android_feedback_hardware('), start.index('pthread_create(&t, &at, game_thread'))
         self.assertTrue(re.search(r'runtime_gamepad_clear\(\); runtime_feedback_quiet\(\);', frontend))
+
+    def test_both_motors_keep_the_clamp_and_stop_paths(self):
+        feedback = (TOTK / 'runtime/feedback_android.c').read_text()
+        self.assertIn('for (int s = 0; s < 2; s++) amp[s] = rumble_amplitude(g_want[s], g_want_at[s], now, gain);', feedback)
+        self.assertIn('(jint)amp[0], (jint)amp[1]', feedback)
+        quiet = feedback[feedback.index('void runtime_feedback_quiet(void)'):feedback.index('/* ---- motion:')]
+        self.assertIn('g_want_at[0] = g_want_at[1] = 0;', quiet)
+        self.assertIn('pthread_cond_signal(&g_cv)', quiet)
+        java = (JAVA / 'GameFeedback.java').read_text()
+        self.assertIn('play(vibrators[0], left); play(vibrators[1], right);', java)
+        self.assertIn('play(vibrators[0], Math.max(left, right))', java)
+        self.assertIn('Math.min(255, amplitude)', java)
+        self.assertIn('v.cancel(); return;', java)
+        pause = java[java.index('void pause()'):java.index('void close()')]
+        self.assertIn('rumble(0, 0);', pause)
+        activity = (JAVA / 'TotkActivity.java').read_text()
+        focus = activity[activity.index('public void onWindowFocusChanged'):activity.index('@Override protected void onPause')]
+        self.assertIn('else f.pause();', focus)
+        pause = activity[activity.index('@Override protected void onPause'):activity.index('@Override protected void onStop')]
+        self.assertIn('f.pause();', pause)
 
     def test_vibrate_permission(self):
         self.assertIn("'android.permission.VIBRATE'", (TOTK / 'android/apk/build_apk.py').read_text())

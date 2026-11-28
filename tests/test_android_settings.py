@@ -356,8 +356,37 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(any(l.startswith('TOTK_RUMBLE_GAIN') for l in off))   # no vibration devices for the game at all
         self.assertIn('TOTK_RUMBLE_GAIN=0.25', self.env(rumble='25'))
         self.assertIn('TOTK_RUMBLE_GAIN=0.75', self.env(rumble='75'))
+        for strength, gain in (('150', '1.5'), ('200', '2.0'), ('300', '3.0'), ('400', '4.0')):
+            with self.subTest(strength=strength):
+                env = self.env(rumble=strength)
+                self.assertIn('TOTK_RUMBLE=1', env)
+                self.assertIn('TOTK_RUMBLE_GAIN=' + gain, env)
         self.assertIn('TOTK_GYRO=0', self.env(motion='off'))
         self.assertIn('TOTK_RUMBLE_GAIN=1.0', self.env(rumble='33'))   # not a menu value: the default
+
+    def test_rumble_choices_validate_step_and_survive_loading(self):
+        choices = ('0', '25', '50', '75', '100', '150', '200', '300', '400')
+        for i, strength in enumerate(choices):
+            with self.subTest(strength=strength):
+                commands = (f'stored101 QCS8550 rumble={strength}', f'set rumble={strength}',
+                            f'step rumble 1 rumble={strength}', f'step rumble -1 rumble={strength}')
+                stored, set_value, up, down = map(self.values, self.run_probe(*commands))
+                self.assertEqual(stored['rumble'], strength)   # old and new stores keep their exact choice
+                self.assertEqual(set_value['rumble'], strength)
+                self.assertEqual(up['rumble'], choices[(i + 1) % len(choices)])
+                self.assertEqual(down['rumble'], choices[(i - 1) % len(choices)])
+        for invalid in ('-1', '33', '125', '401', '500', '1.5', 'bad'):
+            with self.subTest(invalid=invalid):
+                stored, set_value = map(self.values, self.run_probe(f'stored rumble={invalid}',
+                                                                  f'set rumble=200 rumble={invalid}'))
+                self.assertEqual(stored['rumble'], '100')
+                self.assertEqual(set_value['rumble'], '200')
+        self.assertEqual(self.values(self.run_probe('defaults controls QCS8550 rumble=400')[0])['rumble'], '100')
+        for preset in ('light', 'balanced', 'smooth', '60fps'):
+            for strength in ('0', '100', '400'):
+                with self.subTest(preset=preset, strength=strength):
+                    self.assertEqual(self.values(self.run_probe(f'apply {preset} rumble={strength}')[0])['rumble'], strength)
+            self.assertEqual(self.values(self.run_probe(f'apply {preset}')[0])['rumble'], '100')
 
     def test_sharpness_follows_the_selected_upscaler_only(self):
         fsr = self.env(upscaler='fsr')

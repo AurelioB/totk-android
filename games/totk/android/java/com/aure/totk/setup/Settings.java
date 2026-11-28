@@ -50,7 +50,7 @@ final class Settings {
         new Option("second_screen", SCREEN, "on", "off", "on"),
         new Option("buttons", CONTROLS, "nintendo", "nintendo", "xbox"),
         new Option("audio_latency", CONTROLS, "balanced", "low", "balanced", "safe"),
-        new Option("rumble", CONTROLS, "100", "0", "25", "50", "75", "100"),
+        new Option("rumble", CONTROLS, "100", "0", "25", "50", "75", "100", "150", "200", "300", "400"),
         new Option("motion", CONTROLS, "on", "on", "off"),
         new Option("game_language", CONTROLS, "auto", LANGUAGES),
     };

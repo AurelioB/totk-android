@@ -69,12 +69,18 @@ both processes without a SharedPreferences cache. They contain no URL; changing 
 | Second screen | Off / On | `TOTK_COMPANION=0` / `1` |
 | Button layout | Nintendo / Xbox | `TOTK_FACE_BUTTONS=label` / `position` |
 | Audio latency | Low / Balanced / Safe | `TOTK_AUDIO_PREFILL_MS=10` / `20` / `40` |
-| Rumble | Off / 25–100 % | `TOTK_RUMBLE=0`, or `TOTK_RUMBLE=1` + `TOTK_RUMBLE_GAIN=0.25`…`1.0` |
+| Rumble | Off / 25 / 50 / 75 / 100 / 150 / 200 / 300 / 400 % | `TOTK_RUMBLE=0`, or `TOTK_RUMBLE=1` + `TOTK_RUMBLE_GAIN=0.25`…`4.0` |
 | Motion controls | On / Off | `TOTK_GYRO=1` / `0` |
 | Game language | Device language / a language | `TOTK_LOCALE=<device's first language tag>` / `TOTK_LANG=<code>` (`en-US`, `ja`, `de`, `fr`, `es`, `it`, `nl`, `ru`, `ko`, `zh-Hans`, `zh-Hant`, `pt-BR`) |
 
 The exact `settings.env` of each benchmarked device profile is recorded in
 [benchmarks/baseline-1.0.0.json](benchmarks/baseline-1.0.0.json).
+
+Rumble defaults to 100 %; presets leave it alone, and existing stored choices are retained. Above 100 %, the game's
+rumble signal is amplified up to each motor's maximum; it cannot exceed the hardware's strength. Strong signals
+already at the maximum will not get stronger. On motors without amplitude control, amplification can make more
+signals cross the on/off threshold rather than increase the motor's strength. Zero, stale signals, focus loss and
+pause still silence rumble. This does not change the vibration renewal timing.
 
 ## Useful `totk.env` switches
 

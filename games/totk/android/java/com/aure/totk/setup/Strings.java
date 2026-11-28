@@ -168,7 +168,7 @@ final class Strings {
             case "buttons": return "Which face button is the Switch's A";
             case "audio_latency": return "Low · Balanced · Safe";
             case "game_language": return "Text and voices in the game";
-            case "rumble": return "Vibration strength · Off";
+            case "rumble": return "Off · 25–400 % of the game's signal";
             case "motion": return "Aiming by tilting the device or controller";
             default: return "";
         }
@@ -214,7 +214,8 @@ final class Strings {
             case "game_language": return "The language of the game's text and voices. Device language follows this device's first "
                     + "language when the game has it, and falls back to English otherwise.";
             case "rumble": return "The game's rumble on the controller's motors when it has its own, otherwise on this device's "
-                    + "vibration motor. Off gives the game no rumble at all.";
+                    + "vibration motor. Off gives the game no rumble at all. Above 100 %, the game's rumble signal is amplified "
+                    + "up to the motor's maximum; it cannot exceed the hardware's strength.";
             case "motion": return "The game's motion controls (aiming the bow, some puzzles) from the controller's gyroscope when it "
                     + "has one, otherwise from this device's. The game's own options can still turn motion aiming off.";
             default: return "";
@@ -233,7 +234,7 @@ final class Strings {
                 switch (value) { case "tl": return "Top left"; case "tr": return "Top right"; case "bl": return "Bottom left"; default: return "Bottom right"; }
             case "buttons": return value.equals("xbox") ? "Xbox" : "Nintendo";
             case "game_language": return languageName(value);
-            case "rumble": return value.equals("0") ? "Off" : value + " %";
+            case "rumble": return value.equals("0") ? "Off" : value + " %" + (Integer.parseInt(value) > 100 ? " (amplified)" : "");
             default: return value.isEmpty() ? value : Character.toUpperCase(value.charAt(0)) + value.substring(1);
         }
     }
