@@ -63,7 +63,10 @@ void setup_fail(SetupCtx *c, const char *code, const char *fmt, ...) {
     snprintf(c->fail_code, sizeof c->fail_code, "%s", code);
     va_list ap; va_start(ap, fmt); vsnprintf(c->fail_msg, sizeof c->fail_msg, fmt, ap); va_end(ap);
 }
-void setup_clear_fail(SetupCtx *c) { c->failed = 0; c->fail_code[0] = c->fail_msg[0] = 0; }
+void setup_clear_fail(SetupCtx *c) {
+    c->failed = 0; c->fail_code[0] = c->fail_msg[0] = 0;
+    memset(&c->romfs_verify, 0, sizeof c->romfs_verify);
+}
 const char *setup_game_dir(const SetupCtx *c) { return c->game; }
 const char *setup_lib_dir(const SetupCtx *c) { return c->lib; }
 const char *setup_staging_dir(const SetupCtx *c) { return c->staging; }
@@ -662,16 +665,17 @@ static int romfs_fifo_cleanup(SetupCtx *c) {
     return rc;
 }
 
-static char *result_fail(const char *stage, const char *code, const char *msg) {
+static char *result_fail(const char *stage, const char *code, const char *msg, const SetupCtx *c) {
     Buf b = {0};
     buf_puts(&b, "{\"ok\":false,\"stage\":"); buf_jstr(&b, stage); buf_puts(&b, ",\"code\":"); buf_jstr(&b, code);
-    buf_puts(&b, ",\"message\":"); buf_jstr(&b, msg); buf_puts(&b, "}");
+    buf_puts(&b, ",\"message\":"); buf_jstr(&b, msg);
+    setup_romfs_failure_json(&b, c); buf_puts(&b, "}");
     return b.oom ? (buf_free(&b), strdup("{\"ok\":false,\"stage\":\"setup\",\"code\":\"internal\",\"message\":\"out of memory\"}")) : b.p;
 }
 static char *result_ok(const SetupInstall *s) {
     Buf b = {0};
     buf_puts(&b, "{\"ok\":true,\"install\":"); setup_install_json(&b, s); buf_puts(&b, "}");
-    return b.oom ? (buf_free(&b), result_fail("setup", "internal", "out of memory")) : b.p;
+    return b.oom ? (buf_free(&b), result_fail("setup", "internal", "out of memory", NULL)) : b.p;
 }
 
 /* Bytes a stage may add while its old outputs still exist. The 17 GB RomFS dominates; the container route also keeps a
@@ -693,8 +697,8 @@ char *setup_run_json(const char *request, size_t len, SetupProgressFn progress, 
     Run *u = calloc(1, sizeof *u);
     SetupCtx *c = calloc(1, sizeof *c);
     char err[256], *res = NULL; int lock = -1, failed_stage = -1;
-    if (!r || !u || !c) { free(r); free(u); free(c); return result_fail("setup", "internal", "out of memory"); }
-    if (setup_request_parse(r, request, len, err, sizeof err)) { res = result_fail("setup", "internal", err); goto done; }
+    if (!r || !u || !c) { free(r); free(u); free(c); return result_fail("setup", "internal", "out of memory", NULL); }
+    if (setup_request_parse(r, request, len, err, sizeof err)) { res = result_fail("setup", "internal", err, NULL); goto done; }
     setup_ctx_init(c, r->game, r->lib, r->nobackup, cancel);
     if (pins) c->pins = *pins;
     c->progress = progress; c->progress_user = user; c->req = r;
@@ -759,7 +763,7 @@ char *setup_run_json(const char *request, size_t len, SetupProgressFn progress, 
 fail:
     staging_cleanup(c);
     if (!c->failed) setup_fail(c, "internal", "Setup failed");
-    res = result_fail(failed_stage >= 0 ? stage_names[failed_stage] : "setup", c->fail_code, c->fail_msg);
+    res = result_fail(failed_stage >= 0 ? stage_names[failed_stage] : "setup", c->fail_code, c->fail_msg, c);
 done:
     containers_free(&u->sc);
     if (c->keydir[0]) keys_cleanup(c);
@@ -779,8 +783,8 @@ static void item(Buf *b, int *first, const char *role, int ok, const char *what,
 char *setup_inspect_json(const char *request, size_t len, const SetupPins *pins) {
     SetupRequest *r = calloc(1, sizeof *r); SetupCtx *c = calloc(1, sizeof *c); SetupContainers *sc = calloc(1, sizeof *sc);
     char err[256]; Buf b = {0}; int first = 1;
-    if (!r || !c || !sc) { free(r); free(c); free(sc); return result_fail("inspect", "internal", "out of memory"); }
-    if (setup_request_parse(r, request, len, err, sizeof err)) { free(r); free(c); free(sc); return result_fail("inspect", "internal", err); }
+    if (!r || !c || !sc) { free(r); free(c); free(sc); return result_fail("inspect", "internal", "out of memory", NULL); }
+    if (setup_request_parse(r, request, len, err, sizeof err)) { free(r); free(c); free(sc); return result_fail("inspect", "internal", err, NULL); }
     setup_ctx_init(c, r->game, r->lib, r->nobackup, NULL);
     if (pins) c->pins = *pins;
     SetupInstall st; setup_install_load(c->game, &st);
@@ -873,6 +877,6 @@ char *setup_inspect_json(const char *request, size_t len, const SetupPins *pins)
     containers_free(sc);
     setup_request_close(r);
     free(r); free(c); free(sc);
-    if (b.oom) { buf_free(&b); return result_fail("inspect", "internal", "out of memory"); }
+    if (b.oom) { buf_free(&b); return result_fail("inspect", "internal", "out of memory", NULL); }
     return b.p;
 }

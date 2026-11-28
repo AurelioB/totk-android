@@ -1,5 +1,6 @@
 """The production plain-text setup report on a host JVM: bounded output and allowlisted, record-safe diagnostics."""
 from pathlib import Path
+import json
 import re
 import shutil
 import subprocess
@@ -48,6 +49,37 @@ class SetupDetailsTests(unittest.TestCase):
         self.assertEqual(report.count('[missing]'), 2)
         self.assertIn('No game files or keys are included; nothing is sent until you choose an app.', report)
         self.assertIn('Share details before Resume to include the logs', report)
+
+    def test_integrity_details_preserve_safe_header_identities(self):
+        digest = '0123456789abcdef' * 4
+        grouped = subprocess.run([self.java, '-cp', str(self.classes), 'com.aure.totk.setup.SetupDetailsProbe',
+                                  'header-digest', digest], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(grouped.replace('-', ''), digest)
+        verification = {'ivfcGood': [0, 1, 2, 3, 4], 'ivfcFailed': [5], 'mergedBytes': 17, 'expectedBytes': 19,
+                        'base': {'programBytes': 100, 'headerSha256': grouped},
+                        'update': {'programBytes': 50, 'headerSha256': grouped}}
+        result = {'ok': False, 'stage': 'romfs', 'code': 'romfs_integrity',
+                  'message': 'The merged game data failed its integrity check (IVFC level 5).',
+                  'romfsVerification': verification}
+        (self.logs / 'hactool-romfs.log').write_text('Rights ID: ' + 'a' * 32 + '\nTitlekey: ' + 'b' * 32)
+        report = self.report('Result JSON: ' + json.dumps(result))
+        self.assertEqual(json.loads(report.split('Result JSON: ', 1)[1].splitlines()[0]), result)
+        self.assertNotIn('a' * 32, report)
+        self.assertNotIn('b' * 32, report)
+        self.assertNotRegex(report, r'[0-9a-fA-F]{32,}')
+        for invalid in ['f' * 32, 'g' * 64, '/private/path', digest + 'extra']:
+            output = subprocess.run([self.java, '-cp', str(self.classes), 'com.aure.totk.setup.SetupDetailsProbe',
+                                     'header-digest', invalid], capture_output=True, text=True, check=True).stdout
+            self.assertEqual(output, '[invalid digest]')
+
+    def test_integrity_error_explains_the_known_failure_without_blame(self):
+        strings = (SOURCE.parent / 'Strings.java').read_text()
+        branch = strings.split('case "romfs_integrity": return ', 1)[1].split(';', 1)[0]
+        message = ''.join(json.loads('"' + text + '"') for text in re.findall(r'"([^"]*)"', branch))
+        self.assertEqual(message, 'The base and update did not combine into the expected data: a dump may differ, '
+                         'or there may be a problem reading it. Verify or re-dump both files with your dump tool. '
+                         'Use the original 1.0.0 base and the 1.4.3 update. Share details helps us investigate.')
+        self.assertNotIn('exit 0', message)
 
     def test_allowlist_never_reads_keys_game_files_or_other_logs(self):
         for name in ['prod.keys', 'title.keys', 'game.nsp', 'other.log', 'shaders.log']:

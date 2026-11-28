@@ -295,6 +295,111 @@ class Containers(Base):
                 self.assertEqual(p.returncode, 1)
 
 
+class RomfsDiagnostics(Base):
+    """Synthetic containers plus a controlled tool process exercise production merge rejection and result JSON.
+    No hactool replacement is shipped: the test executable only supplies specific log/exit outcomes."""
+    def setUp(self):
+        super().setUp()
+        self.base_nca = nca(True)
+        self.base = self.dir / 'base.nsp'
+        self.base.write_bytes(partition([('program.nca', self.base_nca), ('a.tik', ticket())]))
+        self.base_header = bytearray(b''.join(decrypt(HEADER, modes.XTS(i.to_bytes(16, 'big')),
+                                                    self.base_nca[i * 512:(i + 1) * 512]) for i in range(6)))
+        self.update_header = bytearray(self.base_header)
+        self.update_header[0x604] = 4
+        self.update_header[0x2a0:0x2c0] = hashlib.sha256(self.update_header[0x600:0x800]).digest()
+        self.update_nca = b''.join(encrypt(HEADER, modes.XTS(i.to_bytes(16, 'big')),
+                                          self.update_header[i * 512:(i + 1) * 512]) for i in range(6)) + self.base_nca[0xc00:]
+        self.update = self.dir / 'update.nsp'
+        self.update.write_bytes(partition([('program.nca', self.update_nca),
+                                          ('meta.cnmt.nca', nca(content=1, title=0x0100F2C0115B6800)), ('a.tik', ticket())]))
+        self.lib = self.dir / 'lib'
+        self.lib.mkdir()
+
+    @staticmethod
+    def log(failed=(5,), missing=()):
+        return ''.join(f'        Level {i} ({"FAIL" if i in failed else "GOOD"}):\n'
+                       for i in range(6) if i not in missing) + '\nDone!\n'
+
+    def merge(self, log, exit_code=0, crash=False, run=False, payload=None, pins=None):
+        tool = self.lib / 'libhactool.so'
+        script = '#!' + sys.executable + '\nimport os, signal, sys\n'
+        if payload is not None:
+            script += ('target = next(arg.split("=", 1)[1] for arg in sys.argv if arg.startswith("--section"))\n'
+                       + f'with open(target, "wb") as output: output.write({payload!r})\n')
+        tool.write_text(script + f'print({log!r}, flush=True)\n'
+                        + ('os.kill(os.getpid(), signal.SIGTERM)\n' if crash else f'sys.exit({exit_code})\n'))
+        tool.chmod(0o700)
+        work = self.dir / 'work'
+        work.mkdir(exist_ok=True)
+        if run:
+            request = self.dir / 'request.json'
+            request.write_text(json.dumps({'gameDir': str(self.dir / 'game'), 'noBackupDir': str(work),
+                                          'nativeLibDir': str(self.lib), 'stages': ['romfs'],
+                                          'inputs': {role: {'path': str(path)} for role, path in
+                                                     [('base', self.base), ('update', self.update), ('keys', self.keys)]}}))
+            return self.cli_run('run', '--request', request)
+        return self.cli_run('merge', '--base', self.base, '--update', self.update, '--keys', self.keys,
+                            '--out', work / 'romfs', '--work', work, '--nobackup', work, '--libdir', self.lib,
+                            *(['--pins', pins] if pins else []))
+
+    def assert_integrity(self, result, failed):
+        self.assertEqual(result['code'], 'romfs_integrity', result)
+        self.assertNotIn('exit 0', result['message'])
+        self.assertIn('failed its integrity check', result['message'])
+        detail = result['romfsVerification']
+        self.assertEqual(detail['ivfcFailed'], list(failed))
+        self.assertEqual(detail['ivfcGood'], [i for i in range(6) if i not in failed])
+        self.assertEqual((detail['mergedBytes'], detail['expectedBytes']), (0, PINS['romfs']['size']))
+        for role, data, header in [('base', self.base_nca, self.base_header), ('update', self.update_nca, self.update_header)]:
+            self.assertEqual(detail[role], {'programBytes': len(data), 'headerSha256': sha(header)})
+        self.assertEqual(set(detail), {'ivfcGood', 'ivfcFailed', 'mergedBytes', 'expectedBytes', 'base', 'update'})
+        self.assertFalse((self.dir / 'work/romfs/romfs.bin').exists())
+
+    def test_level_five_failure_has_specific_code_and_safe_details(self):
+        p, result = self.merge(self.log())
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(result['message'], 'The merged game data failed its integrity check (IVFC level 5).')
+        self.assert_integrity(result, (5,))
+
+    def test_run_result_retains_diagnostics_after_failure_cleanup(self):
+        p, result = self.merge(self.log(), run=True)
+        self.assertEqual((p.returncode, result['stage']), (1, 'romfs'))
+        self.assert_integrity(result, (5,))
+        self.assertFalse((self.dir / 'game/extracted/v143/romfs/romfs.bin').exists())
+        self.assertTrue((self.dir / 'game/.import/hactool-romfs.log').is_file())
+
+    def test_multiple_failed_levels_are_named(self):
+        _, result = self.merge(self.log(failed=(1, 5)))
+        self.assert_integrity(result, (1, 5))
+        self.assertIn('IVFC levels 1, 5', result['message'])
+
+    def test_nonzero_crash_missing_and_contradictory_levels_stay_internal(self):
+        cases = [(self.log(), 2, False), (self.log(), 0, True),
+                 (self.log(missing=(0,)), 0, False), (self.log(failed=(), missing=(5,)), 0, False),
+                 (self.log() + '        Level 5 (GOOD):\n', 0, False)]
+        for log, code, crash in cases:
+            with self.subTest(code=code, crash=crash, log=log):
+                _, result = self.merge(log, exit_code=code, crash=crash)
+                self.assertEqual(result['code'], 'internal', result)
+                self.assertNotIn('romfsVerification', result)
+                self.assertIn('crashed (signal 15)' if crash else f'exit {code}', result['message'])
+
+    def test_good_ivfc_still_requires_exact_image_size_and_hash(self):
+        _, result = self.merge(self.log(failed=()))
+        self.assertEqual(result['code'], 'hash_mismatch', result)
+        self.assertNotIn('romfsVerification', result)
+
+    def test_good_ivfc_and_exact_size_still_require_pinned_hash(self):
+        payload = bytes(256)
+        pins = write_pins(self.dir / 'pins.json', len(payload), sha(b'not the image'), PINS['romfs_index_sha256'])
+        _, result = self.merge(self.log(failed=()), payload=payload, pins=pins)
+        self.assertEqual(result['code'], 'hash_mismatch', result)
+        self.assertIn('SHA-256 differs', result['message'])
+        self.assertNotIn('romfsVerification', result)
+        self.assertFalse((self.dir / 'work/romfs/romfs.bin').exists())
+
+
 class DecryptedFixture(Base):
     """The run() path with real inherited descriptors, a synthetic RomFS and pins for it (helpers only)."""
     FILES = {'Actor/Pack/a.pack.zs': b'A' * 1000, 'Actor/Pack/b.pack.zs': b'B' * 33, 'Mals/USen.Product.100.sarc.zs': os.urandom(4096),
@@ -659,6 +764,10 @@ class KeysSan(Keys):
 
 
 class ContainersSan(Containers):
+    sanitize = True
+
+
+class RomfsDiagnosticsSan(RomfsDiagnostics):
     sanitize = True
 
 

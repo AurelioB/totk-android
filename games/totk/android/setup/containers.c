@@ -148,6 +148,54 @@ int containers_exefs(SetupCtx *c, SetupContainers *s, const char *out_dir) {
     return rc;
 }
 
+/* Diagnose only explicit, complete data verdicts. Missing or contradictory levels remain an internal/tool failure,
+   as do nonzero exits and crashes. This does not change hactool_log_ok or any acceptance rule. */
+static int romfs_integrity_failure(SetupCtx *c, const SetupContainers *s, const char *log, uint64_t merged_size) {
+    unsigned good = 0, failed = 0;
+    for (const char *p = log; *p;) {
+        const char *end = strchr(p, '\n');
+        if (!end) end = p + strlen(p);
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        if (end - p >= 14 && !memcmp(p, "Level ", 6) && p[6] >= '0' && p[6] <= '5' && p[7] == ' '
+                && (end - p == 14 || p[14] == ':')) {
+            unsigned bit = 1u << (p[6] - '0');
+            if (!memcmp(p + 8, "(GOOD)", 6)) good |= bit;
+            if (!memcmp(p + 8, "(FAIL)", 6)) failed |= bit;
+        }
+        p = *end ? end + 1 : end;
+    }
+    if (!failed || (good | failed) != 0x3f || (good & failed)) return 0;
+    c->romfs_verify.good = good; c->romfs_verify.failed = failed;
+    const NcaRecord *base = &s->base.ncas[s->base.program], *update = &s->update.ncas[s->update.program];
+    c->romfs_verify.base_size = base->size; c->romfs_verify.update_size = update->size;
+    c->romfs_verify.merged_size = merged_size; c->romfs_verify.expected_size = c->pins.romfs_size;
+    /* Hash the already-resident decrypted 0xc00-byte headers, not their rights IDs or encrypted key areas separately.
+       These one-way identities require no extra input reads and never expose header/key/ticket bytes. */
+    sha256_buf_hex(base->hdr, sizeof base->hdr, c->romfs_verify.base_header_sha256);
+    sha256_buf_hex(update->hdr, sizeof update->hdr, c->romfs_verify.update_header_sha256);
+    char levels[32]; size_t n = 0; int count = 0;
+    for (int i = 0; i < 6; i++) if (failed >> i & 1) {
+        n += (size_t)snprintf(levels + n, sizeof levels - n, "%s%d", count ? ", " : "", i);
+        count++;
+    }
+    setup_fail(c, "romfs_integrity", "The merged game data failed its integrity check (IVFC level%s %s).", count == 1 ? "" : "s", levels);
+    return 1;
+}
+
+void setup_romfs_failure_json(Buf *b, const SetupCtx *c) {
+    if (!c || strcmp(c->fail_code, "romfs_integrity") || !c->romfs_verify.failed) return;
+    buf_puts(b, ",\"romfsVerification\":{\"ivfcGood\":[");
+    for (int i = 0, first = 1; i < 6; i++) if (c->romfs_verify.good >> i & 1) { buf_printf(b, "%s%d", first ? "" : ",", i); first = 0; }
+    buf_puts(b, "],\"ivfcFailed\":[");
+    for (int i = 0, first = 1; i < 6; i++) if (c->romfs_verify.failed >> i & 1) { buf_printf(b, "%s%d", first ? "" : ",", i); first = 0; }
+    buf_printf(b, "],\"mergedBytes\":%llu,\"expectedBytes\":%llu,"
+                  "\"base\":{\"programBytes\":%llu,\"headerSha256\":\"%s\"},"
+                  "\"update\":{\"programBytes\":%llu,\"headerSha256\":\"%s\"}}",
+               (unsigned long long)c->romfs_verify.merged_size, (unsigned long long)c->romfs_verify.expected_size,
+               (unsigned long long)c->romfs_verify.base_size, c->romfs_verify.base_header_sha256,
+               (unsigned long long)c->romfs_verify.update_size, c->romfs_verify.update_header_sha256);
+}
+
 /* hactool writes the merged image into an app-private FIFO that the follow loop drains into a RomfsWriter (one
    romfs.bin, or parts where a FAT volume cannot hold the 17 GB file). Shared storage, including exFAT and some OEM
    FUSE mounts, cannot create FIFOs. hactool writes sequentially, so the output itself stays on the game volume. */
@@ -184,7 +232,8 @@ int containers_romfs(SetupCtx *c, SetupContainers *s, const char *out_dir, uint6
     setup_progress(c, "romfs", 0, c->pins.romfs_size, "merging base + update");
     rc = run_with_keys(c, s, "romfs", args, 3, fds, 1, env, 2, "hactool-romfs.log", c->pins.romfs_size, &follow, &log, &code);
     if (!rc && (code || !hactool_log_ok(log, 1))) {
-        setup_fail(c, "internal", "The base + update merge did not verify (exit %d; use Share details for the log)", code);
+        if (code || !romfs_integrity_failure(c, s, log, follow.bytes))
+            setup_fail(c, "internal", "The base + update merge did not verify (exit %d; use Share details for the log)", code);
         rc = -1;
     }
     free(log);

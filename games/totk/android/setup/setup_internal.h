@@ -79,11 +79,18 @@ struct SetupCtx {
     atomic_int *cancel;
     SetupProgressFn progress; void *progress_user;
     int failed; char fail_code[32], fail_msg[1024];
+    /* Present only for a complete, explicit IVFC data failure; no raw headers or key material. */
+    struct {
+        unsigned good, failed;
+        uint64_t base_size, update_size, merged_size, expected_size;
+        char base_header_sha256[65], update_header_sha256[65];
+    } romfs_verify;
     SetupPins pins;
     const SetupRequest *req;
 };
 void setup_ctx_init(SetupCtx *, const char *game, const char *lib, const char *nobackup, atomic_int *cancel);
 void setup_clear_fail(SetupCtx *);
+void setup_romfs_failure_json(Buf *, const SetupCtx *);   /* optional failure diagnostic fields, including leading comma */
 
 /* ---- files (util.c) ---- */
 int st_path(char *out, size_t cap, const char *fmt, ...) __attribute__((format(printf, 3, 4)));  /* -1 if too long */

@@ -704,6 +704,9 @@ final class Strings {
 
     static String error(String code) {
         switch (code == null ? "" : code) {
+            case "romfs_integrity": return "The base and update did not combine into the expected data: a dump may differ, "
+                    + "or there may be a problem reading it. Verify or re-dump both files with your dump tool. "
+                    + "Use the original 1.0.0 base and the 1.4.3 update. Share details helps us investigate.";
             case "hash_mismatch": return "A file does not match Tears of the Kingdom 1.4.3. Make sure the dump is complete "
                     + "(all split parts, update applied), then choose it again.";
             case "missing_input": return "Something is missing. Choose every requested file, then resume.";

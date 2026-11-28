@@ -92,7 +92,8 @@ static int finish(SetupCtx *c, int rc, Buf *extra) {
     else {
         if (rc == SETUP_CANCELLED) { setup_clear_fail(c); setup_fail(c, "cancelled", "cancelled"); }
         buf_puts(&b, "{\"ok\":false,\"code\":"); buf_jstr(&b, c->fail_code[0] ? c->fail_code : "internal");
-        buf_puts(&b, ",\"message\":"); buf_jstr(&b, c->fail_msg); buf_puts(&b, "}");
+        buf_puts(&b, ",\"message\":"); buf_jstr(&b, c->fail_msg);
+        setup_romfs_failure_json(&b, c); buf_puts(&b, "}");
     }
     puts(b.p ? b.p : "{\"ok\":false}");
     buf_free(&b); if (extra) buf_free(extra);

@@ -11,6 +11,10 @@ public final class SetupDetailsProbe {
             System.out.print(SetupDetails.extension(args[1]));
             return;
         }
+        if (args[0].equals("header-digest")) {
+            System.out.print(SetupDetails.headerDigest(args[1]));
+            return;
+        }
         String metadata = new String(System.in.readAllBytes(), StandardCharsets.UTF_8);
         if (args[0].equals("scrub")) {
             System.out.print(SetupDetails.scrub(metadata, Arrays.asList(Arrays.copyOfRange(args, 1, args.length))));

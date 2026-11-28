@@ -167,6 +167,22 @@ URIs and absolute paths are scrubbed.
 Metadata includes the result JSON, app version/code/commit, device/Android/SoC, route, destination kind and free
 bytes, plus each input's direct-path/provider-authority access, extension and size only.
 
+For a complete explicit IVFC failure after a normal zero-status hactool exit, setup reports `romfs_integrity`
+and names the failing level(s), instead of treating a failed data check as an unexpected internal error (#29).
+The menu explains that the base/update did not combine into the expected data, without blaming either file:
+verify or re-dump both with the dump tool, using the original 1.0.0 base and 1.4.3 update, then Share details.
+Nonzero exits, crashes, missing or contradictory level verdicts keep their existing failure classifications.
+All six GOOD levels, exact merged size and the pinned SHA-256 remain mandatory for acceptance.
+The result JSON's `romfsVerification` contains `ivfcGood` / `ivfcFailed` level arrays, observed `mergedBytes`,
+pinned `expectedBytes`, and base/update `programBytes` plus `headerSha256`. These identities are SHA-256 of each
+selected Program NCA's already-decrypted 0xc00-byte header, not container or content hashes; they cannot prove
+whole-input integrity and reveal no raw header, rights ID, ticket or key. Only computed digests are grouped into
+eight hyphen-separated hexadecimal groups in Share details; remove the hyphens to compare them. Blanket long-hex
+redaction remains unchanged for all other metadata/log values. This adds no new hactool behavior or full-file read.
+The pinned reader returns a failed level without a first failing block offset; this diagnosis does not patch its
+hash-reading loop. Host coverage uses synthetic containers and controlled subprocess outcomes, not a real Thor merge.
+
+
 ### Supplying your own launcher image
 
 Add `--launcher-icon /absolute/path/outside/repo/logo.png` to `build_android.py ... --apk` (also supported with

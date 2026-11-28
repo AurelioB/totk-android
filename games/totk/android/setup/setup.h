@@ -15,7 +15,7 @@ extern "C" {
 typedef struct SetupCtx SetupCtx;                       /* opaque */
 int  setup_cancelled(const SetupCtx *);                 /* poll often; return SETUP_CANCELLED promptly */
 void setup_progress(SetupCtx *, const char *stage, uint64_t done, uint64_t total, const char *detail);
-/* Records the first failure (code: hash_mismatch|missing_input|bad_keys|unsupported_version|no_space|io|cancelled|
+/* Records the first failure (code: hash_mismatch|romfs_integrity|missing_input|bad_keys|unsupported_version|no_space|io|cancelled|
    internal, or not_available for a generator this build lacks); the caller then returns -1. Never pass key material. */
 void setup_fail(SetupCtx *, const char *code, const char *fmt, ...)
 #if defined(__GNUC__)

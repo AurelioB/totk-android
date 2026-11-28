@@ -5,6 +5,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 
 ## Unreleased
 
+### Setup
+- Explain failed merged-game-data integrity checks and name the IVFC level instead of showing an unexpected
+  internal error with “exit 0” (#29). Suggest verifying/re-dumping the original 1.0.0 base and 1.4.3 update,
+  without blaming either input. Include level verdicts, Program NCA sizes and non-secret header identities
+  in Share details. Verification requirements and other tool/process failure classifications are unchanged.
+
 ### Developer tools
 - Support explicit single-switch benchmark treatments with `--expected-difference SWITCH:REFERENCE:NEW` in
   `compare.py` and restart `abtest.py`: require the declared on/off states, reject UNKNOWN, ineffective treatments

@@ -3225,8 +3225,26 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             // Longest first so a filename cannot leave the rest of a containing path or URI behind.
             excluded.sort((a, b) -> Integer.compare(b.length(), a.length()));
             // Scrub the message before JSON encoding, not the structural stage/code or source summaries.
-            metadata.append("Result JSON: ").append(SetupService.failure(result.optString("stage"), result.optString("code"),
-                    SetupDetails.scrub(result.optString("message"), excluded))).append('\n');
+            try {
+                JSONObject shared = new JSONObject(SetupService.failure(result.optString("stage"), result.optString("code"),
+                        SetupDetails.scrub(result.optString("message"), excluded)));
+                JSONObject verification = result.optJSONObject("romfsVerification");
+                if ("romfs_integrity".equals(result.optString("code")) && verification != null) {
+                    JSONObject details = new JSONObject()
+                            .put("ivfcGood", verification.optJSONArray("ivfcGood"))
+                            .put("ivfcFailed", verification.optJSONArray("ivfcFailed"))
+                            .put("mergedBytes", verification.optLong("mergedBytes"))
+                            .put("expectedBytes", verification.optLong("expectedBytes"));
+                    for (String role : new String[]{"base", "update"}) {
+                        JSONObject input = verification.optJSONObject(role);
+                        if (input != null) details.put(role, new JSONObject()
+                                .put("programBytes", input.optLong("programBytes"))
+                                .put("headerSha256", SetupDetails.headerDigest(input.optString("headerSha256"))));
+                    }
+                    shared.put("romfsVerification", details);
+                }
+                metadata.append("Result JSON: ").append(shared).append('\n');
+            } catch (JSONException impossible) { throw new IllegalStateException(impossible); }
             String report = SetupDetails.build(metadata.toString(), game, result.optString("stage"), excluded);
             main.post(() -> {
                 sharingDetails = false;
