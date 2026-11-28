@@ -1843,6 +1843,40 @@ class RestartQuartet(unittest.TestCase):
         stats = abtest.paired_metric('throughput_fps', ref, arm, 'restart-quartet')
         self.assertEqual(abtest.metric_verdict('throughput_fps', ref, arm, stats)[3], 'inconclusive')
 
+    def test_restart_pool_rejects_warning_mode_changes_within_either_treatment_arm(self):
+        for modes, declaration in (((0, 1, 2, 0), 'TOTK_MAP_WARN:off:on'),
+                                   ((1, 0, 0, 2), 'TOTK_MAP_WARN:on:off')):
+            with self.subTest(modes=modes):
+                docs = self.treatment_documents((40, 42, 42, 40), 'ABBA')
+                for doc, mode in zip(docs, modes):
+                    states = doc['devices']['thor']['effective_switches']
+                    states['TOTK_WB_ALIAS']['state'] = 'off'
+                    states['TOTK_MAP_WARN'].update(state='on' if mode else 'off', mode=mode)
+                with self.assertRaisesRegex(ValueError, 'TOTK_MAP_WARN mode'):
+                    abtest.restart_analysis(docs, 'A', declaration, list('ABBA'))
+
+    def test_restart_pool_rejects_partially_covered_optional_switch_evidence(self):
+        optional = 'TOTK_VK_REC_ONE_PRIMARY'
+        patterns = [(None, None, 'on', 'off'), (None, None, 'on', 'on')]
+        patterns += [tuple(None if i == missing else 'on' for i in range(4)) for missing in range(4)]
+        for values in patterns:
+            with self.subTest(values=values):
+                docs = self.treatment_documents((40, 42, 42, 40), 'ABBA')
+                for doc, state in zip(docs, values):
+                    if state is not None:
+                        doc['devices']['thor']['effective_switches'][optional] = {
+                            'state': state, 'evidence_version': benchlib.SWITCH_EVIDENCE_VERSION}
+                with self.assertRaisesRegex(ValueError, optional):
+                    abtest.restart_analysis(docs, 'A', 'TOTK_WB_ALIAS:off:on', list('ABBA'))
+
+    def test_restart_pool_admits_uniform_optional_switch_evidence(self):
+        docs = self.treatment_documents((40, 42, 42, 40), 'ABBA')
+        for doc in docs:
+            doc['devices']['thor']['effective_switches']['TOTK_VK_REC_ONE_PRIMARY'] = {
+                'state': 'on', 'evidence_version': benchlib.SWITCH_EVIDENCE_VERSION}
+        pooled = abtest.restart_analysis(docs, 'A', 'TOTK_WB_ALIAS:off:on', list('ABBA'))
+        self.assertEqual(pooled['expected_difference'], 'TOTK_WB_ALIAS:off:on')
+
     def test_restart_treatment_rejects_wrong_extra_unknown_and_identical(self):
         order = list('ABBA')
         for failure in ('wrong', 'extra', 'unknown', 'identical', 'reference_unknown'):

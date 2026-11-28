@@ -109,16 +109,17 @@ def restart_analysis(documents, reference, expected_difference=None, order=None)
             raise ValueError(f'{key}: restart comparison needs identical, explicit pan direction/stick schedules; '
                              're-analyze original pans.txt with current analyze.py')
         if expected_difference is not None:
-            reference_index, candidate_index = order.index(reference), order.index(candidate)
             if any(key[0] not in document.get('devices', {}) for document in documents):
                 raise ValueError(f'{key}: expected difference requires effective-switch device metadata in every session')
             for i, document in enumerate(documents):
-                # Check each reference as a reference too: default admission may not track an optional treatment key.
-                base = document if order[i] == reference else documents[reference_index]
-                new = documents[candidate_index] if order[i] == reference else document
-                reasons = switch_admission(base, key[0], new, key[0], expected_difference)
-                if reasons:
-                    raise ValueError(f'{key}: session {i + 1} effective switches: ' + '; '.join(reasons))
+                for j in range(i + 1, len(documents)):
+                    same_arm = order[i] == order[j]
+                    base, new = (document, documents[j]) if same_arm or order[i] == reference else (documents[j], document)
+                    # Check all pairs: same-arm modes must match, and cross-arm checks require complete optional
+                    # evidence across the pool as well as the exact treatment (which also fixes same-arm states).
+                    reasons = switch_admission(base, key[0], new, key[0], None if same_arm else expected_difference)
+                    if reasons:
+                        raise ValueError(f'{key}: sessions {i + 1}/{j + 1} effective switches: ' + '; '.join(reasons))
         if len({bool(r['summary'].get('uncapped') or r['summary'].get('speed_mode') == 'uncapped')
                 for r in sessions}) != 1:
             raise ValueError(f'{key}: mixed capped/uncapped restart sessions are inconclusive; do not pool them')

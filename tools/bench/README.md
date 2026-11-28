@@ -169,10 +169,16 @@ The states are ordered, lowercase `on` or `off`, and must differ. The declaratio
 Admission requires **exactly that switch** to realize those states: UNKNOWN anywhere in the required effective
 states, the wrong switch, another differing switch, or identical treatment states rejects the comparison.
 For `TOTK_MAP_WARN`, its on/off mode transition belongs to that treatment; differing modes while both on still
-reject. Hardware/cap mismatches and unrelated settings are not waived by `compare.py`. When both raw settings maps
+reject. Restart admission checks the complete pool: sessions within either arm must have identical effective
+states and warning modes, and every cross-arm pair must realize exactly the declaration. If optional one-primary
+evidence is present anywhere in an explicit comparison/pool, it must be authenticated and present everywhere;
+partial coverage fails closed even when one-primary is not the selected treatment.
+Hardware/cap mismatches and unrelated settings are not waived by `compare.py`. When both raw settings maps
 are available, only the declared switch's env entry is excluded from comparison (explicit `0` versus an unset
 default can realize the intended transition). Raw documents, signature fields and hashes are never rewritten.
-Without the declaration, existing comparison admission is unchanged. Supported switch names are `TOTK_WB_ALIAS`,
+Without the declaration, ordinary existing-format comparison admission and two-pair numeric policy are preserved.
+Accepted input domains intentionally expand even without the flag: the analyzer recognizes v3 markers, and restart
+analysis accepts standing schedules and more than four sessions. Supported switch names are `TOTK_WB_ALIAS`,
 `TOTK_MAP_WARN`, `TOTK_MENU_CAPTURE_FIX`, and `TOTK_VK_REC_ONE_PRIMARY`; the last needs authenticated v3 startup
 markers, obtained by re-analyzing original logs with this analyzer. Missing evidence is never inferred from env.
 The base signature keys and historical hashes stay unchanged; one-primary metadata is additional admission evidence.

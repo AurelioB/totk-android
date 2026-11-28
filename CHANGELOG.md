@@ -13,6 +13,8 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   tolerances; reference max−min generalizes the two-session spread without changing two-pair statistics.
   Show per-arm mean GPU clocks, signed new-minus-reference differences and settings-derived frame-cap state
   beside the unchanged 3% clock-confound guard; a capped governor's clock can follow the treatment's load.
+  Check explicit restart treatments across the complete pool, including same-arm warning-mode consistency.
+  Reject partially covered optional one-primary evidence in explicit two-document and pooled comparisons.
 - Fix the pre-existing thermal-step veneer on the real 1.4.3 Android rewrite: its mutable floor
   is about 25 MiB past native text, outside an LDR-literal's reach. Use ADRP+LDR and a flag-free
   clamp for the published one/two-tick floor, retaining the same 108-byte tail allocation.

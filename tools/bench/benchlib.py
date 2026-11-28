@@ -336,7 +336,7 @@ def _switch_admission(states, expected_difference):
     keys = list(SWITCH_KEYS)
     if expected_difference is not None:
         keys.extend(key for key in EXPECTED_SWITCH_KEYS if key not in SWITCH_KEYS and
-                    (key == expected_difference[0] or all(key in state for state in states)))
+                    (key == expected_difference[0] or any(key in state for state in states)))
     reasons = []
     for key in keys:
         if key in SWITCH_KEYS:

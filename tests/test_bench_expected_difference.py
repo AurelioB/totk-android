@@ -336,6 +336,18 @@ class ExpectedDifferenceAdmission(unittest.TestCase):
                     self.assertEqual(benchlib.signature_relation(signature(base), signature(new), expected), 'unknown')
                     self.assertEqual(compare(base, new, expected)[0][1], 'unknown')
 
+    def test_partially_covered_unselected_optional_evidence_rejects_explicit_comparison(self):
+        for state in ('on', 'off', 'UNKNOWN'):
+            for side in ('reference', 'new'):
+                base, new = pair('TOTK_WB_ALIAS', 'off', 'on')
+                set_state(base if side == 'reference' else new, PRIMARY, state)
+                expected = 'TOTK_WB_ALIAS:off:on'
+                with self.subTest(state=state, side=side):
+                    reasons = benchlib.switch_admission(base, 'thor', new, 'thor', expected)
+                    self.assertTrue(any(PRIMARY + '=UNKNOWN' in reason for reason in reasons))
+                    self.assertEqual(benchlib.signature_relation(signature(base), signature(new), expected), 'unknown')
+                    self.assertEqual(compare(base, new, expected)[0][1], 'unknown')
+
     def test_optional_startup_records_are_resolved_only_when_actually_present(self):
         records = {key: [{'line': 2, 'kind': 'marker', 'state': 'off',
                           **({'mode': 0} if key == 'TOTK_MAP_WARN' else {})}]
