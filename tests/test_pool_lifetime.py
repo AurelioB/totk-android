@@ -256,10 +256,12 @@ class PoolLifetimeParity(unittest.TestCase):
         self.assertEqual(self.observed['acd']['parent-before-child']['uploads'], 1)
         self.assertEqual(self.observed['acd']['parent-before-child']['byte'], 0x67)
 
-    def test_stale_child_at_reused_address_is_unchanged(self):
-        self.unchanged('stale-child')
-        # B intentionally remains: surviving refs still permit stale storage sharing.
-        self.assertEqual(self.observed['acd']['stale-child']['old_storage_reused'], 1)
+    def test_stale_child_cannot_rediscover_retired_parent_storage(self):
+        self.assertEqual(self.observed['main']['stale-child']['old_storage_reused'], 1)
+        self.assertEqual(self.observed['acd']['stale-child']['old_storage_reused'], 0)
+        for key in ('stamp_current', 'cancellations'):
+            self.assertEqual(self.observed['main']['stale-child'][key],
+                             self.observed['acd']['stale-child'][key])
 
     def test_host_rebacking_and_failed_backing_are_unchanged(self):
         self.unchanged('host-reback', 'failed-backing')
@@ -281,11 +283,10 @@ class PoolLifetimeParity(unittest.TestCase):
                 self.assertEqual(actual, {'destroy_with_view': 0, 'active_cleared': 1,
                     'deferred_cleared': 1, 'rebuilt': 1, 'resolves': 1, 'unrelated_views': 2})
 
-    def test_image_lookup_and_lifecycle_routing_remain_byte_for_byte_main(self):
+    def test_unrelated_lookup_and_lifecycle_routing_remain_byte_for_byte_main(self):
         main_res, main_pool, main_vpool = self.sources['main']
         acd_res, acd_pool, acd_vpool = self.sources['acd']
-        for name in ('vk_tex_pool_gone', 'stor_key_of', 'tex_drop_locked', 'wb_unref',
-                     'tex_mark_gpu_written_inner', 'vk_wb_range_gone'):
+        for name in ('stor_key_of', 'vk_wb_range_gone'):
             self.assertEqual(fixture.function(main_res, name), fixture.function(acd_res, name), name)
         for name in ('add_range', 'back_pool', 'pool_remove_locked', 'pool_retired', 'mtl_vpool_del',
                      'mtl_vpool_add', 'mtl_vpool_release', 'mtl_pool_finalize'):

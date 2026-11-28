@@ -1,8 +1,8 @@
 """Main-branch defect regressions: execute production C slices without game data.
 
-Only unresolved pacing policy E remains an expected failure. Compilation and probe
-execution fail normally. Vulkan entry points are deterministic lifetime/allocation
-observers, not evidence of GPU synchronization, pixels or shipped scene frequency.
+The storage, allocation, descriptor and pacing assertions are ordinary regressions.
+Compilation and probe execution fail normally. Vulkan entry points are deterministic
+lifetime/allocation observers, not evidence of GPU synchronization, pixels or shipped scene frequency.
 """
 import json
 import os
@@ -324,6 +324,8 @@ def resource_probe(resources=None, pools=None, scenarios=RESOURCE_SCENARIOS):
     code += RESOURCE_AFTER_TYPES
     code += section(resources, 'typedef struct { VkImage img; vk_alloc mem; view_ent *views;', '/* The game finalises textures')
     code += function(resources, 'retire_bview')
+    if 'static void shared_image_idle(' in resources:
+        code += function(resources, 'shared_image_idle')
     for name in ('vk_res_buffer_released', 'stor_key_of', 'tex_mirrored', 'image_layers',
                  'img_create_ex', 'img_create', 'tex_drop_locked', 'tex_get_inner', 'vk_tex_get',
                  'vk_tex_pool_gone', 'tbuf_by_id'):
@@ -511,14 +513,9 @@ class MainDefectReproductions(unittest.TestCase):
         self.assertEqual(self.observed['arena-view'],
                          {'destroy_with_view': 0, 'same_view': 0, 'resolves': 2})
 
-    # B remains conditional/open: see .scratch/perf/main-defects/fix/review-r1.md,
-    # review-r2.md, review-2nd.md and review-r3.md. Do not reintroduce their
-    # storage/image invalidation changes as part of the exact-buffer A fix.
-    @unittest.expectedFailure
     def test_b_finalized_storage_with_texture_ref_has_new_identity(self):
         self.assertEqual(self.observed['storage-ref']['same_image'], 0)
 
-    @unittest.expectedFailure
     def test_b_pool_gone_detaches_writeback_pinned_identity(self):
         self.assertEqual(self.observed['storage-wbref']['same_image'], 0)
 

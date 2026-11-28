@@ -2926,16 +2926,25 @@ recovery and long-session matched-configuration map deltas still require the aut
 | Statistics | Walking totals stay walking-only. Worker/assembly/guard aggregates publish under the recorder mutex and logging reads/resets there. Cross-owner guard/QueueSubmit totals use coarse atomics, with no new per-draw clocks. No worker updates global draw/descriptor statistics. |
 | VMA admission and baseline watch flags | Each dirty unit gate owns its page watch bits and reserved/final run credit; global budget/pressure/retained-capacity counters are atomic. Proc sampling/epoch bookkeeping uses a normal-thread mutex, never a fault-path lock. The ordered failed-slot owner drains under the range-lifetime mutex and unit gates only after its queued GPU fence. A sealed native batch is sorted/rehash-complete before worker publication and immutable until every shard joins. |
 
-The A/C/D split intentionally leaves finalized image-storage discoverability (B) unchanged from main:
-a surviving texture/write-back reference can retain an address/layout lookup identity. The normal
-quiet finalize path has not been shown to retain a write-back-only pin, and no game occurrence of
-a surviving texture reference has been established. Four review rounds of the abandoned broader
-fix found image invalidation regressions (nested/live children, MapVirtual, host re-backing and
-failed backing). See `.scratch/perf/main-defects/fix/review-r1.md`, `review-r2.md`,
-`review-2nd.md`, `review-r3.md` and `.scratch/perf/main-defects/acd/report.md`.
-The B reproductions and the undecided default-120-Hz pacing case E remain expected failures.
-`test_pool_lifetime.py` runs identical scenario probes against main `8bbbce5` and the split,
-asserting image/storage/upload/write-back-routing parity, not claiming main is correct in every case.
+Pool storage identity ends before image ownership: `vk_tex_pool_gone` removes every overlapping shared
+image from the storage lookup even while textures or write-back copies retain it. Detached images
+remain usable by their existing serials and retire after the last texture/write-back pin through the
+ordinary submission fence; retirement never removes a replacement image's lookup entry.
+Detached shared images are already GPU-written or GPU-only, so existing serials keep their content
+without reuploading or republishing it. They cannot create new write-back notes or land pending bytes.
+Existing range cancellation retains
+in-flight staging until its copy fence; the registration identity/full-bounds lock still guards
+both private-alias and ordinary guest stores. Non-owning pool removal and MapVirtual routing are unchanged.
+
+The earlier A/C/D split intentionally left finalized image-storage discoverability (B) unchanged.
+`test_storage_detach.py` now keeps main `8c6c621` as a negative control: actual owning-pool deletion
+followed by a new serial at the same address returns the old image with either texture or write-back
+pins. Current assertions require a new image, retained old owners, both pin-release orders, repeated
+reuse and an unaffected adjacent allocation. `vkdrawtest --storage-detach` adds real lavapipe pixels,
+pending and GPU-gated write-back copies, and cancellation before fence completion. The existing
+pool-view, re-registration, nested-child upload, re-backing and MapVirtual scenarios remain controls;
+only the assertions requiring the stale B identity and exact B function text have changed.
+No game occurrence or device picture/performance improvement is established by these host fixtures.
 
 ### Host identity and race checks
 

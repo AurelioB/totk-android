@@ -212,6 +212,7 @@ typedef struct vk_img {
     int shared, refs; stor_key k; uint64_t idle_sub;
     int trace_selected; uint64_t trace_serial, trace_storage; /* populated only by the opt-in copy diagnostic */
     int wbrefs, orphan;   /* write-back pins are separate from actual texture-object references */
+    int storage_gone;     /* detached from address lookup; existing owners still hold this image */
     view_ent *views; int nviews, capviews;
     int gpu_written;
     int arr3d;      /* 3D, created 2D_ARRAY_COMPATIBLE: its slices can be render targets */
@@ -288,6 +289,13 @@ static void retire_img(vk_img *im) {
     if (im->scene_scratch) retire_img(im->scene_scratch);
     for (unsigned j=0;j<3;j++) if (im->scene_aa[j]) retire_img(im->scene_aa[j]);
     retire((retired_t){.img = im->img, .mem = im->mem, .views = im->views, .nviews = im->nviews, .host = im});
+}
+/* A detached shared image has no cache owner. Its last texture/write-back owner
+   retires it through the same submission fence as any other image. */
+static void shared_image_idle(vk_img *im) {
+    if (im->refs || im->wbrefs) return;
+    if (im->storage_gone) retire_img(im);
+    else im->idle_sub = vk_submit_serial();
 }
 static void retire_bview(VkBufferView bv, VkBuffer buffer) { if (bv) retire((retired_t){.bv = bv, .bv_buffer = buffer}); }
 static void retire_host(void *p) { if (p) retire((retired_t){.host = p}); }
@@ -691,7 +699,7 @@ static void tex_drop_locked(vk_tex *x) {
     texcopy_resource("drop", x);
     if (x->tbv) retire_bview(x->tbv, x->tb_buffer);
     if (x->im) {
-        if (x->im->shared) { if (--x->im->refs == 0) x->im->idle_sub = vk_submit_serial(); }
+        if (x->im->shared) { x->im->refs--; shared_image_idle(x->im); }
         else if (x->im->wbrefs) x->im->orphan = 1;   /* a rendering waiting for write-back keeps it */
         else retire_img(x->im);
     }
@@ -795,7 +803,7 @@ void mtl_tex_release(tex_t *t) {
     tex_epoch_bump();   /* cached id lookups may hold it (vk_tex_by_id) */
     pthread_mutex_unlock(&g_tex_mu);
 }
-void vk_tex_pool_gone(uintptr_t lo, uintptr_t hi) {   /* nvn_vk.c: a pool was finalised: shared images over it are dropped */
+void vk_tex_pool_gone(uintptr_t lo, uintptr_t hi) {   /* storage identity ends independently of its image owners */
     pthread_mutex_lock(&g_tex_mu);
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         vk_tex *x = g_by_serial.vals ? g_by_serial.vals[i] : NULL;
@@ -804,9 +812,10 @@ void vk_tex_pool_gone(uintptr_t lo, uintptr_t hi) {   /* nvn_vk.c: a pool was fi
     }
     for (uint32_t i = 0; i < g_by_storage.cap; i++) {
         vk_img *im = g_by_storage.vals ? g_by_storage.vals[i] : NULL;
-        if (!im || im->k.mem < lo || im->k.mem >= hi) continue;
-        if (im->refs || im->wbrefs) continue;
-        stor_key k = im->k; nvn_hm_del(&g_by_storage, &k); retire_img(im); i--;
+        if (!im || im->k.mem >= hi || (im->k.mem < lo && im->k.size <= lo - im->k.mem)) continue;
+        stor_key k = im->k; nvn_hm_del(&g_by_storage, &k); i--;
+        im->storage_gone = 1;
+        shared_image_idle(im);
     }
     pthread_mutex_unlock(&g_tex_mu);
     tex_epoch_bump();
@@ -1078,7 +1087,7 @@ static void wb_detail(const wb_ent *e, const wb_history *h, enum wb_land_mode mo
 static void wb_ref(vk_img *im) { im->wbrefs++; }
 static void wb_unref(vk_img *im) {
     im->wbrefs--;
-    if (im->shared) { if (!im->refs) im->idle_sub = vk_submit_serial(); }
+    if (im->shared) shared_image_idle(im);
     else if (!im->wbrefs && im->orphan) retire_img(im);
 }
 static void wb_staging_free(wb_ent *e) {
@@ -1115,6 +1124,7 @@ static int wb_watch_tracked(const tex_t *t, void *watch) {
 }
 static void wb_note_locked(vk_tex *x) {
     const tex_t *t = &x->t;
+    if (x->im && x->im->storage_gone) return; /* an old serial must not acquire a replacement pool's write authority */
     uint64_t tile_version = wb_tile_note(x);
     if ((!wb_on() && !settled_on()) || !x->cpu_pool || !x->im || !t->mem || !t->L.size) {
         wb_tile_event(tile_version, !x->cpu_pool ? "not-cpu-pool" : "disabled", 0, 0); return;
@@ -1263,6 +1273,9 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
     const tex_t *t = &e->t; int settled = mode != WB_SYNC; wb_shape s = wb_layout(e);
     uint64_t offset = 0, span = t->L.size;
     if (advanced) *advanced = 0;
+    if (e->im->storage_gone) {
+        wb_tile_event(e->tile_version, "storage-gone", 0, 0); return -1;
+    }
     if (mode == WB_IDLE) {
         uint64_t level = nvn_tex_level_offset(&t->d, e->land_level);
         uint64_t end = e->land_level + 1 < s.levels ? nvn_tex_level_offset(&t->d, e->land_level + 1) : t->L.layer_size;

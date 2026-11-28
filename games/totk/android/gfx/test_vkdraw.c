@@ -2406,6 +2406,87 @@ static int settled_budget(void) {
     return fails != 0;
 }
 
+/* Pool identity reuse, with genuine GPU pixels and write-back staging. Direct
+   detachment also covers a pending/borrowed record before range cancellation. */
+static int storage_detach(void) {
+    enum { BYTES = 65536 };
+    unsetenv("TOTK_VK_WRITEBACK"); setenv("TOTK_VK_SETTLED_WB_SUBS", "1", 1);
+    uint8_t *memory = mmap(NULL, BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) DIE("storage detach mmap");
+    pool_t pool = {.mem = memory, .size = BYTES, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED};
+    mtl_init();
+    for (unsigned round = 0; round < 8; round++) {
+        memset(memory, 0x39, BYTES); mtl_pool_add(memory, BYTES); nvn_dirty_add_range(memory, BYTES);
+        tex_t old = {.pool = &pool, .mem = memory, .serial = 89000 + 2 * round,
+            .d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0xd, .width = 8, .height = 8, .depth = 1, .levels = 1}};
+        nvn_tex_layout(&old.d, &old.L);
+        settled_render(&old); CHECK(mtl_wait(run(), 5000000000ull), "old producer completes");
+        vk_tex *owner = vk_tex_get(&old); VkImage image = vk_tex_image(owner);
+        uint64_t before[7], after[7]; vk_wb_test_stats(before);
+        CHECK(before[2] == 1, "old GPU rendering owns one pending write-back pin");
+        VkEvent gate = VK_NULL_HANDLE; uint64_t fence = 0;
+        if (round & 1) {
+            VkEventCreateInfo ci = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+            VKCHECK(vkCreateEvent(V.dev, &ci, NULL, &gate));
+            mtl_sub_begin();
+            vkCmdWaitEvents(vk_cb(), 1, &gate, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, NULL, 0, NULL, 0, NULL);
+            fence = mtl_sub_commit(); vk_wb_test_stats(after);
+            CHECK(!mtl_wait(fence, 0) && after[5] && after[6] > before[6],
+                "real read-back staging remains GPU-owned at detach");
+        }
+        if (round & 2) mtl_tex_release(&old); /* the pending write-back is the last owner */
+        vk_tex_pool_gone((uintptr_t)memory, (uintptr_t)memory + BYTES);
+        if (gate) {
+            vk_wb_range_gone((uintptr_t)memory, (uintptr_t)memory + BYTES);
+            vk_wb_test_stats(after);
+            CHECK(after[2] == 1 && after[5], "cancellation retains in-flight staging/image until its fence");
+            VKCHECK(vkSetEvent(V.dev, gate)); CHECK(mtl_wait(fence, 5000000000ull), "detached copy retires");
+            vk_rec_lock(); vk_res_sweep(); vk_rec_unlock();
+            vkDestroyEvent(V.dev, gate, NULL);
+        } else {
+            /* Registration remains live here: the image's detached state, not
+               merely a missing pool identity, must prevent the landing. */
+            mtl_pool_invalidate(&pool, 0, old.L.size);
+        }
+        vk_wb_test_stats(after);
+        CHECK(after[0] == before[0] && !after[2] && !after[5] && memory[0] == 0x39,
+            "detached pending bytes never land, even while the registration is live");
+        if (!(round & 2)) {
+            uint8_t pixel[2] = {0}; NVNcopyRegion region = {0, 0, 0, 1, 1, 1};
+            mtl_read_texels(&old, 0, 0, &region, pixel, 2, 2);
+            CHECK(vk_tex_image(owner) == image && pixel[0] == 255 && pixel[1] == 255,
+                "old serial still reads its original GPU pixels until released");
+            vk_tex_mark_gpu_written(owner); vk_wb_test_stats(after);
+            CHECK(!after[2], "old serial cannot acquire replacement write-back authority");
+        }
+        nvn_dirty_remove_range(memory); mtl_pool_del(memory);
+        mtl_pool_add(memory, BYTES); nvn_dirty_add_range(memory, BYTES);
+        tex_t fresh = old; fresh.serial++;
+        vk_tex *replacement = vk_tex_get(&fresh);
+        CHECK(replacement && ((round & 2) || vk_tex_image(replacement) != image),
+            "reused address gets a fresh image while any old owner is still alive");
+        vk_tex_mark_gpu_written(replacement); /* force a GPU read, not the pool-only CPU fast path */
+        uint8_t pixel[2] = {0}; NVNcopyRegion region = {0, 0, 0, 1, 1, 1};
+        mtl_read_texels(&fresh, 0, 0, &region, pixel, 2, 2);
+        CHECK(pixel[0] == 0x39 && pixel[1] == 0x39, "replacement reads its own uploaded bytes");
+        if (!(round & 2)) {
+            vk_wb_test_stats(before); vk_tex_mark_gpu_written(owner); vk_wb_test_stats(after);
+            CHECK(after[2] == before[2] && after[4] == before[4],
+                "old owner cannot supersede the new pool's pending rendering");
+            mtl_tex_release(&old);
+        }
+        CHECK(vk_tex_get(&fresh) == replacement, "old retirement does not remove replacement lookup");
+        mtl_tex_release(&fresh); nvn_dirty_remove_range(memory); mtl_pool_del(memory); settled_idle(2);
+    }
+    uint64_t resources[8]; vk_res_mem(resources);
+    CHECK(!resources[1] && !resources[2] && !resources[3] && !resources[4] && !resources[5] && !resources[7],
+        "repeated reuse leaves no images, owners, retired objects, lookup entries or write-back pins");
+    munmap(memory, BYTES);
+    printf("%s: storage detach %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
+
 static int settled_preflight(const char *off) {
     enum { POOL_BYTES = 8 << 20, MISSES = 4096 };
     unsetenv("TOTK_VK_WRITEBACK"); unsetenv("TOTK_VK_SETTLED_WB_SUBS");
@@ -2915,6 +2996,7 @@ static int nativeui_geometry(void) {
 #endif
 }
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--storage-detach")) return storage_detach();
     if (argc == 2 && !strcmp(argv[1], "--wb-alias-watch-exhaustion")) return wb_alias_watch_exhaustion();
     if (argc == 2 && !strcmp(argv[1], "--nativeui-geometry")) return nativeui_geometry();
     if (argc == 2 && !strcmp(argv[1], "--settled-wb-service")) return settled_service();

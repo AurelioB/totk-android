@@ -5,6 +5,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 
 ## Unreleased
 
+### Graphics
+- Detach images from the storage lookup when their owning pool is released, so reused guest addresses
+  cannot discover the previous pool's image. Existing texture and write-back owners retain their images
+  until ordinary fenced retirement; detached renderings cannot write back into replacement storage.
+
 ### Setup
 - Explain failed merged-game-data integrity checks and name the IVFC level instead of showing an unexpected
   internal error with “exit 0” (#29). Suggest verifying/re-dumping the original 1.0.0 base and 1.4.3 update,
