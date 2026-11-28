@@ -573,6 +573,7 @@ public final class SaveMirror {
             folder.list(dirId(dir), "", docs);
             Map<String, long[]> out = new HashMap<>();
             for (Map.Entry<String, Doc> e : docs.entrySet()) {
+                if (SaveManager.partial(e.getKey())) continue;
                 out.put(e.getKey(), new long[]{e.getValue().size, e.getValue().mtime});
                 fileDocs.put(dir + "/" + e.getKey(), e.getValue());
             }

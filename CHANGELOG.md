@@ -24,11 +24,12 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 
 ### Fixed
 - Ignore reserved save-set root metadata when exporting, syncing, backing up or importing saves (#19).
-  Matching is case-sensitive and root-only: `totk-native-saves.json`, `totk-native-saves.json.tmp`,
-  the `TotK Native saves` wrapper subtree and hidden `.*.partial` markers/subtrees.
-  Identically named files deeper in the set remain ordinary content, verified and counted; `backup.json`
-  belongs outside the set in a backup envelope and is not reserved inside saves.
-  Project older manifests onto retained content without weakening its size/hash verification.
+  Matching is case-sensitive: `totk-native-saves.json`, its `.tmp` and the `TotK Native saves` wrapper
+  are reserved at the set root; hidden `.*.partial` write markers/subtrees are excluded at every depth
+  by export, both mirror stores, backup and import. Other matching names deeper in the set remain
+  ordinary content, verified and counted; `backup.json` is not reserved inside saves.
+  Project older manifests onto retained content before charging file/path budgets, while keeping
+  independent raw parsing guards and retained-file size/hash verification.
   Leave existing root strays untouched; restore omits them from old backups. This fixes an older
   duplicate-manifest export failure, not a regression of the photo-heavy save limits.
 - Accept photo-heavy save imports with up to 16,384 files, instead of 500 (#19, duplicate #27).

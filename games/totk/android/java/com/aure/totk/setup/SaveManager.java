@@ -60,20 +60,27 @@ final class SaveManager {
     private static final Pattern SLOT_PROGRESS = Pattern.compile("(?:.*/)?slot_\\d\\d/progress\\.sav");
     private static final Pattern KNOWN = Pattern.compile("(?i).*\\.(sav|dat|jpg|jpeg|bin)");
 
-    /** Case-sensitive reserved first components relative to a save-set root (subtrees too if directories):
-     * MANIFEST, MANIFEST.tmp, TOP and hidden *.partial markers. A matching name deeper in the
-     * content tree is ordinary save content. backup.json belongs outside the set in a backup envelope;
-     * FileStore's per-directory hidden *.partial writes belong to its generation-store namespace.
-     * Existing live reserved files are left untouched, not deleted by enumeration or safety copies. */
+    /** Case-sensitive reserved first components (subtrees too): MANIFEST, MANIFEST.tmp and TOP.
+     * Hidden *.partial write markers are reserved at every depth, in all content/store consumers.
+     * Other matching names deeper in content are ordinary saves; backup.json belongs outside the set
+     * in a backup envelope. Existing live reserved files are omitted, never deleted by enumeration. */
     static boolean reserved(String path) {
         int end = path.indexOf('/');
         if (end < 0) end = path.length();
-        return named(path, end, MANIFEST) || named(path, end, MANIFEST + ".tmp") || named(path, end, TOP)
-                || end >= ".partial".length() && path.charAt(0) == '.'
-                    && path.regionMatches(end - ".partial".length(), ".partial", 0, ".partial".length());
+        return named(path, end, MANIFEST) || named(path, end, MANIFEST + ".tmp") || named(path, end, TOP) || partial(path);
     }
     private static boolean named(String path, int end, String name) {
         return end == name.length() && path.regionMatches(0, name, 0, name.length());
+    }
+    static boolean partial(String path) {
+        for (int start = 0; start < path.length();) {
+            int end = path.indexOf('/', start);
+            if (end < 0) end = path.length();
+            if (end - start >= ".partial".length() && path.charAt(start) == '.'
+                    && path.regionMatches(end - ".partial".length(), ".partial", 0, ".partial".length())) return true;
+            start = end + 1;
+        }
+        return false;
     }
 
     // ---------- errors ----------
@@ -292,7 +299,7 @@ final class SaveManager {
             if (consume(']')) return;
             int entries = 0;
             while (true) {
-                if (++entries > MAX_FILES) throw new Invalid("too_many", entries + " files (limit " + MAX_FILES + ")");
+                if (++entries > MAX_ENTRIES) throw corrupt("too many raw file records");
                 if (value(depth + 1) != '{') throw corrupt("manifest file entry");
                 entry(depth + 1, manifest);
                 space();
@@ -338,6 +345,7 @@ final class SaveManager {
             // Older writers could list root envelope/temp files. Project only those records out; every
             // retained entry (including nested same-named files) still needs its size/hash verified.
             if (reserved(name)) return;
+            paths.add(name);
             if (sha.length() != 64) throw corrupt("manifest digest");
             boolean uppercase = false;
             for (int i = 0; i < sha.length(); i++) {
@@ -545,7 +553,8 @@ final class SaveManager {
                 int length = out.length();
                 long extra = Character.isLowSurrogate(c) && length != 0 && Character.isHighSurrogate(out.charAt(length - 1))
                         ? 3 : c < 0x80 ? 1 : c < 0x800 ? 2 : Character.isSurrogate(c) ? 1 : 3;
-                long observed = paths.bytes + bytes + extra;
+                // Bound one decoding buffer independently; only retained records charge the shared budget.
+                long observed = bytes + extra;
                 if (observed > MAX_PATH_BYTES)
                     throw new Invalid("path_bytes", observed + " path bytes (limit " + MAX_PATH_BYTES + ")");
                 bytes += extra;
@@ -554,9 +563,7 @@ final class SaveManager {
 
             String finish() throws Invalid {
                 endSegment();
-                String name = normalize(out.toString());
-                paths.add(name);
-                return name;
+                return normalize(out.toString());
             }
         }
 
@@ -772,8 +779,9 @@ final class SaveManager {
         File[] children = dir.listFiles();
         if (children == null) return;
         for (File child : children) {
-            if (Files.isSymbolicLink(child.toPath()) || prefix.isEmpty() && reserved(child.getName())) continue;
+            if (Files.isSymbolicLink(child.toPath())) continue;
             String path = prefix + child.getName();
+            if (reserved(path)) continue;
             if (child.isDirectory()) walk(child, path + "/", out);
             else if (child.isFile()) out.add(path);
         }
@@ -1230,8 +1238,9 @@ final class SaveManager {
         File[] children = from.listFiles();
         if (children == null) return;
         for (File child : children) {
-            if (Files.isSymbolicLink(child.toPath()) || root && reserved(child.getName())) continue;
-            File target = new File(to, child.getName());
+            String name = child.getName();
+            if (Files.isSymbolicLink(child.toPath()) || (root ? reserved(name) : partial(name))) continue;
+            File target = new File(to, name);
             if (child.isDirectory()) copyTree(child, target, false);
             else if (child.isFile()) try (InputStream in = new FileInputStream(child)) { copyLimited(in, target, Long.MAX_VALUE, child.lastModified()); }
         }
@@ -1369,9 +1378,10 @@ final class SaveManager {
             if (children == null) throw new FileNotFoundException(d.getPath());
             for (File c : children) {
                 if (out.size() > MAX_ENTRIES) throw new Invalid("too_many", out.size() + " entries (limit " + MAX_ENTRIES + ")");
-                if (Files.isSymbolicLink(c.toPath())) continue;
-                if (c.isDirectory()) list(c, prefix + c.getName() + "/", out);
-                else if (!(c.getName().startsWith(".") && c.getName().endsWith(PARTIAL))) out.put(prefix + c.getName(), new long[]{c.length(), c.lastModified()});
+                String name = c.getName();
+                if (Files.isSymbolicLink(c.toPath()) || partial(name)) continue;
+                if (c.isDirectory()) list(c, prefix + name + "/", out);
+                else out.put(prefix + name, new long[]{c.length(), c.lastModified()});
             }
         }
         @Override public InputStream open(String dir, String path) throws IOException {

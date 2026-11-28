@@ -160,6 +160,49 @@ public final class SaveMetadataProbe {
         String command=args[0]; File base=new File(args[1]); base.mkdirs();
         boolean direct=args.length<3 || args[2].equals("direct");
         Context context=new Context(new File(base,"private"),direct);
+        if(command.equals("store-list")) {
+            File top=new File(base,"top"), generation=new File(top,"sync-000001"); generation.mkdirs();
+            for(String name:new String[]{"option.sav",".option.sav.partial","slot_00/.caption.sav.partial","album/.upload.partial/photo.jpg"}) {
+                File f=new File(generation,name); f.getParentFile().mkdirs(); Files.writeString(f.toPath(),"x");
+            }
+            SaveManager.Store store;
+            if(direct) store=new SaveManager.FileStore(top);
+            else {
+                Class<?> folderType=Class.forName("com.aure.totk.setup.SaveMirror$Folder");
+                java.lang.reflect.Constructor<?> folderConstructor=folderType.getDeclaredConstructors()[0]; folderConstructor.setAccessible(true);
+                Object folder=folderConstructor.newInstance(context.getContentResolver(),Uri.parse(top.getPath()));
+                Class<?> storeType=Class.forName("com.aure.totk.setup.SaveMirror$SafStore");
+                java.lang.reflect.Constructor<?> storeConstructor=storeType.getDeclaredConstructors()[0]; storeConstructor.setAccessible(true);
+                store=(SaveManager.Store)storeConstructor.newInstance(folder,top.getPath());
+            }
+            java.util.List<String> names=new java.util.ArrayList<>(store.files("sync-000001").keySet());
+            java.util.Collections.sort(names); System.out.println("store-list="+String.join(",",names));
+            return;
+        }
+        if(command.equals("zip-budget")) {
+            File staged=new File(base,"staged");
+            SaveManager.Selection selected=SaveMirror.stageZip(context,Uri.parse(args[3]),staged);
+            long bytes=0; for(SaveManager.Candidate entry:selected.files) bytes+=entry.path.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+            System.out.println("zip-budget=files="+selected.files.size()+" path_bytes="+bytes);
+            return;
+        }
+        if(command.equals("historical-budget")) {
+            SaveManager.Manifest manifest=new SaveManager.Manifest();
+            String sha="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+            manifest.files.add(new SaveManager.FileEntry(SaveManager.MANIFEST+".tmp",0,sha,0));
+            int count=16384, remaining=4194304-10, each=remaining/(count-1), extra=remaining%(count-1);
+            for(int i=0;i<count;i++) {
+                String prefix="album/"+i+"/";
+                int length=each+(i<=extra ? 1 : 0);
+                String path=i==0 ? "option.sav" : prefix+"p".repeat(length-prefix.length()-4)+".jpg";
+                manifest.files.add(new SaveManager.FileEntry(path,0,sha,0));
+            }
+            // This command deliberately uses the real historical serializer, never a hand-built JSON fixture.
+            String json=(String)SaveManager.Manifest.class.getDeclaredMethod("toJson").invoke(manifest);
+            File target=new File(base,"budget.json"); Files.writeString(target.toPath(),json);
+            System.out.println("historical-budget=raw_files="+manifest.files.size());
+            return;
+        }
         if (command.equals("stage-folder") || command.equals("stage-zip")) {
             File source=new File(args[3]), staged=new File(base,"staged");
             report(command, () -> {
@@ -181,6 +224,11 @@ public final class SaveMetadataProbe {
             for(String name:new String[]{"slot_00/progress.sav","album/"+SaveManager.MANIFEST,"slot_00/backup.json",
                     "backup.json","album/"+SaveManager.MANIFEST+".tmp","slot_00/"+SaveManager.TOP+"/note.txt"}) {
                 File f=new File(root,name); f.getParentFile().mkdirs(); Files.writeString(f.toPath(),"ordinary "+name);
+            }
+        }
+        if(command.equals("historical-partial") || command.equals("partial")) {
+            for(String name:new String[]{".option.sav.partial","slot_00/.caption.sav.partial","album/.upload.partial/photo.jpg"}) {
+                File f=new File(root,name); f.getParentFile().mkdirs(); Files.writeString(f.toPath(),"interrupted write");
             }
         }
         if(command.equals("historical-root")) {

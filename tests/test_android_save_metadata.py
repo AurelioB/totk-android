@@ -33,12 +33,12 @@ class SaveMetadataTests(unittest.TestCase):
     def setUp(self):
         self.work = Path(tempfile.mkdtemp(prefix='case-', dir=self.base))
 
-    def run_probe(self, command, name, mode='direct', source=None, classes=None):
+    def run_probe(self, command, name, mode='direct', source=None, classes=None, timeout=30):
         args = [self.java, '-Xmx64m', '-cp', str(classes or self.classes), 'com.aure.totk.setup.SaveMetadataProbe',
                 command, str(self.work / name), mode]
         if source is not None:
             args.append(str(source))
-        result = subprocess.run(args, check=True, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(args, check=True, capture_output=True, text=True, timeout=timeout)
         return dict(line.split('=', 1) for line in result.stdout.splitlines())
 
     def test_stray_metadata_does_not_break_export_sync_backup_or_restore(self):
@@ -92,7 +92,7 @@ class SaveMetadataTests(unittest.TestCase):
     def test_real_historical_nested_files_and_root_projection_round_trip(self):
         for revision in ('v1.0.1', '5762688'):
             classes = compile_mirror(ROOT, self.work / ('compile-' + revision), self.javac, revision)
-            for shape in ('nested', 'root'):
+            for shape in ('nested', 'root', 'partial'):
                 source_name = revision + '-' + shape
                 self.run_probe('historical-' + shape, source_name, classes=classes)
                 archive_path = self.work / source_name / 'clean.zip'
@@ -104,6 +104,9 @@ class SaveMetadataTests(unittest.TestCase):
                                 if name != TOP + '/' + MANIFEST}
                 if shape == 'root':
                     self.assertEqual(len(metadata['files']), 4, 'real old writer must list the excluded root files')
+                    expected = {'option.sav': expected['option.sav']}
+                elif shape == 'partial':
+                    self.assertEqual(len(metadata['files']), 4, 'real old writer exported nested partial markers')
                     expected = {'option.sav': expected['option.sav']}
                 else:
                     self.assertIn('album/' + MANIFEST, expected)
@@ -129,6 +132,30 @@ class SaveMetadataTests(unittest.TestCase):
                     for mode in ('direct', 'saf'):
                         answer = self.run_probe('stage-folder', source_name + '-edited-' + mode, mode, folder)
                         self.assertIn('ERROR Invalid: corrupt:', answer['stage-folder'])
+
+    def test_partial_markers_agree_across_export_mirror_and_backup(self):
+        for mode in ('direct', 'saf'):
+            result = self.run_probe('partial', mode, mode)
+            self.assertEqual(result, {'export': 'option.sav', 'sync': 'pushed ', 'fetch': 'option.sav',
+                                      'backup': 'option.sav', 'preserved': 'true', 'restore': 'option.sav'})
+            self.assertEqual(self.run_probe('store-list', mode + '-list', mode), {'store-list': 'option.sav'})
+
+    def test_historical_projected_records_do_not_charge_retained_limits(self):
+        classes = compile_mirror(ROOT, self.work / 'historical-compile', self.javac, 'v1.0.1')
+        self.assertEqual(self.run_probe('historical-budget', 'historical', classes=classes),
+                         {'historical-budget': 'raw_files=16385'})
+        manifest = (self.work / 'historical/budget.json').read_bytes()
+        records = json.loads(manifest)['files']
+        self.assertEqual(len(records), 16385)
+        self.assertEqual(sum(len(entry['path'].encode('utf-8')) for entry in records[1:]), 4 << 20)
+        archive_path = self.work / 'historical-budget.zip'
+        with zipfile.ZipFile(archive_path, 'w') as archive:
+            for entry in records:
+                archive.writestr(TOP + '/' + entry['path'], b'')
+            archive.writestr(TOP + '/' + MANIFEST, manifest)
+        # Extraction fsyncs every file; use the existing save-count probes' allowance for this maximum-size set.
+        self.assertEqual(self.run_probe('zip-budget', 'imported', source=archive_path, timeout=120),
+                         {'zip-budget': 'files=16384 path_bytes=4194304'})
 
     def test_existing_opaque_stray_is_left_untouched_during_export_sync_backup(self):
         result = self.run_probe('opaque', 'preserved')
